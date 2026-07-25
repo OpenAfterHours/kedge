@@ -407,6 +407,11 @@ def build_mashup_package(section_m: str) -> bytes:
         for name in sorted(contents):
             info = zipfile.ZipInfo(name, date_time=FIXED_ZIP_DATE)
             info.compress_type = zipfile.ZIP_DEFLATED
+            # `zipfile` stamps the host system into "version made by" from the platform it runs
+            # on -- 0 for FAT, 3 for Unix -- so without this the package differs byte for byte
+            # between Windows and Linux and the corpus stops being reproducible. 0 to match the
+            # outer workbook, which pins the same field for the same reason.
+            info.create_system = 0
             archive.writestr(info, contents[name])
     return buffer.getvalue()
 

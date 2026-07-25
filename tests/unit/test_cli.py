@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,21 @@ from kedge.reconcile import ReconciliationStatus
 SECRET = "sk-must-never-be-printed-0123456789"
 
 runner = CliRunner()
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def unstyled(output: str) -> str:
+    """Rendered output with the escape sequences taken out.
+
+    Anything asserting on a *token* in rich-rendered output has to go through this. rich splits
+    a styled run wherever its highlighter says to, and for an option it emits
+    ``\\x1b[1;36m-\\x1b[0m\\x1b[1;36m--out\\x1b[0m`` -- so ``"--out" in result.output`` is false
+    while the text on screen plainly reads ``--out``. Whether that happens depends on whether
+    rich thinks colour is available, which is why this passes on a developer's machine and fails
+    under CI, where ``FORCE_COLOR`` is set.
+    """
+    return _ANSI.sub("", output)
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +96,7 @@ def test_contract_infer_is_reachable() -> None:
     result = runner.invoke(app, ["contract", "infer", "--help"])
 
     assert result.exit_code == 0
-    assert "--out" in result.output
+    assert "--out" in unstyled(result.output)
 
 
 # ── config ───────────────────────────────────────────────────────────────────────────────────
@@ -114,8 +130,10 @@ def test_config_never_prints_the_api_key(monkeypatch: pytest.MonkeyPatch) -> Non
     plain = runner.invoke(app, ["config"])
     machine = runner.invoke(app, ["config", "--json"])
 
-    assert SECRET not in plain.output
-    assert SECRET not in machine.output
+    # Through unstyled(): a secret broken across two style spans is still a leaked secret, and
+    # asserting on the raw output would let exactly that through.
+    assert SECRET not in unstyled(plain.output)
+    assert SECRET not in unstyled(machine.output)
     assert json.loads(machine.output)["api_key"]["status"] == "present"
 
 

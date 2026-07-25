@@ -14,6 +14,7 @@ can act on.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,26 @@ def test_a_network_call_inside_the_allowlist_is_permitted(registry: NameRegistry
 def test_writing_outside_the_working_directory_is_rejected(
     registry: NameRegistry, tmp_path: Path
 ) -> None:
+    # Absolute, and outside `working_dir`, on whichever platform this runs. Spelling it with a
+    # drive letter would only be absolute on Windows: on POSIX `C:\Users\...` is a legal
+    # *relative* filename, so the gate rightly permits it and the assertion would fail for a
+    # reason that has nothing to do with the policy under test.
+    outside = tmp_path.parent / "elsewhere" / "rwa_monthly.csv"
+    report = validate_cell(
+        f"monthly_output.write_csv(r{str(outside)!r})\n",
+        registry=registry,
+        policy=Policy(working_dir=tmp_path),
+    )
+    assert not report.ok
+    assert report.stage is ValidationStage.POLICY
+    assert "outside" in report.messages[0]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a drive letter is only an absolute path on Windows")
+def test_writing_to_another_drive_letter_is_rejected(
+    registry: NameRegistry, tmp_path: Path
+) -> None:
+    """The Windows spelling of the same policy, kept because it is the one users hit."""
     report = validate_cell(
         'monthly_output.write_csv(r"C:\\\\Users\\\\Public\\\\rwa_monthly.csv")\n',
         registry=registry,
