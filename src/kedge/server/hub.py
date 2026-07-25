@@ -1,0 +1,879 @@
+"""The hub: the landing page, the workbook registry over HTTP, and the open sequence.
+
+Until this existed, the only way into kedge was ``kedge open <workbook>`` — the server could not
+be built before the CLI had chosen a workbook, and the notebook pane's placeholder told the user
+to go back to the terminal. The hub is the other end: start the server with nothing open, list
+what kedge has seen, add a workbook by browsing or dropping one, and open it from the browser.
+
+Three parts:
+
+* **The registry surface** — thin HTTP over :mod:`kedge.registry`, which does the deriving. State
+  is recomputed from disk on every list, so a workbook deleted in Explorer shows as missing rather
+  than as a working row that fails when clicked.
+* **The file browser** — a server-side directory listing. This is a local, single-user, loopback
+  tool, so browsing the real filesystem is the correct behaviour and is exactly what marimo's own
+  ``mo.ui.file_browser`` does. Nothing is restricted by *location*; what is enforced is that the
+  file is really an OOXML workbook before it is accepted (:func:`kedge.registry.validate_workbook`).
+* **The open sequence** — the same steps ``kedge open`` runs, as a background job whose progress
+  is streamed with the typed SSE machinery in :mod:`kedge.server.events`. It takes several seconds
+  and does eight distinguishable things; PLAN M3 is explicit that a spinner will not do.
+
+The job runs in an :class:`asyncio.Task` rather than inside the streaming response, and every
+frame it emits is retained, so a browser that reloads mid-open reattaches and catches up instead
+of orphaning a marimo process it can no longer see.
+
+**Reattachment is only ever to our own process.** A workbook already showing a live marimo is
+offered "reattach", and that offer is built from *our* marker file, confirmed over HTTP with the
+token we generated. kedge never adopts a marimo it did not start (PLAN 2.9).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import logging
+import string
+import sys
+import uuid
+from collections.abc import AsyncIterator, Callable, Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
+
+from kedge.errors import KedgeError
+from kedge.registry import RegistryError, WorkbookRegistry, report_path_for
+from kedge.server.events import (
+    OPEN_STEPS,
+    ErrorEvent,
+    HubEvent,
+    OpenProgressEvent,
+    OpenReadyEvent,
+    OpenStep,
+    StepState,
+    encode_sse,
+    sse_comment,
+)
+from kedge.workspace import Workspace
+
+if TYPE_CHECKING:
+    from kedge.server.app import ServerState
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["OpenJob", "open_workbook", "router"]
+
+router = APIRouter()
+
+_STREAM_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+_KEEPALIVE_SECONDS = 15.0
+_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
+_UPLOAD_CHUNK = 1 << 20
+_IS_WINDOWS = sys.platform == "win32"
+
+_HIDDEN_DIRS = frozenset(
+    {"__pycache__", "node_modules", "$RECYCLE.BIN", "System Volume Information"}
+)
+"""Directories that are never where a user keeps a workbook, and only make the listing longer."""
+
+
+def _state(request: Request) -> ServerState:
+    return request.app.state.kedge
+
+
+def _registry(state: ServerState) -> WorkbookRegistry:
+    return WorkbookRegistry.for_user(state.user_directory)
+
+
+# ── request bodies ───────────────────────────────────────────────────────────────────────────
+
+
+class AddWorkbookBody(BaseModel):
+    """Body for registering a workbook already on this machine."""
+
+    path: str
+
+
+class OpenWorkbookBody(BaseModel):
+    """Body for starting an open.
+
+    ``reattach`` asks to adopt the marimo server our own marker file records for this workbook,
+    rather than spawning a second one. It is honoured only when that server answers and accepts
+    our token; otherwise the open falls through to a normal launch.
+    """
+
+    key: str | None = None
+    path: str | None = None
+    reattach: bool = False
+
+
+# ── the pages ────────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/hub", include_in_schema=False)
+def hub_page(request: Request) -> FileResponse:
+    """Serve the hub, whether or not a workbook is open.
+
+    Reachable from the chat view too, so "which workbook am I in, and what else is there?" is one
+    click rather than a restart.
+    """
+    return FileResponse(_state(request).static_dir / "hub.html")
+
+
+# ── the registry ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/api/hub/state")
+async def hub_state(request: Request) -> dict[str, Any]:
+    """Everything the hub page needs to draw itself: the workbooks, and what is open here.
+
+    The status sweep touches the filesystem for every entry and probes every recorded marimo over
+    HTTP, so it runs in a threadpool rather than blocking the loop.
+    """
+    state = _state(request)
+    registry = _registry(state)
+    statuses = await run_in_threadpool(registry.statuses)
+    workspace = state.workspace
+    return {
+        "version": state.version,
+        "attached": workspace is not None,
+        "demo": state.demo,
+        "open_workbook": None
+        if workspace is None
+        else {
+            "key": workspace.key,
+            "path": str(workspace.workbook_path),
+            "name": workspace.workbook_path.name,
+        },
+        "registry_path": str(registry.path),
+        "steps": list(OPEN_STEPS),
+        "workbooks": [status.to_dict() for status in statuses],
+    }
+
+
+@router.post("/api/hub/workbooks", status_code=201)
+async def add_workbook(body: AddWorkbookBody, request: Request) -> dict[str, Any]:
+    """Register a workbook by path, refusing anything that is not a readable workbook."""
+    registry = _registry(_state(request))
+    try:
+        entry = await run_in_threadpool(registry.add, Path(body.path))
+    except RegistryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KedgeError as exc:  # pragma: no cover - workspace construction is already guarded
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"workbook": entry.to_dict()}
+
+
+@router.post("/api/hub/upload", status_code=201)
+async def upload_workbook(request: Request, file: UploadFile) -> dict[str, Any]:
+    """Accept a dropped workbook, save it under ``~/.kedge/dropped``, and register it.
+
+    A dropped file arrives as bytes with no path, which is the same problem marimo's two file
+    inputs have: ``mo.ui.file`` gives bytes with no path and ``mo.ui.file_browser`` gives a path
+    with no bytes. kedge resolves it the way it resolves hand-ins — by giving the bytes a managed
+    location on disk — because a workbook with no path cannot be re-analysed, re-opened, or named
+    in a plan. The browse-and-pick path is still the better one and the page says so.
+    """
+    state = _state(request)
+    name = Path(file.filename or "workbook.xlsx").name
+    if Path(name).suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{name} is not a .xlsx or .xlsm file. kedge reads Office Open XML workbooks.",
+        )
+
+    directory = _dropped_dir(state)
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = _unique_path(directory / name)
+    written = 0
+    try:
+        with destination.open("wb") as handle:
+            while chunk := await file.read(_UPLOAD_CHUNK):
+                written += len(chunk)
+                if written > _MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"{name} is larger than {_MAX_UPLOAD_BYTES // (1024 * 1024)}MB. Add it "
+                            f"by path instead — kedge reads it in place and never copies it."
+                        ),
+                    )
+                handle.write(chunk)
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"could not save {name}: {exc}") from exc
+
+    registry = _registry(state)
+    try:
+        entry = await run_in_threadpool(registry.add, destination)
+    except KedgeError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"workbook": entry.to_dict(), "saved_to": str(destination)}
+
+
+@router.delete("/api/hub/workbooks/{key}")
+def forget_workbook(key: str, request: Request) -> dict[str, Any]:
+    """Remove a workbook from the list. Nothing on disk is touched."""
+    registry = _registry(_state(request))
+    if not registry.forget(key):
+        raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
+    return {"forgotten": key}
+
+
+@router.get("/api/hub/report/{key}")
+def workbook_report(key: str, request: Request) -> FileResponse:
+    """Serve the generated HTML analysis report for one workbook.
+
+    Served rather than linked as a ``file://`` URL, which browsers refuse to follow from an
+    ``http://`` page. The report is a self-contained page written by :func:`kedge.report.write_report`
+    during the analysis step of an open.
+    """
+    state = _state(request)
+    entry = _registry(state).get(key)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
+    try:
+        workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    except KedgeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    path = report_path_for(workspace)
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No report has been generated for {entry.name} yet. Open it, or run "
+                f"`kedge inspect {entry.path} --report <file>`."
+            ),
+        )
+    return FileResponse(path, media_type="text/html")
+
+
+# ── the file browser ─────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/api/hub/browse")
+async def browse(request: Request, path: str | None = None) -> dict[str, Any]:
+    """List a directory, so a workbook can be picked without leaving the browser.
+
+    Nothing is confined to a root. This is a single-user tool on loopback with no accounts, and a
+    sandbox here would be security theatre that stopped the user reaching their own S: drive
+    (PLAN 2.9). Directories and workbooks are listed; other files are counted, not named, so the
+    listing stays about the job.
+    """
+    return await run_in_threadpool(_browse, path)
+
+
+def _browse(path: str | None) -> dict[str, Any]:
+    target = Path(path).expanduser() if path else Path.home()
+    try:
+        target = target.resolve()
+    except OSError as exc:  # pragma: no cover - unresolvable path
+        raise HTTPException(status_code=400, detail=f"could not resolve {path}: {exc}") from exc
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"{target} is not a directory.")
+
+    directories: list[dict[str, Any]] = []
+    workbooks: list[dict[str, Any]] = []
+    other = 0
+    try:
+        for item in sorted(target.iterdir(), key=lambda entry: entry.name.lower()):
+            try:
+                if item.is_dir():
+                    if not item.name.startswith(".") and item.name not in _HIDDEN_DIRS:
+                        directories.append({"name": item.name, "path": str(item)})
+                    continue
+                if item.suffix.lower() in {".xlsx", ".xlsm"} and not item.name.startswith("~$"):
+                    workbooks.append(
+                        {
+                            "name": item.name,
+                            "path": str(item),
+                            "size_bytes": item.stat().st_size,
+                        }
+                    )
+                else:
+                    other += 1
+            except OSError:  # pragma: no cover - raced or unreadable entry
+                continue
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=f"{target} cannot be listed: {exc}") from exc
+    except OSError as exc:  # pragma: no cover - drive vanished
+        raise HTTPException(status_code=400, detail=f"{target} cannot be listed: {exc}") from exc
+
+    parent = None if target.parent == target else str(target.parent)
+    return {
+        "path": str(target),
+        "parent": parent,
+        "roots": [str(Path.home()), *(_drive_roots())],
+        "directories": directories,
+        "workbooks": workbooks,
+        "other_file_count": other,
+    }
+
+
+def _drive_roots() -> list[str]:
+    """Return the filesystem roots worth offering as shortcuts.
+
+    On Windows the process's own drive is not enough: the workbook is as likely to be on a mapped
+    network drive as on C:. ``Path("/")`` is deliberately not offered there — it exists, but it
+    resolves against the *current* drive and is a shortcut to somewhere the user did not ask for.
+    """
+    if _IS_WINDOWS:
+        roots = []
+        for letter in string.ascii_uppercase:
+            candidate = Path(f"{letter}:/")
+            with contextlib.suppress(OSError):
+                if candidate.is_dir():
+                    roots.append(str(candidate))
+        return roots
+    return ["/"]  # pragma: no cover - POSIX only
+
+
+def _dropped_dir(state: ServerState) -> Path:
+    from kedge.config import user_dir
+
+    return (state.user_directory or user_dir()) / "dropped"
+
+
+def _unique_path(path: Path) -> Path:
+    """Return ``path``, or the first ``name (2).xlsx`` style variant that is free."""
+    if not path.exists():
+        return path
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem}-{uuid.uuid4().hex[:8]}{path.suffix}")  # pragma: no cover
+
+
+# ── opening a workbook ───────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class OpenJob:
+    """One run of the open sequence, with everything it has said so far.
+
+    The frames are retained rather than only broadcast, so a subscriber that attaches late — a
+    reloaded tab, a second window — is caught up in full instead of joining halfway through a
+    sequence it cannot infer the start of.
+
+    ``None`` on a subscriber's queue means the job has ended. A sentinel rather than a final event
+    because "the job stopped" is not something the user should see a step for, and a stream parked
+    on a queue must not have to wait out a keep-alive to notice.
+    """
+
+    job_id: str
+    workbook: str
+    frames: list[HubEvent] = field(default_factory=list)
+    subscribers: set[asyncio.Queue[HubEvent | None]] = field(default_factory=set)
+    finished: bool = False
+    task: asyncio.Task[None] | None = None
+
+    def publish(self, event: HubEvent) -> None:
+        """Record ``event`` and hand it to every attached subscriber."""
+        self.frames.append(event)
+        self._push(event)
+
+    def step(self, name: OpenStep, condition: StepState, detail: str = "") -> None:
+        """Publish one progress frame. The step functions' only way to speak."""
+        self.publish(OpenProgressEvent(step=name, state=condition, detail=detail))
+
+    def close(self) -> None:
+        """Mark the job finished and release every stream parked on it."""
+        self.finished = True
+        self._push(None)
+
+    def _push(self, event: HubEvent | None) -> None:
+        for queue in list(self.subscribers):
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
+
+    @contextlib.contextmanager
+    def subscribe(self) -> Iterator[asyncio.Queue[HubEvent | None]]:
+        """Attach a subscriber for the duration of the block."""
+        queue: asyncio.Queue[HubEvent | None] = asyncio.Queue(maxsize=256)
+        self.subscribers.add(queue)
+        try:
+            yield queue
+        finally:
+            self.subscribers.discard(queue)
+
+
+@router.post("/api/hub/open", status_code=202)
+async def start_open(body: OpenWorkbookBody, request: Request) -> dict[str, Any]:
+    """Begin opening a workbook and return the job id to stream progress from.
+
+    Answers immediately. The work happens in a background task so that a browser reload does not
+    abandon a half-spawned marimo, and progress is read back from ``/api/hub/open/{job_id}``.
+    """
+    state = _state(request)
+    registry = _registry(state)
+
+    entry = registry.get(body.key) if body.key else None
+    # The conflict is decided before anything is written, so a refused open does not leave a row
+    # in the registry the user never got to use.
+    _refuse_if_busy(state, entry.path if entry else body.path)
+
+    if entry is None and body.path:
+        try:
+            entry = await run_in_threadpool(registry.add, Path(body.path))
+        except KedgeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Give either the key of a registered workbook or the path of a new one.",
+        )
+
+    _prune_jobs(state)
+    job = OpenJob(job_id=uuid.uuid4().hex[:12], workbook=entry.path)
+    state.opens[job.job_id] = job
+    job.task = asyncio.create_task(
+        _run_open(state, job, entry.key, Path(entry.path), reattach=body.reattach)
+    )
+    logger.info("open job %s started for %s", job.job_id, entry.path)
+    return {"job_id": job.job_id, "key": entry.key, "workbook": entry.path}
+
+
+@router.get("/api/hub/open/{job_id}")
+async def stream_open(job_id: str, request: Request) -> StreamingResponse:
+    """Stream one open job's progress, replaying everything it has already said."""
+    state = _state(request)
+    job = state.opens.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"No open job with id {job_id!r}.")
+
+    async def stream() -> AsyncIterator[str]:
+        with job.subscribe() as queue:
+            # Snapshotted before the first yield, which is the only suspension point available to
+            # a publisher: subscribe-then-snapshot with no await in between means every frame
+            # lands in exactly one of the two, never both and never neither.
+            replay = list(job.frames)
+            finished = job.finished
+            yield sse_comment(f"kedge open {job_id}")
+            for event in replay:
+                yield encode_sse(event)
+            if finished:
+                return
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_SECONDS)
+                except TimeoutError:
+                    yield sse_comment("keep-alive")
+                    continue
+                if event is None:
+                    return
+                yield encode_sse(event)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers=_STREAM_HEADERS)
+
+
+async def _run_open(
+    state: ServerState,
+    job: OpenJob,
+    key: str,
+    workbook: Path,
+    *,
+    reattach: bool,
+    workspace: Workspace | None = None,
+) -> None:
+    """Run the open sequence, publishing one progress frame per step.
+
+    Never raises. Anything that fails becomes a failed step plus an unrecoverable
+    :class:`~kedge.server.events.ErrorEvent`, because a browser waiting on this stream is the only
+    thing the user is looking at.
+    """
+    from kedge import __version__
+
+    try:
+        if workspace is None:
+            workspace = Workspace.for_workbook(workbook, user_directory=state.user_directory)
+        workspace.ensure_dirs()
+
+        adopted = await _step_cleanup(workspace, job, reattach=reattach)
+        analysis = await _step_analyse(workspace, job)
+        plan = await _step_plan(workspace, job)
+        await _step_notebook(workspace, job)
+
+        if adopted is None:
+            await _step_launch(workspace, job, kedge_version=__version__)
+        else:
+            job.step("launching", "skipped", f"reattached to our own marimo on {adopted}")
+        await _step_session(workspace, job)
+
+        driver = await _step_scaffold(workspace, plan, job)
+        demo = await _step_agent(state, workspace, analysis, driver, job)
+
+        if key:
+            _registry(state).record_open(key)
+        job.publish(
+            OpenReadyEvent(
+                key=key,
+                workbook=str(workspace.workbook_path),
+                notebook_url=_notebook_url(workspace),
+                demo=demo,
+            )
+        )
+        logger.info("open job %s finished for %s", job.job_id, workbook)
+    except asyncio.CancelledError:  # pragma: no cover - server shutting down
+        job.close()
+        raise
+    except Exception as exc:
+        logger.exception("open job %s failed", job.job_id)
+        job.publish(ErrorEvent(message=f"Opening {workbook.name} failed: {exc}", recoverable=False))
+    finally:
+        job.close()
+
+
+async def open_workbook(
+    state: ServerState,
+    workbook: Path,
+    *,
+    reattach: bool = True,
+    workspace: Workspace | None = None,
+    on_event: Callable[[HubEvent], None] | None = None,
+) -> OpenJob:
+    """Run the open sequence to completion, off the HTTP path.
+
+    ``kedge open`` needs exactly what the hub's Open button does — clean up after a crashed run,
+    analyse, plan, scaffold, spawn marimo, bootstrap the session, attach the agent — and getting
+    that order wrong is not a small mistake: scaffolding needs a live driver, so it cannot precede
+    the launch. Rather than keep a second copy of the sequence in the CLI and let the two drift,
+    both callers run :func:`_run_open`.
+
+    Args:
+        state: The server state the opened workspace is attached to.
+        workbook: The workbook to open.
+        reattach: Adopt a marimo this workspace already has running, rather than starting a
+            second one. True for the CLI, where a crashed previous run is the common case.
+        workspace: A pre-built workspace, for a caller that needs config overrides applied --
+            ``kedge open --port`` pins marimo's port this way. Built from the workbook otherwise.
+        on_event: Called with each progress frame as it happens, so a caller with no browser can
+            still show the user what is going on.
+
+    Returns:
+        The finished :class:`OpenJob`. Its ``frames`` are the whole story; the sequence never
+        raises, so inspect them to see whether a step failed.
+    """
+    registry = _registry(state)
+    try:
+        key = registry.add(workbook).key
+    except (RegistryError, KedgeError) as exc:
+        # The CLI caller has already named the file explicitly, so a workbook the registry will
+        # not take is not a reason to refuse to open it -- it just will not appear in the hub's
+        # list. The hub's own route validates before it ever gets here.
+        logger.warning("not registering %s: %s", workbook, exc)
+        key = ""
+    job = OpenJob(job_id=uuid.uuid4().hex[:12], workbook=str(workbook))
+
+    if on_event is not None:
+        with job.subscribe() as queue:
+            task = asyncio.create_task(
+                _run_open(state, job, key, workbook, reattach=reattach, workspace=workspace)
+            )
+            while True:
+                event = await queue.get()
+                if event is None:
+                    break
+                on_event(event)
+            await task
+        return job
+
+    await _run_open(state, job, key, workbook, reattach=reattach, workspace=workspace)
+    return job
+
+
+def _refuse_if_busy(state: ServerState, path: str | None) -> None:
+    """Refuse a second, different workbook on a server that already has one open.
+
+    One server owns one workbook and one marimo process (PLAN 2.9). Re-opening the *same* one is
+    allowed and is how a reattach works.
+    """
+    open_workspace = state.workspace
+    if open_workspace is None or path is None:
+        return
+    try:
+        wanted = Workspace.for_workbook(path, user_directory=state.user_directory).key
+    except KedgeError:  # pragma: no cover - the add below reports it properly
+        return
+    if wanted == open_workspace.key:
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"This kedge server already has {open_workspace.workbook_path.name} open. One server "
+            f"owns one workbook and one marimo process (PLAN 2.9); stop it and run `kedge hub` "
+            f"again to work on {Path(path).name}."
+        ),
+    )
+
+
+_MAX_RETAINED_JOBS = 8
+
+
+def _prune_jobs(state: ServerState) -> None:
+    """Forget finished jobs beyond the last few, so a long session does not accumulate them."""
+    finished = [job_id for job_id, job in state.opens.items() if job.finished]
+    for job_id in finished[: max(0, len(finished) - _MAX_RETAINED_JOBS)]:
+        state.opens.pop(job_id, None)
+
+
+def _notebook_url(workspace: Workspace) -> str | None:
+    if workspace.marimo is None or workspace.marimo.session_id is None:
+        return None
+    return workspace.notebook_url()
+
+
+# ── the steps ────────────────────────────────────────────────────────────────────────────────
+
+
+async def _step_cleanup(workspace: Workspace, job: OpenJob, *, reattach: bool) -> str | None:
+    """Clear up after a crashed previous run, or adopt a live server we started.
+
+    Reattachment consults *our* marker file only, and confirms the recorded server answers before
+    adopting it. That is the whole of the "never auto-discover" rule: the token in that marker was
+    generated by this machine's kedge and never left it, so a server that accepts it is ours. A
+    marimo somebody else started is never a candidate, whatever notebook it has open.
+    """
+    from kedge.lifecycle import cleanup_orphan, health_check
+
+    job.step("cleanup", "running", "checking for a marimo left behind by a previous run")
+    marker = workspace.read_marker()
+
+    if reattach and marker is not None:
+        if await run_in_threadpool(health_check, marker.base_url):
+            workspace.attach_marimo(
+                host=marker.host,
+                port=marker.port,
+                token=marker.token,
+                pid=marker.pid,
+            )
+            job.step("cleanup", "ok", f"reattached to our own marimo on {marker.base_url}")
+            return marker.base_url
+        job.step(
+            "cleanup",
+            "ok",
+            f"the marimo we recorded on port {marker.port} is gone; starting a fresh one",
+        )
+
+    outcome = await run_in_threadpool(cleanup_orphan, workspace)
+    job.step("cleanup", "ok", outcome.detail)
+    return None
+
+
+async def _step_analyse(workspace: Workspace, job: OpenJob) -> Any:
+    """Analyse the workbook offline, and write both the analysis and the HTML report.
+
+    The report is written here rather than on demand so that the hub's "Report" link is real the
+    first time a workbook is opened, instead of being a button that generates something.
+    """
+    from kedge.analysis.analyse import analyse
+    from kedge.report import write_report
+
+    job.step("analysing", "running", f"reading {workspace.workbook_path.name}")
+    analysis = await run_in_threadpool(analyse, workspace.workbook_path)
+
+    workspace.analysis_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace.analysis_path.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
+    with contextlib.suppress(OSError):
+        await run_in_threadpool(write_report, analysis, report_path_for(workspace))
+
+    job.step(
+        "analysing",
+        "ok",
+        f"{len(analysis.sheets)} sheet(s), {len(analysis.operations)} logical operation(s), "
+        f"{len(analysis.findings)} finding(s) of which {len(analysis.errors)} error(s)",
+    )
+    return analysis
+
+
+async def _step_plan(workspace: Workspace, job: OpenJob) -> Any:
+    """Find an approved plan, or say plainly that there is not one.
+
+    No plan is *proposed* here. Proposing one is a model call whose output the user must review
+    and approve before anything is written (PLAN 2.2), and doing that silently inside a page load
+    would be exactly the gate this project exists to keep shut.
+    """
+    from kedge.plan.store import PlanStore, PlanStoreError
+
+    job.step("planning", "running", "looking for an approved process plan")
+    store = PlanStore.for_workspace(workspace)
+    try:
+        plan = await run_in_threadpool(store.latest_approved)
+        latest = await run_in_threadpool(store.latest)
+    except PlanStoreError as exc:
+        job.step("planning", "failed", str(exc))
+        return None
+
+    if plan is not None:
+        job.step(
+            "planning",
+            "ok",
+            f"plan v{plan.version} is approved: {len(plan.stages)} stage(s), "
+            f"{plan.assessment.convertible:.0%} judged convertible",
+        )
+        return plan
+    if latest is not None:
+        job.step(
+            "planning",
+            "skipped",
+            f"plan v{latest.version} exists but is '{latest.approval.state.value}', not approved. "
+            f"The notebook stays empty until you approve it — nothing is scaffolded unreviewed.",
+        )
+        return None
+    job.step(
+        "planning",
+        "skipped",
+        "no process plan yet. The notebook opens empty; ask kedge in the chat to propose one.",
+    )
+    return None
+
+
+async def _step_notebook(workspace: Workspace, job: OpenJob) -> None:
+    """Make sure a notebook file exists for marimo to open."""
+    path = workspace.notebook_path
+    if path.is_file():
+        job.step("notebook", "ok", f"{path.name} is already there")
+        return
+    job.step("notebook", "running", f"creating {path.name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_EMPTY_NOTEBOOK, encoding="utf-8")
+    job.step("notebook", "ok", f"created an empty notebook at {path}")
+
+
+_EMPTY_NOTEBOOK = """import marimo
+
+__generated_with = "0.23.15"
+app = marimo.App(width="medium")
+
+
+@app.cell
+def _():
+    import marimo as mo
+
+    return (mo,)
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+"""The smallest notebook marimo will open cleanly.
+
+Written only when there is nothing there. kedge's real cells come from an approved plan through
+``notebook/scaffold.py``, and an empty notebook is the honest state before one exists — better
+than refusing to open, and better than inventing cells nobody reviewed.
+"""
+
+
+async def _step_launch(workspace: Workspace, job: OpenJob, *, kedge_version: str) -> None:
+    """Spawn the marimo server kedge owns, and register the handlers that tear it down."""
+    from kedge.lifecycle import launch_marimo, register_teardown
+
+    job.step("launching", "running", "starting a marimo server that kedge owns")
+    register_teardown(workspace)
+    await run_in_threadpool(launch_marimo, workspace, kedge_version=kedge_version)
+    session = workspace.require_marimo()
+    job.step("launching", "ok", f"marimo is serving {session.base_url} (pid {session.pid})")
+
+
+async def _step_session(workspace: Workspace, job: OpenJob) -> None:
+    """Assert the workspace's stable kernel session onto the server.
+
+    Run on the reattach path too, and idempotent there: the session id is derived from the
+    workbook path, so bootstrapping it a second time re-establishes a session the previous kedge
+    process left behind rather than evicting a live one.
+    """
+    from kedge.lifecycle import establish_session
+
+    job.step("session", "running", "asserting a kernel session onto the server")
+    session_id = await run_in_threadpool(establish_session, workspace)
+    job.step("session", "ok", f"kernel session {session_id} is live")
+
+
+async def _step_scaffold(workspace: Workspace, plan: Any, job: OpenJob) -> Any:
+    """Build the notebook driver, and scaffold from an approved plan where there is one.
+
+    A scaffold failure is reported and stepped over rather than fatal: the notebook, the kernel
+    and the chat all still work, and telling the user "the notebook is open but scaffolding
+    failed, here is why" beats refusing to open the workbook at all.
+    """
+    from kedge.notebook.driver import NotebookDriver
+
+    job.step("scaffolding", "running", "connecting the notebook driver")
+    try:
+        driver = NotebookDriver.for_workspace(workspace)
+    except KedgeError as exc:
+        job.step("scaffolding", "failed", f"the notebook driver could not attach: {exc}")
+        return None
+
+    if plan is None:
+        job.step("scaffolding", "skipped", "no approved plan, so there is nothing to scaffold")
+        return driver
+
+    from kedge.notebook.scaffold import scaffold_notebook
+
+    # `ty` flags this call, and it is right to: `scaffold.CellCreator.create_cell` is declared
+    # `-> str` while `driver.NotebookDriver.create_cell` returns a `MutationResult`, so the list
+    # that comes back holds results rather than cell ids. Only the count is used here, so the
+    # message is honest either way — but the seam is genuinely mismatched and the fix belongs in
+    # `kedge.notebook`, not here.
+    try:
+        cells = await scaffold_notebook(plan, driver, handins_dir=workspace.handins_dir)
+    except (KedgeError, OSError) as exc:
+        job.step("scaffolding", "failed", f"scaffolding plan v{plan.version} failed: {exc}")
+        return driver
+    job.step("scaffolding", "ok", f"wrote {len(cells)} cell(s) from plan v{plan.version}")
+    return driver
+
+
+async def _step_agent(
+    state: ServerState,
+    workspace: Workspace,
+    analysis: Any,
+    driver: Any,
+    job: OpenJob,
+) -> bool:
+    """Attach the agent loop, falling back to the scripted stand-in when there is no model.
+
+    A missing API key is a normal state on a first run, and it must not cost the user the notebook
+    they just waited eight seconds for. The fallback is the same :class:`ScriptedAgent` the demo
+    server uses, and the UI already labels that plainly as demo mode rather than pretending a
+    model answered.
+    """
+    from kedge.server.agent_seam import AgentLoop, ScriptedAgent
+
+    job.step("agent", "running", "wiring up the agent loop")
+    demo = False
+    agent: AgentLoop
+    try:
+        from kedge.agent.loop import KedgeAgent
+
+        agent = await run_in_threadpool(
+            KedgeAgent.for_workspace, workspace, driver=driver, analysis=analysis
+        )
+    except (KedgeError, ImportError) as exc:
+        agent = ScriptedAgent(delay=0.02)
+        demo = True
+        job.step(
+            "agent",
+            "failed",
+            f"no model endpoint is usable ({exc}). Opening in demo mode: the scripted agent "
+            f"answers and nothing is sent to a model.",
+        )
+    else:
+        job.step("agent", "ok", f"agent ready on {workspace.config.model.model}")
+
+    state.attach(workspace, agent=agent, demo=demo)
+    return demo

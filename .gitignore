@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# kedge runtime artifacts
+.kedge/
+# the per-workbook project directory kedge generates beside a workbook
+*.kedge/
+handins/
+*.marker.json
+scratch/

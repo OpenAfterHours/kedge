@@ -1,0 +1,422 @@
+/* kedge — the hub: the landing page listing every workbook kedge has seen.
+   Layered on styles.css, which owns the tokens, the reset and the shared buttons. Plain CSS, no
+   build step, no CDN, no webfont: nothing on this page reaches off the machine. */
+
+.hub-body {
+  /* The chat shell is a fixed two-pane app and locks scrolling; the hub is a document. */
+  overflow: auto;
+  background: var(--bg);
+}
+
+/* ── top bar ────────────────────────────────────────────────────────────────────────── */
+
+.hub-top {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--topbar-h);
+  padding: 0 14px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.hub-strap {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+@media (max-width: 760px) {
+  .hub-strap { display: none; }
+}
+
+/* ── page ───────────────────────────────────────────────────────────────────────────── */
+
+.hub-main {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 26px 18px 60px;
+}
+
+.hub-intro h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+  font-weight: 640;
+  letter-spacing: -0.015em;
+}
+
+.hub-intro > p {
+  margin: 0 0 16px;
+  max-width: 68ch;
+  color: var(--text-muted);
+}
+
+.hub-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.primary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 560;
+  padding: 6px 13px 6px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+  text-decoration: none;
+}
+.primary-button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
+.primary-button:disabled { opacity: 0.55; cursor: default; }
+
+.path-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 320px;
+}
+.path-add input {
+  flex: 1;
+  font: inherit;
+  font-size: 12.5px;
+  font-family: var(--font-mono);
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  min-width: 0;
+}
+.path-add input:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.hub-hint {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+
+.banner {
+  margin-top: 14px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 13px;
+}
+.banner.ok { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+
+/* ── the list ───────────────────────────────────────────────────────────────────────── */
+
+.hub-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 22px;
+}
+
+.empty {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 34px 24px;
+  text-align: center;
+  color: var(--text-muted);
+  background: var(--surface);
+}
+.empty h2 { margin: 0 0 6px; font-size: 16px; font-weight: 600; color: var(--text); }
+.empty p { margin: 0 auto; max-width: 54ch; }
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 13px 15px;
+  box-shadow: var(--shadow);
+}
+.card.missing { border-style: dashed; background: var(--surface-2); }
+.card.current { border-color: var(--accent); }
+
+.card-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.card-name {
+  font-size: 15px;
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.card-path {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.pills { display: flex; flex-wrap: wrap; gap: 5px; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 560;
+  letter-spacing: 0.01em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.pill.ok { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+.pill.warn { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
+.pill.bad { border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
+.pill.accent { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.pill .icon { width: 12px; height: 12px; }
+
+.facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.fact { display: flex; gap: 5px; align-items: baseline; }
+.fact-label { color: var(--text-faint); }
+.fact-value { color: var(--text); font-variant-numeric: tabular-nums; }
+.fact-value.muted { color: var(--text-faint); }
+
+/* A bar rather than a bare percentage: "68% convertible" is a headline number and the point of
+   showing it here is that it is comparable at a glance across a list. */
+.convert-bar {
+  display: inline-block;
+  width: 62px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.convert-bar span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.blockers {
+  margin: 9px 0 0;
+  padding-left: 17px;
+  font-size: 12.5px;
+  color: var(--warn);
+}
+.blockers li { margin: 1px 0; }
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 12px;
+}
+.card-actions .topbar-spacer { min-width: 8px; }
+
+/* ── drop overlay ───────────────────────────────────────────────────────────────────── */
+
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(2px);
+}
+.drop-overlay[hidden] { display: none; }
+
+.drop-card {
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 30px 34px;
+  max-width: 460px;
+  text-align: center;
+  box-shadow: var(--shadow);
+}
+.drop-card h2 { margin: 10px 0 6px; font-size: 17px; }
+.drop-card p { margin: 0; font-size: 12.5px; color: var(--text-muted); }
+.icon.big { width: 30px; height: 30px; color: var(--accent); }
+
+/* ── the file browser ───────────────────────────────────────────────────────────────── */
+
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0;
+  box-shadow: var(--shadow);
+  max-width: min(760px, 94vw);
+  width: 100%;
+}
+dialog::backdrop { background: rgba(10, 13, 16, 0.42); }
+
+.browser-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.browser-path {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.browser-roots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.browser-body {
+  max-height: min(52vh, 440px);
+  overflow: auto;
+  padding: 6px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.row:hover { background: var(--surface-2); }
+.row .icon { color: var(--text-faint); }
+.row.workbook .icon { color: var(--accent); }
+.row-size {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.browser-note {
+  margin: 0;
+  padding: 9px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+/* ── the open progress panel ────────────────────────────────────────────────────────── */
+
+.opening { max-width: min(620px, 94vw); }
+
+.opening-head { padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
+.opening-head h2 { margin: 0; font-size: 16px; font-weight: 620; }
+.opening-path {
+  display: block;
+  margin-top: 3px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.steps {
+  list-style: none;
+  margin: 0;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 9px;
+  padding: 5px 0;
+  align-items: start;
+}
+.step-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  color: #fff;
+}
+.step-mark .icon.tick { width: 10px; height: 10px; stroke-width: 2.4; }
+.step-name { font-size: 13px; font-weight: 560; color: var(--text-faint); }
+.step-detail {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.step.running .step-name { color: var(--text); }
+.step.running .step-mark {
+  border-color: var(--accent);
+  border-right-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+.step.ok .step-name { color: var(--text); }
+.step.ok .step-mark { border-color: var(--ok); background: var(--ok); color: #fff; }
+.step.skipped .step-name { color: var(--text-muted); }
+.step.skipped .step-mark { border-style: dashed; }
+.step.failed .step-name { color: var(--danger); }
+.step.failed .step-mark { border-color: var(--danger); background: var(--danger); color: #fff; }
+.step.failed .step-detail { color: var(--danger); }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .step.running .step-mark { animation: none; border-right-color: var(--accent); }
+}
+
+.opening-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+}
+.opening-detail { margin: 0; flex: 1; font-size: 12.5px; color: var(--text-muted); }
+.opening-detail.bad { color: var(--danger); }

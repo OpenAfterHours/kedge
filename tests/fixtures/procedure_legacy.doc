@@ -1,0 +1,2 @@
+This file stands in for a genuine Word 97-2003 binary .doc.
+It is intentionally NOT an OLE2 compound file, so any attempt to parse it must fail clearly and suggest converting to .docx.

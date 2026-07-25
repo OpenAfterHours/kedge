@@ -1,0 +1,13 @@
+# The repository stores LF regardless of who commits. kedge is developed on Windows and tested on
+# Linux runners, and a CRLF that reached the repo would break the shell steps in the workflows.
+* text=auto eol=lf
+
+# The fixture corpus is binary. Never touch it -- normalising a .xlsx corrupts the zip container,
+# and these files are the analyser's ground truth.
+*.xlsx binary
+*.xlsm binary
+*.docx binary
+*.doc  binary
+
+# Generated. Collapse it in pull request diffs.
+uv.lock linguist-generated=true

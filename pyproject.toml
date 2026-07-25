@@ -1,0 +1,155 @@
+[project]
+name = "kedge"
+# Single source of truth is `__version__` in src/kedge/__init__.py; see [tool.hatch.version].
+dynamic = ["version"]
+description = "Turn manual Excel processes into reviewable, reproducible marimo notebooks."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "OpenAfterHours" }]
+keywords = ["excel", "marimo", "polars", "notebook", "reproducibility"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    # ── analysis (M1) ────────────────────────────────────────────────
+    "openpyxl==3.1.5",
+    "polars==1.43.0",
+    "fastexcel>=0.12",          # calamine engine behind pl.read_excel
+    "python-docx>=1.1",
+    # ── models & config ──────────────────────────────────────────────
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "keyring>=25.4",
+    "tomli-w>=1.0",
+    "pyyaml>=6.0",
+    # ── notebook bridge (M2) ─────────────────────────────────────────
+    "marimo==0.23.15",          # PINNED: _code_mode is a private API (§6.1)
+    "httpx>=0.27",
+    # ── server & UI (M3) ─────────────────────────────────────────────
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.9",  # the hub's drag-and-drop upload; FastAPI needs it for UploadFile
+    # ── agent loop (M4) ──────────────────────────────────────────────
+    "openai>=1.60",
+    "tiktoken>=0.8",
+    # ── ingest (M5) ──────────────────────────────────────────────────
+    "watchdog>=5.0",
+    # ── cli ──────────────────────────────────────────────────────────
+    "typer>=0.15",
+    "rich>=13.9",
+    "jinja2>=3.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/OpenAfterHours/kedge"
+Repository = "https://github.com/OpenAfterHours/kedge"
+Issues = "https://github.com/OpenAfterHours/kedge/issues"
+Changelog = "https://github.com/OpenAfterHours/kedge/releases"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "ruff>=0.8",
+    "ty>=0.0.1a1",
+]
+
+[project.scripts]
+kedge = "kedge.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.27"]     # 1.27 is where PEP 639 `license`/`license-files` landed
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/kedge/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kedge"]
+
+[tool.hatch.build.targets.sdist]
+# The sdist is what a distributor builds from, so it carries the tests and the fixture corpus
+# the tests assert against -- but none of the working notes.
+include = ["src", "tests", "utils", "README.md", "LICENSE", "CONVENTIONS.md", "pyproject.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",      # pycodestyle / pyflakes
+    "I",                # isort
+    "UP",               # pyupgrade
+    "B",                # bugbear
+    "SIM",              # simplify
+    "C4",               # comprehensions
+    "RUF",              # ruff-specific
+    "PTH",              # use pathlib
+    "TID",              # tidy imports
+    "N",                # pep8-naming
+    "T20",              # flake8-print: no print() in library code
+    "G",                # flake8-logging-format: lazy %-formatting in log calls
+    "LOG",              # flake8-logging
+]
+ignore = [
+    "E501",             # line length handled by formatter
+    "B008",             # typer uses function calls in defaults
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/kedge/cli.py" = ["T20"]
+"tests/**" = ["S101", "T20", "G"]
+"tests/fixtures/generate.py" = ["T20"]
+"scripts/**" = ["T20", "G"]
+# RUF001 flags ambiguous unicode to catch accidental homoglyphs. In the driver's escaping tests
+# those characters are the subject under test -- U+2028/U+2029 terminate a line for
+# str.splitlines() but not for a Python tokeniser, which is precisely the embedder bug the
+# hostile-string table exists to catch. They are deliberate fixture data, not a typo.
+"tests/unit/test_driver_codegen.py" = ["S101", "T20", "G", "RUF001"]
+
+[tool.ruff.lint.isort]
+# `utils` is first-party too: it lives at the repo root rather than in the package because it is
+# the user-editable half, imported from notebook cells.
+known-first-party = ["kedge", "utils"]
+
+# No [tool.ruff.format] section by design — house style is ruff format defaults.
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+exclude = ["tests/fixtures/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "contract: live-kernel contract tests against a real marimo server (slow)",
+    "corpus: runs against the committed .xlsx fixture corpus",
+    "llm: requires a configured model endpoint; skipped by default",
+]
+# Contract tests spawn a real marimo server (~12s); llm tests need a model endpoint.
+# Both are opt-in: `uv run pytest -m contract`, `uv run pytest -m llm`.
+addopts = "-ra --strict-markers -m 'not contract and not llm'"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["src/kedge"]
+branch = true

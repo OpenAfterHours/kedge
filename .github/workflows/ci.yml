@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml calls this, so a tag is gated by exactly the checks main is gated by, rather
+  # than by a second copy of them that can drift.
+  workflow_call:
+
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first run's answer irrelevant. Tags are exempt:
+# release.yml calls this workflow and cancelling a release mid-flight is never what anyone wants.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  static:
+    name: lint, format, guardrails
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # --locked, not --frozen: this fails the build when uv.lock has drifted from
+      # pyproject.toml, rather than quietly resolving something nobody committed.
+      - run: uv sync --locked
+      - name: ruff check
+        run: uv run ruff check --output-format=github .
+      - name: ruff format
+        run: uv run ruff format --check .
+      - name: non-negotiables
+        run: uv run python scripts/guardrails.py
+
+  types:
+    name: ty (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Advisory on purpose. `ty check src/` reports 6 known diagnostics -- mostly mypy-dialect
+    # `# type: ignore` comments ty does not honour, plus a real one in plan/__init__.py. Clearing
+    # those is the prerequisite for deleting this line and letting the job gate merges.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv sync --locked
+      - run: uv run ty check src/
+
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # One platform's failure must not hide another's: the reconciliation and lifecycle paths
+      # differ by OS, and a half-reported matrix is how that gets missed.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --locked
+      # The default addopts deselect `contract` and `llm`; this is unit plus corpus.
+      - name: pytest
+        run: uv run pytest -q
+
+  contract:
+    name: contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          python-version: "3.12"
+      - run: uv sync --locked
+      # These spawn a real `marimo edit` and drive its private _code_mode API over HTTP. They are
+      # the only thing in the suite that would notice marimo changing that API under the pin, and
+      # they run on both platforms because teardown is where the two genuinely differ: Windows has
+      # no SIGTERM, so `stop_marimo` escalates to CTRL_BREAK_EVENT and then taskkill.
+      - name: pytest -m contract
+        run: uv run pytest -m contract -q
+
+  build:
+    name: build and check metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: build sdist and wheel
+        run: uv build
+      - name: check the metadata PyPI will render
+        run: uvx twine check --strict dist/*
+      - name: install the wheel and run the entry point
+        # Proves the console script resolves and the package imports from an installed layout,
+        # not just from the source tree the tests run against.
+        run: |
+          uv venv /tmp/smoke
+          VIRTUAL_ENV=/tmp/smoke uv pip install dist/*.whl
+          /tmp/smoke/bin/kedge --version
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

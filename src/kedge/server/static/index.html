@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="colour-scheme" content="light dark">
+<meta name="color-scheme" content="light dark">
+<title>kedge</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='3' fill='%230f6f6a'/><path d='M8 3v9M4.5 6.5 8 3l3.5 3.5M4 11.5c1.5 1.4 6.5 1.4 8 0' fill='none' stroke='white' stroke-width='1.4' stroke-linecap='round'/></svg>">
+</head>
+<body>
+
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5 6.2 12 13 4.5"/></symbol>
+  <symbol id="i-cross" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-tool" viewBox="0 0 16 16"><path d="M2.5 4.5h11M2.5 8h7M2.5 11.5h11"/><circle cx="12" cy="8" r="1.6"/></symbol>
+  <symbol id="i-cell" viewBox="0 0 16 16"><path d="M6 2.5H3.5v11H6M10 2.5h2.5v11H10"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M5 3.2v9.6l7-4.8z"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 2.2 13 4v4.2c0 2.6-2 4.6-5 5.6-3-1-5-3-5-5.6V4z"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.4 14.4 13.4H1.6z"/><path d="M8 6.4v3.2M8 11.4v.6"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+  <symbol id="i-bin" viewBox="0 0 16 16"><path d="M3.5 4.5h9M6.5 4.5V3h3v1.5M5 4.5l.6 8.5h4.8l.6-8.5"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 16 16"><rect x="2.5" y="3" width="11" height="10" rx="1.5"/><path d="M6.5 3v10"/></symbol>
+  <symbol id="i-external" viewBox="0 0 16 16"><path d="M9 3h4v4M13 3 7.5 8.5M12 9.5V13H3V4h3.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.6-3.7M13 2.6V5.4H10.2"/></symbol>
+  <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8h9M8 4.2 11.9 8 8 11.8"/></symbol>
+  <symbol id="i-stop" viewBox="0 0 16 16"><rect x="4.5" y="4.5" width="7" height="7" rx="1"/></symbol>
+</svg>
+
+<div class="app">
+
+  <header class="topbar">
+    <button class="icon-button" id="toggle-sidebar" title="Show or hide the chat list" aria-label="Show or hide the chat list">
+      <svg class="icon"><use href="#i-panel"></use></svg>
+    </button>
+
+    <a class="brand" href="/hub" title="Back to the hub: every workbook kedge has seen">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">kedge</span>
+    </a>
+
+    <div class="crumbs" id="crumbs">
+      <span class="crumb" id="crumb-workbook">&mdash;</span>
+      <span class="crumb-sep" aria-hidden="true">/</span>
+      <span class="crumb muted" id="crumb-notebook">&mdash;</span>
+    </div>
+
+    <div class="topbar-spacer"></div>
+
+    <div class="pane-switch" id="pane-switch" role="tablist" aria-label="Which pane to show">
+      <button role="tab" data-pane="chat" class="active">Chat</button>
+      <button role="tab" data-pane="notebook">Notebook</button>
+    </div>
+
+    <label class="model-picker" title="Model used for the next turn">
+      <span class="model-label">Model</span>
+      <input id="model-input" list="model-options" spellcheck="false" autocomplete="off" placeholder="model name">
+      <datalist id="model-options"></datalist>
+    </label>
+
+    <div class="health" id="health" title="marimo kernel status">
+      <span class="dot" id="health-dot"></span>
+      <span class="health-label" id="health-label">Checking</span>
+    </div>
+  </header>
+
+  <div class="body">
+
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <h2>Chats</h2>
+        <button class="ghost-button" id="new-chat">
+          <svg class="icon"><use href="#i-plus"></use></svg><span>New</span>
+        </button>
+      </div>
+      <ul class="session-list" id="session-list"></ul>
+      <div class="sidebar-foot" id="sidebar-foot"></div>
+    </aside>
+
+    <main class="panes" id="panes">
+
+      <section class="pane chat-pane" id="chat-pane" aria-label="Chat">
+        <div class="notice" id="drift-notice" hidden></div>
+        <!-- Decisions the model recorded and refused to take on its own: a cell it wants deleted,
+             an amendment it wants made to the approved plan. Nothing here happens without a
+             click (PLAN 2.2). -->
+        <div class="pending" id="pending" hidden></div>
+        <div class="transcript" id="transcript" aria-live="polite"></div>
+        <form class="composer" id="composer">
+          <div class="composer-box">
+            <textarea id="prompt" rows="1" spellcheck="true"
+              placeholder="Ask kedge to translate a region, check a join key, or explain what a stage does…"></textarea>
+            <div class="composer-buttons">
+              <button type="button" class="stop-button" id="stop" hidden>
+                <svg class="icon"><use href="#i-stop"></use></svg><span>Stop</span>
+              </button>
+              <button type="submit" class="send-button" id="send">
+                <svg class="icon"><use href="#i-send"></use></svg><span>Send</span>
+              </button>
+            </div>
+          </div>
+          <p class="composer-hint">
+            <kbd>Enter</kbd> sends &middot; <kbd>Shift</kbd>+<kbd>Enter</kbd> new line &middot;
+            <kbd>Esc</kbd> cancels the turn in flight
+          </p>
+        </form>
+      </section>
+
+      <div class="splitter" id="splitter" role="separator" aria-orientation="vertical"
+           aria-label="Resize the panes" tabindex="0"></div>
+
+      <section class="pane notebook-pane" id="notebook-pane" aria-label="Notebook">
+        <div class="pane-head">
+          <svg class="icon muted"><use href="#i-cell"></use></svg>
+          <span class="pane-title" id="notebook-title">Notebook</span>
+          <div class="topbar-spacer"></div>
+          <button class="icon-button" id="reload-notebook" title="Reload the notebook pane" aria-label="Reload the notebook pane">
+            <svg class="icon"><use href="#i-refresh"></use></svg>
+          </button>
+          <a class="icon-button" id="open-notebook" target="_blank" rel="noreferrer" title="Open the notebook in a new tab" aria-label="Open the notebook in a new tab">
+            <svg class="icon"><use href="#i-external"></use></svg>
+          </a>
+        </div>
+        <div class="frame-wrap">
+          <iframe id="notebook-frame" title="marimo notebook" hidden></iframe>
+          <div class="pane-placeholder" id="notebook-placeholder">
+            <h3>No notebook attached</h3>
+            <p>
+              This pane frames the marimo editor directly, with the access token in the query
+              string so the login page — the one endpoint that refuses to be framed — is never
+              reached.
+            </p>
+            <code class="placeholder-url">http://127.0.0.1:&lt;port&gt;/?file=&lt;notebook&gt;.py&amp;access_token=&lt;token&gt;</code>
+            <p class="muted" id="placeholder-detail">No marimo server is attached to this workbook.</p>
+            <p><a class="ghost-button" href="/hub">Open a workbook from the hub</a></p>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

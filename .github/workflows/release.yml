@@ -1,0 +1,128 @@
+name: Release
+
+# Cutting a release is: bump `__version__`, commit, tag `vX.Y.Z`, push the tag. Everything below
+# happens on the tag. See RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify tag matches package version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v7
+      # Deliberately the first job and deliberately dependency-free: a tag that disagrees with
+      # `__version__` should cost five seconds, not a full matrix. scripts/version.py parses the
+      # assignment with `ast` and needs nothing installed.
+      - id: version
+        run: python scripts/version.py "${GITHUB_REF_NAME}" --github-output >> "$GITHUB_OUTPUT"
+      - name: summarise
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          {
+            echo "### Release ${GITHUB_REF_NAME}"
+            echo ""
+            echo "- version: \`${VERSION}\`"
+            echo "- pre-release: \`${PRERELEASE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci:
+    name: ci
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build release artifacts
+    needs: [verify, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: uv build
+      - name: check the metadata PyPI will render
+        run: uvx twine check --strict dist/*
+      # The wheel filename is what actually gets uploaded, so assert on that rather than trusting
+      # that the build backend read the same version scripts/version.py did.
+      - name: confirm the artifacts carry the tagged version
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f "dist/kedge-${VERSION}-py3-none-any.whl" \
+            || { echo "no wheel for ${VERSION}; dist/ holds:"; ls -1 dist; exit 1; }
+          test -f "dist/kedge-${VERSION}.tar.gz" \
+            || { echo "no sdist for ${VERSION}; dist/ holds:"; ls -1 dist; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+  publish:
+    name: publish to PyPI
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The environment is half of the Trusted Publishing claim -- PyPI is configured to accept
+    # this repository, this workflow file, and this environment name. It is also where a manual
+    # approval gate goes, should you ever want one before an upload.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kedge
+    permissions:
+      # Mints the short-lived OIDC token PyPI exchanges for an upload token. No API key is stored
+      # anywhere in this repository.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        # Defaults are what we want: OIDC trusted publishing, PEP 740 attestations, upload to
+        # pypi.org. Nothing to configure beyond the pending publisher on PyPI's side.
+
+  github-release:
+    name: create the GitHub release
+    needs: [verify, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # Creating a release writes to the repository.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # --generate-notes diffs against the previous tag, which needs the tag history.
+          fetch-depth: 0
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      # Last, so a release never claims success for an upload that failed. `gh` is preinstalled
+      # on the runner, which keeps a third-party action out of the step that holds contents:write.
+      - name: gh release create
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=(--generate-notes --verify-tag --title "${GITHUB_REF_NAME}")
+          if [ "${PRERELEASE}" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "${GITHUB_REF_NAME}" "${flags[@]}" dist/*

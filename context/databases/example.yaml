@@ -1,0 +1,57 @@
+# An example knowledge pack for one database. Copy this file, rename it after your database,
+# and replace the contents. Every field except `name` is optional.
+#
+# `grain` and `gotchas` are the fields that earn their place. A column list can be read off the
+# schema; the fact that a table is one row per counterparty *per reporting date* cannot, and it
+# is what stops a join producing twelve times the rows anyone expected.
+
+database: risk_warehouse
+
+tables:
+  - name: counterparty_exposure
+    schema: dbo
+    description: Exposure by counterparty and netting set, as at a reporting date.
+    grain: one row per netting_set_id per cob_date
+    join_keys: [counterparty_id, netting_set_id, cob_date]
+    gotchas:
+      - "Not one row per counterparty. Joining on counterparty_id alone multiplies rows by the
+         number of netting sets, which for large clients is dozens."
+      - "cob_date is the position date, not the load date. There is a separate loaded_at."
+      - "Rows for defaulted counterparties persist with ead_gbp = 0 rather than being deleted."
+    columns:
+      - name: counterparty_id
+        dtype: string
+        key: true
+        description: Group-wide client identifier. Stable across systems.
+      - name: netting_set_id
+        dtype: string
+        key: true
+      - name: cob_date
+        dtype: date
+        key: true
+        description: Position date. Month-end rows land on the last working day.
+      - name: ead_gbp
+        dtype: decimal(18,2)
+        description: Exposure at default, post-CRM, in GBP.
+      - name: asset_class
+        dtype: string
+        description: Joins to the collateral haircut reference table.
+
+  - name: collateral_haircut
+    schema: ref
+    description: Proportional haircut applied to collateral value, by asset class.
+    grain: one row per asset_class per effective_from
+    join_keys: [asset_class]
+    gotchas:
+      - "Slowly changing: filter to the row effective at cob_date before joining, or the join
+         multiplies by the number of historic revisions."
+      - "asset_class is stored upper-case here and mixed-case in counterparty_exposure."
+    columns:
+      - name: asset_class
+        dtype: string
+        key: true
+      - name: haircut
+        dtype: decimal(6,4)
+        description: Proportion, not a percentage. 0.15 means fifteen per cent.
+      - name: effective_from
+        dtype: date

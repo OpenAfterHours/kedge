@@ -1,0 +1,1107 @@
+/* kedge chat pane.
+ *
+ * No framework, no build step, no CDN — plain modules-in-one-file, the same house style as the
+ * rest of the OpenAfterHours tooling, and local-first: nothing here reaches off the machine.
+ *
+ * The interesting parts, in order down the file:
+ *   markdown  — a small renderer that is safe against untrusted model output and tolerant of
+ *               half-arrived fenced blocks, because prose is rendered while it streams;
+ *   stream    — SSE read off a fetch body reader rather than EventSource, which cannot POST and
+ *               gives no way to abort;
+ *   turn      — the block model that interleaves prose and activity in arrival order, so the
+ *               same code renders a live turn and a replayed one;
+ *   pending   — the two decisions the model is not allowed to take on its own. `delete_cell` and
+ *               `amend_plan` record a request and refuse; this is where the user says yes or no.
+ */
+
+(() => {
+  "use strict";
+
+  // ── small helpers ──────────────────────────────────────────────────────────────────
+
+  const $ = (id) => document.getElementById(id);
+
+  function el(tag, attrs, ...children) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(attrs || {})) {
+      if (value === null || value === undefined || value === false) continue;
+      if (key === "class") node.className = value;
+      else if (key === "html") node.innerHTML = value;
+      else if (key === "text") node.textContent = value;
+      else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value === true ? "" : value);
+    }
+    for (const child of children.flat()) {
+      if (child === null || child === undefined || child === false) continue;
+      node.append(child.nodeType ? child : document.createTextNode(String(child)));
+    }
+    return node;
+  }
+
+  function icon(name, cls) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "icon" + (cls ? " " + cls : ""));
+    const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+    use.setAttribute("href", "#" + name);
+    svg.append(use);
+    return svg;
+  }
+
+  function ago(iso) {
+    const then = new Date(iso).getTime();
+    if (Number.isNaN(then)) return "";
+    const seconds = Math.max(0, (Date.now() - then) / 1000);
+    if (seconds < 60) return "just now";
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} h ago`;
+    if (seconds < 604800) return `${Math.floor(seconds / 86400)} d ago`;
+    return new Date(then).toLocaleDateString("en-GB");
+  }
+
+  async function api(path, options) {
+    const response = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+    if (!response.ok) {
+      let detail = response.statusText;
+      try {
+        detail = (await response.json()).detail || detail;
+      } catch (_) {
+        /* the body was not JSON; the status text will do */
+      }
+      throw new Error(detail);
+    }
+    return response.status === 204 ? null : response.json();
+  }
+
+  // ── markdown ───────────────────────────────────────────────────────────────────────
+
+  const ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+  const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (c) => ESCAPES[c]);
+
+  const safeUrl = (url) => /^(https?:|mailto:|#|\/)/i.test(url.trim());
+
+  /* Inline code is lifted out of the text before bold and italic are applied, so a run of
+     backticks cannot be chewed through by them. The placeholder is NUL because escapeHtml has
+     already removed every character that could plausibly collide with it. */
+  const SENTINEL = String.fromCharCode(0);
+  const RESTORE_SENTINEL = new RegExp(SENTINEL + "(\\d+)" + SENTINEL, "g");
+
+  const PY_KEYWORDS =
+    "and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|" +
+    "for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|" +
+    "with|yield|None|True|False|match|case";
+  const PY_BUILTINS =
+    "print|len|range|list|dict|set|tuple|str|int|float|bool|sum|min|max|abs|round|sorted|" +
+    "enumerate|zip|isinstance|open|type|self|pl|mo";
+
+  const PY_TOKENS = new RegExp(
+    [
+      "(#[^\\n]*)",
+      "([rbfu]{0,2}\"\"\"[\\s\\S]*?\"\"\"|[rbfu]{0,2}'''[\\s\\S]*?''')",
+      "([rbfu]{0,2}\"(?:\\\\.|[^\"\\\\\\n])*\"|[rbfu]{0,2}'(?:\\\\.|[^'\\\\\\n])*')",
+      "(\\b\\d[\\d_]*\\.?\\d*(?:[eE][+-]?\\d+)?\\b)",
+      "(@[A-Za-z_][\\w.]*)",
+      `\\b(${PY_KEYWORDS})\\b`,
+      `\\b(${PY_BUILTINS})\\b`,
+      "([A-Za-z_]\\w*)(?=\\s*\\()",
+    ].join("|"),
+    "g",
+  );
+
+  const TOKEN_CLASSES = ["c-com", "c-str", "c-str", "c-num", "c-dec", "c-kw", "c-bi", "c-fn"];
+
+  function highlight(code, language) {
+    if (!/^(py|python|)$/i.test(language || "")) return escapeHtml(code);
+    let out = "";
+    let last = 0;
+    let match;
+    PY_TOKENS.lastIndex = 0;
+    while ((match = PY_TOKENS.exec(code)) !== null) {
+      out += escapeHtml(code.slice(last, match.index));
+      const group = match.slice(1).findIndex((value) => value !== undefined);
+      out += `<span class="${TOKEN_CLASSES[group] || ""}">${escapeHtml(match[0])}</span>`;
+      last = match.index + match[0].length;
+    }
+    return out + escapeHtml(code.slice(last));
+  }
+
+  function inlineMarkdown(text) {
+    const codes = [];
+    let out = escapeHtml(text).replace(/`([^`]+)`/g, (_, body) => {
+      codes.push(body);
+      return SENTINEL + (codes.length - 1) + SENTINEL;
+    });
+    out = out
+      .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+      .replace(/~~([^~\n]+)~~/g, "<del>$1</del>")
+      .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, href) =>
+        safeUrl(href)
+          ? `<a href="${href}" target="_blank" rel="noreferrer noopener">${label}</a>`
+          : whole,
+      );
+    return out.replace(RESTORE_SENTINEL, (_, index) => `<code>${codes[index]}</code>`);
+  }
+
+  function codeBlockHtml(code, language) {
+    const label = language ? `<span class="code-lang">${escapeHtml(language)}</span>` : "";
+    return `<div class="code-block">${label}<pre><code>${highlight(code, language)}</code></pre></div>`;
+  }
+
+  /* Block-level markdown. Deliberately small: headings, lists, quotes, rules, fenced code and
+     paragraphs are what a model writing about a notebook actually emits. An unterminated fence
+     renders as a code block anyway, which is what makes streaming look right rather than
+     flickering between prose and code as the closing fence arrives. */
+  function renderMarkdown(source) {
+    const lines = String(source).split("\n");
+    let html = "";
+    let index = 0;
+
+    const flushList = (items, ordered) => {
+      const tag = ordered ? "ol" : "ul";
+      return `<${tag}>${items.map((item) => `<li>${inlineMarkdown(item)}</li>`).join("")}</${tag}>`;
+    };
+
+    while (index < lines.length) {
+      const line = lines[index];
+      const fence = line.match(/^\s*```(\S*)\s*$/);
+      if (fence) {
+        const body = [];
+        index += 1;
+        while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+          body.push(lines[index]);
+          index += 1;
+        }
+        index += 1;
+        html += codeBlockHtml(body.join("\n"), fence[1] || "");
+        continue;
+      }
+
+      if (/^\s*$/.test(line)) {
+        index += 1;
+        continue;
+      }
+
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        const level = Math.min(heading[1].length, 4);
+        html += `<h${level}>${inlineMarkdown(heading[2])}</h${level}>`;
+        index += 1;
+        continue;
+      }
+
+      if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
+        html += "<hr>";
+        index += 1;
+        continue;
+      }
+
+      const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+      const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (bullet || numbered) {
+        const ordered = Boolean(numbered);
+        const items = [];
+        while (index < lines.length) {
+          const item = lines[index].match(ordered ? /^\s*\d+[.)]\s+(.*)$/ : /^\s*[-*+]\s+(.*)$/);
+          if (!item) break;
+          items.push(item[1]);
+          index += 1;
+        }
+        html += flushList(items, ordered);
+        continue;
+      }
+
+      if (/^\s*>\s?/.test(line)) {
+        const quoted = [];
+        while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+          quoted.push(lines[index].replace(/^\s*>\s?/, ""));
+          index += 1;
+        }
+        html += `<blockquote>${renderMarkdown(quoted.join("\n"))}</blockquote>`;
+        continue;
+      }
+
+      const paragraph = [];
+      while (index < lines.length) {
+        const next = lines[index];
+        if (
+          /^\s*$/.test(next) ||
+          /^\s*```/.test(next) ||
+          /^#{1,6}\s/.test(next) ||
+          /^\s*[-*+]\s/.test(next) ||
+          /^\s*\d+[.)]\s/.test(next) ||
+          /^\s*>/.test(next)
+        ) {
+          break;
+        }
+        paragraph.push(next);
+        index += 1;
+      }
+      html += `<p>${inlineMarkdown(paragraph.join("\n"))}</p>`;
+    }
+    return html;
+  }
+
+  // ── application state ──────────────────────────────────────────────────────────────
+
+  const state = {
+    context: null,
+    sessionId: null,
+    sessions: [],
+    turn: null, // { controller, turnId, view }
+    pending: { deletions: [], amendments: [] },
+    autoScroll: true,
+  };
+
+  const transcript = $("transcript");
+  const promptBox = $("prompt");
+
+  const PHASE_LABELS = {
+    analysing: "Analysing",
+    thinking: "Thinking",
+    editing: "Editing the notebook",
+    running: "Running cells",
+  };
+
+  const SUGGESTIONS = [
+    "Summarise what this workbook actually does, stage by stage.",
+    "Translate the haircut lookup on Calc!H2:H50000 and reconcile it against the cached values.",
+    "Which stages of the plan are still unconverted, and why?",
+    "Check whether the join key in the hand-in is unique before we rely on it.",
+  ];
+
+  // ── turn rendering ─────────────────────────────────────────────────────────────────
+
+  /* One assistant message. Prose and activity are appended in arrival order, so the trail is
+     genuinely interleaved with the reasoning rather than parked in a drawer at the bottom —
+     which is the whole point of PLAN M3's "the user is not sat there wondering what is
+     happening". Prose accumulates into the block currently at the end; an activity event closes
+     that block, so the next token starts a new one. */
+  function createTurnView() {
+    const phase = el("span", { class: "phase-chip", hidden: true });
+    const phaseText = el("span", { text: "" });
+    phase.append(el("span", { class: "pulse" }), phaseText);
+
+    const tokensNote = el("span", { class: "tokens-note" });
+    const head = el(
+      "div",
+      { class: "message-head" },
+      el("span", { class: "role", text: "kedge" }),
+      phase,
+      tokensNote,
+    );
+    const blocks = el("div", { class: "blocks" });
+    const root = el("div", { class: "message assistant" }, head, blocks);
+
+    const view = {
+      root,
+      blocks,
+      phase,
+      phaseText,
+      tokensNote,
+      proseNode: null,
+      proseText: "",
+      pending: false,
+    };
+
+    view.setPhase = (name) => {
+      if (!name) {
+        view.phase.hidden = true;
+        return;
+      }
+      view.phase.hidden = false;
+      view.phaseText.textContent = PHASE_LABELS[name] || name;
+    };
+
+    view.flushProse = () => {
+      if (!view.proseNode) return;
+      view.proseNode.innerHTML = renderMarkdown(view.proseText);
+      view.pending = false;
+    };
+
+    view.addToken = (text) => {
+      if (!view.proseNode) {
+        view.proseNode = el("div", { class: "prose" });
+        view.proseText = "";
+        view.blocks.append(view.proseNode);
+      }
+      view.proseText += text;
+      if (!view.pending) {
+        view.pending = true;
+        requestAnimationFrame(() => {
+          view.flushProse();
+          maybeScroll();
+        });
+      }
+    };
+
+    view.addTrail = (node) => {
+      view.flushProse();
+      view.proseNode = null;
+      view.blocks.append(node);
+      maybeScroll();
+    };
+
+    return view;
+  }
+
+  function trailItem({ kind, title, iconName, tone, detail, args, preview, violations, cellId }) {
+    const body = el("div", { class: "trail-body" });
+    const heading = el("div", { class: "trail-title" }, el("span", { class: "trail-kind", text: kind }));
+    if (title) heading.append(el("span", { text: title }));
+    if (cellId) heading.append(el("span", { class: "trail-cell-id", text: cellId }));
+    body.append(heading);
+    if (args) body.append(el("div", { class: "trail-args", text: args }));
+    if (detail) body.append(el("div", { class: "trail-detail", text: detail }));
+    if (preview) body.append(el("pre", { class: "trail-preview", text: preview }));
+    if (violations && violations.length) {
+      body.append(
+        el(
+          "ul",
+          { class: "trail-violations" },
+          violations.map((violation) => el("li", { text: violation })),
+        ),
+      );
+    }
+    return el("div", { class: "trail" + (tone ? " " + tone : "") }, icon(iconName), body);
+  }
+
+  /* The one place an event becomes something on screen. Live streaming and replaying a stored
+     session both come through here, so a resumed conversation looks exactly like a live one. */
+  function applyEvent(view, event) {
+    switch (event.type) {
+      case "status":
+        view.setPhase(event.phase);
+        break;
+
+      case "token":
+        view.addToken(event.text);
+        break;
+
+      case "tool_call":
+        view.addTrail(
+          trailItem({
+            kind: "Tool",
+            title: event.name,
+            iconName: "i-tool",
+            tone: "accent",
+            args: event.args_summary || null,
+          }),
+        );
+        break;
+
+      case "tool_result":
+        view.addTrail(
+          trailItem({
+            kind: event.ok ? "Result" : "Failed",
+            title: event.name,
+            iconName: event.ok ? "i-check" : "i-cross",
+            tone: event.ok ? "ok" : "bad",
+            detail: event.summary || null,
+          }),
+        );
+        break;
+
+      case "cell_created":
+        view.addTrail(
+          trailItem({
+            kind: "Cell created",
+            title: event.name,
+            cellId: event.cell_id,
+            iconName: "i-cell",
+            tone: "accent",
+            preview: event.preview || null,
+          }),
+        );
+        break;
+
+      case "cell_running":
+        view.addTrail(
+          trailItem({
+            kind: "Running",
+            cellId: event.cell_id,
+            iconName: "i-play",
+            tone: "running",
+          }),
+        );
+        break;
+
+      case "cell_result":
+        view.addTrail(
+          trailItem({
+            kind: event.ok ? "Cell ran" : "Cell failed",
+            cellId: event.cell_id,
+            iconName: event.ok ? "i-check" : "i-cross",
+            tone: event.ok ? "ok" : "bad",
+            detail: event.error || null,
+          }),
+        );
+        break;
+
+      case "validation":
+        view.addTrail(
+          trailItem({
+            kind: "Validation",
+            title: event.ok
+              ? "passed"
+              : `rejected (${(event.violations || []).length})`,
+            iconName: "i-shield",
+            tone: event.ok ? "ok" : "bad",
+            violations: event.ok ? null : event.violations,
+          }),
+        );
+        break;
+
+      case "error":
+        view.addTrail(
+          trailItem({
+            kind: event.recoverable ? "Problem" : "Fatal",
+            iconName: "i-warn",
+            tone: "bad",
+            detail: event.message,
+          }),
+        );
+        break;
+
+      case "done":
+        view.flushProse();
+        view.setPhase(null);
+        if (event.tokens_used) {
+          view.tokensNote.textContent = `${event.tokens_used.toLocaleString("en-GB")} tokens`;
+        }
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  // ── transcript ─────────────────────────────────────────────────────────────────────
+
+  function maybeScroll() {
+    if (state.autoScroll) transcript.scrollTop = transcript.scrollHeight;
+  }
+
+  transcript.addEventListener("scroll", () => {
+    const distance = transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+    state.autoScroll = distance < 80;
+  });
+
+  function addUserMessage(text) {
+    transcript.append(
+      el(
+        "div",
+        { class: "message user" },
+        el("div", { class: "message-head" }, el("span", { class: "role", text: "You" })),
+        el("div", { class: "bubble", text }),
+      ),
+    );
+    maybeScroll();
+  }
+
+  function showWelcome() {
+    transcript.replaceChildren(
+      el(
+        "div",
+        { class: "welcome" },
+        el("h2", { text: "What shall we work on?" }),
+        el("p", {
+          text:
+            "kedge reads the workbook's structure, proposes cells, runs them, and reconciles the " +
+            "result against the values Excel last calculated. Everything it does appears here as " +
+            "it happens.",
+        }),
+        el(
+          "div",
+          { class: "suggestions" },
+          SUGGESTIONS.map((suggestion) =>
+            el("button", {
+              class: "suggestion",
+              type: "button",
+              text: suggestion,
+              onclick: () => {
+                promptBox.value = suggestion;
+                promptBox.focus();
+                autoGrow();
+              },
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── sessions ───────────────────────────────────────────────────────────────────────
+
+  async function refreshSessions() {
+    const data = await api("/api/sessions");
+    state.sessions = data.sessions;
+    renderSessionList();
+  }
+
+  function renderSessionList() {
+    const list = $("session-list");
+    if (!state.sessions.length) {
+      list.replaceChildren(el("li", { class: "session-empty", text: "No chats yet." }));
+      return;
+    }
+    list.replaceChildren(
+      ...state.sessions.map((session) => {
+        const item = el(
+          "li",
+          {
+            class: "session-item" + (session.id === state.sessionId ? " active" : ""),
+            onclick: () => openSession(session.id),
+          },
+          el(
+            "div",
+            { class: "session-item-main" },
+            el("div", { class: "session-title", text: session.title }),
+            el("div", {
+              class: "session-meta",
+              text: `${session.message_count} message${session.message_count === 1 ? "" : "s"} · ${ago(session.updated_at)}`,
+            }),
+          ),
+        );
+        item.append(
+          el(
+            "button",
+            {
+              class: "icon-button session-delete",
+              title: "Delete this chat",
+              "aria-label": "Delete this chat",
+              onclick: async (event) => {
+                event.stopPropagation();
+                await api(`/api/sessions/${session.id}`, { method: "DELETE" });
+                if (state.sessionId === session.id) state.sessionId = null;
+                await refreshSessions();
+                if (!state.sessionId) await ensureSession();
+              },
+            },
+            icon("i-bin"),
+          ),
+        );
+        return item;
+      }),
+    );
+  }
+
+  async function newSession() {
+    const data = await api("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ model: $("model-input").value || null }),
+    });
+    state.sessionId = data.session.id;
+    localStorage.setItem("kedge.session", state.sessionId);
+    showWelcome();
+    $("drift-notice").hidden = true;
+    await refreshSessions();
+    promptBox.focus();
+  }
+
+  async function openSession(sessionId) {
+    const data = await api(`/api/sessions/${sessionId}`);
+    state.sessionId = sessionId;
+    localStorage.setItem("kedge.session", sessionId);
+    if (data.session.model) $("model-input").value = data.session.model;
+
+    const notice = $("drift-notice");
+    notice.hidden = !data.drifted;
+    notice.classList.remove("bad");
+    if (data.drifted) {
+      notice.textContent =
+        "The notebook has changed since this chat was started. kedge rebuilds notebook state " +
+        "from the live kernel each turn, so it will see the current cells — but earlier " +
+        "messages in this chat describe an older notebook.";
+    }
+
+    transcript.replaceChildren();
+    if (!data.messages.length) {
+      showWelcome();
+    } else {
+      for (const message of data.messages) {
+        if (message.role === "user") {
+          addUserMessage(message.content);
+          continue;
+        }
+        if (message.role !== "assistant") continue;
+        const view = createTurnView();
+        transcript.append(view.root);
+        if (message.events && message.events.length) {
+          for (const event of message.events) applyEvent(view, event);
+        } else if (message.content) {
+          view.addToken(message.content);
+        }
+        view.flushProse();
+        view.setPhase(null);
+      }
+    }
+    renderSessionList();
+    state.autoScroll = true;
+    maybeScroll();
+    refreshPending().catch(() => {});
+  }
+
+  async function ensureSession() {
+    const remembered = localStorage.getItem("kedge.session");
+    if (remembered && state.sessions.some((session) => session.id === remembered)) {
+      await openSession(remembered);
+      return;
+    }
+    if (state.sessions.length) {
+      await openSession(state.sessions[0].id);
+      return;
+    }
+    await newSession();
+  }
+
+  // ── pending decisions ──────────────────────────────────────────────────────────────
+
+  /* `delete_cell` never deletes and `amend_plan` never amends: both record the request, tell the
+     model plainly that nothing has happened, and hand it to the user. This panel is that hand-off
+     made visible. A deletion shows what reads the doomed cell's names, because that is the part
+     of the decision the user cannot work out from the conversation; an amendment shows the
+     model's rationale next to the change it wants, because approving is a review, not a dismiss. */
+  async function refreshPending() {
+    const panel = $("pending");
+    if (!state.sessionId) {
+      panel.hidden = true;
+      return;
+    }
+    let data;
+    try {
+      data = await api(`/api/sessions/${state.sessionId}/pending`);
+    } catch (_) {
+      panel.hidden = true;
+      return;
+    }
+    state.pending = data;
+    const cards = [
+      ...data.deletions.map((item, index) => deletionCard(item, index)),
+      ...data.amendments.map((item, index) => amendmentCard(item, index)),
+    ];
+    panel.replaceChildren(...cards);
+    panel.hidden = cards.length === 0;
+  }
+
+  function decisionCard({ kind, title, tone, body, confirmLabel, onConfirm, onDismiss }) {
+    return el(
+      "div",
+      { class: "decision " + (tone || "") },
+      el(
+        "div",
+        { class: "decision-head" },
+        icon(tone === "bad" ? "i-warn" : "i-shield"),
+        el("span", { class: "decision-kind", text: kind }),
+        el("span", { class: "decision-title", text: title }),
+      ),
+      body,
+      el(
+        "div",
+        { class: "decision-actions" },
+        el("button", { class: "danger-button", type: "button", text: confirmLabel, onclick: onConfirm }),
+        el("button", { class: "ghost-button", type: "button", text: "Keep it", onclick: onDismiss }),
+      ),
+    );
+  }
+
+  function deletionCard(item, index) {
+    const body = el("div", { class: "decision-body" });
+    body.append(el("p", { text: item.reason }));
+    if (item.descendants.length) {
+      body.append(
+        el("p", {
+          class: "decision-warn",
+          text:
+            `${item.descendants.length} cell(s) read names this cell defines and will break: ` +
+            item.descendants.join(", "),
+        }),
+      );
+    } else {
+      body.append(el("p", { class: "decision-muted", text: "Nothing else reads what it defines." }));
+    }
+    return decisionCard({
+      kind: "Delete cell",
+      title: item.cell,
+      tone: item.descendants.length ? "bad" : "",
+      body,
+      confirmLabel: "Delete it",
+      onConfirm: () => decide(`pending/deletions/${index}`, "POST", "The cell was deleted."),
+      onDismiss: () => decide(`pending/deletions/${index}`, "DELETE", "Deletion declined."),
+    });
+  }
+
+  function amendmentCard(item, index) {
+    const body = el("div", { class: "decision-body" });
+    body.append(el("p", { text: item.change }));
+    body.append(el("p", { class: "decision-muted", text: `Because: ${item.rationale}` }));
+    return decisionCard({
+      kind: "Amend the plan",
+      title: item.stage ? `stage ${item.stage}` : "plan-level",
+      body,
+      confirmLabel: "Approve and write a new plan version",
+      onConfirm: () =>
+        decide(`pending/amendments/${index}`, "POST", "A new plan version was written."),
+      onDismiss: () => decide(`pending/amendments/${index}`, "DELETE", "Amendment declined."),
+    });
+  }
+
+  async function decide(path, method, success) {
+    try {
+      const data = await api(`/api/sessions/${state.sessionId}/${path}`, { method });
+      let message = success;
+      if (data.version) {
+        message =
+          `Plan v${data.version} written` +
+          (data.approved
+            ? " and approved."
+            : `, as a draft — it cannot be approved yet: ${(data.blockers || []).join("; ")}`);
+      }
+      if (data.ok === false && data.detail) message = `The kernel refused: ${data.detail}`;
+      notice(message);
+    } catch (error) {
+      notice(error.message, true);
+    }
+    await refreshPending();
+  }
+
+  function notice(message, bad) {
+    const node = $("drift-notice");
+    node.hidden = false;
+    node.textContent = message;
+    node.classList.toggle("bad", Boolean(bad));
+  }
+
+  // ── the turn ───────────────────────────────────────────────────────────────────────
+
+  function setRunning(running) {
+    $("send").disabled = running;
+    $("stop").hidden = !running;
+    promptBox.disabled = false;
+  }
+
+  /* SSE off a fetch body reader. EventSource would be less code but cannot POST, so the message
+     would have to travel in a query string, and it gives no handle to abort — and Escape must
+     cancel the turn in flight. */
+  async function* readEvents(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let split;
+      while ((split = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, split);
+        buffer = buffer.slice(split + 2);
+        const data = frame
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim())
+          .join("\n");
+        if (!data) continue;
+        try {
+          yield JSON.parse(data);
+        } catch (_) {
+          /* a frame we cannot parse is not worth killing the turn over */
+        }
+      }
+    }
+  }
+
+  async function send(message) {
+    if (!state.sessionId || state.turn) return;
+
+    if (transcript.querySelector(".welcome")) transcript.replaceChildren();
+    addUserMessage(message);
+
+    const view = createTurnView();
+    view.setPhase("thinking");
+    transcript.append(view.root);
+    state.autoScroll = true;
+    maybeScroll();
+
+    const controller = new AbortController();
+    state.turn = { controller, turnId: null, view };
+    setRunning(true);
+
+    try {
+      const response = await fetch(`/api/sessions/${state.sessionId}/turns`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, model: $("model-input").value || null }),
+        signal: controller.signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`the server answered ${response.status}`);
+      }
+      state.turn.turnId = response.headers.get("X-Kedge-Turn-Id");
+      for await (const event of readEvents(response)) {
+        applyEvent(view, event);
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        applyEvent(view, {
+          type: "error",
+          message: `The connection to the kedge server failed: ${error.message}`,
+          recoverable: true,
+        });
+      }
+      view.setPhase(null);
+    } finally {
+      view.flushProse();
+      state.turn = null;
+      setRunning(false);
+      refreshSessions().catch(() => {});
+      // A turn is the only thing that can record a pending deletion or amendment, so this is the
+      // one moment the panel can change without the user having clicked something.
+      refreshPending().catch(() => {});
+      promptBox.focus();
+    }
+  }
+
+  async function cancelTurn() {
+    const turn = state.turn;
+    if (!turn) return;
+    if (turn.turnId) {
+      try {
+        await api(`/api/turns/${turn.turnId}/cancel`, { method: "POST" });
+        return; // the loop will finish cooperatively and the stream will close itself
+      } catch (_) {
+        /* the turn had already finished; fall through to aborting the read */
+      }
+    }
+    turn.controller.abort();
+  }
+
+  // ── health ─────────────────────────────────────────────────────────────────────────
+
+  const HEALTH_STATES = {
+    running: ["ok", "Kernel running"],
+    unreachable: ["bad", "Kernel unreachable"],
+    absent: ["warn", "No kernel attached"],
+  };
+
+  async function pollHealth() {
+    const badge = $("health");
+    try {
+      const data = await api("/api/health");
+      const [tone, label] = HEALTH_STATES[data.marimo.state] || ["warn", data.marimo.state];
+      badge.className = "health " + tone;
+      $("health-label").textContent = label;
+      badge.title = data.marimo.detail || `marimo at ${data.marimo.base_url || "—"}`;
+    } catch (_) {
+      badge.className = "health bad";
+      $("health-label").textContent = "Server unreachable";
+      badge.title = "The kedge server is not answering.";
+    }
+  }
+
+  // ── models ─────────────────────────────────────────────────────────────────────────
+
+  async function loadModels() {
+    const input = $("model-input");
+    try {
+      const data = await api("/api/models");
+      $("model-options").replaceChildren(
+        ...data.models.map((name) => el("option", { value: name })),
+      );
+      if (!input.value) input.value = data.selected || data.models[0] || "";
+      input.title =
+        data.source === "endpoint"
+          ? "Listed by the configured endpoint. Any name may be typed."
+          : data.detail || "Type a model name.";
+    } catch (_) {
+      input.title = "The model list could not be fetched. Type a model name.";
+    }
+  }
+
+  // ── notebook pane ──────────────────────────────────────────────────────────────────
+
+  function applyContext(context) {
+    state.context = context;
+    $("crumb-workbook").textContent = context.workbook.name;
+    $("crumb-workbook").title = context.workbook.path;
+    $("crumb-notebook").textContent = context.notebook.name;
+    $("notebook-title").textContent = context.notebook.name;
+    document.title = `${context.workbook.name} — kedge`;
+
+    $("sidebar-foot").replaceChildren(
+      el("div", { text: context.demo ? "Demo mode: scripted agent, no model called." : "" }),
+      el("code", { text: context.workbook.path }),
+    );
+
+    const frame = $("notebook-frame");
+    const placeholder = $("notebook-placeholder");
+    if (context.notebook_url) {
+      /* The token rides in the query string on purpose. An iframe that loads unauthenticated
+         lands on marimo's login page, which is the one endpoint setting X-Frame-Options: DENY,
+         and the frame breaks (PLAN 1.3). */
+      frame.src = context.notebook_url;
+      frame.hidden = false;
+      placeholder.hidden = true;
+      $("open-notebook").href = context.notebook_url;
+    } else {
+      frame.hidden = true;
+      placeholder.hidden = false;
+      $("placeholder-detail").textContent = context.demo
+        ? "Demo mode: no marimo server was started, so there is nothing to frame."
+        : "No marimo server is attached to this workbook. Open it from the hub to start one.";
+      $("open-notebook").hidden = true;
+      $("reload-notebook").hidden = true;
+    }
+  }
+
+  // ── splitter ───────────────────────────────────────────────────────────────────────
+
+  function setupSplitter() {
+    const panes = $("panes");
+    const splitter = $("splitter");
+    const stored = Number(localStorage.getItem("kedge.split"));
+    if (stored >= 20 && stored <= 80) panes.style.setProperty("--chat-w", `${stored}%`);
+
+    const setFraction = (percent) => {
+      const clamped = Math.min(80, Math.max(20, percent));
+      panes.style.setProperty("--chat-w", `${clamped}%`);
+      localStorage.setItem("kedge.split", String(Math.round(clamped)));
+    };
+
+    splitter.addEventListener("pointerdown", (event) => {
+      splitter.setPointerCapture(event.pointerId);
+      splitter.classList.add("dragging");
+      document.body.style.userSelect = "none";
+      /* The iframe would otherwise swallow every pointermove the moment the cursor crossed it. */
+      $("notebook-frame").style.pointerEvents = "none";
+    });
+    splitter.addEventListener("pointermove", (event) => {
+      if (!splitter.classList.contains("dragging")) return;
+      const bounds = panes.getBoundingClientRect();
+      setFraction(((event.clientX - bounds.left) / bounds.width) * 100);
+    });
+    const release = (event) => {
+      if (!splitter.classList.contains("dragging")) return;
+      splitter.releasePointerCapture(event.pointerId);
+      splitter.classList.remove("dragging");
+      document.body.style.userSelect = "";
+      $("notebook-frame").style.pointerEvents = "";
+    };
+    splitter.addEventListener("pointerup", release);
+    splitter.addEventListener("pointercancel", release);
+    splitter.addEventListener("keydown", (event) => {
+      const current = parseFloat(getComputedStyle(panes).getPropertyValue("--chat-w")) || 46;
+      if (event.key === "ArrowLeft") setFraction(current - 2);
+      else if (event.key === "ArrowRight") setFraction(current + 2);
+    });
+  }
+
+  // ── composer ───────────────────────────────────────────────────────────────────────
+
+  function autoGrow() {
+    promptBox.style.height = "auto";
+    promptBox.style.height = `${Math.min(promptBox.scrollHeight, 190)}px`;
+  }
+
+  function setupComposer() {
+    promptBox.addEventListener("input", autoGrow);
+    promptBox.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        $("composer").requestSubmit();
+      }
+    });
+    $("composer").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const message = promptBox.value.trim();
+      if (!message || state.turn) return;
+      promptBox.value = "";
+      autoGrow();
+      send(message);
+    });
+    $("stop").addEventListener("click", cancelTurn);
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      if (state.turn) {
+        event.preventDefault();
+        cancelTurn();
+      }
+    });
+  }
+
+  // ── chrome ─────────────────────────────────────────────────────────────────────────
+
+  function setupChrome() {
+    $("new-chat").addEventListener("click", () => newSession());
+    $("toggle-sidebar").addEventListener("click", () => {
+      const collapsed = $("sidebar").classList.toggle("collapsed");
+      localStorage.setItem("kedge.sidebar", collapsed ? "collapsed" : "open");
+    });
+    if (localStorage.getItem("kedge.sidebar") === "collapsed") {
+      $("sidebar").classList.add("collapsed");
+    }
+
+    $("reload-notebook").addEventListener("click", () => {
+      const frame = $("notebook-frame");
+      if (frame.src) frame.src = frame.src;
+    });
+
+    $("model-input").addEventListener("change", () => {
+      if (!state.sessionId) return;
+      api(`/api/sessions/${state.sessionId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ model: $("model-input").value || null }),
+      }).catch(() => {});
+    });
+
+    const panes = $("panes");
+    panes.dataset.pane = "chat";
+    for (const button of $("pane-switch").querySelectorAll("button")) {
+      button.addEventListener("click", () => {
+        for (const other of $("pane-switch").querySelectorAll("button")) {
+          other.classList.toggle("active", other === button);
+        }
+        panes.dataset.pane = button.dataset.pane;
+      });
+    }
+  }
+
+  // ── boot ───────────────────────────────────────────────────────────────────────────
+
+  async function boot() {
+    setupChrome();
+    setupSplitter();
+    setupComposer();
+    try {
+      const context = await api("/api/context");
+      if (!context.attached) {
+        // A server started with `kedge hub` has no workbook. Drawing an empty chat against one
+        // that does not exist is worse than going where the workbooks are.
+        window.location.replace(context.hub_url || "/hub");
+        return;
+      }
+      applyContext(context);
+    } catch (error) {
+      transcript.replaceChildren(
+        el(
+          "div",
+          { class: "welcome" },
+          el("h2", { text: "The kedge server is not answering" }),
+          el("p", { text: String(error.message) }),
+        ),
+      );
+      return;
+    }
+    await loadModels();
+    await refreshSessions();
+    await ensureSession();
+    pollHealth();
+    setInterval(pollHealth, 5000);
+    setInterval(renderSessionList, 60000);
+    promptBox.focus();
+  }
+
+  boot();
+})();
