@@ -272,6 +272,27 @@ class Workspace:
         """The configuration together with the provenance of each value."""
         return self._loaded_config
 
+    def reload_config(self) -> LoadedConfig:
+        """Re-read the layered config files and adopt the result.
+
+        Config is loaded once at construction, which is right for a process that is handed its
+        settings and gets on with it. The hub's settings panel breaks that assumption: the user
+        changes the model endpoint while the server is running, and every later read of
+        :attr:`config` should see it without a restart.
+
+        Only the *configuration* is replaced. The marimo session, the paths and the workbook are
+        untouched, because none of them can change without a different workspace. Anything already
+        constructed from config — an ``OpenAIClient``, an agent loop — holds the old values and
+        must be rebuilt by whoever built it.
+
+        Raises:
+            ConfigFileError: A config file exists but will not parse.
+            ConfigValidationError: A value or key in one of them is not valid.
+        """
+        self._loaded_config = load_config(project_dir=self.workbook_path.parent)
+        logger.debug("reloaded config for %s", self.workbook_path)
+        return self._loaded_config
+
     # ── project locations ────────────────────────────────────────────────────────────────
 
     @property

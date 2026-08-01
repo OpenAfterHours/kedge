@@ -26,6 +26,7 @@
   <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 12.5v-9M4 7.5 8 3.5l4 4"/></symbol>
   <symbol id="i-sheet" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="11" rx="1.2"/><path d="M2.5 6h11M6 6v7.5"/></symbol>
   <symbol id="i-link" viewBox="0 0 16 16"><path d="M6.5 9.5a2.5 2.5 0 0 0 3.5 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-.8.8"/><path d="M9.5 6.5a2.5 2.5 0 0 0-3.5 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l.8-.8"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.1"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2"/></symbol>
 </svg>
 
 <header class="hub-top">
@@ -38,6 +39,9 @@
   <a class="ghost-button" id="open-current" href="/" hidden>
     <svg class="icon"><use href="#i-book"></use></svg><span id="open-current-name">Back to the notebook</span>
   </a>
+  <button class="icon-button" id="settings-open" title="Model endpoint, API key and model" aria-label="Settings">
+    <svg class="icon"><use href="#i-cog"></use></svg>
+  </button>
   <button class="icon-button" id="refresh" title="Re-read every workbook's state from disk" aria-label="Refresh">
     <svg class="icon"><use href="#i-refresh"></use></svg>
   </button>
@@ -66,6 +70,13 @@
     </div>
     <p class="hub-hint">You can also drag a workbook anywhere onto this page.</p>
     <div class="banner" id="banner" hidden></div>
+    <div class="nudge" id="settings-nudge" hidden>
+      <svg class="icon"><use href="#i-warn"></use></svg>
+      <p id="settings-nudge-text"></p>
+      <button class="ghost-button" id="settings-nudge-open">
+        <svg class="icon"><use href="#i-cog"></use></svg><span>Set it up</span>
+      </button>
+    </div>
   </section>
 
   <section class="hub-list" id="hub-list" aria-live="polite"></section>
@@ -113,6 +124,76 @@
     <a class="primary-button" id="opening-go" href="/" hidden>
       <svg class="icon"><use href="#i-play"></use></svg><span>Go to the notebook</span>
     </a>
+  </div>
+</dialog>
+
+<dialog class="settings" id="settings">
+  <form method="dialog" class="settings-head">
+    <h2>Model endpoint</h2>
+    <div class="topbar-spacer"></div>
+    <button class="ghost-button" value="cancel">Close</button>
+  </form>
+
+  <div class="settings-body">
+    <p class="settings-intro">
+      Where kedge sends its prompts. Any OpenAI-compatible endpoint will do — the hosted API, a
+      gateway, or something running on this machine. The key is stored in the operating system's
+      keyring, never in a config file, and is never sent anywhere but the endpoint below.
+    </p>
+
+    <div class="field">
+      <label class="field-label" for="settings-url">Endpoint URL</label>
+      <input id="settings-url" type="text" spellcheck="false" autocomplete="off"
+             placeholder="https://api.openai.com/v1">
+      <p class="field-note" id="settings-url-note"></p>
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="settings-key">API key</label>
+      <input id="settings-key" type="password" spellcheck="false" autocomplete="off">
+      <p class="field-note" id="settings-key-note"></p>
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="settings-model">Model</label>
+      <div class="field-row">
+        <input id="settings-model" type="text" spellcheck="false" autocomplete="off"
+               placeholder="gpt-4o">
+        <button class="ghost-button" id="settings-fetch" type="button">
+          <svg class="icon"><use href="#i-refresh"></use></svg><span>List models</span>
+        </button>
+      </div>
+      <select class="field-select" id="settings-model-select" hidden
+              aria-label="Models offered by the endpoint"></select>
+      <p class="field-note" id="settings-model-note"></p>
+    </div>
+
+    <details class="settings-advanced">
+      <summary>Advanced</summary>
+      <div class="field">
+        <label class="field-label" for="settings-ref">Keyring entry</label>
+        <input id="settings-ref" type="text" spellcheck="false" autocomplete="off">
+        <p class="field-note">
+          The name kedge stores the key under, in the keyring service <code>kedge</code>. Change it
+          to keep more than one key on this machine and switch between them.
+        </p>
+      </div>
+      <p class="field-note" id="settings-where"></p>
+      <button class="ghost-button danger" id="settings-forget" type="button">
+        <svg class="icon"><use href="#i-bin"></use></svg><span>Forget the stored key</span>
+      </button>
+    </details>
+
+    <div class="banner" id="settings-banner" hidden></div>
+  </div>
+
+  <div class="settings-foot">
+    <button class="ghost-button" id="settings-test" type="button">Test connection</button>
+    <div class="topbar-spacer"></div>
+    <button class="ghost-button" id="settings-cancel" type="button">Cancel</button>
+    <button class="primary-button" id="settings-save" type="button">
+      <svg class="icon"><use href="#i-check"></use></svg><span>Save</span>
+    </button>
   </div>
 </dialog>
 

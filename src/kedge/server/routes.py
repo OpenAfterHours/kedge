@@ -45,6 +45,7 @@ from kedge.lifecycle import health_check
 from kedge.server.agent_seam import TurnMessage, TurnRequest
 from kedge.server.events import DoneEvent, ErrorEvent, TokenEvent, encode_sse, sse_comment
 from kedge.server.sessions import ChatSession, notebook_snapshot
+from kedge.server.settings import fetch_model_names
 
 if TYPE_CHECKING:
     from kedge.server.app import ServerState
@@ -64,7 +65,6 @@ STREAM_HEADERS = {
 }
 
 _KEEPALIVE_SECONDS = 15.0
-_MODELS_TIMEOUT = 10.0
 _DEMO_MODELS = (
     "gpt-4o",
     "gpt-4o-mini",
@@ -246,12 +246,7 @@ async def models(request: Request) -> dict[str, Any]:
         }
 
     try:
-        async with httpx.AsyncClient(timeout=_MODELS_TIMEOUT) as http:
-            response = await http.get(
-                f"{base_url}/models", headers={"Authorization": f"Bearer {key}"}
-            )
-        response.raise_for_status()
-        payload = response.json()
+        names = await fetch_model_names(base_url, key)
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("could not list models from %s: %s", base_url, exc)
         return {
@@ -261,10 +256,6 @@ async def models(request: Request) -> dict[str, Any]:
             "detail": f"{base_url}/models did not answer usefully ({exc}). Type a model name.",
         }
 
-    entries = payload.get("data") if isinstance(payload, dict) else None
-    names = sorted(
-        {str(item["id"]) for item in entries or [] if isinstance(item, dict) and item.get("id")}
-    )
     if not names:
         return {
             "models": [configured],

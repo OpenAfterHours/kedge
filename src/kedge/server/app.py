@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,7 @@ from kedge.server.events import EventBus, NotebookNotifier, notebook_mirror
 from kedge.server.hub import router as hub_router
 from kedge.server.routes import router
 from kedge.server.sessions import SessionStore
+from kedge.server.settings import router as settings_router
 from kedge.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,15 @@ class ServerState:
     opens: dict[str, Any] = field(default_factory=dict)
     """In-flight and finished workbook opens, keyed by job id (see :mod:`kedge.server.hub`)."""
 
+    agent_factory: Callable[[], AgentLoop] | None = None
+    """Rebuilds the agent loop against current config, or ``None`` if nothing can.
+
+    Set by the open sequence, which is the only place that holds the notebook driver and the
+    analysis the loop needs. It exists so that saving a model endpoint from the settings panel can
+    take effect in this process: a first run with no API key opens in demo mode, and without this
+    the user would have to stop the server and start again to get the real agent.
+    """
+
     @property
     def attached(self) -> bool:
         """Whether a workbook is open on this server."""
@@ -126,6 +136,25 @@ class ServerState:
             raise WorkspaceNotAttachedError(msg)
         return self.agent
 
+    def rebuild_agent(self) -> bool:
+        """Rebuild the agent loop against the configuration as it now stands.
+
+        Called after the settings panel writes a new model endpoint. Returns whether a real loop
+        is now attached: a rebuild that fails leaves the previous agent in place and the server in
+        demo mode, which is the same honest fallback the open sequence uses, rather than a server
+        with no agent at all.
+        """
+        if self.agent_factory is None:
+            return not self.demo
+        try:
+            self.agent = self.agent_factory()
+        except (KedgeError, ImportError):
+            logger.info("could not rebuild the agent loop from the new settings", exc_info=True)
+            return False
+        self.demo = False
+        logger.info("rebuilt the agent loop after a settings change")
+        return True
+
     def attach(
         self,
         workspace: Workspace,
@@ -133,6 +162,7 @@ class ServerState:
         agent: AgentLoop,
         demo: bool = False,
         notifier: NotebookNotifier | None = None,
+        agent_factory: Callable[[], AgentLoop] | None = None,
     ) -> None:
         """Adopt a workbook and the loop that drives it, in a server that had neither.
 
@@ -152,6 +182,7 @@ class ServerState:
         self.workspace = workspace
         self.agent = agent
         self.demo = demo
+        self.agent_factory = agent_factory
         if notifier is not None:
             self.bus.add_observer(notebook_mirror(notifier))
         logger.info("attached workbook %s", workspace.workbook_path)
@@ -259,6 +290,7 @@ def _build(state: ServerState) -> FastAPI:
     )
     app.state.kedge = state
     app.include_router(hub_router)
+    app.include_router(settings_router)
     app.include_router(router)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     return app

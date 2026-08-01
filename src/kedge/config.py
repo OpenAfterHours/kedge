@@ -13,6 +13,12 @@ than emitting a raw pydantic traceback.
 The model endpoint's API key is never held here. Config carries ``api_key_ref``, the name of an
 entry in the OS keyring (Windows Credential Manager); :func:`get_api_key` fetches it on demand
 and it is never stored on, logged by, or reachable through a :class:`Config` instance.
+
+Loading is the common case, but the hub can also *write* the machine-wide file, which is how a
+user configures the model endpoint without a terminal. :func:`update_user_config` merges a section
+back into ``~/.kedge/config.toml``; :func:`set_api_key` puts the key in the keyring, where the
+writer physically cannot put it. Only the user file is ever written — the per-project
+``kedge.toml`` belongs to the process being converted and is the user's to edit.
 """
 
 from __future__ import annotations
@@ -20,13 +26,16 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import tempfile
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import keyring
 import keyring.errors
+import tomli_w
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from kedge.errors import ConfigError
@@ -38,6 +47,7 @@ __all__ = [
     "KEYRING_SERVICE",
     "PROJECT_CONFIG_FILENAME",
     "USER_CONFIG_FILENAME",
+    "ApiKeyStoreError",
     "Config",
     "ConfigFileError",
     "ConfigValidationError",
@@ -51,9 +61,12 @@ __all__ = [
     "RedactionConfig",
     "SamplingConfig",
     "api_key_status",
+    "delete_api_key",
     "get_api_key",
     "keyring_set_command",
     "load_config",
+    "set_api_key",
+    "update_user_config",
     "user_config_path",
     "user_dir",
 ]
@@ -84,6 +97,10 @@ class MissingApiKeyError(ConfigError):
     """The configured keyring entry does not exist, or the keyring is unreachable."""
 
 
+class ApiKeyStoreError(ConfigError):
+    """The OS keyring refused to store or remove a key."""
+
+
 # ── models ───────────────────────────────────────────────────────────────────────────────────
 
 
@@ -101,8 +118,8 @@ class ModelConfig(_Section):
     """The OpenAI-compatible endpoint the agent talks to."""
 
     base_url: str = "https://api.openai.com/v1"
-    model: str = "gpt-4o"
-    api_key_ref: str = "default"
+    model: str = Field(default="gpt-4o", min_length=1)
+    api_key_ref: str = Field(default="default", min_length=1)
     """Name of the keyring entry holding the key. Never the key itself."""
     timeout_seconds: float = Field(default=120.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
@@ -464,3 +481,165 @@ def api_key_status(config: Config) -> Literal["present", "missing", "unavailable
         logger.debug("keyring backend unavailable while checking entry")
         return "unavailable"
     return "present" if secret else "missing"
+
+
+def set_api_key(api_key_ref: str, secret: str) -> None:
+    """Store the model endpoint's API key in the OS keyring under ``api_key_ref``.
+
+    The counterpart to :func:`get_api_key`, and the only supported way for kedge itself to put a
+    key anywhere. The secret is never logged and never written to a config file; on Windows it
+    lands in Credential Manager.
+
+    Raises:
+        ApiKeyStoreError: The entry name is empty, or the keyring refused the write.
+    """
+    ref = api_key_ref.strip()
+    if not ref:
+        msg = "the keyring entry name cannot be empty"
+        raise ApiKeyStoreError(msg)
+    if not secret:
+        msg = f"refusing to store an empty API key in '{KEYRING_SERVICE}/{ref}'"
+        raise ApiKeyStoreError(msg)
+    try:
+        keyring.set_password(KEYRING_SERVICE, ref, secret)
+    except keyring.errors.KeyringError as exc:
+        msg = (
+            f"could not store the API key in the OS keyring (service '{KEYRING_SERVICE}', entry "
+            f"'{ref}'): {exc}. Check that a keyring backend is available, or store it yourself "
+            f"with `{keyring_set_command(ref)}`."
+        )
+        raise ApiKeyStoreError(msg) from exc
+    # The entry name, never the secret and never its length.
+    logger.info("stored an API key in the OS keyring entry %s/%s", KEYRING_SERVICE, ref)
+
+
+def delete_api_key(api_key_ref: str) -> bool:
+    """Remove the keyring entry named by ``api_key_ref``.
+
+    Returns:
+        Whether an entry was there to remove. Deleting one that does not exist is not an error;
+        the caller asked for it to be gone and it is.
+
+    Raises:
+        ApiKeyStoreError: The keyring is unreachable, so nothing can be said about the entry.
+    """
+    ref = api_key_ref.strip()
+    try:
+        keyring.delete_password(KEYRING_SERVICE, ref)
+    except keyring.errors.PasswordDeleteError:
+        logger.debug("no keyring entry %s/%s to delete", KEYRING_SERVICE, ref)
+        return False
+    except keyring.errors.KeyringError as exc:
+        msg = (
+            f"could not remove the API key from the OS keyring (service '{KEYRING_SERVICE}', "
+            f"entry '{ref}'): {exc}."
+        )
+        raise ApiKeyStoreError(msg) from exc
+    logger.info("removed the OS keyring entry %s/%s", KEYRING_SERVICE, ref)
+    return True
+
+
+# ── writing ──────────────────────────────────────────────────────────────────────────────────
+
+_USER_CONFIG_BANNER = (
+    "# kedge machine-wide configuration.\n"
+    "#\n"
+    "# Rewritten whenever settings are saved from the hub, so comments added by hand below do\n"
+    "# not survive. Process-shaped settings — tolerances, redaction, sampling — belong in a\n"
+    "# kedge.toml beside the workbook, which kedge never writes.\n"
+    "#\n"
+    "# The model endpoint's API key is deliberately not here. It lives in the OS keyring under\n"
+    "# the entry named by model.api_key_ref, and a key written into this file is refused.\n"
+)
+
+
+def update_user_config(
+    section: str,
+    values: Mapping[str, Any],
+    *,
+    path: Path | None = None,
+) -> Path:
+    """Merge ``values`` into ``[section]`` of the machine-wide config file and write it back.
+
+    Only ``~/.kedge/config.toml`` is ever written. Machine-shaped settings — the model endpoint,
+    the keyring entry — are exactly what belongs there, and the per-project ``kedge.toml`` is the
+    user's to edit (PLAN 2.9). A project file that overrides one of these keys keeps winning after
+    the write, which is why callers should report the resolved value rather than what they sent.
+
+    A value of ``None`` removes that key, so the built-in default applies again.
+
+    The merged file is validated as a whole before anything is written, and written atomically
+    via a temporary file in the same directory, so a rejected value or a full disk leaves the
+    previous configuration intact rather than truncated.
+
+    Args:
+        section: Top-level table to merge into, such as ``"model"``.
+        values: Keys to set within it. ``None`` removes a key.
+        path: Overrides the file written. For tests.
+
+    Returns:
+        The path written.
+
+    Raises:
+        ConfigValidationError: ``section`` or a key is unknown, a value is invalid, or ``values``
+            carries something that looks like a secret.
+        ConfigFileError: The existing file will not parse, or the write failed.
+    """
+    target = user_config_path() if path is None else path
+
+    raw = _read_toml(target) if target.is_file() else {}
+    _reject_inline_secrets({section: dict(values)}, target)
+
+    existing = raw.get(section, {})
+    if not isinstance(existing, dict):
+        msg = f"{target}: '{section}' is not a table, so kedge will not write into it"
+        raise ConfigValidationError(msg)
+
+    table = dict(existing)
+    for key, value in values.items():
+        if value is None:
+            table.pop(key, None)
+        else:
+            table[key] = value
+
+    merged = dict(raw)
+    if table:
+        merged[section] = table
+    else:
+        merged.pop(section, None)
+
+    try:
+        Config.model_validate(merged)
+    except ValidationError as exc:
+        raise ConfigValidationError(_describe_validation_error(exc, [(target, merged)])) from exc
+
+    _write_toml(target, merged)
+    logger.info("wrote [%s] to %s", section, target)
+    return target
+
+
+def _write_toml(path: Path, raw: Mapping[str, Any]) -> None:
+    """Write ``raw`` to ``path`` atomically, replacing whatever was there.
+
+    Temporary file in the same directory then :meth:`Path.replace`, matching the workbook registry
+    and the marker files: a crash mid-write must not leave a half-written config that then fails
+    to parse on the next launch.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        body = _USER_CONFIG_BANNER + "\n" + tomli_w.dumps(dict(raw))
+        # mkstemp rather than a fixed name, so two writes racing cannot land on the same file.
+        handle, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(body)
+            temporary.replace(path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    except OSError as exc:
+        msg = f"{path}: could not be written: {exc}"
+        raise ConfigFileError(msg) from exc

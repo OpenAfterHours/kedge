@@ -84,7 +84,7 @@
     return response.status === 204 ? null : response.json();
   }
 
-  const state = { steps: [], workbooks: [], attached: null, browsing: null };
+  const state = { steps: [], workbooks: [], attached: null, browsing: null, settings: null };
 
   // ── banner ─────────────────────────────────────────────────────────────────────────
 
@@ -594,6 +594,180 @@
     }
   }
 
+  // ── settings ───────────────────────────────────────────────────────────────────────
+
+  /* The model endpoint, its key, and which model to use. Before this panel existed the only way
+     to configure any of it was to hand-edit ~/.kedge/config.toml and run `keyring set` in a
+     terminal — and a first run with no key opens in demo mode, so the fix lived somewhere the
+     user had never been shown.
+
+     The key is write-only from here: the server never sends one back, so the box is always empty
+     on open and an empty box means "leave the stored one alone". The model is a free-text box
+     with a dropdown beside it rather than a dropdown alone, because plenty of OpenAI-compatible
+     servers do not implement /models and the user must still be able to name one. */
+
+  function settingsSay(message, tone) {
+    const banner = $("settings-banner");
+    banner.textContent = message || "";
+    banner.className = "banner" + (tone ? " " + tone : "");
+    banner.hidden = !message;
+  }
+
+  const APPLIED = {
+    now: "Saved. The agent is using it now.",
+    next_open: "Saved. It takes effect when you open a workbook.",
+    unusable:
+      "Saved, but the endpoint could not be used, so this workbook stays in demo mode. " +
+      "Test connection will say why.",
+  };
+
+  function keyNote(data) {
+    const key = data.api_key;
+    if (key.status === "unavailable") {
+      return `This machine has no working keyring backend, so kedge cannot store or read a key.
+              You can still set one with \`${key.set_command}\`.`;
+    }
+    if (key.status === "present") {
+      return `A key is stored under ${key.service}/${key.entry}. Leave this empty to keep it.`;
+    }
+    return `No key is stored under ${key.service}/${key.entry}. Until there is one, kedge opens
+            workbooks in demo mode: the scripted agent answers and nothing is sent to a model.`;
+  }
+
+  function fillSettings(data) {
+    state.settings = data;
+    $("settings-url").value = data.base_url;
+    $("settings-model").value = data.model;
+    $("settings-ref").value = data.api_key_ref;
+    $("settings-key").value = "";
+    $("settings-key").placeholder = data.api_key.status === "present" ? "•".repeat(16) : "";
+    $("settings-key-note").textContent = keyNote(data);
+    $("settings-forget").disabled = data.api_key.status !== "present";
+
+    /* A project kedge.toml layered over the file this panel writes still wins. Saying so is the
+       difference between "kedge ignored me" and "that value is pinned by this file". */
+    const pinned = Object.entries(data.overridden_by_project);
+    const note = $("settings-url-note");
+    if (pinned.length) {
+      const names = pinned.map(([key]) => key).join(", ");
+      note.textContent = `Note: ${names} ${pinned.length > 1 ? "are" : "is"} overridden by
+        ${pinned[0][1]}, which wins over anything saved here. Edit that file to change it.`;
+      note.className = "field-note warn";
+    } else {
+      note.textContent = "";
+      note.className = "field-note";
+    }
+    $("settings-where").textContent = `Saved to ${data.config_path}. Values not set there fall
+      back to kedge's defaults; a kedge.toml beside a workbook overrides both.`;
+    updateNudge(data);
+  }
+
+  function updateNudge(data) {
+    const nudge = $("settings-nudge");
+    if (!data || data.api_key.status === "present") {
+      nudge.hidden = true;
+      return;
+    }
+    $("settings-nudge-text").textContent =
+      data.api_key.status === "unavailable"
+        ? `This machine has no working keyring, so kedge cannot read an API key. Workbooks will
+           open in demo mode.`
+        : `No API key is stored yet, so workbooks open in demo mode — the scripted agent answers
+           and nothing is sent to a model.`;
+    nudge.hidden = false;
+  }
+
+  function showModels(names, detail, tone) {
+    const select = $("settings-model-select");
+    select.replaceChildren();
+    select.hidden = !names.length;
+    if (names.length) {
+      select.append(
+        el("option", { value: "", disabled: true, selected: true },
+           `${names.length} model${names.length === 1 ? "" : "s"} from the endpoint…`),
+      );
+      for (const name of names) select.append(el("option", { value: name }, name));
+    }
+    const note = $("settings-model-note");
+    note.textContent = detail || "";
+    note.className = "field-note" + (tone ? " " + tone : "");
+  }
+
+  function settingsPayload() {
+    const key = $("settings-key").value.trim();
+    return {
+      base_url: $("settings-url").value.trim(),
+      api_key_ref: $("settings-ref").value.trim(),
+      // Only ever sent when the user typed one. An empty box means "keep what is stored".
+      api_key: key || null,
+    };
+  }
+
+  async function probeModels(quiet) {
+    const button = $("settings-fetch");
+    button.disabled = true;
+    if (!quiet) $("settings-model-note").textContent = "Asking the endpoint…";
+    try {
+      const data = await api("/api/settings/model/probe", {
+        method: "POST",
+        body: JSON.stringify(settingsPayload()),
+      });
+      showModels(data.models, data.detail, data.ok ? null : "warn");
+    } catch (error) {
+      showModels([], error.message, "warn");
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function saveSettings() {
+    const button = $("settings-save");
+    button.disabled = true;
+    settingsSay("");
+    try {
+      const data = await api("/api/settings/model", {
+        method: "PUT",
+        body: JSON.stringify({ ...settingsPayload(), model: $("settings-model").value.trim() }),
+      });
+      fillSettings(data);
+      settingsSay(APPLIED[data.applied] || "Saved.", data.applied === "unusable" ? null : "ok");
+      // Outside the catch: the save succeeded, and a list that failed to redraw must not be
+      // reported as a save that failed.
+      refresh().catch(() => {});
+    } catch (error) {
+      settingsSay(error.message, null);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function forgetKey() {
+    settingsSay("");
+    try {
+      const data = await api("/api/settings/model/key", { method: "DELETE" });
+      fillSettings(data);
+      settingsSay("The stored key has been removed from the keyring.", "ok");
+    } catch (error) {
+      settingsSay(error.message, null);
+    }
+  }
+
+  async function openSettings() {
+    const dialog = $("settings");
+    settingsSay("");
+    showModels([], "");
+    try {
+      fillSettings(await api("/api/settings/model"));
+    } catch (error) {
+      settingsSay(error.message, null);
+      return;
+    }
+    if (!dialog.open) dialog.showModal();
+    // A stored key means the list can usually be had for free, so the picker is populated before
+    // the user goes looking for it. Quietly: a dead endpoint is not worth an error on open.
+    if (state.settings && state.settings.api_key.status === "present") await probeModels(true);
+  }
+
   // ── wiring ─────────────────────────────────────────────────────────────────────────
 
   function setup() {
@@ -616,6 +790,20 @@
       $("opening").close();
       refresh().catch(() => {});
     });
+
+    $("settings-open").addEventListener("click", () => openSettings());
+    $("settings-nudge-open").addEventListener("click", () => openSettings());
+    $("settings-cancel").addEventListener("click", () => $("settings").close());
+    $("settings-save").addEventListener("click", () => saveSettings());
+    $("settings-test").addEventListener("click", () => probeModels(false));
+    $("settings-fetch").addEventListener("click", () => probeModels(false));
+    $("settings-forget").addEventListener("click", () => forgetKey());
+    $("settings-model-select").addEventListener("change", (event) => {
+      if (!event.target.value) return;
+      $("settings-model").value = event.target.value;
+    });
+    // The endpoint the list came from is no longer the one in the box, so the list is stale.
+    $("settings-url").addEventListener("input", () => showModels([], ""));
 
     let depth = 0;
     const overlay = $("drop-overlay");
@@ -645,6 +833,13 @@
       await refresh();
     } catch (error) {
       say(`The kedge server is not answering: ${error.message}`);
+    }
+    // Without a key every workbook opens in demo mode, which is a surprise worth heading off on
+    // the page where the user is about to choose one.
+    try {
+      updateNudge(await api("/api/settings/model"));
+    } catch (_) {
+      /* the banner above has already said the server is not answering */
     }
     // The registry's derived state changes underneath this page — a marimo shuts itself down on
     // its idle timeout, a reconciliation is run in another terminal — so it is re-read on a slow

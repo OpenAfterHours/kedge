@@ -851,18 +851,24 @@ async def _step_agent(
     they just waited eight seconds for. The fallback is the same :class:`ScriptedAgent` the demo
     server uses, and the UI already labels that plainly as demo mode rather than pretending a
     model answered.
+
+    The same closure that builds the loop here is handed to :meth:`ServerState.attach`, so that a
+    user who then fills in the settings panel gets the real agent without reopening the workbook.
+    That is the whole point of falling back rather than failing: demo mode is meant to be a state
+    you can climb out of.
     """
     from kedge.server.agent_seam import AgentLoop, ScriptedAgent
+
+    def build() -> AgentLoop:
+        from kedge.agent.loop import KedgeAgent
+
+        return KedgeAgent.for_workspace(workspace, driver=driver, analysis=analysis)
 
     job.step("agent", "running", "wiring up the agent loop")
     demo = False
     agent: AgentLoop
     try:
-        from kedge.agent.loop import KedgeAgent
-
-        agent = await run_in_threadpool(
-            KedgeAgent.for_workspace, workspace, driver=driver, analysis=analysis
-        )
+        agent = await run_in_threadpool(build)
     except (KedgeError, ImportError) as exc:
         agent = ScriptedAgent(delay=0.02)
         demo = True
@@ -870,10 +876,11 @@ async def _step_agent(
             "agent",
             "failed",
             f"no model endpoint is usable ({exc}). Opening in demo mode: the scripted agent "
-            f"answers and nothing is sent to a model.",
+            f"answers and nothing is sent to a model. Set the endpoint and key in Settings, on "
+            f"the hub, and the real agent takes over without reopening the workbook.",
         )
     else:
         job.step("agent", "ok", f"agent ready on {workspace.config.model.model}")
 
-    state.attach(workspace, agent=agent, demo=demo)
+    state.attach(workspace, agent=agent, demo=demo, agent_factory=build)
     return demo

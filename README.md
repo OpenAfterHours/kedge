@@ -37,6 +37,12 @@ sequence `kedge open` runs — clean up, analyse, plan, scaffold, spawn marimo, 
 — with the progress streamed into the page, and lands you in the chat-plus-notebook view. Where a
 marimo kedge started is still running, the hub offers to reattach rather than starting a second.
 
+The AI half needs an endpoint. Open **Settings** on the hub and give it an OpenAI-compatible base
+URL, a key and a model — the hosted API, a gateway, or something local. The base URL and model go
+to `~/.kedge/config.toml`; the key goes to the operating system's keyring and never to a file.
+Until a key is stored, workbooks open in demo mode, where a scripted agent answers and nothing is
+sent to a model — so the analysis, the scaffold and the notebook all work with no endpoint at all.
+
 Or, offline and standalone — the analyser is useful on its own:
 
 ```bash
