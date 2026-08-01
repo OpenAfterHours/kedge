@@ -17,9 +17,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from conftest import make_plan
+from kedge import config as config_module
 from kedge.agent.tools import PendingAmendment, PendingDeletion, ToolContext, ToolRegistry
 from kedge.plan.review import acknowledge_all_drops, approve
 from kedge.plan.store import PlanStore
+from kedge.server import routes as routes_module
 from kedge.server.agent_seam import CancelToken, ScriptedAgent, TurnRequest
 from kedge.server.app import ServerError, create_app, require_loopback
 from kedge.server.events import (
@@ -45,6 +47,16 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
     built.ensure_dirs()
     built.notebook_path.write_text("import marimo\n", encoding="utf-8")
     return built
+
+
+@pytest.fixture(autouse=True)
+def no_real_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real Windows Credential Manager is never consulted by a test.
+
+    Without this, a developer who has stored a key under the default entry has `/api/models`
+    send it to the real ``api.openai.com`` on every ``pytest`` run.
+    """
+    monkeypatch.setattr(config_module.keyring, "get_password", lambda service, username: None)
 
 
 @pytest.fixture
@@ -241,19 +253,47 @@ def test_models_answers_without_a_network_call_in_demo_mode(client: TestClient) 
     assert payload["selected"]
 
 
+def _live_client(workspace: Workspace, tmp_path: Path) -> TestClient:
+    """A client with demo mode off, so the model routes take their real branches."""
+    return TestClient(
+        create_app(
+            workspace,
+            agent=ScriptedAgent(delay=0.0),
+            store=SessionStore(tmp_path / "s.sqlite"),
+            demo=False,
+        )
+    )
+
+
 def test_models_degrades_to_the_configured_model_without_a_key(
     workspace: Workspace, tmp_path: Path
 ) -> None:
-    app = create_app(
-        workspace,
-        agent=ScriptedAgent(delay=0.0),
-        store=SessionStore(tmp_path / "s.sqlite"),
-        demo=False,
-    )
-    with TestClient(app) as opened:
+    with _live_client(workspace, tmp_path) as opened:
         payload = opened.get("/api/models").json()
-    assert payload["source"] in ("configured", "unavailable")
+
+    assert payload["source"] == "configured"
     assert payload["models"] == [workspace.config.model.model]
+
+
+def test_models_degrades_to_the_configured_model_when_the_endpoint_will_not_list(
+    workspace: Workspace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plenty of OpenAI-compatible servers do not implement /models (PLAN M6)."""
+    monkeypatch.setattr(
+        config_module.keyring, "get_password", lambda service, username: "sk-stored"
+    )
+
+    async def refuse(base_url: str, api_key: str) -> list[str]:
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setattr(routes_module, "fetch_model_names", refuse)
+
+    with _live_client(workspace, tmp_path) as opened:
+        payload = opened.get("/api/models").json()
+
+    assert payload["source"] == "unavailable"
+    assert payload["models"] == [workspace.config.model.model]
+    assert "type a model name" in payload["detail"].lower()
 
 
 # ── sessions ─────────────────────────────────────────────────────────────────────────────────
