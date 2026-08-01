@@ -91,6 +91,7 @@ __all__ = [
     "OpenAIClient",
     "PendingToolCall",
     "build_agent_app",
+    "chat_deltas",
     "responses_delta",
     "responses_input",
     "responses_tools",
@@ -272,6 +273,32 @@ def responses_delta(event: Any) -> ChatDelta | None:
     return None
 
 
+def chat_deltas(chunk: Any) -> list[ChatDelta]:
+    """Translate one streamed chat-completions chunk into the fragments the loop reassembles.
+
+    Chat completions streams anonymous deltas: prose and tool-call pieces arrive in the same
+    envelope, and ``index`` is the only thing tying a call's name to the arguments that follow.
+    """
+    deltas: list[ChatDelta] = []
+    for choice in chunk.choices or ():
+        delta = choice.delta
+        if delta is None:
+            continue
+        if delta.content:
+            deltas.append(ChatDelta(text=delta.content))
+        for call in delta.tool_calls or ():
+            function = call.function
+            deltas.append(
+                ChatDelta(
+                    index=call.index or 0,
+                    call_id=call.id,
+                    name=function.name if function is not None else None,
+                    arguments=(function.arguments or "") if function is not None else "",
+                )
+            )
+    return deltas
+
+
 def _mentions_reasoning(exc: Exception) -> bool:
     """Whether a refusal was about the reasoning parameter rather than the request as a whole."""
     return "reasoning" in str(exc).lower()
@@ -308,8 +335,25 @@ class OpenAIClient:
     the user has — a hosted API, a gateway, a llama.cpp on the next desk — and most of those
     implement chat completions only. So both are discovered rather than assumed: a missing
     ``/responses`` route downgrades the client once and permanently, and a refusal that names
-    reasoning drops the parameter and retries. Each costs one round trip, on the first turn only,
-    and is logged. Pin :attr:`~kedge.config.ModelConfig.api` to skip the probe.
+    reasoning is walked down a ladder until something is accepted. Each costs one round trip, on
+    the first turn only, and is logged. Pin :attr:`~kedge.config.ModelConfig.api` to skip the probe.
+
+    **Saying nothing about reasoning is not the same as asking for none of it.** A reasoning model
+    behind a gateway has a *default* effort, so a request that omits the parameter still arrives
+    carrying one, and chat completions then refuses it in the presence of function tools. Sending
+    nothing cannot fix that; only an explicit ``"none"`` can. That is why the chat ladder ends at
+    omission rather than starting there:
+
+    ==================  ==========================================================
+    configured effort   what is tried, in order
+    ==================  ==========================================================
+    ``"high"``          ``"high"``, then ``"none"``, then the parameter omitted
+    unset               omitted, then ``"none"``
+    ==================  ==========================================================
+
+    An endpoint that has never heard of the parameter never refuses over it, so it never leaves
+    the first rung. One that defaults it lands on ``"none"``, which is the remedy its own error
+    message names.
 
     Example:
         >>> OpenAIClient.__name__
@@ -337,6 +381,15 @@ class OpenAIClient:
         self._use_responses = api != "chat_completions"
         self._pinned = api != "auto"
         self._reasoning_effort = reasoning_effort
+        """What the user configured. Never mutated; the two dialects negotiate around it."""
+
+        self._responses_effort = reasoning_effort
+        """What responses is currently sending, dropped to ``None`` if it is refused."""
+
+        self._chat_ladder: tuple[str | None, ...] = (
+            (reasoning_effort, "none", None) if reasoning_effort is not None else (None, "none")
+        )
+        self._chat_rung = 0
 
     @classmethod
     def from_workspace(cls, workspace: Workspace) -> OpenAIClient:
@@ -375,36 +428,63 @@ class OpenAIClient:
         from openai import BadRequestError, NotFoundError
 
         while True:
-            if not self._use_responses:
-                async for delta in self._stream_chat(model, messages, tools):
-                    yield delta
-                return
+            responses = self._use_responses
             try:
-                stream = await self._open_responses(model, messages, tools)
+                stream = (
+                    await self._open_responses(model, messages, tools)
+                    if responses
+                    else await self._open_chat(model, messages, tools)
+                )
             except (BadRequestError, NotFoundError) as exc:
-                if not self._pinned and _missing_route(exc):
-                    logger.info(
-                        "the endpoint has no responses API (%s); using chat completions from "
-                        "here on",
-                        exc,
-                    )
-                    self._use_responses = False
-                    continue
-                if self._reasoning_effort is not None and _mentions_reasoning(exc):
-                    logger.warning(
-                        "the endpoint refused reasoning_effort=%r (%s); retrying without it and "
-                        "not asking again this session",
-                        self._reasoning_effort,
-                        exc,
-                    )
-                    self._reasoning_effort = None
+                if self._recover(exc):
                     continue
                 raise
-            async for event in stream:
-                delta = responses_delta(event)
-                if delta is not None:
-                    yield delta
+            if responses:
+                async for event in stream:
+                    delta = responses_delta(event)
+                    if delta is not None:
+                        yield delta
+            else:
+                async for chunk in stream:
+                    for delta in chat_deltas(chunk):
+                        yield delta
             return
+
+    def _recover(self, exc: Exception) -> bool:
+        """Adjust for a refusal and report whether the request is worth sending again.
+
+        False for anything that is not about the dialect or about reasoning, because degrading
+        around every 400 would turn a real complaint -- an unknown model, a malformed schema --
+        into a turn that silently did nothing and said why to nobody.
+        """
+        if self._use_responses and not self._pinned and _missing_route(exc):
+            logger.info(
+                "the endpoint has no responses API (%s); using chat completions from here on", exc
+            )
+            self._use_responses = False
+            return True
+        if not _mentions_reasoning(exc):
+            return False
+        if self._use_responses:
+            if self._responses_effort is None:
+                return False
+            logger.warning(
+                "the endpoint refused reasoning effort %r on the responses API (%s); dropping it",
+                self._responses_effort,
+                exc,
+            )
+            self._responses_effort = None
+            return True
+        if self._chat_rung + 1 >= len(self._chat_ladder):
+            return False
+        self._chat_rung += 1
+        logger.warning(
+            "the endpoint refused reasoning_effort=%r on chat completions (%s); trying %r",
+            self._chat_ladder[self._chat_rung - 1],
+            exc,
+            self._chat_ladder[self._chat_rung],
+        )
+        return True
 
     async def _open_responses(
         self,
@@ -421,17 +501,17 @@ class OpenAIClient:
         if tools:
             payload["tools"] = responses_tools(tools)
             payload["tool_choice"] = "auto"
-        if self._reasoning_effort is not None:
-            payload["reasoning"] = {"effort": self._reasoning_effort}
+        if self._responses_effort is not None:
+            payload["reasoning"] = {"effort": self._responses_effort}
         return await self._client.responses.create(**payload)
 
-    async def _stream_chat(
+    async def _open_chat(
         self,
         model: str,
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
-    ) -> AsyncIterator[ChatDelta]:
-        """Stream in the chat-completions dialect, which is what most endpoints implement."""
+    ) -> Any:
+        """Send the request in the chat-completions dialect, which most endpoints implement."""
         payload: dict[str, Any] = {
             "model": model,
             "messages": [dict(message) for message in messages],
@@ -440,25 +520,10 @@ class OpenAIClient:
         if tools:
             payload["tools"] = [dict(tool) for tool in tools]
             payload["tool_choice"] = "auto"
-        # Deliberately not sent here. Chat completions is the fallback dialect precisely because
-        # the endpoint would not take reasoning alongside tools, and sending it again on the way
-        # down would reproduce the refusal kedge just worked around.
-        stream = await self._client.chat.completions.create(**payload)
-        async for chunk in stream:
-            for choice in chunk.choices or ():
-                delta = choice.delta
-                if delta is None:
-                    continue
-                if delta.content:
-                    yield ChatDelta(text=delta.content)
-                for call in delta.tool_calls or ():
-                    function = call.function
-                    yield ChatDelta(
-                        index=call.index or 0,
-                        call_id=call.id,
-                        name=function.name if function is not None else None,
-                        arguments=(function.arguments or "") if function is not None else "",
-                    )
+        effort = self._chat_ladder[self._chat_rung]
+        if effort is not None:
+            payload["reasoning_effort"] = effort
+        return await self._client.chat.completions.create(**payload)
 
     async def aclose(self) -> None:
         """Release the underlying HTTP client."""

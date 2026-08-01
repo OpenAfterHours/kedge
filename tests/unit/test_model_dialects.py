@@ -23,6 +23,12 @@ from kedge.agent.loop import OpenAIClient, responses_delta, responses_input, res
 # ── fakes ────────────────────────────────────────────────────────────────────────────────────
 
 
+def _not_found() -> type[Exception]:
+    from openai import NotFoundError
+
+    return NotFoundError
+
+
 def _status_error(kind: type[Exception], status: int, message: str) -> Exception:
     """Build a real SDK error, so the client is tested against what it will actually catch."""
     request = httpx.Request("POST", "http://127.0.0.1:1/v1/responses")
@@ -70,6 +76,11 @@ class FakeSDK:
 
     ``responses_errors`` is consumed one entry per call: an exception is raised, ``None`` succeeds.
     That is how a downgrade is expressed -- refuse the first attempt, accept the retry.
+
+    ``chat_refuses_effort`` models the endpoint that started all this: it does not reject the
+    reasoning parameter, it rejects the *effort it has already applied by default*, so a request
+    that says nothing is refused just as firmly as one asking for ``"high"``. Only an explicit
+    ``"none"`` satisfies it.
     """
 
     def __init__(
@@ -78,12 +89,14 @@ class FakeSDK:
         responses_errors: list[Exception | None] | None = None,
         responses_events: list[Any] | None = None,
         chat_chunks: list[Any] | None = None,
+        chat_refuses_effort: bool = False,
     ) -> None:
         self.responses_payloads: list[dict[str, Any]] = []
         self.chat_payloads: list[dict[str, Any]] = []
         self._responses_errors = list(responses_errors or [])
         self._responses_events = list(responses_events or [])
         self._chat_chunks = list(chat_chunks or [])
+        self._chat_refuses_effort = chat_refuses_effort
         self.responses = SimpleNamespace(create=self._create_response)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create_chat))
 
@@ -96,7 +109,21 @@ class FakeSDK:
         return _Stream(list(self._responses_events))
 
     async def _create_chat(self, **payload: Any) -> _Stream:
+        from openai import BadRequestError
+
         self.chat_payloads.append(payload)
+        if (
+            self._chat_refuses_effort
+            and payload.get("tools")
+            and payload.get("reasoning_effort") != "none"
+        ):
+            raise _status_error(
+                BadRequestError,
+                400,
+                "Function tools with reasoning_effort are not supported for gpt-5.6-terra in "
+                "/v1/chat/completions. To use function tools, use /v1/responses or set "
+                "reasoning_effort to 'none'.",
+            )
         return _Stream(list(self._chat_chunks))
 
     async def close(self) -> None:
@@ -315,6 +342,95 @@ async def test_a_refusal_that_is_not_about_reasoning_is_raised() -> None:
 
     with pytest.raises(BadRequestError):
         await _drain(_client(sdk, reasoning_effort="high"))
+
+
+TOOLS = [{"type": "function", "function": {"name": "probe", "parameters": {}}}]
+
+
+async def test_the_gateway_that_defaults_reasoning_is_answered_with_an_explicit_none() -> None:
+    """The failure this whole negotiation exists for, end to end.
+
+    The endpoint has no ``/responses`` route *and* applies a default reasoning effort to the
+    model, so kedge arrives at chat completions and is refused for a parameter it never sent.
+    Saying nothing cannot fix that. Only ``"none"`` can, which is what the endpoint's own error
+    message asks for.
+    """
+    from openai import NotFoundError
+
+    sdk = FakeSDK(
+        responses_errors=[_status_error(NotFoundError, 404, "Not Found")],
+        chat_refuses_effort=True,
+        chat_chunks=[_chat_chunk("done")],
+    )
+    client = _client(sdk)
+
+    assert [delta.text for delta in await _drain(client, tools=TOOLS)] == ["done"]
+
+    assert "reasoning_effort" not in sdk.chat_payloads[0], "first it says nothing, as before"
+    assert sdk.chat_payloads[1]["reasoning_effort"] == "none", "then it says so explicitly"
+
+
+async def test_the_working_rung_is_kept_for_the_rest_of_the_session() -> None:
+    from openai import NotFoundError
+
+    sdk = FakeSDK(
+        responses_errors=[_status_error(NotFoundError, 404, "Not Found")],
+        chat_refuses_effort=True,
+        chat_chunks=[_chat_chunk("done")],
+    )
+    client = _client(sdk)
+    await _drain(client, tools=TOOLS)
+    settled = len(sdk.chat_payloads)
+
+    await _drain(client, tools=TOOLS)
+
+    assert len(sdk.chat_payloads) == settled + 1, "no re-probing once something works"
+    assert sdk.chat_payloads[-1]["reasoning_effort"] == "none"
+
+
+async def test_a_configured_effort_is_tried_before_it_is_given_up_on() -> None:
+    # The user asked for it, so it is asked for. It just cannot be the reason the turn dies.
+    from openai import NotFoundError
+
+    sdk = FakeSDK(
+        responses_errors=[_status_error(NotFoundError, 404, "Not Found")],
+        chat_refuses_effort=True,
+        chat_chunks=[_chat_chunk("done")],
+    )
+
+    await _drain(_client(sdk, reasoning_effort="high"), tools=TOOLS)
+
+    assert [payload.get("reasoning_effort") for payload in sdk.chat_payloads] == ["high", "none"]
+
+
+async def test_an_endpoint_that_never_complains_stays_on_the_first_rung() -> None:
+    # Most endpoints. They must not pay for this negotiation with an extra round trip.
+    sdk = FakeSDK(
+        responses_errors=[_status_error(_not_found(), 404, "Not Found")],
+        chat_chunks=[_chat_chunk("done")],
+    )
+
+    await _drain(_client(sdk), tools=TOOLS)
+
+    assert len(sdk.chat_payloads) == 1
+    assert "reasoning_effort" not in sdk.chat_payloads[0]
+
+
+async def test_chat_completions_gives_up_once_the_ladder_is_exhausted() -> None:
+    # A model that refuses every rung is a real problem, and the user is told rather than left
+    # watching a turn that quietly retried for ever.
+    from openai import BadRequestError, NotFoundError
+
+    class AlwaysRefuses(FakeSDK):
+        async def _create_chat(self, **payload: Any) -> _Stream:
+            self.chat_payloads.append(payload)
+            raise _status_error(BadRequestError, 400, "reasoning is not supported here at all")
+
+    sdk = AlwaysRefuses(responses_errors=[_status_error(NotFoundError, 404, "Not Found")])
+
+    with pytest.raises(BadRequestError):
+        await _drain(_client(sdk, reasoning_effort="high"), tools=TOOLS)
+    assert [p.get("reasoning_effort") for p in sdk.chat_payloads] == ["high", "none", None]
 
 
 async def test_pinning_the_dialect_skips_the_probe_entirely() -> None:
