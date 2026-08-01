@@ -95,9 +95,27 @@ def test_the_shell_is_served_at_the_root(client: TestClient) -> None:
     assert 'id="notebook-frame"' in body
 
 
+def test_the_shell_is_never_cached(client: TestClient) -> None:
+    # `/` answers with the chat shell or with the hub depending on whether a workbook is open, so
+    # a browser holding one of them and reusing it for the other sends "Go to the notebook"
+    # somewhere that is not the notebook.
+    for path in ("/", "/hub"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
 def test_the_static_assets_are_served(client: TestClient) -> None:
     for path in ("/static/app.js", "/static/styles.css"):
         assert client.get(path).status_code == 200
+
+
+def test_the_static_assets_are_revalidated_rather_than_assumed_fresh(client: TestClient) -> None:
+    # A page and the script that drives it are separate URLs that go stale independently. Without
+    # this, a browser runs today's hub.js against yesterday's hub.html and the first element that
+    # is not there yet takes the page down.
+    for path in ("/static/app.js", "/static/hub.js", "/static/styles.css"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["cache-control"] == "no-cache", path
 
 
 def test_the_ui_fetches_nothing_from_off_the_machine(client: TestClient) -> None:

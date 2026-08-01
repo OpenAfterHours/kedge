@@ -32,7 +32,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from kedge.errors import KedgeError
 from kedge.observability import configure_logging
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LOOPBACK_HOSTS",
     "STATIC_DIR",
+    "RevalidatedStaticFiles",
     "ServerError",
     "ServerState",
     "WorkspaceNotAttachedError",
@@ -63,6 +66,32 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 """The only hosts kedge will bind. There is no deployment story here and there should not be."""
+
+
+class RevalidatedStaticFiles(StaticFiles):
+    """``StaticFiles`` that makes the browser ask before it reuses anything it is holding.
+
+    Starlette answers with an ``etag`` and a ``last-modified`` but no ``cache-control``, which
+    leaves the browser free to *heuristically* cache: with no freshness stated, Chrome invents one
+    of roughly a tenth of the file's age, so an asset untouched for a week is reused for hours
+    without a single request reaching this process.
+
+    That is fine for a versioned asset and wrong for these, because the page and the script that
+    drives it are separate URLs with separate ages and they go stale independently. A browser
+    holding yesterday's ``hub.html`` next to today's ``hub.js`` runs the new script against the old
+    markup, and the first ``document.getElementById`` that comes back ``null`` takes the whole page
+    down — a kedge page that renders its header and nothing else.
+
+    ``no-cache`` does not mean "do not store": it means "revalidate before use". Every load still
+    costs one conditional request per asset and still answers 304 with no body, which on loopback
+    is not worth measuring.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        """Answer as ``StaticFiles`` would, having pinned the caching rule."""
+        response = await super().get_response(path, scope)
+        response.headers["cache-control"] = "no-cache"
+        return response
 
 
 class ServerError(KedgeError):
@@ -292,7 +321,7 @@ def _build(state: ServerState) -> FastAPI:
     app.include_router(hub_router)
     app.include_router(settings_router)
     app.include_router(router)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", RevalidatedStaticFiles(directory=STATIC_DIR), name="static")
     return app
 
 

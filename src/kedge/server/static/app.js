@@ -1071,9 +1071,15 @@
   // ── boot ───────────────────────────────────────────────────────────────────────────
 
   async function boot() {
-    setupChrome();
-    setupSplitter();
-    setupComposer();
+    // Defended for the reason hub.js's boot is: one missing element must cost its own listener,
+    // not the transcript, the composer and the notebook pane along with it.
+    try {
+      setupChrome();
+      setupSplitter();
+      setupComposer();
+    } catch (error) {
+      console.error("kedge: part of the shell could not be wired up", error);
+    }
     try {
       const context = await api("/api/context");
       if (!context.attached) {

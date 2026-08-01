@@ -70,6 +70,32 @@ def test_the_hub_is_reachable_by_name_as_well(client: TestClient) -> None:
     assert 'id="hub-list"' in client.get("/hub").text
 
 
+def test_the_root_stops_being_the_hub_the_moment_a_workbook_is_open(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The two bodies of ``/``, and the header that stops a browser conflating them.
+
+    Opening a workbook changes what ``/`` means. A browser that had cached the hub against that URL
+    went on serving it after the open, so the "Go to the notebook" button on the open dialogue --
+    which is a plain link to ``/`` -- redrew the hub instead. Nothing about that is visible from
+    the server, which answers correctly every time it is asked; the fix is to make sure it is asked.
+    """
+    from kedge.server.agent_seam import ScriptedAgent
+
+    before = client.get("/")
+    assert 'id="hub-list"' in before.text
+    assert before.headers["cache-control"] == "no-store"
+
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0), demo=True)
+
+    after = client.get("/")
+    assert 'id="notebook-frame"' in after.text
+    assert 'id="hub-list"' not in after.text
+    assert after.headers["cache-control"] == "no-store"
+
+
 def test_the_hub_renders_with_no_workbooks_at_all(client: TestClient) -> None:
     payload = client.get("/api/hub/state").json()
 

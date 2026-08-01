@@ -75,6 +75,14 @@ _STREAM_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+_SHELL_HEADERS = {"Cache-Control": "no-store"}
+"""Same reasoning as :data:`kedge.server.routes.SHELL_HEADERS`, which owns the explanation.
+
+Repeated rather than imported for the same reason ``_STREAM_HEADERS`` is: ``routes`` and ``hub``
+are siblings that both hang off ``app``, and a dependency between them to share two words of
+header would be the wrong shape.
+"""
+
 _KEEPALIVE_SECONDS = 15.0
 _MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 _UPLOAD_CHUNK = 1 << 20
@@ -126,7 +134,7 @@ def hub_page(request: Request) -> FileResponse:
     Reachable from the chat view too, so "which workbook am I in, and what else is there?" is one
     click rather than a restart.
     """
-    return FileResponse(_state(request).static_dir / "hub.html")
+    return FileResponse(_state(request).static_dir / "hub.html", headers=_SHELL_HEADERS)
 
 
 # ── the registry ─────────────────────────────────────────────────────────────────────────────

@@ -828,7 +828,16 @@
   }
 
   async function boot() {
-    setup();
+    /* Wiring is done first and defended, because every listener below is optional to the page
+       being *readable* and none of them is worth the whole page. An uncaught throw here — one
+       getElementById returning null against markup this script does not match — stops boot before
+       the first render and leaves a kedge page with a header and nothing under it, which reads as
+       "kedge is broken" rather than as "reload me". */
+    try {
+      setup();
+    } catch (error) {
+      say(`Part of this page could not be wired up (${error.message}). Reload it.`);
+    }
     try {
       await refresh();
     } catch (error) {

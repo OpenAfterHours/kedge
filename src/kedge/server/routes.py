@@ -53,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["STREAM_HEADERS", "router"]
+__all__ = ["SHELL_HEADERS", "STREAM_HEADERS", "router"]
 
 router = APIRouter()
 
@@ -63,6 +63,21 @@ STREAM_HEADERS = {
     # Belt and braces for anyone who later puts a reverse proxy in front of this.
     "X-Accel-Buffering": "no",
 }
+
+SHELL_HEADERS = {"Cache-Control": "no-store"}
+"""What the two HTML shells are served with. They are answers about server state, not files.
+
+``/`` returns ``hub.html`` or ``index.html`` depending on whether a workbook is open, so the one
+URL has two bodies and the browser has no way to tell which it is holding. Left uncached, Starlette
+sends an ``etag`` and a ``last-modified`` and nothing else, and a browser is entitled to reuse a
+response with no stated freshness for a fraction of its age without asking. Opening a workbook and
+then following a link back to ``/`` then re-rendered the *hub* out of the cache, so "Go to the
+notebook" led anywhere but the notebook.
+
+``no-store`` rather than ``no-cache``: there is nothing here worth revalidating -- the document is
+small, the server is on loopback, and the answer depends on state this process holds rather than on
+a file's mtime.
+"""
 
 _KEEPALIVE_SECONDS = 15.0
 _DEMO_MODELS = (
@@ -127,10 +142,14 @@ def index(request: Request) -> FileResponse:
     The root is the front door either way. A server started with ``kedge open`` has a workbook and
     lands on the chat; one started with ``kedge hub`` has not and lands on the list, which is the
     difference between the two commands and the whole of it.
+
+    Because *which* page comes back is a fact about this process rather than about a file, the
+    answer is served :data:`SHELL_HEADERS` -- uncached, it is the same URL holding two different
+    documents and the browser cannot know which of them it kept.
     """
     state = get_state(request)
     page = "index.html" if state.attached else "hub.html"
-    return FileResponse(state.static_dir / page)
+    return FileResponse(state.static_dir / page, headers=SHELL_HEADERS)
 
 
 # ── context and health ───────────────────────────────────────────────────────────────────────
