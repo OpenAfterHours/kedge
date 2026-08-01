@@ -26,13 +26,15 @@ from __future__ import annotations
 import argparse
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI
+from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
+from starlette.types import Scope
 
 from kedge.errors import KedgeError
 from kedge.observability import configure_logging
@@ -41,6 +43,7 @@ from kedge.server.events import EventBus, NotebookNotifier, notebook_mirror
 from kedge.server.hub import router as hub_router
 from kedge.server.routes import router
 from kedge.server.sessions import SessionStore
+from kedge.server.settings import router as settings_router
 from kedge.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -48,8 +51,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "LOOPBACK_HOSTS",
     "STATIC_DIR",
+    "RevalidatedStaticFiles",
     "ServerError",
     "ServerState",
+    "TurnInFlightError",
     "WorkspaceNotAttachedError",
     "create_app",
     "create_demo_app",
@@ -64,6 +69,32 @@ LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 """The only hosts kedge will bind. There is no deployment story here and there should not be."""
 
 
+class RevalidatedStaticFiles(StaticFiles):
+    """``StaticFiles`` that makes the browser ask before it reuses anything it is holding.
+
+    Starlette answers with an ``etag`` and a ``last-modified`` but no ``cache-control``, which
+    leaves the browser free to *heuristically* cache: with no freshness stated, Chrome invents one
+    of roughly a tenth of the file's age, so an asset untouched for a week is reused for hours
+    without a single request reaching this process.
+
+    That is fine for a versioned asset and wrong for these, because the page and the script that
+    drives it are separate URLs with separate ages and they go stale independently. A browser
+    holding yesterday's ``hub.html`` next to today's ``hub.js`` runs the new script against the old
+    markup, and the first ``document.getElementById`` that comes back ``null`` takes the whole page
+    down — a kedge page that renders its header and nothing else.
+
+    ``no-cache`` does not mean "do not store": it means "revalidate before use". Every load still
+    costs one conditional request per asset and still answers 304 with no body, which on loopback
+    is not worth measuring.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        """Answer as ``StaticFiles`` would, having pinned the caching rule."""
+        response = await super().get_response(path, scope)
+        response.headers["cache-control"] = "no-cache"
+        return response
+
+
 class ServerError(KedgeError):
     """The server could not be built or started as asked."""
 
@@ -73,6 +104,15 @@ class WorkspaceNotAttachedError(ServerError):
 
     Not an internal error: it is the normal state of a server started with ``kedge hub``, and the
     right response is to send the user to the hub to pick a workbook.
+    """
+
+
+class TurnInFlightError(ServerError):
+    """The workbook cannot be released while the agent is part-way through a turn.
+
+    The loop holds a notebook driver pointed at a marimo about to be shut down, and a turn stopped
+    half-way through an edit is the one thing kedge's notebook contract is built to prevent.
+    Refusing is momentary — the caller stops the turn and asks again.
     """
 
 
@@ -104,6 +144,15 @@ class ServerState:
     opens: dict[str, Any] = field(default_factory=dict)
     """In-flight and finished workbook opens, keyed by job id (see :mod:`kedge.server.hub`)."""
 
+    agent_factory: Callable[[], AgentLoop] | None = None
+    """Rebuilds the agent loop against current config, or ``None`` if nothing can.
+
+    Set by the open sequence, which is the only place that holds the notebook driver and the
+    analysis the loop needs. It exists so that saving a model endpoint from the settings panel can
+    take effect in this process: a first run with no API key opens in demo mode, and without this
+    the user would have to stop the server and start again to get the real agent.
+    """
+
     @property
     def attached(self) -> bool:
         """Whether a workbook is open on this server."""
@@ -126,6 +175,25 @@ class ServerState:
             raise WorkspaceNotAttachedError(msg)
         return self.agent
 
+    def rebuild_agent(self) -> bool:
+        """Rebuild the agent loop against the configuration as it now stands.
+
+        Called after the settings panel writes a new model endpoint. Returns whether a real loop
+        is now attached: a rebuild that fails leaves the previous agent in place and the server in
+        demo mode, which is the same honest fallback the open sequence uses, rather than a server
+        with no agent at all.
+        """
+        if self.agent_factory is None:
+            return not self.demo
+        try:
+            self.agent = self.agent_factory()
+        except (KedgeError, ImportError):
+            logger.info("could not rebuild the agent loop from the new settings", exc_info=True)
+            return False
+        self.demo = False
+        logger.info("rebuilt the agent loop after a settings change")
+        return True
+
     def attach(
         self,
         workspace: Workspace,
@@ -133,28 +201,88 @@ class ServerState:
         agent: AgentLoop,
         demo: bool = False,
         notifier: NotebookNotifier | None = None,
+        agent_factory: Callable[[], AgentLoop] | None = None,
     ) -> None:
         """Adopt a workbook and the loop that drives it, in a server that had neither.
 
-        Called once, by the hub, when the user opens a workbook. Switching to a *different*
-        workbook is deliberately not supported in-process: the marimo subprocess, the notebook
-        driver and the audit log are all bound to the workspace that owns them, and swapping one
-        out from under a turn in flight is a class of bug worth not having. The hub restarts the
-        open sequence instead, which is honest and takes the same few seconds it took first time.
+        Called by the hub when the user opens a workbook. Swapping one workbook for another in a
+        single step is deliberately not supported: the marimo subprocess, the notebook driver and
+        the audit log are all bound to the workspace that owns them, and exchanging them under a
+        turn in flight is a class of bug worth not having. A different workbook is refused here and
+        the caller must :meth:`detach` first, which stops the marimo it is giving up before the
+        next open starts one — so the two never overlap, and the user still gets there in a click.
         """
         if self.workspace is not None and self.workspace.key != workspace.key:
             msg = (
-                f"this kedge server already has {self.workspace.workbook_path.name} open. Stop it "
-                f"and start again for {workspace.workbook_path.name}; one server owns one "
-                f"workbook and one marimo process (PLAN 2.9)."
+                f"this kedge server already has {self.workspace.workbook_path.name} open. Close it "
+                f"first — one server owns one workbook and one marimo process (PLAN 2.9), so "
+                f"{workspace.workbook_path.name} cannot be adopted alongside it."
             )
             raise ServerError(msg)
         self.workspace = workspace
         self.agent = agent
         self.demo = demo
+        self.agent_factory = agent_factory
         if notifier is not None:
             self.bus.add_observer(notebook_mirror(notifier))
         logger.info("attached workbook %s", workspace.workbook_path)
+
+    def detach(self) -> Workspace | None:
+        """Release the open workbook, stopping the marimo process kedge started for it.
+
+        The other half of :meth:`attach`, and the reason that method can go on refusing a second
+        workbook. One server owning one workbook is a sound rule; making the only way out of it a
+        trip to the terminal was not, and a user who opened the wrong file from a list of six had
+        no way back — the hub answered 409 and told them to restart the process they were standing
+        in front of.
+
+        Blocking is deliberate. ``stop_marimo`` asks the server to shut down, waits, and escalates
+        to termination; callers on the event loop must run this in a threadpool. Doing it here
+        rather than leaving the process to the next ``cleanup_orphan`` is what keeps "one server,
+        one marimo" true through a switch rather than only at a cold start.
+
+        Returns:
+            The workspace that was released, or ``None`` if nothing was open.
+
+        Raises:
+            TurnInFlightError: A turn is running. Cancel it and ask again.
+        """
+        from kedge.lifecycle import stop_marimo
+
+        workspace = self.workspace
+        if workspace is None:
+            return None
+        if self.turns.active:
+            msg = (
+                f"a turn is still running against {workspace.workbook_path.name}. Stop it in the "
+                f"chat before closing the workbook — the agent is holding a notebook driver "
+                f"pointed at the marimo this would shut down."
+            )
+            raise TurnInFlightError(msg)
+
+        # Cleared before the stop, not after. `stop_marimo` blocks for as long as it takes a
+        # process to die, and a caller running this in a threadpool leaves the event loop free the
+        # whole time -- so a turn started in that window would find an agent holding a driver
+        # pointed at a marimo already being shut down. Detaching first makes that request a 409.
+        self.workspace = None
+        self.agent = None
+        self.agent_factory = None
+        self.demo = False
+
+        try:
+            stop_marimo(workspace)
+        except Exception:
+            # A marimo that will not die must not trap the user on this workbook. The marker and
+            # the token file are the next run's business; `cleanup_orphan` is built for exactly
+            # this and runs at the top of every open.
+            logger.warning(
+                "could not stop marimo for %s cleanly; detaching anyway",
+                workspace.workbook_path,
+                exc_info=True,
+            )
+
+        logger.info("detached workbook %s", workspace.workbook_path)
+        return workspace
 
 
 def create_app(
@@ -259,8 +387,9 @@ def _build(state: ServerState) -> FastAPI:
     )
     app.state.kedge = state
     app.include_router(hub_router)
+    app.include_router(settings_router)
     app.include_router(router)
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    app.mount("/static", RevalidatedStaticFiles(directory=STATIC_DIR), name="static")
     return app
 
 

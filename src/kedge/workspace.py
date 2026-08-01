@@ -272,6 +272,27 @@ class Workspace:
         """The configuration together with the provenance of each value."""
         return self._loaded_config
 
+    def reload_config(self) -> LoadedConfig:
+        """Re-read the layered config files and adopt the result.
+
+        Config is loaded once at construction, which is right for a process that is handed its
+        settings and gets on with it. The hub's settings panel breaks that assumption: the user
+        changes the model endpoint while the server is running, and every later read of
+        :attr:`config` should see it without a restart.
+
+        Only the *configuration* is replaced. The marimo session, the paths and the workbook are
+        untouched, because none of them can change without a different workspace. Anything already
+        constructed from config — an ``OpenAIClient``, an agent loop — holds the old values and
+        must be rebuilt by whoever built it.
+
+        Raises:
+            ConfigFileError: A config file exists but will not parse.
+            ConfigValidationError: A value or key in one of them is not valid.
+        """
+        self._loaded_config = load_config(project_dir=self.workbook_path.parent)
+        logger.debug("reloaded config for %s", self.workbook_path)
+        return self._loaded_config
+
     # ── project locations ────────────────────────────────────────────────────────────────
 
     @property
@@ -350,8 +371,17 @@ class Workspace:
         It must be *stable*, not fresh per launch: edit mode holds at most one session, so
         bootstrapping a second id evicts the first and the old one starts failing. Deriving it
         from the workbook path makes reconnecting idempotent.
+
+        **The shape is not cosmetic.** marimo's own frontend will adopt a session id handed to it
+        in the query string, but only one matching ``s_[0-9a-z]{6}`` — anything else it silently
+        discards and mints its own. The iframe is not an observer here: on connecting it resumes
+        the orphaned session kedge bootstrapped and *renames* it to whatever id it is using, so an
+        id the frontend will not adopt is an id kedge loses the moment the notebook pane loads.
+        Hence ``s_`` plus six hex digits of the same digest :attr:`key` uses. Uniqueness costs
+        nothing here — the server serves exactly one notebook — so only stability matters.
         """
-        return f"kedge-{self.key}"
+        digest = hashlib.sha256(str(self._workbook_path).encode("utf-8")).hexdigest()[:6]
+        return f"s_{digest}"
 
     @property
     def marker_path(self) -> Path:
@@ -466,9 +496,19 @@ class Workspace:
         unauthenticated lands on marimo's login page, which is the one endpoint that sets
         ``X-Frame-Options: DENY``, so the frame breaks. Passing ``access_token`` means the login
         page is never reached (PLAN 1.3).
+
+        ``session_id`` is there for a sharper reason: without it the frontend mints its own id,
+        and marimo's edit-mode resume then hands it kedge's session under that new name. kedge
+        keeps addressing the old id and every ``/api/kernel/execute`` answers 500 "Invalid session
+        id" — the notebook looks perfectly healthy in the frame while every tool call fails.
+        Naming the session in the URL makes both sides agree on one id from the start
+        (docs/marimo-api.md 5.3).
         """
         session = self.require_marimo()
-        query = f"file={quote(str(session.notebook_path))}"
+        # The established id, not the derived one, so the frame is pointed at the session kedge
+        # actually holds rather than the one it would have asked for.
+        established = session.session_id or self.session_id
+        query = f"file={quote(str(session.notebook_path))}&session_id={quote(established)}"
         if with_token:
             query += f"&access_token={quote(session.token)}"
         return f"{session.base_url}/?{query}"

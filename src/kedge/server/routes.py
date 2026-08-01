@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -45,6 +45,7 @@ from kedge.lifecycle import health_check
 from kedge.server.agent_seam import TurnMessage, TurnRequest
 from kedge.server.events import DoneEvent, ErrorEvent, TokenEvent, encode_sse, sse_comment
 from kedge.server.sessions import ChatSession, notebook_snapshot
+from kedge.server.settings import fetch_model_names
 
 if TYPE_CHECKING:
     from kedge.server.app import ServerState
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["STREAM_HEADERS", "router"]
+__all__ = ["SHELL_HEADERS", "STREAM_HEADERS", "router"]
 
 router = APIRouter()
 
@@ -63,8 +64,22 @@ STREAM_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+SHELL_HEADERS = {"Cache-Control": "no-store"}
+"""What the shells and the state endpoints are served with: answers about this process, not files.
+
+``/`` returns ``hub.html`` or ``index.html`` depending on whether a workbook is open, so the one
+URL has two bodies and the browser has no way to tell which it is holding. Left uncached, Starlette
+sends an ``etag`` and a ``last-modified`` and nothing else, and a browser is entitled to reuse a
+response with no stated freshness for a fraction of its age without asking. Opening a workbook and
+then following a link back to ``/`` then re-rendered the *hub* out of the cache, so "Go to the
+notebook" led anywhere but the notebook.
+
+``no-store`` rather than ``no-cache``: there is nothing here worth revalidating -- the document is
+small, the server is on loopback, and the answer depends on state this process holds rather than on
+a file's mtime.
+"""
+
 _KEEPALIVE_SECONDS = 15.0
-_MODELS_TIMEOUT = 10.0
 _DEMO_MODELS = (
     "gpt-4o",
     "gpt-4o-mini",
@@ -127,24 +142,34 @@ def index(request: Request) -> FileResponse:
     The root is the front door either way. A server started with ``kedge open`` has a workbook and
     lands on the chat; one started with ``kedge hub`` has not and lands on the list, which is the
     difference between the two commands and the whole of it.
+
+    Because *which* page comes back is a fact about this process rather than about a file, the
+    answer is served :data:`SHELL_HEADERS` -- uncached, it is the same URL holding two different
+    documents and the browser cannot know which of them it kept.
     """
     state = get_state(request)
     page = "index.html" if state.attached else "hub.html"
-    return FileResponse(state.static_dir / page)
+    return FileResponse(state.static_dir / page, headers=SHELL_HEADERS)
 
 
 # ── context and health ───────────────────────────────────────────────────────────────────────
 
 
 @router.get("/api/context")
-def context(request: Request) -> dict[str, Any]:
+def context(request: Request, response: Response) -> dict[str, Any]:
     """Everything the UI needs to draw itself once, on load.
 
     Includes the notebook iframe URL with the access token already in the query string. That is
     the whole of PLAN 1.3: an iframe that loads unauthenticated lands on marimo's login page,
     which is the one endpoint setting ``X-Frame-Options: DENY``, and the frame breaks. Passing
     ``access_token`` as a query parameter means the login page is never reached.
+
+    Served :data:`SHELL_HEADERS` for the same reason the shells are: this is a report on what the
+    process holds right now -- whether a workbook is attached, whether marimo has answered -- and
+    all of it can change while a tab sits open. A stale copy of this is a pane that says there is
+    no notebook when there is one.
     """
+    response.headers.update(SHELL_HEADERS)
     state = get_state(request)
     workspace = state.workspace
     if workspace is None:
@@ -179,12 +204,15 @@ def context(request: Request) -> dict[str, Any]:
 
 
 @router.get("/api/health")
-async def health(request: Request) -> dict[str, Any]:
+async def health(request: Request, response: Response) -> dict[str, Any]:
     """Report on the marimo kernel, which is a separate process and can die under us.
 
     Liveness is decided by asking the server, never by inspecting a PID: PID checks are
     unreliable on Windows and PIDs are recycled (PLAN 6.2).
+
+    Uncached for the same reason as :func:`context`: a poll answered from a cache is not a poll.
     """
+    response.headers.update(SHELL_HEADERS)
     state = get_state(request)
     session = None if state.workspace is None else state.workspace.marimo
     if session is None:
@@ -246,12 +274,7 @@ async def models(request: Request) -> dict[str, Any]:
         }
 
     try:
-        async with httpx.AsyncClient(timeout=_MODELS_TIMEOUT) as http:
-            response = await http.get(
-                f"{base_url}/models", headers={"Authorization": f"Bearer {key}"}
-            )
-        response.raise_for_status()
-        payload = response.json()
+        names = await fetch_model_names(base_url, key)
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("could not list models from %s: %s", base_url, exc)
         return {
@@ -261,10 +284,6 @@ async def models(request: Request) -> dict[str, Any]:
             "detail": f"{base_url}/models did not answer usefully ({exc}). Type a model name.",
         }
 
-    entries = payload.get("data") if isinstance(payload, dict) else None
-    names = sorted(
-        {str(item["id"]) for item in entries or [] if isinstance(item, dict) and item.get("id")}
-    )
     if not names:
         return {
             "models": [configured],

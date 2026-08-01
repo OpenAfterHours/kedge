@@ -221,7 +221,8 @@ def test_doctor_reports_a_workspace_for_a_named_workbook(workbook: Path) -> None
         c for c in json.loads(result.output)["checks"] if c["check"] == "workspace"
     )
     assert workspace_check["status"] == "ok"
-    assert "kedge-process-" in workspace_check["detail"]
+    assert "process.kedge" in workspace_check["detail"]
+    assert re.search(r"session id s_[\da-z]{6}", workspace_check["detail"])
 
 
 # ── argument validation ──────────────────────────────────────────────────────────────────────

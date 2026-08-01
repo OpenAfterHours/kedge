@@ -263,7 +263,14 @@
     thinking: "Thinking",
     editing: "Editing the notebook",
     running: "Running cells",
+    stopping: "Stopping",
   };
+
+  /* How long a cancelled turn is given to close its own stream before the connection is dropped
+     from this end. The loop abandons its model call the moment the flag is set, so this is slack
+     for the round trip rather than a guess at how long a step takes -- and dropping the connection
+     is not a worse outcome, because the server tears a turn down when its client disconnects. */
+  const CANCEL_GRACE_MS = 4000;
 
   const SUGGESTIONS = [
     "Summarise what this workbook actually does, stage by stage.",
@@ -274,12 +281,31 @@
 
   // ── turn rendering ─────────────────────────────────────────────────────────────────
 
+  /* When a replayed message was written, or nothing at all for one happening now.
+
+     A stored turn is deliberately replayed through the same renderer as a live one, so that a
+     resumed conversation looks like the conversation it is. The cost of that is a failure recorded
+     hours ago being indistinguishable from one that has just happened — a stale "Fatal: the model
+     endpoint refused" reads as the endpoint refusing right now, and the user goes looking for a
+     bug that was fixed between the two. Dating the replayed heads is the whole of the remedy: a
+     live turn has no stamp, because "just now" is what an undated message already means. */
+  function stamp(when) {
+    if (!when) return null;
+    const at = new Date(when);
+    if (Number.isNaN(at.getTime())) return null;
+    return el("span", {
+      class: "message-when",
+      text: ago(when),
+      title: at.toLocaleString("en-GB"),
+    });
+  }
+
   /* One assistant message. Prose and activity are appended in arrival order, so the trail is
      genuinely interleaved with the reasoning rather than parked in a drawer at the bottom —
      which is the whole point of PLAN M3's "the user is not sat there wondering what is
      happening". Prose accumulates into the block currently at the end; an activity event closes
      that block, so the next token starts a new one. */
-  function createTurnView() {
+  function createTurnView(when) {
     const phase = el("span", { class: "phase-chip", hidden: true });
     const phaseText = el("span", { text: "" });
     phase.append(el("span", { class: "pulse" }), phaseText);
@@ -290,6 +316,7 @@
       { class: "message-head" },
       el("span", { class: "role", text: "kedge" }),
       phase,
+      stamp(when),
       tokensNote,
     );
     const blocks = el("div", { class: "blocks" });
@@ -489,12 +516,17 @@
     state.autoScroll = distance < 80;
   });
 
-  function addUserMessage(text) {
+  function addUserMessage(text, when) {
     transcript.append(
       el(
         "div",
         { class: "message user" },
-        el("div", { class: "message-head" }, el("span", { class: "role", text: "You" })),
+        el(
+          "div",
+          { class: "message-head" },
+          el("span", { class: "role", text: "You" }),
+          stamp(when),
+        ),
         el("div", { class: "bubble", text }),
       ),
     );
@@ -623,11 +655,11 @@
     } else {
       for (const message of data.messages) {
         if (message.role === "user") {
-          addUserMessage(message.content);
+          addUserMessage(message.content, message.created_at);
           continue;
         }
         if (message.role !== "assistant") continue;
-        const view = createTurnView();
+        const view = createTurnView(message.created_at);
         transcript.append(view.root);
         if (message.events && message.events.length) {
           for (const event of message.events) applyEvent(view, event);
@@ -779,6 +811,10 @@
   function setRunning(running) {
     $("send").disabled = running;
     $("stop").hidden = !running;
+    // Re-armed rather than left as cancelTurn found it: the button is disabled for the length of
+    // one cancellation, not for the rest of the session.
+    $("stop").disabled = false;
+    $("stop-label").textContent = "Stop";
     promptBox.disabled = false;
   }
 
@@ -843,16 +879,19 @@
         applyEvent(view, event);
       }
     } catch (error) {
-      if (error.name !== "AbortError") {
-        applyEvent(view, {
-          type: "error",
-          message: `The connection to the kedge server failed: ${error.message}`,
-          recoverable: true,
-        });
-      }
+      applyEvent(view, {
+        type: "error",
+        recoverable: true,
+        message:
+          error.name === "AbortError"
+            ? "Stopped. The connection was dropped rather than waited out, so anything the " +
+              "turn had already done to the notebook stands — the pane shows the truth."
+            : `The connection to the kedge server failed: ${error.message}`,
+      });
       view.setPhase(null);
     } finally {
       view.flushProse();
+      if (state.turn && state.turn.grace) clearTimeout(state.turn.grace);
       state.turn = null;
       setRunning(false);
       refreshSessions().catch(() => {});
@@ -863,13 +902,27 @@
     }
   }
 
+  /* Stop has to say something the instant it is pressed. Cancellation is cooperative all the way
+     down — the browser asks, the server sets a flag, the loop abandons what it is waiting on — and
+     every one of those hops is invisible, so a button that acknowledges nothing reads as a button
+     that did nothing, and the user presses it again. The chip goes to "Stopping", the button
+     disables itself, and if the stream has not closed within the grace period the connection is
+     dropped from this end so the UI is returned either way. */
   async function cancelTurn() {
     const turn = state.turn;
-    if (!turn) return;
+    if (!turn || turn.stopping) return;
+    turn.stopping = true;
+    turn.view.setPhase("stopping");
+    $("stop").disabled = true;
+    $("stop-label").textContent = "Stopping";
+
     if (turn.turnId) {
       try {
         await api(`/api/turns/${turn.turnId}/cancel`, { method: "POST" });
-        return; // the loop will finish cooperatively and the stream will close itself
+        turn.grace = setTimeout(() => {
+          if (state.turn === turn) turn.controller.abort();
+        }, CANCEL_GRACE_MS);
+        return; // the loop finishes cooperatively and the stream closes itself
       } catch (_) {
         /* the turn had already finished; fall through to aborting the read */
       }
@@ -893,6 +946,17 @@
       badge.className = "health " + tone;
       $("health-label").textContent = label;
       badge.title = data.marimo.detail || `marimo at ${data.marimo.base_url || "—"}`;
+      // This poll already knows the two things the pane cannot work out for itself. A kernel that
+      // is running while the pane holds no frame means the context the pane was drawn from is out
+      // of date; an absent one may mean the workbook has been closed from the hub, and a chat
+      // against a workbook this server no longer has open is a page about nothing. Either way the
+      // answer is to re-read the context, which knows what to do with both.
+      if (
+        (data.marimo.state === "running" && !$("notebook-frame").src) ||
+        data.marimo.state === "absent"
+      ) {
+        await refreshContext();
+      }
     } catch (_) {
       badge.className = "health bad";
       $("health-label").textContent = "Server unreachable";
@@ -940,18 +1004,45 @@
       /* The token rides in the query string on purpose. An iframe that loads unauthenticated
          lands on marimo's login page, which is the one endpoint setting X-Frame-Options: DENY,
          and the frame breaks (PLAN 1.3). */
-      frame.src = context.notebook_url;
+      if (frame.src !== context.notebook_url) frame.src = context.notebook_url;
       frame.hidden = false;
       placeholder.hidden = true;
       $("open-notebook").href = context.notebook_url;
+      // Un-hidden as well as pointed, because the branch below hides them and this one has to be
+      // able to undo that: a pane that fills in later must come back with its controls.
+      $("open-notebook").hidden = false;
+      $("reload-notebook").hidden = false;
     } else {
       frame.hidden = true;
       placeholder.hidden = false;
       $("placeholder-detail").textContent = context.demo
         ? "Demo mode: no marimo server was started, so there is nothing to frame."
-        : "No marimo server is attached to this workbook. Open it from the hub to start one.";
+        : "No marimo server is attached yet. kedge is watching for one and will frame it here " +
+          "as soon as it answers.";
       $("open-notebook").hidden = true;
       $("reload-notebook").hidden = true;
+    }
+  }
+
+  /* Re-read the context and redraw the pane from it.
+     The pane used to be drawn once, from the context fetched at boot, which assumed the notebook
+     URL is knowable the moment the page loads. It is not always: a shell opened while marimo is
+     still coming up, or restored by a back navigation, gets `notebook_url: null` and then sits on
+     "No notebook attached" for ever with a live kernel on the other side of the loopback and no
+     way back but a manual reload. */
+  async function refreshContext() {
+    try {
+      const context = await api("/api/context");
+      if (context.attached) {
+        applyContext(context);
+        return;
+      }
+      // The workbook was closed from the hub while this tab sat here. There is no chat to have
+      // and no notebook to frame, and the hub is where a workbook is chosen — the same call boot
+      // makes, for the same reason.
+      if (!state.turn) window.location.replace(context.hub_url || "/hub");
+    } catch (_) {
+      /* the health badge already reports an unreachable server */
     }
   }
 
@@ -1071,9 +1162,15 @@
   // ── boot ───────────────────────────────────────────────────────────────────────────
 
   async function boot() {
-    setupChrome();
-    setupSplitter();
-    setupComposer();
+    // Defended for the reason hub.js's boot is: one missing element must cost its own listener,
+    // not the transcript, the composer and the notebook pane along with it.
+    try {
+      setupChrome();
+      setupSplitter();
+      setupComposer();
+    } catch (error) {
+      console.error("kedge: part of the shell could not be wired up", error);
+    }
     try {
       const context = await api("/api/context");
       if (!context.attached) {

@@ -70,6 +70,32 @@ def test_the_hub_is_reachable_by_name_as_well(client: TestClient) -> None:
     assert 'id="hub-list"' in client.get("/hub").text
 
 
+def test_the_root_stops_being_the_hub_the_moment_a_workbook_is_open(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The two bodies of ``/``, and the header that stops a browser conflating them.
+
+    Opening a workbook changes what ``/`` means. A browser that had cached the hub against that URL
+    went on serving it after the open, so the "Go to the notebook" button on the open dialogue --
+    which is a plain link to ``/`` -- redrew the hub instead. Nothing about that is visible from
+    the server, which answers correctly every time it is asked; the fix is to make sure it is asked.
+    """
+    from kedge.server.agent_seam import ScriptedAgent
+
+    before = client.get("/")
+    assert 'id="hub-list"' in before.text
+    assert before.headers["cache-control"] == "no-store"
+
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0), demo=True)
+
+    after = client.get("/")
+    assert 'id="notebook-frame"' in after.text
+    assert 'id="hub-list"' not in after.text
+    assert after.headers["cache-control"] == "no-store"
+
+
 def test_the_hub_renders_with_no_workbooks_at_all(client: TestClient) -> None:
     payload = client.get("/api/hub/state").json()
 
@@ -465,6 +491,84 @@ def test_a_refused_open_by_path_does_not_leave_a_row_behind(
 
     assert response.status_code == 409
     assert client.get("/api/hub/state").json()["workbooks"] == []
+
+
+def test_a_refused_open_names_the_workbook_holding_the_server(
+    client: TestClient, workbook: Path, tmp_path: Path, home: Path
+) -> None:
+    """The refusal has to be answerable, so it says which workbook is in the way."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    other = _make_workbook(tmp_path / "other.xlsx")
+    key = client.post("/api/hub/workbooks", json={"path": str(other)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0))
+
+    response = client.post("/api/hub/open", json={"key": key})
+
+    assert response.status_code == 409
+    assert response.headers["X-Kedge-Open-Workbook"] == workspace.key
+    assert "close it" in response.json()["detail"].lower()
+
+
+# ── closing ──────────────────────────────────────────────────────────────────────────────────
+
+
+def test_closing_releases_the_workbook_so_another_can_be_opened(
+    client: TestClient, workbook: Path, tmp_path: Path, home: Path, no_marimo: None
+) -> None:
+    """The whole point: picking the wrong file costs a click, not a restart of the server."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    other = _make_workbook(tmp_path / "other.xlsx")
+    key = client.post("/api/hub/workbooks", json={"path": str(other)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0), demo=True)
+
+    assert client.post("/api/hub/open", json={"key": key}).status_code == 409
+
+    closed = client.post("/api/hub/close")
+    assert closed.status_code == 200
+    assert closed.json()["name"] == workbook.name
+
+    state = _state(client)
+    assert state.attached is False
+    assert state.agent is None
+    assert state.demo is False, "demo mode belonged to the workbook that has just been let go"
+    assert client.get("/api/context").json()["attached"] is False
+    assert client.post("/api/hub/open", json={"key": key}).status_code == 202
+
+
+def test_closing_is_refused_while_a_turn_is_in_flight(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The loop holds a driver pointed at the marimo this would stop."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    state = _state(client)
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    state.attach(workspace, agent=ScriptedAgent(delay=0.0))
+    state.turns.start("turn-1")
+
+    response = client.post("/api/hub/close")
+
+    assert response.status_code == 409
+    assert "a turn is still running" in response.json()["detail"]
+    assert state.attached is True
+
+    state.turns.finish("turn-1")
+    assert client.post("/api/hub/close").status_code == 200
+
+
+def test_closing_nothing_is_not_an_error(client: TestClient) -> None:
+    """A hub with no workbook open is the normal state, not a failed request."""
+    response = client.post("/api/hub/close")
+
+    assert response.status_code == 200
+    assert response.json()["closed"] is None
 
 
 def test_reopening_the_same_workbook_on_an_attached_server_is_allowed(

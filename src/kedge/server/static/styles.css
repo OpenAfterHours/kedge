@@ -85,6 +85,25 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* The `hidden` attribute is how both scripts show and hide everything conditional -- the phase
+   chip, the Stop button, the notebook placeholder, the drift notice, the pending panel. It is a
+   property assignment rather than a class toggle, and it only works while nothing else sets
+   `display`.
+
+   Nothing else may. An author `display` beats the user agent's own `[hidden] { display: none }`
+   before specificity is even consulted, because author styles win over UA styles by origin. So
+   `.phase-chip { display: inline-flex }` quietly disarms `chip.hidden = true`, and the symptom is
+   not a styling glitch: the chip goes on saying "Thinking" after the turn has finished, the Stop
+   button stays on screen with no turn behind it, and the notebook placeholder -- absolutely
+   positioned across the whole pane -- sits over a working iframe insisting no notebook is
+   attached.
+
+   One rule, stated once, rather than a `[hidden]` guard bolted onto each offending selector as it
+   is discovered: the next `display` added anywhere in this file or in hub.css is then safe by
+   construction. `!important` is not decoration here -- `#notebook-frame { display: block }` is an
+   id selector and would otherwise still win. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
@@ -538,6 +557,8 @@ kbd {
   50% { opacity: 1; transform: scale(1.15); }
 }
 .tokens-note { font-size: 11px; color: var(--text-faint); }
+/* Only ever on a replayed message: a live turn is undated because it is happening now. */
+.message-when { font-size: 11px; color: var(--text-faint); }
 
 .message.user .bubble {
   background: var(--surface);

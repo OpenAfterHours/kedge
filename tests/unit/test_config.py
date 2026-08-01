@@ -11,14 +11,18 @@ import pytest
 from kedge import config as config_module
 from kedge.config import (
     KEYRING_SERVICE,
+    ApiKeyStoreError,
     Config,
     ConfigFileError,
     ConfigValidationError,
     MissingApiKeyError,
     api_key_status,
+    delete_api_key,
     get_api_key,
     keyring_set_command,
     load_config,
+    set_api_key,
+    update_user_config,
     user_config_path,
     user_dir,
 )
@@ -48,17 +52,31 @@ class _FakeKeyring:
     def __init__(
         self, entries: dict[tuple[str, str], str] | None = None, error: Exception | None = None
     ) -> None:
-        self._entries = entries or {}
+        self.entries = entries or {}
         self._error = error
 
     def get_password(self, service: str, username: str) -> str | None:
         if self._error is not None:
             raise self._error
-        return self._entries.get((service, username))
+        return self.entries.get((service, username))
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        if self._error is not None:
+            raise self._error
+        self.entries[(service, username)] = password
+
+    def delete_password(self, service: str, username: str) -> None:
+        if self._error is not None:
+            raise self._error
+        if (service, username) not in self.entries:
+            raise keyring.errors.PasswordDeleteError(username)
+        del self.entries[(service, username)]
 
 
 def _install_keyring(monkeypatch: pytest.MonkeyPatch, fake: _FakeKeyring) -> None:
     monkeypatch.setattr(config_module.keyring, "get_password", fake.get_password)
+    monkeypatch.setattr(config_module.keyring, "set_password", fake.set_password)
+    monkeypatch.setattr(config_module.keyring, "delete_password", fake.delete_password)
 
 
 # ── layering ─────────────────────────────────────────────────────────────────────────────────
@@ -314,3 +332,145 @@ def test_config_is_frozen() -> None:
 
     with pytest.raises(Exception, match=r"frozen|immutable"):
         config.model.model = "gpt-5"  # ty: ignore[invalid-assignment]
+
+
+# ── writing ──────────────────────────────────────────────────────────────────────────────────
+
+
+def test_update_user_config_creates_the_file_and_round_trips(kedge_home: Path) -> None:
+    path = update_user_config("model", {"base_url": "http://localhost:11434/v1", "model": "qwen"})
+
+    assert path == user_config_path()
+    loaded = load_config(project_dir=kedge_home)
+    assert loaded.config.model.base_url == "http://localhost:11434/v1"
+    assert loaded.config.model.model == "qwen"
+    assert loaded.origin("model.base_url") == str(path)
+
+
+def test_update_user_config_normalises_through_the_same_validator(kedge_home: Path) -> None:
+    """A trailing slash is stripped on load, so what is written must survive a round trip."""
+    update_user_config("model", {"base_url": "https://example.test/v1"})
+
+    assert load_config(project_dir=kedge_home).config.model.base_url == "https://example.test/v1"
+
+
+def test_update_user_config_leaves_untouched_keys_and_sections_alone(kedge_home: Path) -> None:
+    user_config_path().write_text(
+        '[model]\nmodel = "gpt-4o"\ntimeout_seconds = 45.0\n\n[sampling]\nmax_rows = 7\n',
+        encoding="utf-8",
+    )
+
+    update_user_config("model", {"base_url": "https://example.test/v1"})
+
+    config = load_config(project_dir=kedge_home).config
+    assert config.model.base_url == "https://example.test/v1"
+    assert config.model.model == "gpt-4o"
+    assert config.model.timeout_seconds == 45.0
+    assert config.sampling.max_rows == 7
+
+
+def test_update_user_config_removes_a_key_when_the_value_is_none(kedge_home: Path) -> None:
+    update_user_config("model", {"model": "qwen"})
+    update_user_config("model", {"model": None})
+
+    loaded = load_config(project_dir=kedge_home)
+    assert loaded.config.model.model == "gpt-4o", "removing the key restores the default"
+    assert loaded.origin("model.model") == "default"
+
+
+def test_update_user_config_refuses_an_invalid_value_without_touching_the_file(
+    kedge_home: Path,
+) -> None:
+    update_user_config("model", {"base_url": "https://good.test/v1"})
+    before = user_config_path().read_text(encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError, match="must start with http"):
+        update_user_config("model", {"base_url": "ftp://nope"})
+
+    assert user_config_path().read_text(encoding="utf-8") == before
+
+
+def test_update_user_config_refuses_an_unknown_key(kedge_home: Path) -> None:
+    with pytest.raises(ConfigValidationError, match=r"unknown key 'model\.base_ur'"):
+        update_user_config("model", {"base_ur": "https://typo.test/v1"})
+
+
+def test_update_user_config_refuses_to_write_a_secret(kedge_home: Path) -> None:
+    """The writer refuses independently of the loader, so a key cannot reach the file either way."""
+    with pytest.raises(ConfigValidationError, match="looks like a secret"):
+        update_user_config("model", {"api_key": SECRET})
+
+    assert not user_config_path().exists()
+
+
+def test_update_user_config_leaves_no_temporary_file_behind(kedge_home: Path) -> None:
+    update_user_config("model", {"model": "qwen"})
+
+    assert [entry.name for entry in kedge_home.iterdir()] == ["config.toml"]
+
+
+# ── storing the key ──────────────────────────────────────────────────────────────────────────
+
+
+def test_set_api_key_stores_it_in_the_keyring_and_not_in_config(
+    monkeypatch: pytest.MonkeyPatch, kedge_home: Path
+) -> None:
+    fake = _FakeKeyring()
+    _install_keyring(monkeypatch, fake)
+
+    set_api_key("default", SECRET)
+    update_user_config("model", {"base_url": "https://example.test/v1"})
+
+    assert fake.entries == {(KEYRING_SERVICE, "default"): SECRET}
+    assert SECRET not in user_config_path().read_text(encoding="utf-8")
+    assert get_api_key(load_config(project_dir=kedge_home).config) == SECRET
+
+
+def test_set_api_key_refuses_an_empty_key_or_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _FakeKeyring()
+    _install_keyring(monkeypatch, fake)
+
+    with pytest.raises(ApiKeyStoreError, match="empty API key"):
+        set_api_key("default", "")
+    with pytest.raises(ApiKeyStoreError, match="entry name cannot be empty"):
+        set_api_key("  ", SECRET)
+    assert fake.entries == {}
+
+
+def test_set_api_key_reports_an_unwritable_keyring_with_the_manual_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_keyring(monkeypatch, _FakeKeyring(error=keyring.errors.KeyringError("no backend")))
+
+    with pytest.raises(ApiKeyStoreError, match="keyring set kedge work"):
+        set_api_key("work", SECRET)
+
+
+def test_set_api_key_never_logs_the_secret(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _install_keyring(monkeypatch, _FakeKeyring())
+
+    with caplog.at_level("DEBUG", logger="kedge.config"):
+        set_api_key("default", SECRET)
+
+    assert SECRET not in caplog.text
+    assert "default" in caplog.text
+
+
+def test_delete_api_key_removes_the_entry_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeKeyring({(KEYRING_SERVICE, "default"): SECRET})
+    _install_keyring(monkeypatch, fake)
+
+    assert delete_api_key("default") is True
+    assert fake.entries == {}
+    assert delete_api_key("default") is False, "deleting what is already gone is not an error"
+
+
+def test_delete_api_key_reports_an_unreachable_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_keyring(monkeypatch, _FakeKeyring(error=keyring.errors.KeyringError("no backend")))
+
+    with pytest.raises(ApiKeyStoreError, match="could not remove"):
+        delete_api_key("default")

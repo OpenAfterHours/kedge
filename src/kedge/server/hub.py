@@ -17,6 +17,9 @@ Three parts:
 * **The open sequence** — the same steps ``kedge open`` runs, as a background job whose progress
   is streamed with the typed SSE machinery in :mod:`kedge.server.events`. It takes several seconds
   and does eight distinguishable things; PLAN M3 is explicit that a spinner will not do.
+* **Closing** — the counterpart, and the reason opening a second workbook can go on being refused.
+  One server owns one workbook and one marimo process; ``/api/hub/close`` is how the first one is
+  let go, so picking the wrong file from the list costs a click rather than a restart.
 
 The job runs in an :class:`asyncio.Task` rather than inside the streaming response, and every
 frame it emits is retained, so a browser that reloads mid-open reattaches and catches up instead
@@ -75,6 +78,14 @@ _STREAM_HEADERS = {
     "X-Accel-Buffering": "no",
 }
 
+_SHELL_HEADERS = {"Cache-Control": "no-store"}
+"""Same reasoning as :data:`kedge.server.routes.SHELL_HEADERS`, which owns the explanation.
+
+Repeated rather than imported for the same reason ``_STREAM_HEADERS`` is: ``routes`` and ``hub``
+are siblings that both hang off ``app``, and a dependency between them to share two words of
+header would be the wrong shape.
+"""
+
 _KEEPALIVE_SECONDS = 15.0
 _MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 _UPLOAD_CHUNK = 1 << 20
@@ -126,7 +137,7 @@ def hub_page(request: Request) -> FileResponse:
     Reachable from the chat view too, so "which workbook am I in, and what else is there?" is one
     click rather than a restart.
     """
-    return FileResponse(_state(request).static_dir / "hub.html")
+    return FileResponse(_state(request).static_dir / "hub.html", headers=_SHELL_HEADERS)
 
 
 # ── the registry ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +242,40 @@ def forget_workbook(key: str, request: Request) -> dict[str, Any]:
     if not registry.forget(key):
         raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
     return {"forgotten": key}
+
+
+@router.post("/api/hub/close")
+async def close_workbook(request: Request) -> dict[str, Any]:
+    """Release the open workbook, so a different one can be opened without a restart.
+
+    The counterpart to the 409 :func:`_refuse_if_busy` raises. That refusal is right — one server
+    owns one workbook and one marimo process (PLAN 2.9) — but until this route existed it was also
+    terminal: a user who picked the wrong file from a list of six was told to stop the server and
+    start it again, from a browser, which is the one place they could not do it.
+
+    Closing is explicit rather than implicit in the next open. Opening a workbook is a visible,
+    eight-step, several-second sequence with a marimo process on the end of it, and quietly killing
+    one because the user clicked a different card would be exactly the kind of unasked-for
+    destruction kedge refuses everywhere else. The hub asks first; this route is the yes.
+    """
+    from kedge.server.app import TurnInFlightError
+
+    state = _state(request)
+    if state.workspace is None:
+        return {"closed": None, "detail": "No workbook was open."}
+
+    name = state.workspace.workbook_path.name
+    try:
+        released = await run_in_threadpool(state.detach)
+    except TurnInFlightError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    logger.info("closed workbook %s at the user's request", name)
+    return {
+        "closed": None if released is None else str(released.workbook_path),
+        "name": name,
+        "detail": f"{name} is closed and its marimo has been stopped.",
+    }
 
 
 @router.get("/api/hub/report/{key}")
@@ -614,9 +659,10 @@ def _refuse_if_busy(state: ServerState, path: str | None) -> None:
         status_code=409,
         detail=(
             f"This kedge server already has {open_workspace.workbook_path.name} open. One server "
-            f"owns one workbook and one marimo process (PLAN 2.9); stop it and run `kedge hub` "
-            f"again to work on {Path(path).name}."
+            f"owns one workbook and one marimo process (PLAN 2.9), so close it before opening "
+            f"{Path(path).name}."
         ),
+        headers={"X-Kedge-Open-Workbook": open_workspace.key},
     )
 
 
@@ -851,18 +897,24 @@ async def _step_agent(
     they just waited eight seconds for. The fallback is the same :class:`ScriptedAgent` the demo
     server uses, and the UI already labels that plainly as demo mode rather than pretending a
     model answered.
+
+    The same closure that builds the loop here is handed to :meth:`ServerState.attach`, so that a
+    user who then fills in the settings panel gets the real agent without reopening the workbook.
+    That is the whole point of falling back rather than failing: demo mode is meant to be a state
+    you can climb out of.
     """
     from kedge.server.agent_seam import AgentLoop, ScriptedAgent
+
+    def build() -> AgentLoop:
+        from kedge.agent.loop import KedgeAgent
+
+        return KedgeAgent.for_workspace(workspace, driver=driver, analysis=analysis)
 
     job.step("agent", "running", "wiring up the agent loop")
     demo = False
     agent: AgentLoop
     try:
-        from kedge.agent.loop import KedgeAgent
-
-        agent = await run_in_threadpool(
-            KedgeAgent.for_workspace, workspace, driver=driver, analysis=analysis
-        )
+        agent = await run_in_threadpool(build)
     except (KedgeError, ImportError) as exc:
         agent = ScriptedAgent(delay=0.02)
         demo = True
@@ -870,10 +922,11 @@ async def _step_agent(
             "agent",
             "failed",
             f"no model endpoint is usable ({exc}). Opening in demo mode: the scripted agent "
-            f"answers and nothing is sent to a model.",
+            f"answers and nothing is sent to a model. Set the endpoint and key in Settings, on "
+            f"the hub, and the real agent takes over without reopening the workbook.",
         )
     else:
         job.step("agent", "ok", f"agent ready on {workspace.config.model.model}")
 
-    state.attach(workspace, agent=agent, demo=demo)
+    state.attach(workspace, agent=agent, demo=demo, agent_factory=build)
     return demo

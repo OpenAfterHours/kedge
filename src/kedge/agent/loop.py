@@ -7,9 +7,16 @@ fake's, because the fake is what the UI was judged against.
 
 **The model endpoint is behind a seam of its own.** :class:`ModelClient` is a two-field protocol
 that yields :class:`ChatDelta` fragments, and :class:`OpenAIClient` is the only thing in kedge that
-knows what a chat completion looks like. That is not abstraction for its own sake: a loop that can
-only be exercised against a live endpoint does not get exercised, so every test in
+knows what a request on the wire looks like. That is not abstraction for its own sake: a loop that
+can only be exercised against a live endpoint does not get exercised, so every test in
 ``tests/unit/test_agent_loop.py`` drives a scripted client and none of them needs a key.
+
+That seam is also what lets kedge speak two dialects without the loop knowing. Everything above
+:class:`OpenAIClient` — the window, the audit log, the stored transcript — is chat-completions
+shaped, because that is the lingua franca and the shape the conversation is kept in.
+:class:`OpenAIClient` prefers the responses API on the way out, since it is the only one that
+carries a reasoning model's thinking across a tool call, and falls back on its own when the
+endpoint has never heard of it.
 
 **Notebook state is rebuilt from the kernel at the top of every turn** and never taken from
 history. PLAN M4 calls this the single most important context rule, and the reason is mundane: the
@@ -29,6 +36,7 @@ budget rephrasing the same mistake.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -61,7 +69,7 @@ from kedge.server.events import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -84,6 +92,10 @@ __all__ = [
     "OpenAIClient",
     "PendingToolCall",
     "build_agent_app",
+    "chat_deltas",
+    "responses_delta",
+    "responses_input",
+    "responses_tools",
     "serve",
 ]
 
@@ -156,12 +168,193 @@ class ModelClient(Protocol):
         ...
 
 
+def responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Translate chat-completions messages into responses-API input items.
+
+    The loop, the context window and the audit log all speak chat completions, and they should
+    keep speaking it: it is the shape the conversation is *stored* in, and it is the one every
+    other endpoint understands. Only the wire needs the other dialect, so the translation lives
+    here rather than spreading a second message format back through :mod:`kedge.agent.context`.
+
+    Three shapes differ. A tool result stops being a message with a role and becomes a
+    ``function_call_output`` keyed by ``call_id``; an assistant turn that made tool calls becomes
+    its prose followed by one ``function_call`` item per call, because responses models a turn as
+    a list of output items rather than one message with a list hanging off it; everything else is
+    a role and content, unchanged.
+
+    Example:
+        >>> responses_input([{"role": "user", "content": "hello"}])
+        [{'role': 'user', 'content': 'hello'}]
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id") or "",
+                    "output": message.get("content") or "",
+                }
+            )
+            continue
+        if role == "assistant":
+            if message.get("content"):
+                items.append({"role": "assistant", "content": message["content"]})
+            for call in message.get("tool_calls") or ():
+                function = call.get("function") or {}
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call.get("id") or "",
+                        "name": function.get("name") or "",
+                        "arguments": function.get("arguments") or "",
+                    }
+                )
+            continue
+        items.append({"role": role, "content": message.get("content") or ""})
+    return items
+
+
+def responses_tools(tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten chat-completions tool definitions into the responses-API shape.
+
+    Chat completions nests the schema under ``function``; responses puts it at the top level.
+
+    ``strict`` is sent explicitly false. Left unsaid it can default true, and strict mode demands
+    that every property be required — kedge's tools have genuinely optional arguments, so strict
+    would reject schemas that are correct (:meth:`kedge.agent.tools.ToolSpec.schema`).
+
+    Example:
+        >>> responses_tools([{"type": "function", "function": {"name": "probe"}}])[0]["name"]
+        'probe'
+    """
+    flattened: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") or {}
+        flattened.append(
+            {
+                "type": "function",
+                "name": function.get("name") or "",
+                "description": function.get("description") or "",
+                "parameters": function.get("parameters") or {},
+                "strict": False,
+            }
+        )
+    return flattened
+
+
+def responses_delta(event: Any) -> ChatDelta | None:
+    """Translate one streamed responses event into a :class:`ChatDelta`, or ``None`` to skip it.
+
+    Responses streams typed, semantic events where chat completions streams anonymous deltas, so
+    the fragments arrive already labelled: the call id and name once, on the item that opens, and
+    the arguments as their own event stream afterwards. ``output_index`` is what ties them
+    together, and it is what :class:`ChatDelta.index` carries.
+
+    Read through ``getattr`` rather than by attribute, because the set of event types grows with
+    the SDK and an unrecognised one must be ignored rather than raise.
+    """
+    kind = getattr(event, "type", "")
+    if kind == "response.output_text.delta":
+        return ChatDelta(text=getattr(event, "delta", "") or "")
+    if kind == "response.function_call_arguments.delta":
+        return ChatDelta(
+            index=getattr(event, "output_index", 0) or 0,
+            arguments=getattr(event, "delta", "") or "",
+        )
+    if kind == "response.output_item.added":
+        item = getattr(event, "item", None)
+        if getattr(item, "type", "") == "function_call":
+            return ChatDelta(
+                index=getattr(event, "output_index", 0) or 0,
+                call_id=getattr(item, "call_id", None),
+                name=getattr(item, "name", None),
+            )
+    return None
+
+
+def chat_deltas(chunk: Any) -> list[ChatDelta]:
+    """Translate one streamed chat-completions chunk into the fragments the loop reassembles.
+
+    Chat completions streams anonymous deltas: prose and tool-call pieces arrive in the same
+    envelope, and ``index`` is the only thing tying a call's name to the arguments that follow.
+    """
+    deltas: list[ChatDelta] = []
+    for choice in chunk.choices or ():
+        delta = choice.delta
+        if delta is None:
+            continue
+        if delta.content:
+            deltas.append(ChatDelta(text=delta.content))
+        for call in delta.tool_calls or ():
+            function = call.function
+            deltas.append(
+                ChatDelta(
+                    index=call.index or 0,
+                    call_id=call.id,
+                    name=function.name if function is not None else None,
+                    arguments=(function.arguments or "") if function is not None else "",
+                )
+            )
+    return deltas
+
+
+def _mentions_reasoning(exc: Exception) -> bool:
+    """Whether a refusal was about the reasoning parameter rather than the request as a whole."""
+    return "reasoning" in str(exc).lower()
+
+
+def _missing_route(exc: Exception) -> bool:
+    """Whether a refusal means this endpoint has no responses API at all.
+
+    A server that has never heard of ``/responses`` answers 404 or 405 from its router. Some
+    gateways answer 400 and say so in prose instead, so the text is checked as well -- narrowly,
+    because a 400 that merely *mentions* the word is more likely to be about the request.
+    """
+    status = getattr(exc, "status_code", None)
+    if status in (404, 405):
+        return True
+    text = str(exc).lower()
+    return "unknown" in text and "responses" in text
+
+
 class OpenAIClient:
-    """A :class:`ModelClient` over an OpenAI-compatible chat-completions endpoint.
+    """A :class:`ModelClient` over an OpenAI-compatible endpoint, in either dialect.
 
     The only place in kedge that knows the wire format. The SDK is imported inside ``__init__``
     rather than at module scope so that importing :mod:`kedge.agent` — which the CLI does — costs
     nothing until somebody actually wants to talk to a model.
+
+    **Responses first, chat completions when it has to be.** Every kedge turn is tool calls, and
+    chat completions has nowhere to keep a reasoning model's thinking across one: the model
+    reasons, calls a tool, and by the time the result comes back the reasoning that motivated the
+    call is gone. Endpoints increasingly refuse the combination outright rather than quietly
+    degrading. Responses keeps it, so that is what kedge asks for first.
+
+    **Neither the dialect nor the reasoning setting may be fatal.** kedge is pointed at whatever
+    the user has — a hosted API, a gateway, a llama.cpp on the next desk — and most of those
+    implement chat completions only. So both are discovered rather than assumed: a missing
+    ``/responses`` route downgrades the client once and permanently, and a refusal that names
+    reasoning is walked down a ladder until something is accepted. Each costs one round trip, on
+    the first turn only, and is logged. Pin :attr:`~kedge.config.ModelConfig.api` to skip the probe.
+
+    **Saying nothing about reasoning is not the same as asking for none of it.** A reasoning model
+    behind a gateway has a *default* effort, so a request that omits the parameter still arrives
+    carrying one, and chat completions then refuses it in the presence of function tools. Sending
+    nothing cannot fix that; only an explicit ``"none"`` can. That is why the chat ladder ends at
+    omission rather than starting there:
+
+    ==================  ==========================================================
+    configured effort   what is tried, in order
+    ==================  ==========================================================
+    ``"high"``          ``"high"``, then ``"none"``, then the parameter omitted
+    unset               omitted, then ``"none"``
+    ==================  ==========================================================
+
+    An endpoint that has never heard of the parameter never refuses over it, so it never leaves
+    the first rung. One that defaults it lands on ``"none"``, which is the remedy its own error
+    message names.
 
     Example:
         >>> OpenAIClient.__name__
@@ -175,12 +368,29 @@ class OpenAIClient:
         api_key: str,
         timeout: float = 120.0,
         max_retries: int = 2,
+        api: str = "auto",
+        reasoning_effort: str | None = None,
+        client: Any | None = None,
     ) -> None:
-        from openai import AsyncOpenAI
+        if client is None:
+            from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(
-            base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
+            client = AsyncOpenAI(
+                base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
+            )
+        self._client = client
+        self._use_responses = api != "chat_completions"
+        self._pinned = api != "auto"
+        self._reasoning_effort = reasoning_effort
+        """What the user configured. Never mutated; the two dialects negotiate around it."""
+
+        self._responses_effort = reasoning_effort
+        """What responses is currently sending, dropped to ``None`` if it is refused."""
+
+        self._chat_ladder: tuple[str | None, ...] = (
+            (reasoning_effort, "none", None) if reasoning_effort is not None else (None, "none")
         )
+        self._chat_rung = 0
 
     @classmethod
     def from_workspace(cls, workspace: Workspace) -> OpenAIClient:
@@ -198,6 +408,8 @@ class OpenAIClient:
             api_key=get_api_key(workspace.config),
             timeout=model.timeout_seconds,
             max_retries=model.max_retries,
+            api=model.api,
+            reasoning_effort=model.reasoning_effort,
         )
 
     async def stream(
@@ -207,7 +419,100 @@ class OpenAIClient:
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
     ) -> AsyncIterator[ChatDelta]:
-        """Stream one completion, translating SDK chunks into :class:`ChatDelta`."""
+        """Stream one completion, translating whatever the endpoint speaks into deltas.
+
+        The negotiation happens around opening the stream rather than around consuming it: with
+        ``stream=True`` the SDK has already sent the request and seen the status by the time it
+        hands back an iterator, so a refusal arrives here, before a single fragment has been
+        yielded. That is what makes retrying safe — nothing downstream has seen a partial turn.
+        """
+        from openai import BadRequestError, NotFoundError
+
+        while True:
+            responses = self._use_responses
+            try:
+                stream = (
+                    await self._open_responses(model, messages, tools)
+                    if responses
+                    else await self._open_chat(model, messages, tools)
+                )
+            except (BadRequestError, NotFoundError) as exc:
+                if self._recover(exc):
+                    continue
+                raise
+            if responses:
+                async for event in stream:
+                    delta = responses_delta(event)
+                    if delta is not None:
+                        yield delta
+            else:
+                async for chunk in stream:
+                    for delta in chat_deltas(chunk):
+                        yield delta
+            return
+
+    def _recover(self, exc: Exception) -> bool:
+        """Adjust for a refusal and report whether the request is worth sending again.
+
+        False for anything that is not about the dialect or about reasoning, because degrading
+        around every 400 would turn a real complaint -- an unknown model, a malformed schema --
+        into a turn that silently did nothing and said why to nobody.
+        """
+        if self._use_responses and not self._pinned and _missing_route(exc):
+            logger.info(
+                "the endpoint has no responses API (%s); using chat completions from here on", exc
+            )
+            self._use_responses = False
+            return True
+        if not _mentions_reasoning(exc):
+            return False
+        if self._use_responses:
+            if self._responses_effort is None:
+                return False
+            logger.warning(
+                "the endpoint refused reasoning effort %r on the responses API (%s); dropping it",
+                self._responses_effort,
+                exc,
+            )
+            self._responses_effort = None
+            return True
+        if self._chat_rung + 1 >= len(self._chat_ladder):
+            return False
+        self._chat_rung += 1
+        logger.warning(
+            "the endpoint refused reasoning_effort=%r on chat completions (%s); trying %r",
+            self._chat_ladder[self._chat_rung - 1],
+            exc,
+            self._chat_ladder[self._chat_rung],
+        )
+        return True
+
+    async def _open_responses(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> Any:
+        """Send the request in the responses dialect and return the event stream."""
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": responses_input(messages),
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = responses_tools(tools)
+            payload["tool_choice"] = "auto"
+        if self._responses_effort is not None:
+            payload["reasoning"] = {"effort": self._responses_effort}
+        return await self._client.responses.create(**payload)
+
+    async def _open_chat(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> Any:
+        """Send the request in the chat-completions dialect, which most endpoints implement."""
         payload: dict[str, Any] = {
             "model": model,
             "messages": [dict(message) for message in messages],
@@ -216,23 +521,10 @@ class OpenAIClient:
         if tools:
             payload["tools"] = [dict(tool) for tool in tools]
             payload["tool_choice"] = "auto"
-
-        stream = await self._client.chat.completions.create(**payload)
-        async for chunk in stream:
-            for choice in chunk.choices or ():
-                delta = choice.delta
-                if delta is None:
-                    continue
-                if delta.content:
-                    yield ChatDelta(text=delta.content)
-                for call in delta.tool_calls or ():
-                    function = call.function
-                    yield ChatDelta(
-                        index=call.index or 0,
-                        call_id=call.id,
-                        name=function.name if function is not None else None,
-                        arguments=(function.arguments or "") if function is not None else "",
-                    )
+        effort = self._chat_ladder[self._chat_rung]
+        if effort is not None:
+            payload["reasoning_effort"] = effort
+        return await self._client.chat.completions.create(**payload)
 
     async def aclose(self) -> None:
         """Release the underlying HTTP client."""
@@ -261,6 +553,56 @@ class _Meter:
     def total(self) -> int:
         """Prompt plus output."""
         return self.prompt + self.output
+
+
+async def _abandon_if_cancelled[T](work: Awaitable[T], cancel: CancelToken) -> T:
+    """Await ``work``, abandoning it the moment the user asks the turn to stop.
+
+    Checking the token *between* steps is not enough on its own, and the gap is not a corner case.
+    A reasoning model spends the whole of its thinking on one await inside
+    :meth:`OpenAIClient.stream`, emitting reasoning events that :func:`responses_delta` translates
+    to ``None`` and the loop therefore never sees — so a check written inside ``async for delta``
+    does not run once during exactly the stretch a user reaches for Stop. Racing the token against
+    the work makes the stop land while the model is still thinking, which is where it was aimed.
+
+    Cancelling is deliberately confined to the model call. A tool call is left to finish: the
+    kernel has already been handed the program by the time the await is pending, so dropping the
+    HTTP read would not undo the edit, it would only lose the confirmation of it — and a loop that
+    believes a cell was not created when it was is a worse failure than a Stop that waits out one
+    round trip.
+
+    This races rather than replaces. A token that is already set stops the turn here without
+    starting anything, and a caller that goes on to check the token itself after each result is not
+    being redundant: work that finishes *and* a stop that arrives in the same moment must resolve
+    as stopped, and only the caller knows what it was about to do with the result.
+
+    Raises:
+        asyncio.CancelledError: The token was set before ``work`` finished. ``work`` has been
+            cancelled and awaited, so nothing is left running behind it.
+    """
+    cancel.raise_if_cancelled()
+    task = asyncio.ensure_future(work)
+    stop = asyncio.ensure_future(cancel.wait())
+    try:
+        await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        stop.cancel()
+
+    if task.done():
+        return task.result()
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        # The turn is being abandoned; how the work it was waiting on died is no longer material.
+        logger.debug("abandoned work raised while being cancelled", exc_info=True)
+    raise asyncio.CancelledError
 
 
 # ── the loop ─────────────────────────────────────────────────────────────────────────────────
@@ -445,23 +787,43 @@ class KedgeAgent:
         cancel: CancelToken,
         reply: _Reply,
     ) -> AsyncIterator[AnyEvent]:
-        """Stream one completion, emitting prose as it arrives and collecting tool calls."""
+        """Stream one completion, emitting prose as it arrives and collecting tool calls.
+
+        Pulled one fragment at a time through :func:`_abandon_if_cancelled` rather than with a
+        plain ``async for``, so that Stop lands while the model is still thinking rather than only
+        once it has something to say. See that function for why the difference is not academic.
+        """
         parts: dict[int, dict[str, str]] = {}
-        async for delta in self._client.stream(
+        stream = self._client.stream(
             model=model or self._model, messages=messages, tools=self._tools
-        ):
-            cancel.raise_if_cancelled()
-            if delta.text:
-                reply.content += delta.text
-                yield TokenEvent(text=delta.text)
-            if delta.call_id is None and delta.name is None and not delta.arguments:
-                continue
-            slot = parts.setdefault(delta.index, {"id": "", "name": "", "arguments": ""})
-            if delta.call_id:
-                slot["id"] = delta.call_id
-            if delta.name:
-                slot["name"] = delta.name
-            slot["arguments"] += delta.arguments
+        ).__aiter__()
+        try:
+            while True:
+                try:
+                    delta = await _abandon_if_cancelled(stream.__anext__(), cancel)
+                except StopAsyncIteration:
+                    break
+                cancel.raise_if_cancelled()
+                if delta.text:
+                    reply.content += delta.text
+                    yield TokenEvent(text=delta.text)
+                if delta.call_id is None and delta.name is None and not delta.arguments:
+                    continue
+                slot = parts.setdefault(delta.index, {"id": "", "name": "", "arguments": ""})
+                if delta.call_id:
+                    slot["id"] = delta.call_id
+                if delta.name:
+                    slot["name"] = delta.name
+                slot["arguments"] += delta.arguments
+        finally:
+            # The connection is the endpoint's to hold open until somebody closes it, and an
+            # abandoned turn must not leave one behind. Suppressed rather than checked: closing a
+            # generator that has already unwound is a no-op, and closing one that has not is the
+            # whole point.
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
 
         reply.calls = [
             PendingToolCall(

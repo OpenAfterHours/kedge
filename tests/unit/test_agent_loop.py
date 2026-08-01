@@ -72,6 +72,24 @@ class CancellingClient:
         yield ChatDelta(text="still ")
 
 
+class ThinkingClient:
+    """A reasoning model: a long silence on the wire before anything the loop can translate.
+
+    This is the shape that made Stop inert, and it is the ordinary case rather than a contrived
+    one. ``responses_delta`` maps every reasoning event to ``None``, so for the whole of a model's
+    thinking nothing reaches the loop — and a cancellation check written inside ``async for delta``
+    does not run once during exactly the stretch a user reaches for Stop.
+    """
+
+    def __init__(self) -> None:
+        self.finished = False
+
+    async def stream(self, **_kwargs: Any) -> Any:
+        await asyncio.sleep(30)  # thinking, none of which becomes a delta
+        self.finished = True  # pragma: no cover - the turn is stopped long before this
+        yield ChatDelta(text="...")  # pragma: no cover
+
+
 class FakeDriver:
     def __init__(self) -> None:
         self.graphs_read = 0
@@ -189,6 +207,39 @@ async def test_a_pre_cancelled_turn_still_finishes_cleanly() -> None:
     events = [event async for event in agent.run(request, cancel=token)]
     assert [event.type for event in events].count("done") == 1
     assert not any(event.type == "token" for event in events)
+
+
+async def test_stop_lands_while_the_model_is_still_thinking() -> None:
+    """Cancellation must not wait for the model to say something first.
+
+    The check used to sit inside ``async for delta``, so a reasoning model that spends a minute
+    thinking before its first token left Stop doing nothing for that whole minute — and the chat
+    went on saying "Thinking" while the user pressed it again. The wait here is 30 seconds of model
+    call against a 5 second deadline: it only passes if the turn abandons the call rather than
+    outliving it.
+    """
+    token = CancelToken()
+    client = ThinkingClient()
+    agent = build(client)
+    request = TurnRequest(turn_id="t1", session_id="s1", message="go")
+
+    async def collect() -> list[Any]:
+        return [event async for event in agent.run(request, cancel=token)]
+
+    async def press_stop() -> None:
+        await asyncio.sleep(0.05)
+        token.cancel()
+
+    stopper = asyncio.create_task(press_stop())
+    events = await asyncio.wait_for(collect(), timeout=5)
+    await stopper
+
+    types = [event.type for event in events]
+    assert types.count("done") == 1
+    assert types[-1] == "done"
+    stopped = next(event for event in events if event.type == "error")
+    assert stopped.message == "Turn cancelled at your request."
+    assert client.finished is False, "the model call was abandoned, not waited out"
 
 
 async def test_a_task_cancellation_that_is_not_the_user_s_is_re_raised() -> None:

@@ -27,7 +27,7 @@ classifiers = [
 dependencies = [
     # ── analysis (M1) ────────────────────────────────────────────────
     "openpyxl==3.1.5",
-    "polars==1.43.0",
+    "polars==1.43.2",
     "fastexcel>=0.12",          # calamine engine behind pl.read_excel
     "python-docx>=1.1",
     # ── models & config ──────────────────────────────────────────────

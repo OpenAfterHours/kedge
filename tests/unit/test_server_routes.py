@@ -95,9 +95,76 @@ def test_the_shell_is_served_at_the_root(client: TestClient) -> None:
     assert 'id="notebook-frame"' in body
 
 
+def test_the_state_endpoints_are_never_cached(client: TestClient) -> None:
+    # Both report what this process holds right now, and both can change while a tab sits open.
+    # A stale /api/context is a notebook pane insisting there is no notebook when there is one.
+    for path in ("/api/context", "/api/health"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
+def test_context_reports_the_notebook_url_once_marimo_answers(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """The pane is drawn from this, and it is not always knowable when the page first loads.
+
+    A shell opened while marimo is still coming up gets ``notebook_url: null``. That is honest,
+    and it is why the browser re-reads this rather than drawing the pane once and living with it.
+    """
+    assert client.get("/api/context").json()["notebook_url"] is None
+
+    workspace.attach_marimo(host="127.0.0.1", port=2718, token="tok-abc123", pid=4242)
+    workspace.set_session_id("kedge-session")
+
+    payload = client.get("/api/context").json()
+    assert payload["notebook_url"] is not None
+    assert "access_token=tok-abc123" in payload["notebook_url"]
+    assert payload["marimo"]["attached"] is True
+
+
+def test_the_shell_is_never_cached(client: TestClient) -> None:
+    # `/` answers with the chat shell or with the hub depending on whether a workbook is open, so
+    # a browser holding one of them and reusing it for the other sends "Go to the notebook"
+    # somewhere that is not the notebook.
+    for path in ("/", "/hub"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
 def test_the_static_assets_are_served(client: TestClient) -> None:
     for path in ("/static/app.js", "/static/styles.css"):
         assert client.get(path).status_code == 200
+
+
+def test_the_static_assets_are_revalidated_rather_than_assumed_fresh(client: TestClient) -> None:
+    # A page and the script that drives it are separate URLs that go stale independently. Without
+    # this, a browser runs today's hub.js against yesterday's hub.html and the first element that
+    # is not there yet takes the page down.
+    for path in ("/static/app.js", "/static/hub.js", "/static/styles.css"):
+        response = client.get(path)
+        assert response.status_code == 200, path
+        assert response.headers["cache-control"] == "no-cache", path
+
+
+def test_the_hidden_attribute_is_not_disarmed_by_a_display_rule(client: TestClient) -> None:
+    # Both scripts show and hide everything conditional by assigning `hidden`, and an author
+    # `display` beats the user agent's own `[hidden] { display: none }` before specificity is
+    # consulted -- author styles win over UA styles by origin. So one `.phase-chip { display:
+    # inline-flex }` is enough to make `chip.hidden = true` do nothing, and the symptom does not
+    # read as a styling glitch: the chip goes on saying "Thinking" after the turn has finished, the
+    # Stop button stays on screen with no turn behind it and does nothing when pressed, and the
+    # notebook placeholder -- absolutely positioned across the pane -- sits over a working iframe
+    # insisting no notebook is attached.
+    #
+    # One unconditional rule makes every `display` in these stylesheets safe. `!important` is load
+    # bearing: `#notebook-frame { display: block }` is an id selector and would otherwise win.
+    styles = client.get("/static/styles.css").text
+    guard = re.compile(r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", re.DOTALL)
+    assert guard.search(styles), "styles.css must keep `hidden` working; hub.css layers on it"
+
+    # The coupling the rule above protects, asserted so that deleting it fails here rather than in
+    # front of a user.
+    script = client.get("/static/app.js").text
+    assert "placeholder.hidden = true" in script
+    assert '$("stop").hidden = !running' in script
 
 
 def test_the_ui_fetches_nothing_from_off_the_machine(client: TestClient) -> None:
