@@ -95,6 +95,32 @@ def test_the_shell_is_served_at_the_root(client: TestClient) -> None:
     assert 'id="notebook-frame"' in body
 
 
+def test_the_state_endpoints_are_never_cached(client: TestClient) -> None:
+    # Both report what this process holds right now, and both can change while a tab sits open.
+    # A stale /api/context is a notebook pane insisting there is no notebook when there is one.
+    for path in ("/api/context", "/api/health"):
+        assert client.get(path).headers["cache-control"] == "no-store", path
+
+
+def test_context_reports_the_notebook_url_once_marimo_answers(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """The pane is drawn from this, and it is not always knowable when the page first loads.
+
+    A shell opened while marimo is still coming up gets ``notebook_url: null``. That is honest,
+    and it is why the browser re-reads this rather than drawing the pane once and living with it.
+    """
+    assert client.get("/api/context").json()["notebook_url"] is None
+
+    workspace.attach_marimo(host="127.0.0.1", port=2718, token="tok-abc123", pid=4242)
+    workspace.set_session_id("kedge-session")
+
+    payload = client.get("/api/context").json()
+    assert payload["notebook_url"] is not None
+    assert "access_token=tok-abc123" in payload["notebook_url"]
+    assert payload["marimo"]["attached"] is True
+
+
 def test_the_shell_is_never_cached(client: TestClient) -> None:
     # `/` answers with the chat shell or with the hub depending on whether a workbook is open, so
     # a browser holding one of them and reusing it for the other sends "Go to the notebook"

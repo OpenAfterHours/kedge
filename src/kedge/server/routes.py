@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -65,7 +65,7 @@ STREAM_HEADERS = {
 }
 
 SHELL_HEADERS = {"Cache-Control": "no-store"}
-"""What the two HTML shells are served with. They are answers about server state, not files.
+"""What the shells and the state endpoints are served with: answers about this process, not files.
 
 ``/`` returns ``hub.html`` or ``index.html`` depending on whether a workbook is open, so the one
 URL has two bodies and the browser has no way to tell which it is holding. Left uncached, Starlette
@@ -156,14 +156,20 @@ def index(request: Request) -> FileResponse:
 
 
 @router.get("/api/context")
-def context(request: Request) -> dict[str, Any]:
+def context(request: Request, response: Response) -> dict[str, Any]:
     """Everything the UI needs to draw itself once, on load.
 
     Includes the notebook iframe URL with the access token already in the query string. That is
     the whole of PLAN 1.3: an iframe that loads unauthenticated lands on marimo's login page,
     which is the one endpoint setting ``X-Frame-Options: DENY``, and the frame breaks. Passing
     ``access_token`` as a query parameter means the login page is never reached.
+
+    Served :data:`SHELL_HEADERS` for the same reason the shells are: this is a report on what the
+    process holds right now -- whether a workbook is attached, whether marimo has answered -- and
+    all of it can change while a tab sits open. A stale copy of this is a pane that says there is
+    no notebook when there is one.
     """
+    response.headers.update(SHELL_HEADERS)
     state = get_state(request)
     workspace = state.workspace
     if workspace is None:
@@ -198,12 +204,15 @@ def context(request: Request) -> dict[str, Any]:
 
 
 @router.get("/api/health")
-async def health(request: Request) -> dict[str, Any]:
+async def health(request: Request, response: Response) -> dict[str, Any]:
     """Report on the marimo kernel, which is a separate process and can die under us.
 
     Liveness is decided by asking the server, never by inspecting a PID: PID checks are
     unreliable on Windows and PIDs are recycled (PLAN 6.2).
+
+    Uncached for the same reason as :func:`context`: a poll answered from a cache is not a poll.
     """
+    response.headers.update(SHELL_HEADERS)
     state = get_state(request)
     session = None if state.workspace is None else state.workspace.marimo
     if session is None:

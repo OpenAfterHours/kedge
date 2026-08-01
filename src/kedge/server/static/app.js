@@ -893,6 +893,12 @@
       badge.className = "health " + tone;
       $("health-label").textContent = label;
       badge.title = data.marimo.detail || `marimo at ${data.marimo.base_url || "—"}`;
+      // This poll already knows the one thing the empty pane is waiting to hear. A kernel that is
+      // running while the pane holds no frame means the context the pane was drawn from is out of
+      // date, so re-read it rather than leaving the user looking at a placeholder that is wrong.
+      if (data.marimo.state === "running" && !$("notebook-frame").src) {
+        await refreshContext();
+      }
     } catch (_) {
       badge.className = "health bad";
       $("health-label").textContent = "Server unreachable";
@@ -940,18 +946,38 @@
       /* The token rides in the query string on purpose. An iframe that loads unauthenticated
          lands on marimo's login page, which is the one endpoint setting X-Frame-Options: DENY,
          and the frame breaks (PLAN 1.3). */
-      frame.src = context.notebook_url;
+      if (frame.src !== context.notebook_url) frame.src = context.notebook_url;
       frame.hidden = false;
       placeholder.hidden = true;
       $("open-notebook").href = context.notebook_url;
+      // Un-hidden as well as pointed, because the branch below hides them and this one has to be
+      // able to undo that: a pane that fills in later must come back with its controls.
+      $("open-notebook").hidden = false;
+      $("reload-notebook").hidden = false;
     } else {
       frame.hidden = true;
       placeholder.hidden = false;
       $("placeholder-detail").textContent = context.demo
         ? "Demo mode: no marimo server was started, so there is nothing to frame."
-        : "No marimo server is attached to this workbook. Open it from the hub to start one.";
+        : "No marimo server is attached yet. kedge is watching for one and will frame it here " +
+          "as soon as it answers.";
       $("open-notebook").hidden = true;
       $("reload-notebook").hidden = true;
+    }
+  }
+
+  /* Re-read the context and redraw the pane from it.
+     The pane used to be drawn once, from the context fetched at boot, which assumed the notebook
+     URL is knowable the moment the page loads. It is not always: a shell opened while marimo is
+     still coming up, or restored by a back navigation, gets `notebook_url: null` and then sits on
+     "No notebook attached" for ever with a live kernel on the other side of the loopback and no
+     way back but a manual reload. */
+  async function refreshContext() {
+    try {
+      const context = await api("/api/context");
+      if (context.attached) applyContext(context);
+    } catch (_) {
+      /* the health badge already reports an unreachable server */
     }
   }
 
