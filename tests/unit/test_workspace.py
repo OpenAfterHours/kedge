@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -83,12 +84,12 @@ def test_two_workbooks_with_the_same_name_get_different_markers(
 def test_the_session_id_is_stable_across_workspaces_for_the_same_workbook(
     kedge_home: Path, workbook: Path
 ) -> None:
-    """Edit mode holds one session, so a fresh id per launch would evict the previous one."""
+    """Edit mode holds one session, so a fresh id per launch would take the previous one over."""
     first = _workspace(workbook).session_id
     second = _workspace(workbook).session_id
 
     assert first == second
-    assert first.startswith("kedge-")
+    assert first.startswith("s_")
 
 
 def test_a_directory_is_not_a_workbook(kedge_home: Path, tmp_path: Path) -> None:
@@ -162,6 +163,35 @@ def test_notebook_url_carries_the_token_in_the_query_string(
     assert url.startswith("http://127.0.0.1:2718/?file=")
     assert f"access_token={TOKEN}" in url
     assert "access_token" not in workspace.notebook_url(with_token=False)
+
+
+def test_the_session_id_is_one_marimos_frontend_will_adopt(
+    kedge_home: Path, workbook: Path
+) -> None:
+    """`session-*.js` validates against this exact pattern and mints its own if it fails.
+
+    An id the frontend rejects is not a cosmetic problem: the iframe would generate one of its
+    own, resume kedge's orphaned session under it, and leave kedge addressing an id the server no
+    longer knows.
+    """
+    workspace = _workspace(workbook)
+
+    assert re.fullmatch(r"s_[\da-z]{6}", workspace.session_id)
+
+
+def test_notebook_url_names_the_session_so_the_frame_does_not_rename_it(
+    kedge_home: Path, workbook: Path
+) -> None:
+    """Both sides must agree on one session id, or every kernel call 500s once the frame loads."""
+    workspace = _workspace(workbook)
+    workspace.attach_marimo(host="127.0.0.1", port=2718, token=TOKEN, pid=1)
+
+    assert f"session_id={workspace.session_id}" in workspace.notebook_url()
+
+    workspace.set_session_id("s_abc123")
+    assert "session_id=s_abc123" in workspace.notebook_url(), (
+        "the frame must be pointed at the session kedge established, not the one it derived"
+    )
 
 
 def test_the_token_is_not_in_the_session_repr(kedge_home: Path, workbook: Path) -> None:

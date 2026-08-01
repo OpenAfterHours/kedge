@@ -204,8 +204,26 @@ without `--session-ttl` there is no TTL close, so a one-shot request is a suffic
 WebSocket `ws://{host}:{port}/ws?session_id=<id>&access_token=<token>` also works and is the
 only option on < 0.23.15.
 
-**Takeover caveat:** edit mode holds at most one session. Bootstrapping a *second* `session_id`
-evicts the first, and the old id then 500s. Pick one stable session id and reuse it.
+**Takeover caveat:** edit mode holds at most one session per file. A *second* transport connecting
+with a different `session_id` does not get a second session and does not evict the first —
+`EditModeResumeStrategy.try_resume` (`_server/resume_strategies.py`) finds the existing session,
+and if it is `ORPHANED` it calls `update_session_id_sync(old, new)`. The session and its kernel
+state survive under the **new** id; the old id is gone, and every request carrying it 500s with
+`ValueError: Invalid session id`. Pick one stable session id and make sure *everything* uses it.
+
+**That includes the browser.** kedge's bootstrap stream is closed after ~2s, which is exactly the
+`ORPHANED` state resume looks for, so the notebook `<iframe>` loading a moment later renames
+kedge's session out from under it. The frame then looks perfectly healthy while every
+`/api/kernel/execute` fails. The remedy is to hand the frontend the id in the query string:
+
+```
+GET {base}/?file=<nb>.py&session_id=<our-id>&access_token=<token>
+```
+
+**The id must match `/^s_[\da-z]{6}$/`** — `session-*.js` validates it and silently mints its own
+(`s_` + a 6-char nanoid) if it does not match, which puts you straight back into the rename. The
+Python side imposes no such format; only the frontend does. Note also that the frontend strips
+`session_id` from the address bar via `history.replaceState` once read, unless `kiosk` is set.
 
 ### 5.4 Health and sessions
 
