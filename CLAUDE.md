@@ -58,6 +58,8 @@ uv run ruff check --fix . && uv run ruff format .
 uv run ty check src/
 uv run python scripts/guardrails.py        # non-negotiables 1 and 2, by AST not by grep
 uv run python scripts/version.py v0.2.0    # does that tag match __version__?
+uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole release
+
 uv run python tests/fixtures/generate.py   # regenerate the fixture corpus
 uv run kedge --help
 ```

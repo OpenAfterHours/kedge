@@ -44,6 +44,38 @@ Versions are PEP 440 and the single source of truth is `__version__` in `src/ked
 `pyproject.toml` declares the version dynamic and reads it from there. Bump one place.
 
 ```bash
+uv run python scripts/release.py 0.2.0
+```
+
+That is the whole thing. `scripts/release.py` bumps `__version__`, runs every gate CI runs — in
+the order that fails cheapest first — commits, tags, shows you exactly what is about to leave the
+machine, and pushes once you say yes. The push is the trigger; everything after it is
+`release.yml`.
+
+Useful flags:
+
+| Flag | What it does |
+|---|---|
+| `--dry-run` | Runs every check, prints the git commands it would have run, and leaves `__version__` exactly as it found it. |
+| `--yes` | Skips the confirmation prompt. Without a terminal, the script stops before pushing rather than assuming consent. |
+| `--skip-contract` | Skips the live-kernel tests. They spawn a real marimo and take a couple of minutes; CI still runs them on the tag, on both platforms. |
+| `--skip-build-check` | Skips `uv build` and the `twine` metadata check, which need the network on first use. |
+
+It refuses to start on a dirty tree, off `main`, behind `origin/main`, or onto a tag that already
+exists locally or on the remote — the last one because PyPI will not accept a version twice, so a
+tag that is already out there needs a decision rather than a retry. The one dirty file it
+tolerates is `src/kedge/__init__.py` already bumped to the version you asked for, which is what a
+re-run after a failed gate looks like.
+
+If a gate fails, nothing is committed, tagged or pushed, and the bump is left in place so that
+fixing the cause and re-running carries on from there. `git checkout src/kedge/__init__.py`
+abandons it.
+
+### By hand
+
+The script exists because this sequence is easy to half-do, not because the sequence is secret:
+
+```bash
 # 1. Bump the version.
 #    Edit src/kedge/__init__.py -> __version__ = "0.2.0"
 
@@ -64,7 +96,8 @@ git push origin v0.2.0
 ```
 
 The tag must be `v` followed by the version — `v0.2.0` for `0.2.0`. A mismatch fails the first
-job in about five seconds, before anything is built or uploaded.
+job in about five seconds, before anything is built or uploaded. Skipping step 1 and tagging
+anyway is how `v0.0.2` came to sit on the remote pointing at a tree that still said `0.0.1`.
 
 Pre-releases work the same way: `__version__ = "0.2.0rc1"`, tag `v0.2.0rc1`. The pipeline detects
 the PEP 440 pre-release segment and marks the GitHub release accordingly, and pip will not install

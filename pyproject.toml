@@ -126,8 +126,9 @@ ignore = [
 
 [tool.ruff.lint.isort]
 # `utils` is first-party too: it lives at the repo root rather than in the package because it is
-# the user-editable half, imported from notebook cells.
-known-first-party = ["kedge", "utils"]
+# the user-editable half, imported from notebook cells. `scripts` likewise -- repo-root namespace
+# packages that tests import via the sys.path entry tests/conftest.py adds.
+known-first-party = ["kedge", "scripts", "utils"]
 
 # No [tool.ruff.format] section by design — house style is ruff format defaults.
 
