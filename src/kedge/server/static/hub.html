@@ -39,6 +39,12 @@
   <a class="ghost-button" id="open-current" href="/" hidden>
     <svg class="icon"><use href="#i-book"></use></svg><span id="open-current-name">Back to the notebook</span>
   </a>
+  <!-- One server owns one workbook and one marimo process, so opening a second is refused. This
+       is how the first one is let go without stopping the server from a terminal. -->
+  <button class="ghost-button" id="close-current" type="button" hidden
+          title="Stop this workbook's marimo and return this server to the hub">
+    <svg class="icon"><use href="#i-cross"></use></svg><span>Close</span>
+  </button>
   <button class="icon-button" id="settings-open" title="Model endpoint, API key and model" aria-label="Settings">
     <svg class="icon"><use href="#i-cog"></use></svg>
   </button>
@@ -120,6 +126,7 @@
   <ol class="steps" id="steps"></ol>
   <div class="opening-foot">
     <p class="opening-detail" id="opening-detail"></p>
+    <button class="ghost-button" id="opening-switch" type="button" hidden></button>
     <button class="ghost-button" id="opening-close" type="button" hidden>Close</button>
     <a class="primary-button" id="opening-go" href="/" hidden>
       <svg class="icon"><use href="#i-play"></use></svg><span>Go to the notebook</span>

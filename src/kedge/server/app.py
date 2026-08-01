@@ -54,6 +54,7 @@ __all__ = [
     "RevalidatedStaticFiles",
     "ServerError",
     "ServerState",
+    "TurnInFlightError",
     "WorkspaceNotAttachedError",
     "create_app",
     "create_demo_app",
@@ -103,6 +104,15 @@ class WorkspaceNotAttachedError(ServerError):
 
     Not an internal error: it is the normal state of a server started with ``kedge hub``, and the
     right response is to send the user to the hub to pick a workbook.
+    """
+
+
+class TurnInFlightError(ServerError):
+    """The workbook cannot be released while the agent is part-way through a turn.
+
+    The loop holds a notebook driver pointed at a marimo about to be shut down, and a turn stopped
+    half-way through an edit is the one thing kedge's notebook contract is built to prevent.
+    Refusing is momentary — the caller stops the turn and asks again.
     """
 
 
@@ -195,17 +205,18 @@ class ServerState:
     ) -> None:
         """Adopt a workbook and the loop that drives it, in a server that had neither.
 
-        Called once, by the hub, when the user opens a workbook. Switching to a *different*
-        workbook is deliberately not supported in-process: the marimo subprocess, the notebook
-        driver and the audit log are all bound to the workspace that owns them, and swapping one
-        out from under a turn in flight is a class of bug worth not having. The hub restarts the
-        open sequence instead, which is honest and takes the same few seconds it took first time.
+        Called by the hub when the user opens a workbook. Swapping one workbook for another in a
+        single step is deliberately not supported: the marimo subprocess, the notebook driver and
+        the audit log are all bound to the workspace that owns them, and exchanging them under a
+        turn in flight is a class of bug worth not having. A different workbook is refused here and
+        the caller must :meth:`detach` first, which stops the marimo it is giving up before the
+        next open starts one — so the two never overlap, and the user still gets there in a click.
         """
         if self.workspace is not None and self.workspace.key != workspace.key:
             msg = (
-                f"this kedge server already has {self.workspace.workbook_path.name} open. Stop it "
-                f"and start again for {workspace.workbook_path.name}; one server owns one "
-                f"workbook and one marimo process (PLAN 2.9)."
+                f"this kedge server already has {self.workspace.workbook_path.name} open. Close it "
+                f"first — one server owns one workbook and one marimo process (PLAN 2.9), so "
+                f"{workspace.workbook_path.name} cannot be adopted alongside it."
             )
             raise ServerError(msg)
         self.workspace = workspace
@@ -215,6 +226,63 @@ class ServerState:
         if notifier is not None:
             self.bus.add_observer(notebook_mirror(notifier))
         logger.info("attached workbook %s", workspace.workbook_path)
+
+    def detach(self) -> Workspace | None:
+        """Release the open workbook, stopping the marimo process kedge started for it.
+
+        The other half of :meth:`attach`, and the reason that method can go on refusing a second
+        workbook. One server owning one workbook is a sound rule; making the only way out of it a
+        trip to the terminal was not, and a user who opened the wrong file from a list of six had
+        no way back — the hub answered 409 and told them to restart the process they were standing
+        in front of.
+
+        Blocking is deliberate. ``stop_marimo`` asks the server to shut down, waits, and escalates
+        to termination; callers on the event loop must run this in a threadpool. Doing it here
+        rather than leaving the process to the next ``cleanup_orphan`` is what keeps "one server,
+        one marimo" true through a switch rather than only at a cold start.
+
+        Returns:
+            The workspace that was released, or ``None`` if nothing was open.
+
+        Raises:
+            TurnInFlightError: A turn is running. Cancel it and ask again.
+        """
+        from kedge.lifecycle import stop_marimo
+
+        workspace = self.workspace
+        if workspace is None:
+            return None
+        if self.turns.active:
+            msg = (
+                f"a turn is still running against {workspace.workbook_path.name}. Stop it in the "
+                f"chat before closing the workbook — the agent is holding a notebook driver "
+                f"pointed at the marimo this would shut down."
+            )
+            raise TurnInFlightError(msg)
+
+        # Cleared before the stop, not after. `stop_marimo` blocks for as long as it takes a
+        # process to die, and a caller running this in a threadpool leaves the event loop free the
+        # whole time -- so a turn started in that window would find an agent holding a driver
+        # pointed at a marimo already being shut down. Detaching first makes that request a 409.
+        self.workspace = None
+        self.agent = None
+        self.agent_factory = None
+        self.demo = False
+
+        try:
+            stop_marimo(workspace)
+        except Exception:
+            # A marimo that will not die must not trap the user on this workbook. The marker and
+            # the token file are the next run's business; `cleanup_orphan` is built for exactly
+            # this and runs at the top of every open.
+            logger.warning(
+                "could not stop marimo for %s cleanly; detaching anyway",
+                workspace.workbook_path,
+                exc_info=True,
+            )
+
+        logger.info("detached workbook %s", workspace.workbook_path)
+        return workspace
 
 
 def create_app(

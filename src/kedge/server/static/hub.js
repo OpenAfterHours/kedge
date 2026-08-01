@@ -5,6 +5,8 @@
  *   list      — render every registered workbook with the state the server derived from disk;
  *   add       — a server-side file browser, a path box, and drag-and-drop;
  *   open      — POST the open, then read its progress off an SSE stream and draw a checklist;
+ *   close     — let go of the open workbook, so the wrong click is a click to undo and not a
+ *               restart; the server refuses a second workbook and this is the way past that;
  *   transition— once the stream says ready, move to the chat + iframe view at /.
  *
  * The step list is drawn up front from the server's own list of steps, so the user can see what
@@ -79,7 +81,12 @@
       } catch (_) {
         /* the body was not JSON; the status text will do */
       }
-      throw new Error(detail);
+      const error = new Error(detail);
+      // Carried because one refusal here is answerable rather than fatal: a 409 from the open
+      // route means a different workbook is holding this server, and that is a thing the user can
+      // be offered a way out of instead of a sentence.
+      error.status = response.status;
+      throw error;
     }
     return response.status === 204 ? null : response.json();
   }
@@ -352,8 +359,12 @@
 
     const back = $("open-current");
     back.hidden = !data.attached;
+    $("close-current").hidden = !data.attached;
     if (data.open_workbook) {
       $("open-current-name").textContent = data.open_workbook.name;
+      $("close-current").title =
+        `Close ${data.open_workbook.name}: its marimo is stopped and this server returns to the ` +
+        `hub, free to open another workbook.`;
     }
     render();
   }
@@ -529,6 +540,7 @@
     $("opening-detail").className = "opening-detail";
     $("opening-go").hidden = true;
     $("opening-close").hidden = true;
+    $("opening-switch").hidden = true;
     drawSteps();
     if (!dialog.open) dialog.showModal();
 
@@ -539,6 +551,14 @@
         body: JSON.stringify({ key: item.key, reattach: Boolean(reattach) }),
       });
     } catch (error) {
+      // A 409 means another workbook is holding this server. That refusal is correct — one server
+      // owns one workbook and one marimo — but it is answerable, and being told to restart the
+      // process from inside the browser that cannot restart it is a dead end rather than an
+      // answer. Offer the switch; do not take it, because closing stops a live kernel.
+      if (error.status === 409 && state.attached) {
+        offerSwitch(item, reattach, error.message);
+        return;
+      }
       fail(error.message);
       return;
     }
@@ -582,6 +602,50 @@
     detail.className = "opening-detail bad";
     detail.textContent = message;
     $("opening-close").hidden = false;
+  }
+
+  /* The open was refused because another workbook holds this server. Say so, and put the one
+     action that resolves it next to the sentence that describes it. */
+  function offerSwitch(item, reattach, message) {
+    const detail = $("opening-detail");
+    detail.className = "opening-detail warn";
+    detail.textContent =
+      `${message} Closing stops its marimo kernel; the notebook, the plan and every chat are on ` +
+      `disk and come back when you reopen it.`;
+    $("opening-close").hidden = false;
+
+    const button = $("opening-switch");
+    button.hidden = false;
+    button.replaceChildren(
+      icon("i-cross"),
+      el("span", { text: `Close ${state.attached.name} and open ${item.name}` }),
+    );
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await api("/api/hub/close", { method: "POST" });
+      } catch (error) {
+        button.disabled = false;
+        fail(error.message);
+        return;
+      }
+      await refresh();
+      button.disabled = false;
+      await openWorkbook(item, reattach);
+    };
+  }
+
+  async function closeWorkbook() {
+    const open = state.attached;
+    if (!open) return;
+    try {
+      const data = await api("/api/hub/close", { method: "POST" });
+      say(data.detail, "ok");
+    } catch (error) {
+      say(error.message, null);
+      return;
+    }
+    await refresh();
   }
 
   async function forget(item) {
@@ -809,6 +873,7 @@
       $("opening").close();
       refresh().catch(() => {});
     });
+    $("close-current").addEventListener("click", () => closeWorkbook());
 
     $("settings-open").addEventListener("click", () => openSettings());
     $("settings-nudge-open").addEventListener("click", () => openSettings());

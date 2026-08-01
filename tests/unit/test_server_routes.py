@@ -144,6 +144,29 @@ def test_the_static_assets_are_revalidated_rather_than_assumed_fresh(client: Tes
         assert response.headers["cache-control"] == "no-cache", path
 
 
+def test_the_hidden_attribute_is_not_disarmed_by_a_display_rule(client: TestClient) -> None:
+    # Both scripts show and hide everything conditional by assigning `hidden`, and an author
+    # `display` beats the user agent's own `[hidden] { display: none }` before specificity is
+    # consulted -- author styles win over UA styles by origin. So one `.phase-chip { display:
+    # inline-flex }` is enough to make `chip.hidden = true` do nothing, and the symptom does not
+    # read as a styling glitch: the chip goes on saying "Thinking" after the turn has finished, the
+    # Stop button stays on screen with no turn behind it and does nothing when pressed, and the
+    # notebook placeholder -- absolutely positioned across the pane -- sits over a working iframe
+    # insisting no notebook is attached.
+    #
+    # One unconditional rule makes every `display` in these stylesheets safe. `!important` is load
+    # bearing: `#notebook-frame { display: block }` is an id selector and would otherwise win.
+    styles = client.get("/static/styles.css").text
+    guard = re.compile(r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", re.DOTALL)
+    assert guard.search(styles), "styles.css must keep `hidden` working; hub.css layers on it"
+
+    # The coupling the rule above protects, asserted so that deleting it fails here rather than in
+    # front of a user.
+    script = client.get("/static/app.js").text
+    assert "placeholder.hidden = true" in script
+    assert '$("stop").hidden = !running' in script
+
+
 def test_the_ui_fetches_nothing_from_off_the_machine(client: TestClient) -> None:
     # Local-first, and PLAN's house style: no CDN, no npm, no webfont. The only absolute URLs
     # allowed are loopback and the SVG namespace identifier, which is a name rather than a fetch.

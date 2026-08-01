@@ -1,6 +1,10 @@
 /* kedge — the hub: the landing page listing every workbook kedge has seen.
    Layered on styles.css, which owns the tokens, the reset and the shared buttons. Plain CSS, no
-   build step, no CDN, no webfont: nothing on this page reaches off the machine. */
+   build step, no CDN, no webfont: nothing on this page reaches off the machine.
+
+   styles.css also owns the `[hidden]` rule that keeps `display` here from disarming the `hidden`
+   attribute this page's script sets. Read the comment there before adding a `display` to anything
+   below. */
 
 .hub-body {
   /* The chat shell is a fixed two-pane app and locks scrolling; the hub is a document. */
@@ -251,7 +255,6 @@
   background: color-mix(in srgb, var(--bg) 82%, transparent);
   backdrop-filter: blur(2px);
 }
-.drop-overlay[hidden] { display: none; }
 
 .drop-card {
   border: 2px dashed var(--accent);
@@ -420,6 +423,9 @@ dialog::backdrop { background: rgba(10, 13, 16, 0.42); }
 }
 .opening-detail { margin: 0; flex: 1; font-size: 12.5px; color: var(--text-muted); }
 .opening-detail.bad { color: var(--danger); }
+/* An open refused because another workbook holds this server is not a failure — there is an
+   action next to it that resolves it — so it is not dressed as one. */
+.opening-detail.warn { color: var(--warn); }
 
 /* ── the settings panel ─────────────────────────────────────────────────────────────── */
 
@@ -435,7 +441,6 @@ dialog::backdrop { background: rgba(10, 13, 16, 0.42); }
   color: var(--warn);
   font-size: 13px;
 }
-.nudge[hidden] { display: none; }
 .nudge p { margin: 0; flex: 1; }
 .nudge .icon { flex: none; }
 .nudge .ghost-button { flex: none; color: var(--warn); border-color: var(--warn); }
@@ -487,7 +492,6 @@ dialog::backdrop { background: rgba(10, 13, 16, 0.42); }
 .field input:focus-visible,
 .field-select:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
 .field-select { margin-top: 6px; }
-.field-select[hidden] { display: none; }
 
 .field-row { display: flex; align-items: center; gap: 6px; }
 .field-row input { flex: 1; }

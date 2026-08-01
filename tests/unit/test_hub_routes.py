@@ -493,6 +493,84 @@ def test_a_refused_open_by_path_does_not_leave_a_row_behind(
     assert client.get("/api/hub/state").json()["workbooks"] == []
 
 
+def test_a_refused_open_names_the_workbook_holding_the_server(
+    client: TestClient, workbook: Path, tmp_path: Path, home: Path
+) -> None:
+    """The refusal has to be answerable, so it says which workbook is in the way."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    other = _make_workbook(tmp_path / "other.xlsx")
+    key = client.post("/api/hub/workbooks", json={"path": str(other)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0))
+
+    response = client.post("/api/hub/open", json={"key": key})
+
+    assert response.status_code == 409
+    assert response.headers["X-Kedge-Open-Workbook"] == workspace.key
+    assert "close it" in response.json()["detail"].lower()
+
+
+# ── closing ──────────────────────────────────────────────────────────────────────────────────
+
+
+def test_closing_releases_the_workbook_so_another_can_be_opened(
+    client: TestClient, workbook: Path, tmp_path: Path, home: Path, no_marimo: None
+) -> None:
+    """The whole point: picking the wrong file costs a click, not a restart of the server."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    other = _make_workbook(tmp_path / "other.xlsx")
+    key = client.post("/api/hub/workbooks", json={"path": str(other)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    _state(client).attach(workspace, agent=ScriptedAgent(delay=0.0), demo=True)
+
+    assert client.post("/api/hub/open", json={"key": key}).status_code == 409
+
+    closed = client.post("/api/hub/close")
+    assert closed.status_code == 200
+    assert closed.json()["name"] == workbook.name
+
+    state = _state(client)
+    assert state.attached is False
+    assert state.agent is None
+    assert state.demo is False, "demo mode belonged to the workbook that has just been let go"
+    assert client.get("/api/context").json()["attached"] is False
+    assert client.post("/api/hub/open", json={"key": key}).status_code == 202
+
+
+def test_closing_is_refused_while_a_turn_is_in_flight(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The loop holds a driver pointed at the marimo this would stop."""
+    from kedge.server.agent_seam import ScriptedAgent
+
+    state = _state(client)
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    state.attach(workspace, agent=ScriptedAgent(delay=0.0))
+    state.turns.start("turn-1")
+
+    response = client.post("/api/hub/close")
+
+    assert response.status_code == 409
+    assert "a turn is still running" in response.json()["detail"]
+    assert state.attached is True
+
+    state.turns.finish("turn-1")
+    assert client.post("/api/hub/close").status_code == 200
+
+
+def test_closing_nothing_is_not_an_error(client: TestClient) -> None:
+    """A hub with no workbook open is the normal state, not a failed request."""
+    response = client.post("/api/hub/close")
+
+    assert response.status_code == 200
+    assert response.json()["closed"] is None
+
+
 def test_reopening_the_same_workbook_on_an_attached_server_is_allowed(
     client: TestClient, workbook: Path, home: Path, no_marimo: None
 ) -> None:
