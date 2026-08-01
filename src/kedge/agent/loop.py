@@ -36,6 +36,7 @@ budget rephrasing the same mistake.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -68,7 +69,7 @@ from kedge.server.events import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -554,6 +555,56 @@ class _Meter:
         return self.prompt + self.output
 
 
+async def _abandon_if_cancelled[T](work: Awaitable[T], cancel: CancelToken) -> T:
+    """Await ``work``, abandoning it the moment the user asks the turn to stop.
+
+    Checking the token *between* steps is not enough on its own, and the gap is not a corner case.
+    A reasoning model spends the whole of its thinking on one await inside
+    :meth:`OpenAIClient.stream`, emitting reasoning events that :func:`responses_delta` translates
+    to ``None`` and the loop therefore never sees — so a check written inside ``async for delta``
+    does not run once during exactly the stretch a user reaches for Stop. Racing the token against
+    the work makes the stop land while the model is still thinking, which is where it was aimed.
+
+    Cancelling is deliberately confined to the model call. A tool call is left to finish: the
+    kernel has already been handed the program by the time the await is pending, so dropping the
+    HTTP read would not undo the edit, it would only lose the confirmation of it — and a loop that
+    believes a cell was not created when it was is a worse failure than a Stop that waits out one
+    round trip.
+
+    This races rather than replaces. A token that is already set stops the turn here without
+    starting anything, and a caller that goes on to check the token itself after each result is not
+    being redundant: work that finishes *and* a stop that arrives in the same moment must resolve
+    as stopped, and only the caller knows what it was about to do with the result.
+
+    Raises:
+        asyncio.CancelledError: The token was set before ``work`` finished. ``work`` has been
+            cancelled and awaited, so nothing is left running behind it.
+    """
+    cancel.raise_if_cancelled()
+    task = asyncio.ensure_future(work)
+    stop = asyncio.ensure_future(cancel.wait())
+    try:
+        await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    finally:
+        stop.cancel()
+
+    if task.done():
+        return task.result()
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        # The turn is being abandoned; how the work it was waiting on died is no longer material.
+        logger.debug("abandoned work raised while being cancelled", exc_info=True)
+    raise asyncio.CancelledError
+
+
 # ── the loop ─────────────────────────────────────────────────────────────────────────────────
 
 
@@ -736,23 +787,43 @@ class KedgeAgent:
         cancel: CancelToken,
         reply: _Reply,
     ) -> AsyncIterator[AnyEvent]:
-        """Stream one completion, emitting prose as it arrives and collecting tool calls."""
+        """Stream one completion, emitting prose as it arrives and collecting tool calls.
+
+        Pulled one fragment at a time through :func:`_abandon_if_cancelled` rather than with a
+        plain ``async for``, so that Stop lands while the model is still thinking rather than only
+        once it has something to say. See that function for why the difference is not academic.
+        """
         parts: dict[int, dict[str, str]] = {}
-        async for delta in self._client.stream(
+        stream = self._client.stream(
             model=model or self._model, messages=messages, tools=self._tools
-        ):
-            cancel.raise_if_cancelled()
-            if delta.text:
-                reply.content += delta.text
-                yield TokenEvent(text=delta.text)
-            if delta.call_id is None and delta.name is None and not delta.arguments:
-                continue
-            slot = parts.setdefault(delta.index, {"id": "", "name": "", "arguments": ""})
-            if delta.call_id:
-                slot["id"] = delta.call_id
-            if delta.name:
-                slot["name"] = delta.name
-            slot["arguments"] += delta.arguments
+        ).__aiter__()
+        try:
+            while True:
+                try:
+                    delta = await _abandon_if_cancelled(stream.__anext__(), cancel)
+                except StopAsyncIteration:
+                    break
+                cancel.raise_if_cancelled()
+                if delta.text:
+                    reply.content += delta.text
+                    yield TokenEvent(text=delta.text)
+                if delta.call_id is None and delta.name is None and not delta.arguments:
+                    continue
+                slot = parts.setdefault(delta.index, {"id": "", "name": "", "arguments": ""})
+                if delta.call_id:
+                    slot["id"] = delta.call_id
+                if delta.name:
+                    slot["name"] = delta.name
+                slot["arguments"] += delta.arguments
+        finally:
+            # The connection is the endpoint's to hold open until somebody closes it, and an
+            # abandoned turn must not leave one behind. Suppressed rather than checked: closing a
+            # generator that has already unwound is a no-op, and closing one that has not is the
+            # whole point.
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
 
         reply.calls = [
             PendingToolCall(
