@@ -1,4 +1,4 @@
-"""The pure half of the release script.
+"""The pure half of the release script, and the one promise its driver makes about the tree.
 
 Everything in `scripts/release.py` that touches git or spawns `uv` is exercised by actually
 cutting a release; there is no honest way to unit test it and no value in mocking it into a
@@ -6,14 +6,23 @@ tautology. What can be tested is the part that would silently corrupt the releas
 rewrite of the ``__version__`` assignment, the porcelain parsing that decides whether the tree is
 clean enough, and the version pattern that catches a typed tag before anything is written.
 
+The driver is tested too, but only for where it leaves the version file. The steps are stubbed
+and the assertion is bytes on disk rather than which stub was called, so this pins the contract
+-- a run that does not reach the release commit leaves the tree as it found it -- without pinning
+the shape of the code that keeps it.
+
 `tests/conftest.py` puts the repo root on `sys.path`, so `scripts` imports as a namespace package
 the same way `utils` does.
 """
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import pytest
 
+from scripts import release
 from scripts.release import VERSION_PATTERN, ReleaseError, bump, changed_paths
 
 _MODULE = '''"""A module docstring mentioning __version__ to be unhelpful."""
@@ -90,6 +99,86 @@ def test_changed_paths_resolves_renames_and_quoting() -> None:
     porcelain = 'R  scripts/old.py -> scripts/new.py\n M "src/kedge/a b.py"\n'
 
     assert changed_paths(porcelain) == ["scripts/new.py", "src/kedge/a b.py"]
+
+
+# ── what a run leaves on disk ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def version_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A stand-in for `src/kedge/__init__.py`, in a stand-in repo root, past preflight."""
+    path = tmp_path / "src" / "kedge" / "__init__.py"
+    path.parent.mkdir(parents=True)
+    path.write_text(_MODULE, encoding="utf-8")
+    monkeypatch.setattr(release, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(release, "VERSION_FILE", path)
+    monkeypatch.setattr(release, "preflight", lambda version, tag: None)
+    return path
+
+
+def _args(**overrides: bool) -> argparse.Namespace:
+    """The flags of a run that asks nothing of the network and nobody at the keyboard."""
+    settings = {"dry_run": False, "yes": True, "skip_contract": True, "skip_build_check": True}
+    return argparse.Namespace(**{**settings, **overrides})
+
+
+def test_a_failed_gate_puts_the_version_file_back(
+    version_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bug this pins: 0.0.1 -> 0.0.3 left on disk by a release that never happened.
+
+    Nobody reads an uncommitted one-line version bump as debris three days later. They read it as
+    a change somebody meant to make, and commit it.
+    """
+
+    def fail(ordered: object) -> None:
+        raise ReleaseError("pytest failed (exit 1)")
+
+    monkeypatch.setattr(release, "_run_gates", fail)
+
+    with pytest.raises(ReleaseError, match="pytest failed"):
+        release._release("0.2.0", _args())
+
+    assert version_file.read_text(encoding="utf-8") == _MODULE
+
+
+def test_a_dry_run_puts_the_version_file_back(
+    version_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(release, "_run_gates", lambda ordered: None)
+
+    assert release._release("0.2.0", _args(dry_run=True)) == 0
+    assert version_file.read_text(encoding="utf-8") == _MODULE
+
+
+def test_the_bump_stays_once_the_release_commit_holds_it(
+    version_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(release, "_run_gates", lambda ordered: None)
+    monkeypatch.setattr(release, "_commit_and_tag", lambda version, tag: "abc1234")
+    monkeypatch.setattr(release, "_confirm", lambda *a, **kw: None)
+    monkeypatch.setattr(release, "_push", lambda tag: None)
+
+    assert release._release("0.2.0", _args()) == 0
+    assert '__version__ = "0.2.0"' in version_file.read_text(encoding="utf-8")
+
+
+def test_a_declined_push_leaves_the_committed_bump_alone(
+    version_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the commit the bump is git's, not the working tree's; reverting it would desync them."""
+
+    def decline(*args: object, **kwargs: object) -> None:
+        raise ReleaseError("declined")
+
+    monkeypatch.setattr(release, "_run_gates", lambda ordered: None)
+    monkeypatch.setattr(release, "_commit_and_tag", lambda version, tag: "abc1234")
+    monkeypatch.setattr(release, "_confirm", decline)
+
+    with pytest.raises(ReleaseError, match="declined"):
+        release._release("0.2.0", _args())
+
+    assert '__version__ = "0.2.0"' in version_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("version", ["0.2.0", "1.0.0rc1", "0.2.0a1", "1.0.0.dev1", "2.0"])

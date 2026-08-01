@@ -64,12 +64,13 @@ Useful flags:
 It refuses to start on a dirty tree, off `main`, behind `origin/main`, or onto a tag that already
 exists locally or on the remote — the last one because PyPI will not accept a version twice, so a
 tag that is already out there needs a decision rather than a retry. The one dirty file it
-tolerates is `src/kedge/__init__.py` already bumped to the version you asked for, which is what a
-re-run after a failed gate looks like.
+tolerates is `src/kedge/__init__.py` already bumped to the version you asked for and nothing else,
+which is what a hand bump, or a run killed before it could tidy up, leaves behind.
 
-If a gate fails, nothing is committed, tagged or pushed, and the bump is left in place so that
-fixing the cause and re-running carries on from there. `git checkout src/kedge/__init__.py`
-abandons it.
+If a gate fails, nothing is committed, tagged or pushed and `__version__` is put back the way it
+was: a run that does not reach the release commit leaves the tree exactly as it found it. Fix the
+cause and re-run. Past the release commit the bump belongs to a commit rather than to your working
+tree, so a declined or rejected push is recovered with the git commands the error prints.
 
 ### By hand
 

@@ -14,6 +14,11 @@ everything before it is green::
     uv run python scripts/release.py 0.2.0 --yes       # no confirmation prompt (for CI or cron)
     uv run python scripts/release.py 0.2.0 --skip-contract --skip-build-check   # when in a hurry
 
+A run that stops short of the release commit -- a failed gate, a dry run, an interrupt -- puts
+``__version__`` back the way it found it. A half-finished release that leaves a modified file
+behind is a release that gets committed by accident three days later, by someone who reasonably
+assumes a dirty tracked file is a change somebody meant to make.
+
 Nothing here uploads anything, and there is no credential to leak: the push *is* the trigger, and
 `.github/workflows/release.yml` builds the artifacts and hands them to PyPI over OIDC. The last
 thing this script does is print the URL of the run to watch.
@@ -234,9 +239,11 @@ def changed_paths(porcelain: str) -> list[str]:
 def _check_tree_is_clean(target: str) -> None:
     """Refuse to release from a dirty tree, tolerating a bump this script itself would make.
 
-    The one permitted exception makes retrying survivable: a gate fails, you fix the cause, and
-    re-running finds `src/kedge/__init__.py` already carrying the target version. Anything else
-    uncommitted, including an untracked file, stops the release.
+    A failed run now puts the version file back, so the tolerated case is the one nothing can
+    clean up after: a run killed hard enough that its rollback never ran, or a bump someone made
+    by hand before reaching for this script. Both leave `src/kedge/__init__.py` already carrying
+    the target version and nothing else, which is exactly what this run would write anyway.
+    Anything else uncommitted, including an untracked file, stops the release.
 
     Args:
         target: The version being released.
@@ -251,7 +258,7 @@ def _check_tree_is_clean(target: str) -> None:
     paths = changed_paths(porcelain)
     _, current = _find_assignment(_read_source())
     if paths == [_relative(VERSION_FILE)] and current == target:
-        print(f"  tree holds only the {target} bump from an earlier run; carrying on")
+        print(f"  tree holds only the {target} bump and nothing else; carrying on")
         return
 
     listed = "\n".join(f"    {path}" for path in paths)
@@ -394,9 +401,9 @@ def _run_gates(ordered: Sequence[Gate]) -> None:
             print(f"  {gate.name} failed, which is advisory. Carrying on.")
             continue
         raise ReleaseError(
-            f"{gate.name} failed (exit {code}). Nothing has been committed, tagged or pushed.\n"
-            f"  {_relative(VERSION_FILE)} is bumped and uncommitted -- fix the failure and "
-            "re-run, or `git checkout` it to abandon the release."
+            f"{gate.name} failed (exit {code}). Nothing has been committed, tagged or pushed, "
+            f"and {_relative(VERSION_FILE)} has been put back the way it was.\n"
+            "  Fix the failure and re-run."
         )
 
 
@@ -583,6 +590,7 @@ def _release(version: str, args: argparse.Namespace) -> int:
     original = _read_source()
     updated, previous = bump(original, version)
     bumped = updated != original
+    committed = False
     try:
         if bumped:
             print(f"\nbumping __version__: {previous} -> {version}")
@@ -599,13 +607,17 @@ def _release(version: str, args: argparse.Namespace) -> int:
             return 0
 
         sha = _commit_and_tag(version, tag)
+        committed = True
         _confirm(version, tag, sha, assume_yes=args.yes)
         _push(tag)
     finally:
-        # A dry run leaves nothing behind, the bump included. A real run that failed keeps it, so
-        # that fixing the cause and re-running picks up where it stopped -- which is why
-        # _check_tree_is_clean tolerates exactly that one dirty file.
-        if args.dry_run and bumped:
+        # A run that does not reach the release commit leaves the tree exactly as it found it.
+        # Anything else hands the next person a modified `__init__.py` with no commit behind it,
+        # which reads as a change someone made on purpose -- and gets committed as one. Once
+        # `_commit_and_tag` has run the bump belongs to a commit, so there is nothing to undo
+        # here: a decline or a rejected push is recovered with the git commands those errors
+        # print, not by rewriting a tracked file underneath them.
+        if bumped and not committed:
             _write_source(original)
 
     print(
