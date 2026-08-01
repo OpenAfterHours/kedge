@@ -43,6 +43,13 @@ to `~/.kedge/config.toml`; the key goes to the operating system's keyring and ne
 Until a key is stored, workbooks open in demo mode, where a scripted agent answers and nothing is
 sent to a model — so the analysis, the scaffold and the notebook all work with no endpoint at all.
 
+**Reasoning** is set in the same panel, and left unset by default. kedge prefers the responses API
+because it is the only one that carries a reasoning model's thinking across a tool call, and every
+kedge turn is tool calls. Neither that choice nor the reasoning setting can end a turn: an endpoint
+with no `/responses` route is discovered on the first call and spoken to in chat completions from
+then on, and a request refused over reasoning is retried without it. Pin `api` under `[model]` in
+`~/.kedge/config.toml` to skip the probe.
+
 Or, offline and standalone — the analyser is useful on its own:
 
 ```bash

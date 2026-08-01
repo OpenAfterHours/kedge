@@ -7,9 +7,16 @@ fake's, because the fake is what the UI was judged against.
 
 **The model endpoint is behind a seam of its own.** :class:`ModelClient` is a two-field protocol
 that yields :class:`ChatDelta` fragments, and :class:`OpenAIClient` is the only thing in kedge that
-knows what a chat completion looks like. That is not abstraction for its own sake: a loop that can
-only be exercised against a live endpoint does not get exercised, so every test in
+knows what a request on the wire looks like. That is not abstraction for its own sake: a loop that
+can only be exercised against a live endpoint does not get exercised, so every test in
 ``tests/unit/test_agent_loop.py`` drives a scripted client and none of them needs a key.
+
+That seam is also what lets kedge speak two dialects without the loop knowing. Everything above
+:class:`OpenAIClient` — the window, the audit log, the stored transcript — is chat-completions
+shaped, because that is the lingua franca and the shape the conversation is kept in.
+:class:`OpenAIClient` prefers the responses API on the way out, since it is the only one that
+carries a reasoning model's thinking across a tool call, and falls back on its own when the
+endpoint has never heard of it.
 
 **Notebook state is rebuilt from the kernel at the top of every turn** and never taken from
 history. PLAN M4 calls this the single most important context rule, and the reason is mundane: the
@@ -84,6 +91,9 @@ __all__ = [
     "OpenAIClient",
     "PendingToolCall",
     "build_agent_app",
+    "responses_delta",
+    "responses_input",
+    "responses_tools",
     "serve",
 ]
 
@@ -156,12 +166,150 @@ class ModelClient(Protocol):
         ...
 
 
+def responses_input(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Translate chat-completions messages into responses-API input items.
+
+    The loop, the context window and the audit log all speak chat completions, and they should
+    keep speaking it: it is the shape the conversation is *stored* in, and it is the one every
+    other endpoint understands. Only the wire needs the other dialect, so the translation lives
+    here rather than spreading a second message format back through :mod:`kedge.agent.context`.
+
+    Three shapes differ. A tool result stops being a message with a role and becomes a
+    ``function_call_output`` keyed by ``call_id``; an assistant turn that made tool calls becomes
+    its prose followed by one ``function_call`` item per call, because responses models a turn as
+    a list of output items rather than one message with a list hanging off it; everything else is
+    a role and content, unchanged.
+
+    Example:
+        >>> responses_input([{"role": "user", "content": "hello"}])
+        [{'role': 'user', 'content': 'hello'}]
+    """
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            items.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id") or "",
+                    "output": message.get("content") or "",
+                }
+            )
+            continue
+        if role == "assistant":
+            if message.get("content"):
+                items.append({"role": "assistant", "content": message["content"]})
+            for call in message.get("tool_calls") or ():
+                function = call.get("function") or {}
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call.get("id") or "",
+                        "name": function.get("name") or "",
+                        "arguments": function.get("arguments") or "",
+                    }
+                )
+            continue
+        items.append({"role": role, "content": message.get("content") or ""})
+    return items
+
+
+def responses_tools(tools: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Flatten chat-completions tool definitions into the responses-API shape.
+
+    Chat completions nests the schema under ``function``; responses puts it at the top level.
+
+    ``strict`` is sent explicitly false. Left unsaid it can default true, and strict mode demands
+    that every property be required — kedge's tools have genuinely optional arguments, so strict
+    would reject schemas that are correct (:meth:`kedge.agent.tools.ToolSpec.schema`).
+
+    Example:
+        >>> responses_tools([{"type": "function", "function": {"name": "probe"}}])[0]["name"]
+        'probe'
+    """
+    flattened: list[dict[str, Any]] = []
+    for tool in tools:
+        function = tool.get("function") or {}
+        flattened.append(
+            {
+                "type": "function",
+                "name": function.get("name") or "",
+                "description": function.get("description") or "",
+                "parameters": function.get("parameters") or {},
+                "strict": False,
+            }
+        )
+    return flattened
+
+
+def responses_delta(event: Any) -> ChatDelta | None:
+    """Translate one streamed responses event into a :class:`ChatDelta`, or ``None`` to skip it.
+
+    Responses streams typed, semantic events where chat completions streams anonymous deltas, so
+    the fragments arrive already labelled: the call id and name once, on the item that opens, and
+    the arguments as their own event stream afterwards. ``output_index`` is what ties them
+    together, and it is what :class:`ChatDelta.index` carries.
+
+    Read through ``getattr`` rather than by attribute, because the set of event types grows with
+    the SDK and an unrecognised one must be ignored rather than raise.
+    """
+    kind = getattr(event, "type", "")
+    if kind == "response.output_text.delta":
+        return ChatDelta(text=getattr(event, "delta", "") or "")
+    if kind == "response.function_call_arguments.delta":
+        return ChatDelta(
+            index=getattr(event, "output_index", 0) or 0,
+            arguments=getattr(event, "delta", "") or "",
+        )
+    if kind == "response.output_item.added":
+        item = getattr(event, "item", None)
+        if getattr(item, "type", "") == "function_call":
+            return ChatDelta(
+                index=getattr(event, "output_index", 0) or 0,
+                call_id=getattr(item, "call_id", None),
+                name=getattr(item, "name", None),
+            )
+    return None
+
+
+def _mentions_reasoning(exc: Exception) -> bool:
+    """Whether a refusal was about the reasoning parameter rather than the request as a whole."""
+    return "reasoning" in str(exc).lower()
+
+
+def _missing_route(exc: Exception) -> bool:
+    """Whether a refusal means this endpoint has no responses API at all.
+
+    A server that has never heard of ``/responses`` answers 404 or 405 from its router. Some
+    gateways answer 400 and say so in prose instead, so the text is checked as well -- narrowly,
+    because a 400 that merely *mentions* the word is more likely to be about the request.
+    """
+    status = getattr(exc, "status_code", None)
+    if status in (404, 405):
+        return True
+    text = str(exc).lower()
+    return "unknown" in text and "responses" in text
+
+
 class OpenAIClient:
-    """A :class:`ModelClient` over an OpenAI-compatible chat-completions endpoint.
+    """A :class:`ModelClient` over an OpenAI-compatible endpoint, in either dialect.
 
     The only place in kedge that knows the wire format. The SDK is imported inside ``__init__``
     rather than at module scope so that importing :mod:`kedge.agent` — which the CLI does — costs
     nothing until somebody actually wants to talk to a model.
+
+    **Responses first, chat completions when it has to be.** Every kedge turn is tool calls, and
+    chat completions has nowhere to keep a reasoning model's thinking across one: the model
+    reasons, calls a tool, and by the time the result comes back the reasoning that motivated the
+    call is gone. Endpoints increasingly refuse the combination outright rather than quietly
+    degrading. Responses keeps it, so that is what kedge asks for first.
+
+    **Neither the dialect nor the reasoning setting may be fatal.** kedge is pointed at whatever
+    the user has — a hosted API, a gateway, a llama.cpp on the next desk — and most of those
+    implement chat completions only. So both are discovered rather than assumed: a missing
+    ``/responses`` route downgrades the client once and permanently, and a refusal that names
+    reasoning drops the parameter and retries. Each costs one round trip, on the first turn only,
+    and is logged. Pin :attr:`~kedge.config.ModelConfig.api` to skip the probe.
 
     Example:
         >>> OpenAIClient.__name__
@@ -175,12 +323,20 @@ class OpenAIClient:
         api_key: str,
         timeout: float = 120.0,
         max_retries: int = 2,
+        api: str = "auto",
+        reasoning_effort: str | None = None,
+        client: Any | None = None,
     ) -> None:
-        from openai import AsyncOpenAI
+        if client is None:
+            from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(
-            base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
-        )
+            client = AsyncOpenAI(
+                base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
+            )
+        self._client = client
+        self._use_responses = api != "chat_completions"
+        self._pinned = api != "auto"
+        self._reasoning_effort = reasoning_effort
 
     @classmethod
     def from_workspace(cls, workspace: Workspace) -> OpenAIClient:
@@ -198,6 +354,8 @@ class OpenAIClient:
             api_key=get_api_key(workspace.config),
             timeout=model.timeout_seconds,
             max_retries=model.max_retries,
+            api=model.api,
+            reasoning_effort=model.reasoning_effort,
         )
 
     async def stream(
@@ -207,7 +365,73 @@ class OpenAIClient:
         messages: Sequence[Mapping[str, Any]],
         tools: Sequence[Mapping[str, Any]],
     ) -> AsyncIterator[ChatDelta]:
-        """Stream one completion, translating SDK chunks into :class:`ChatDelta`."""
+        """Stream one completion, translating whatever the endpoint speaks into deltas.
+
+        The negotiation happens around opening the stream rather than around consuming it: with
+        ``stream=True`` the SDK has already sent the request and seen the status by the time it
+        hands back an iterator, so a refusal arrives here, before a single fragment has been
+        yielded. That is what makes retrying safe — nothing downstream has seen a partial turn.
+        """
+        from openai import BadRequestError, NotFoundError
+
+        while True:
+            if not self._use_responses:
+                async for delta in self._stream_chat(model, messages, tools):
+                    yield delta
+                return
+            try:
+                stream = await self._open_responses(model, messages, tools)
+            except (BadRequestError, NotFoundError) as exc:
+                if not self._pinned and _missing_route(exc):
+                    logger.info(
+                        "the endpoint has no responses API (%s); using chat completions from "
+                        "here on",
+                        exc,
+                    )
+                    self._use_responses = False
+                    continue
+                if self._reasoning_effort is not None and _mentions_reasoning(exc):
+                    logger.warning(
+                        "the endpoint refused reasoning_effort=%r (%s); retrying without it and "
+                        "not asking again this session",
+                        self._reasoning_effort,
+                        exc,
+                    )
+                    self._reasoning_effort = None
+                    continue
+                raise
+            async for event in stream:
+                delta = responses_delta(event)
+                if delta is not None:
+                    yield delta
+            return
+
+    async def _open_responses(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> Any:
+        """Send the request in the responses dialect and return the event stream."""
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": responses_input(messages),
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = responses_tools(tools)
+            payload["tool_choice"] = "auto"
+        if self._reasoning_effort is not None:
+            payload["reasoning"] = {"effort": self._reasoning_effort}
+        return await self._client.responses.create(**payload)
+
+    async def _stream_chat(
+        self,
+        model: str,
+        messages: Sequence[Mapping[str, Any]],
+        tools: Sequence[Mapping[str, Any]],
+    ) -> AsyncIterator[ChatDelta]:
+        """Stream in the chat-completions dialect, which is what most endpoints implement."""
         payload: dict[str, Any] = {
             "model": model,
             "messages": [dict(message) for message in messages],
@@ -216,7 +440,9 @@ class OpenAIClient:
         if tools:
             payload["tools"] = [dict(tool) for tool in tools]
             payload["tool_choice"] = "auto"
-
+        # Deliberately not sent here. Chat completions is the fallback dialect precisely because
+        # the endpoint would not take reasoning alongside tools, and sending it again on the way
+        # down would reproduce the refusal kedge just worked around.
         stream = await self._client.chat.completions.create(**payload)
         async for chunk in stream:
             for choice in chunk.choices or ():

@@ -168,6 +168,18 @@
       <p class="field-note" id="settings-model-note"></p>
     </div>
 
+    <div class="field">
+      <label class="field-label" for="settings-reasoning">Reasoning</label>
+      <select class="field-select" id="settings-reasoning">
+        <option value="">Do not mention it</option>
+      </select>
+      <p class="field-note">
+        How hard a reasoning model should think before answering. Leave it unmentioned for a model
+        that does not reason, or for an endpoint that has never heard of the setting. Nothing here
+        can break a turn: kedge asks, and an endpoint that refuses is not asked again.
+      </p>
+    </div>
+
     <details class="settings-advanced">
       <summary>Advanced</summary>
       <div class="field">

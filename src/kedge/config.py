@@ -124,6 +124,26 @@ class ModelConfig(_Section):
     timeout_seconds: float = Field(default=120.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
 
+    api: Literal["auto", "responses", "chat_completions"] = "auto"
+    """Which wire format to speak. ``auto`` tries responses and falls back on its own.
+
+    The responses API is the only one that carries reasoning across a tool call, which is what
+    kedge's turns are made of. It is also implemented by far fewer of the OpenAI-compatible
+    servers people actually point kedge at, so ``auto`` is the default and the fallback is
+    automatic: an endpoint with no ``/responses`` route is discovered on the first call and the
+    client speaks chat completions from then on. Pin it only to stop the probing.
+    """
+
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high"] | None = None
+    """How hard a reasoning model should think, or ``None`` to say nothing about it.
+
+    ``None`` rather than a value by default, because the parameter is meaningless to a
+    non-reasoning model and rejected outright by some endpoints. kedge never lets it be fatal:
+    a request refused over reasoning is retried without it and the endpoint is not asked again
+    (:class:`kedge.agent.loop.OpenAIClient`), so raising this on a model that cannot honour it
+    costs one extra round trip on the first turn and nothing after.
+    """
+
     @field_validator("base_url")
     @classmethod
     def _check_base_url(cls, value: str) -> str:

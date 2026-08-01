@@ -178,6 +178,40 @@ def test_saving_one_field_leaves_the_others_alone(client: TestClient) -> None:
     assert body["base_url"] == "https://x.test/v1"
 
 
+def test_the_reasoning_effort_round_trips(client: TestClient) -> None:
+    """A property of the model rather than of kedge, so it changes whenever the model does."""
+    assert client.get("/api/settings/model").json()["reasoning_effort"] is None
+
+    body = client.put("/api/settings/model", json={"reasoning_effort": "high"}).json()
+
+    assert body["reasoning_effort"] == "high"
+    assert "high" in body["reasoning_efforts"]
+    assert client.get("/api/settings/model").json()["reasoning_effort"] == "high"
+
+
+def test_clearing_the_reasoning_effort_is_not_the_same_as_setting_it_to_none(
+    client: TestClient,
+) -> None:
+    """Absent means kedge never mentions reasoning; "none" means it asks for none of it.
+
+    The distinction is the whole of the fallback: an endpoint that has never heard of the
+    parameter needs it left out, not set to a value.
+    """
+    client.put("/api/settings/model", json={"reasoning_effort": "none"})
+    assert client.get("/api/settings/model").json()["reasoning_effort"] == "none"
+
+    body = client.put("/api/settings/model", json={"reasoning_effort": ""}).json()
+
+    assert body["reasoning_effort"] is None
+
+
+def test_an_unknown_reasoning_effort_is_refused_by_name(client: TestClient) -> None:
+    response = client.put("/api/settings/model", json={"reasoning_effort": "extreme"})
+
+    assert response.status_code == 400
+    assert "reasoning_effort" in response.json()["detail"]
+
+
 def test_an_empty_key_leaves_the_stored_one_alone(client: TestClient, kr: _FakeKeyring) -> None:
     """An empty password box is what a browser sends when nobody touched it."""
     kr.entries[(KEYRING_SERVICE, "default")] = SECRET

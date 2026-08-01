@@ -634,11 +634,24 @@
             workbooks in demo mode: the scripted agent answers and nothing is sent to a model.`;
   }
 
+  /* The efforts come from the server rather than being written out here, so the panel cannot
+     offer a value kedge.config would reject. The empty option is not one of them: it is the
+     absence of the setting, which is a different thing from "none" and the right default for a
+     model that does not reason at all. */
+  function fillReasoning(data) {
+    const select = $("settings-reasoning");
+    const efforts = data.reasoning_efforts || [];
+    select.replaceChildren(el("option", { value: "" }, "Do not mention it"));
+    for (const effort of efforts) select.append(el("option", { value: effort }, effort));
+    select.value = data.reasoning_effort || "";
+  }
+
   function fillSettings(data) {
     state.settings = data;
     $("settings-url").value = data.base_url;
     $("settings-model").value = data.model;
     $("settings-ref").value = data.api_key_ref;
+    fillReasoning(data);
     $("settings-key").value = "";
     $("settings-key").placeholder = data.api_key.status === "present" ? "•".repeat(16) : "";
     $("settings-key-note").textContent = keyNote(data);
@@ -727,7 +740,13 @@
     try {
       const data = await api("/api/settings/model", {
         method: "PUT",
-        body: JSON.stringify({ ...settingsPayload(), model: $("settings-model").value.trim() }),
+        body: JSON.stringify({
+          ...settingsPayload(),
+          model: $("settings-model").value.trim(),
+          // Always sent, including empty: empty is how the panel clears the setting, and a field
+          // omitted from this body means "leave it alone".
+          reasoning_effort: $("settings-reasoning").value,
+        }),
       });
       fillSettings(data);
       settingsSay(APPLIED[data.applied] || "Saved.", data.applied === "unusable" ? null : "ok");

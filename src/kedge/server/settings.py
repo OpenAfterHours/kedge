@@ -63,9 +63,17 @@ router = APIRouter()
 
 _PROBE_TIMEOUT = 10.0
 
-_MANAGED_KEYS = ("base_url", "model", "api_key_ref")
+_MANAGED_KEYS = ("base_url", "model", "api_key_ref", "reasoning_effort")
 """The ``[model]`` keys the settings panel writes. Timeouts and retries stay hand-edited: they
-are tuning, not setup, and every control on the panel is one more thing to read past."""
+are tuning, not setup, and every control on the panel is one more thing to read past.
+
+``reasoning_effort`` earns its place because it is the one of them that is a property of the
+*model* rather than of kedge, so it changes whenever the model does -- and because getting it
+wrong used to end a turn with a raw 400 from the endpoint."""
+
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high")
+"""What the panel offers. ``None`` -- the absence of a value -- is a separate thing from "none":
+it means kedge says nothing about reasoning at all, which is what a non-reasoning model wants."""
 
 
 def _state(request: Request) -> ServerState:
@@ -106,6 +114,8 @@ class ModelSettingsBody(BaseModel):
     base_url: str | None = None
     model: str | None = None
     api_key_ref: str | None = None
+    reasoning_effort: str | None = None
+    """One of :data:`REASONING_EFFORTS`, or ``""`` to clear it back to "say nothing"."""
     api_key: str | None = Field(default=None, repr=False)
     """Stored in the OS keyring, never in config. Excluded from ``repr`` so it cannot reach a log
     line through an exception rendering the model."""
@@ -167,6 +177,9 @@ def _describe(state: ServerState, loaded: LoadedConfig) -> dict[str, Any]:
         "base_url": model.base_url,
         "model": model.model,
         "api_key_ref": entry,
+        "reasoning_effort": model.reasoning_effort,
+        "reasoning_efforts": list(REASONING_EFFORTS),
+        "api": model.api,
         "timeout_seconds": model.timeout_seconds,
         "max_retries": model.max_retries,
         "api_key": {
@@ -203,14 +216,19 @@ async def model_settings(request: Request) -> dict[str, Any]:
 # ── writing ──────────────────────────────────────────────────────────────────────────────────
 
 
-def _validated(current: Config, body: ModelSettingsBody) -> dict[str, str]:
+def _validated(current: Config, body: ModelSettingsBody) -> dict[str, str | None]:
     """Return the managed keys ``body`` changes, normalised, or raise 400 naming the field.
 
     Validation goes through :class:`~kedge.config.ModelConfig` rather than being restated here, so
     the panel and a hand-edited file accept exactly the same values — and the stored ``base_url``
     is the normalised one, without its trailing slash.
+
+    ``reasoning_effort`` is the one key that can be *removed*: an empty string clears it, which
+    :func:`~kedge.config.update_user_config` writes as the key's absence. That is a real state and
+    not the same as ``"none"`` -- absent means kedge never mentions reasoning, which is what an
+    endpoint that has never heard of it needs to hear.
     """
-    supplied = {
+    supplied: dict[str, str | None] = {
         key: value.strip()
         for key, value in (
             ("base_url", body.base_url),
@@ -219,6 +237,8 @@ def _validated(current: Config, body: ModelSettingsBody) -> dict[str, str]:
         )
         if value is not None
     }
+    if body.reasoning_effort is not None:
+        supplied["reasoning_effort"] = body.reasoning_effort.strip() or None
     if not supplied:
         return {}
     try:
@@ -246,7 +266,9 @@ async def save_model_settings(body: ModelSettingsBody, request: Request) -> dict
     loaded = _loaded(state)
     changes = _validated(loaded.config, body)
 
-    entry = changes.get("api_key_ref", loaded.config.model.api_key_ref)
+    # `or` rather than a default, because the managed keys are no longer all strings: clearing
+    # reasoning_effort writes None, and a None slipping through here would name the keyring entry.
+    entry = changes.get("api_key_ref") or loaded.config.model.api_key_ref
     if body.api_key is not None and body.api_key.strip():
         try:
             await run_in_threadpool(set_api_key, entry, body.api_key.strip())
