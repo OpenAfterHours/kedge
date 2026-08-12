@@ -753,9 +753,12 @@ def generate_probe(code: str) -> str:
     stream's ``stderr`` instead.
 
     If the last statement is an expression it is bound to a temporary so its value can be
-    reported, which is what makes ``probe("df.height")`` behave the way a REPL would. The source
-    is normalised through :func:`ast.unparse`, so it is re-emitted from a parsed tree rather than
-    spliced as text.
+    reported, which is what makes ``probe("df.height")`` behave the way a REPL would. A last
+    statement that *assigns to a single name* reports that name instead: a probe ending
+    ``total = frame.height`` is asking for ``total``, and answering it here saves the round trip
+    that would otherwise go on adding a final line naming the binding. The source is normalised
+    through :func:`ast.unparse`, so it is re-emitted from a parsed tree rather than spliced as
+    text.
 
     Args:
         code: Python source to evaluate against the notebook's globals.
@@ -782,13 +785,22 @@ def generate_probe(code: str) -> str:
         raise CellSyntaxError(msg)
 
     last = tree.body[-1] if tree.body else None
-    has_value = isinstance(last, ast.Expr)
+    has_value = True
     if isinstance(last, ast.Expr):
         tree.body[-1] = ast.Assign(
             targets=[ast.Name(id="_kedge_value", ctx=ast.Store())],
             value=last.value,
         )
-        ast.fix_missing_locations(tree)
+    elif (bound := _trailing_binding(last)) is not None:
+        tree.body.append(
+            ast.Assign(
+                targets=[ast.Name(id="_kedge_value", ctx=ast.Store())],
+                value=ast.Name(id=bound, ctx=ast.Load()),
+            )
+        )
+    else:
+        has_value = False
+    ast.fix_missing_locations(tree)
 
     lines = [
         "import json as _kedge_json",
@@ -810,6 +822,28 @@ def generate_probe(code: str) -> str:
         *_emit_payload(),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _trailing_binding(node: ast.stmt | None) -> str | None:
+    """The single name a trailing assignment binds, or ``None`` if it binds no one name.
+
+    Only an unambiguous target qualifies. A tuple unpack, an attribute or a subscript has no one
+    obvious value to report, and guessing at one would answer a question the probe did not ask.
+
+    Args:
+        node: The probe's last top-level statement.
+
+    Returns:
+        The bound name, or ``None``.
+    """
+    if isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target = node.targets[0]
+        return target.id if isinstance(target, ast.Name) else None
+    if isinstance(node, ast.AugAssign):
+        return node.target.id if isinstance(node.target, ast.Name) else None
+    if isinstance(node, ast.AnnAssign) and node.value is not None:
+        return node.target.id if isinstance(node.target, ast.Name) else None
+    return None
 
 
 # ── reading the reply ────────────────────────────────────────────────────────────────────────
@@ -1568,7 +1602,8 @@ class NotebookDriver:
         cell the user then has to read past.
 
         Args:
-            code: Python source. If it ends in an expression, that value is reported.
+            code: Python source. If it ends in an expression, that value is reported; if it ends
+                in an assignment to a single name, that name's value is reported instead.
 
         Returns:
             The probe's outcome. A probe that raises comes back with ``ok=False`` and the

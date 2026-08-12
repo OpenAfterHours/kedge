@@ -479,9 +479,12 @@ async def test_probe_returns_real_values_and_leaves_no_trace_in_the_notebook(
     assert typed.value_repr == "[3, 'kedge']"
     assert typed.value_type == "list"
 
-    # A probe that binds a name must not leave it behind for the next one.
-    assert (await driver.probe("scratch_only = 99")).value_repr is None
+    # A trailing assignment reports what it bound -- and must not leave it behind for the next one.
+    assert (await driver.probe("scratch_only = 99")).value_repr == "99"
     assert (await driver.probe("'scratch_only' in dir()")).value_repr == "False"
+
+    # A block binds nothing there is one obvious value for, so it reports none.
+    assert (await driver.probe("for _kedge_i in range(2):\n    _kedge_i")).value_repr is None
 
     after = await driver.list_cells(with_code=False)
     assert names_of(after) == names_of(before)

@@ -346,11 +346,25 @@ def test_probe_binds_a_trailing_expression_so_its_value_comes_back() -> None:
     assert "_kedge_value = frame.height" in program
 
 
-def test_probe_leaves_statement_only_code_without_a_value() -> None:
-    # An assignment is genuinely statement-only. Note `print('hello')` would NOT be: it is an
-    # expression statement, so its value (None) is correctly bound and reported.
-    program = driver.generate_probe("x = 1")
-    assert "_kedge_text = repr(_kedge_value) if False else None" in program
+def test_probe_reports_the_name_a_trailing_assignment_binds() -> None:
+    # `total = frame.height` is asking for `total`; answering here saves a whole round trip.
+    program = driver.generate_probe("total = frame.height")
+    assert "_kedge_value = total" in program
+    assert "_kedge_text = repr(_kedge_value) if True else None" in program
+
+
+@pytest.mark.parametrize("code", ["items[0] = 1", "a, b = 1, 2", "frame.height = 1"])
+def test_probe_does_not_guess_at_an_ambiguous_assignment_target(code: str) -> None:
+    # A tuple unpack or an attribute target has no one obvious value, and picking one would answer
+    # a question the probe did not ask.
+    assert "_kedge_text = repr(_kedge_value) if False else None" in driver.generate_probe(code)
+
+
+@pytest.mark.parametrize("code", ["import json", "for i in range(2):\n    i", "if x:\n    x + 1"])
+def test_probe_leaves_statement_only_code_without_a_value(code: str) -> None:
+    # A block or an import binds nothing to report. Note `print('hello')` is NOT statement-only:
+    # it is an expression statement, so its value (None) is correctly bound and reported.
+    assert "_kedge_text = repr(_kedge_value) if False else None" in driver.generate_probe(code)
 
 
 def test_probe_never_indents_the_submitted_source() -> None:
