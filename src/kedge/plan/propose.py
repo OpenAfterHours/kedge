@@ -176,11 +176,20 @@ class OpenAICompleter:
         model: str,
         timeout: float = 120.0,
         max_retries: int = 2,
+        ca_bundle: Path | None = None,
     ) -> None:
         from openai import OpenAI
 
+        from kedge import tls
+
+        # Verified against the OS trust store rather than certifi, so a TLS-inspecting proxy
+        # does not turn the first plan into an unreadable SSL error (kedge.tls).
         self._client = OpenAI(
-            base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            max_retries=max_retries,
+            http_client=tls.client(ca_bundle=ca_bundle, timeout=timeout),
         )
         self._model = model
         self.mode = "json_schema"
@@ -305,6 +314,7 @@ def completer_from_config(config: Config) -> OpenAICompleter:
         model=config.model.model,
         timeout=config.model.timeout_seconds,
         max_retries=config.model.max_retries,
+        ca_bundle=config.model.ca_bundle,
     )
 
 

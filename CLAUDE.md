@@ -43,6 +43,12 @@ Read this first, then the document you actually need:
    different shape — and even it imports the path and headers from `marimo_http`. Also enforced
    by `scripts/guardrails.py`. (CONVENTIONS.md numbers this one 6; it has no reconciliation
    entry.)
+8. **Certificate trust for the model endpoint is decided in `src/kedge/tls.py` alone.** It is the
+   only thing kedge speaks TLS to. Build clients with `tls.client()` / `tls.async_client()` and
+   always hand the `openai` SDK an explicit `http_client=` -- left alone it verifies against
+   `certifi`, which never holds the root a corporate TLS-inspecting proxy re-signs with. There is
+   no setting that turns verification off; `[model] ca_bundle` names a PEM instead. Also enforced
+   by `scripts/guardrails.py`. (CONVENTIONS.md numbers this one 7.)
 
 ## Architecture in one paragraph
 
@@ -65,7 +71,7 @@ uv run pytest -m contract          # live-kernel tests; spawns a real marimo
 uv run pytest -m llm               # needs a configured model endpoint; skipped by default
 uv run ruff check --fix . && uv run ruff format .
 uv run ty check src/
-uv run python scripts/guardrails.py        # non-negotiables 1, 2 and 7, by AST not by grep
+uv run python scripts/guardrails.py        # non-negotiables 1, 2, 7 and 8, by AST not by grep
 uv run python scripts/version.py v0.2.0    # does that tag match __version__?
 uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole release
 

@@ -23,6 +23,14 @@ Read `PLAN.md` for *what* to build. This file is *how*. It is binding: reviewers
    `POST /api/kernel/execute` asynchronously is a different shape from the rest — and even it
    imports the path and the auth headers from `marimo_http`. One marimo release moving an
    endpoint should cost one file, not a hunt. Enforced by `scripts/guardrails.py`.
+7. **Certificate trust is decided in `src/kedge/tls.py` alone.** The model endpoint is the only
+   thing kedge speaks TLS to, and the machines this runs on sit behind TLS-inspecting proxies
+   whose root is in the OS trust store and never in `certifi`. Build outbound clients with
+   `tls.client()` / `tls.async_client()`, and give the `openai` SDK an explicit `http_client=` —
+   left to itself it makes one against `certifi` and the first model call dies with an error
+   that mentions no proxy. **There is no setting that turns verification off**, and adding one
+   would be a regression, not a feature: `[model] ca_bundle` names a PEM instead, which is
+   visible to whoever reads that config next. Enforced by `scripts/guardrails.py`.
 
 ## Python style
 

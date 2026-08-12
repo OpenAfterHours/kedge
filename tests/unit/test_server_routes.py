@@ -283,7 +283,8 @@ def test_models_degrades_to_the_configured_model_when_the_endpoint_will_not_list
         config_module.keyring, "get_password", lambda service, username: "sk-stored"
     )
 
-    async def refuse(base_url: str, api_key: str) -> list[str]:
+    async def refuse(base_url: str, api_key: str, *, ca_bundle: Path | None = None) -> list[str]:
+        del ca_bundle  # accepted so the route cannot silently stop passing it (kedge.tls)
         raise httpx.ConnectError("refused")
 
     monkeypatch.setattr(routes_module, "fetch_model_names", refuse)

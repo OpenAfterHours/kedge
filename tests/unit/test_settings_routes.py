@@ -344,10 +344,16 @@ def test_saving_makes_the_attached_workspace_re_read_its_config(
 
 
 def _fake_models(monkeypatch: pytest.MonkeyPatch, result: object) -> list[tuple[str, str]]:
-    """Replace the outbound call, recording what it was asked for."""
+    """Replace the outbound call, recording what it was asked for.
+
+    ``ca_bundle`` is accepted rather than ignored because the probe is one of the four places
+    that must verify against the configured trust (:mod:`kedge.tls`); a fake that swallowed
+    ``**kwargs`` would let the route quietly stop passing it.
+    """
     calls: list[tuple[str, str]] = []
 
-    async def fake(base_url: str, api_key: str) -> list[str]:
+    async def fake(base_url: str, api_key: str, *, ca_bundle: Path | None = None) -> list[str]:
+        assert ca_bundle is None or isinstance(ca_bundle, Path)
         calls.append((base_url, api_key))
         if isinstance(result, Exception):
             raise result

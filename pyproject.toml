@@ -53,6 +53,13 @@ dependencies = [
     # ── agent loop (M4) ──────────────────────────────────────────────
     "openai>=1.60",
     "tiktoken>=0.8",
+    # The model endpoint is the only thing kedge speaks TLS to, and the machines this runs on
+    # sit behind TLS-inspecting proxies whose root lives in the OS trust store rather than in
+    # certifi. truststore reads the OS store; certifi is imported directly by kedge.tls to
+    # supplement it, so it is declared rather than left transitive through httpx. See
+    # src/kedge/tls.py and SECURITY.md.
+    "truststore>=0.10",
+    "certifi>=2024.7.4",
     # ── ingest (M5) ──────────────────────────────────────────────────
     "watchdog>=5.0",
     # ── cli ──────────────────────────────────────────────────────────
@@ -74,6 +81,10 @@ dev = [
     "pytest-cov>=6.0",
     "ruff>=0.8",
     "ty>=0.0.1a1",
+    # Mints a throwaway CA and server certificate in a tmpdir, so the certificate tests prove
+    # the real thing -- a context that rejects an untrusted chain and accepts it once the CA is
+    # supplied -- rather than asserting against a mock of ssl.
+    "trustme>=1.1",
 ]
 
 [project.scripts]

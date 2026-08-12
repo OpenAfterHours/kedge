@@ -124,6 +124,21 @@ class ModelConfig(_Section):
     timeout_seconds: float = Field(default=120.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
 
+    ca_bundle: Path | None = None
+    """A PEM to verify the endpoint against, instead of the operating system's trust store.
+
+    Only needed where a TLS-inspecting proxy re-signs the connection and its root has not been
+    pushed to the OS store. Unset by default, because :mod:`kedge.tls` already reads that store
+    and the corporate root is normally in it. There is deliberately no setting that turns
+    verification off; supplying the proxy's PEM here is the supported answer, and unlike
+    ``verify=False`` it stays visible to whoever reads this file next (``SECURITY.md``).
+    """
+
+    @field_validator("ca_bundle")
+    @classmethod
+    def _expand_ca_bundle(cls, value: Path | None) -> Path | None:
+        return None if value is None else Path(value).expanduser()
+
     api: Literal["auto", "responses", "chat_completions"] = "auto"
     """Which wire format to speak. ``auto`` tries responses and falls back on its own.
 

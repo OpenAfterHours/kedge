@@ -56,6 +56,23 @@ KERNEL_API_PREFIX = "/api/kernel/"
 KERNEL_API_ROOTS = ("src",)
 KERNEL_API_HOMES = ("src/kedge/marimo_http.py", "src/kedge/notebook/kernel.py")
 
+# CONVENTIONS.md 7: certificate trust for the model endpoint is decided in kedge/tls.py alone.
+# Two shapes, because there are two ways to end up on certifi by accident. Building a raw httpx
+# client is the first: httpx defaults to certifi, which never contains the root a TLS-inspecting
+# proxy re-signs with, so a new module doing its own outbound call would reintroduce the failure
+# tls.py exists to fix. The loopback homes are exempt -- they speak plain HTTP to 127.0.0.1 and
+# no certificate is involved. The second is constructing an openai client without handing it a
+# client we built: the SDK makes its own otherwise, and it too defaults to certifi.
+HTTPX_CLIENT_NAMES = ("Client", "AsyncClient")
+HTTPX_ROOTS = ("src",)
+HTTPX_HOMES = (
+    "src/kedge/tls.py",
+    "src/kedge/marimo_http.py",
+    "src/kedge/notebook/kernel.py",
+)
+OPENAI_CLIENT_NAMES = ("OpenAI", "AsyncOpenAI")
+OPENAI_ROOTS = ("src",)
+
 
 @dataclass(frozen=True, slots=True)
 class Breach:
@@ -197,6 +214,68 @@ def _check_kernel_api() -> list[Breach]:
     return breaches
 
 
+def _outbound_trust() -> list[Breach]:
+    """Collect every outbound client built somewhere that cannot have decided what it trusts.
+
+    Both halves are about the same accident: a default-constructed client verifies against
+    ``certifi``, which is a fixed list of public roots, so on a machine behind a TLS-inspecting
+    proxy it fails with an error that says nothing about proxies. ``kedge.tls`` reads the
+    operating system's store instead, and this keeps everything pointed through it.
+    """
+    httpx_rule = (
+        f"outbound HTTP clients are built in {HTTPX_HOMES[0]}, so they verify against the "
+        "operating system trust store rather than certifi (CONVENTIONS.md non-negotiable 7)"
+    )
+    openai_rule = (
+        "an openai client must be given http_client=kedge.tls.client(...) or "
+        "kedge.tls.async_client(...); without it the SDK builds its own against certifi "
+        "(CONVENTIONS.md non-negotiable 7)"
+    )
+    breaches: list[Breach] = []
+    for path in _python_files(HTTPX_ROOTS):
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue  # already reported by the import checks, which parse the same files
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            name = called.attr if isinstance(called, ast.Attribute) else None
+            if isinstance(called, ast.Name):
+                name = called.id
+            if name is None:
+                continue
+            if (
+                name in HTTPX_CLIENT_NAMES
+                and isinstance(called, ast.Attribute)
+                and isinstance(called.value, ast.Name)
+                and called.value.id == "httpx"
+                and relative not in HTTPX_HOMES
+            ):
+                breaches.append(
+                    Breach(
+                        path=path,
+                        line=node.lineno,
+                        statement=f"httpx.{name}(...) built outside {HTTPX_HOMES[0]}",
+                        rule=httpx_rule,
+                    )
+                )
+            if name in OPENAI_CLIENT_NAMES and not any(
+                keyword.arg == "http_client" for keyword in node.keywords
+            ):
+                breaches.append(
+                    Breach(
+                        path=path,
+                        line=node.lineno,
+                        statement=f"{name}(...) constructed with no http_client",
+                        rule=openai_rule,
+                    )
+                )
+    return sorted(breaches, key=lambda breach: (breach.path, breach.line))
+
+
 def main() -> int:
     """Report every breach and return a process exit code."""
     breaches = [
@@ -213,6 +292,7 @@ def main() -> int:
             home=CODE_MODE_HOME,
         ),
         *_check_kernel_api(),
+        *_outbound_trust(),
     ]
 
     if breaches:
@@ -224,7 +304,8 @@ def main() -> int:
 
     print(
         f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}; "
-        f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}."
+        f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}; "
+        f"outbound TLS trust decided in {HTTPX_HOMES[0]}."
     )
     return 0
 

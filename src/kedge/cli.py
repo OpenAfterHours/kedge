@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import ssl
 import sys
 import webbrowser
 from collections.abc import Callable
@@ -33,7 +34,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from kedge import __version__
+from kedge import __version__, tls
 from kedge.config import (
     KEYRING_SERVICE,
     Config,
@@ -798,6 +799,7 @@ def doctor(
 
     if loaded is not None:
         _check_keyring(results, loaded.config)
+        _check_trust(results, loaded.config)
         if network:
             _check_endpoint(results, loaded.config)
         else:
@@ -883,15 +885,62 @@ def _check_keyring(results: list[dict[str, str]], config: Config) -> None:
         _check(results, "keyring", "fail", "no working keyring backend; the API key cannot be read")
 
 
+def _check_trust(results: list[dict[str, str]], config: Config) -> None:
+    """Report which certificates kedge would verify the model endpoint against.
+
+    Printed whether or not the endpoint is reachable, because it is half of the answer when it
+    is not: "0 roots" and "certifi only" are different diagnoses with different fixes.
+    """
+    try:
+        trust = tls.describe(config.model.ca_bundle)
+    except ConfigError as exc:
+        _check(results, "certificate trust", "fail", str(exc))
+        return
+    counted = "" if trust.ca_count is None else f", {trust.ca_count} root(s)"
+    _check(results, "certificate trust", "ok", f"{trust.detail}{counted}")
+
+
 def _check_endpoint(results: list[dict[str, str]], config: Config) -> None:
     base_url = config.model.base_url
     try:
-        response = httpx.get(f"{base_url}/models", timeout=5.0)
+        with tls.client(ca_bundle=config.model.ca_bundle, timeout=5.0) as http:
+            response = http.get(f"{base_url}/models")
+    except ConfigError as exc:
+        _check(results, "model endpoint", "fail", str(exc))
+        return
     except httpx.HTTPError as exc:
-        _check(results, "model endpoint", "fail", f"{base_url} is not reachable: {exc}")
+        certificate = tls.certificate_error(exc)
+        if certificate is None:
+            _check(results, "model endpoint", "fail", f"{base_url} is not reachable: {exc}")
+        else:
+            _check(results, "model endpoint", "fail", _explain_certificate(base_url, certificate))
         return
     # Any HTTP answer proves reachability; 401 just means we did not send the key.
     _check(results, "model endpoint", "ok", f"{base_url} answered HTTP {response.status_code}")
+
+
+def _explain_certificate(base_url: str, error: ssl.SSLCertVerificationError) -> str:
+    """Turn a certificate failure into the sentence the user actually needs.
+
+    ``unable to get local issuer certificate`` is true and useless. On a corporate machine it
+    almost always means a TLS-inspecting proxy re-signed the connection with a root that Python
+    has not been told about, and the fastest way to make that obvious is to name the issuer --
+    which is usually the proxy vendor, at which point nobody has to guess. Same reasoning as the
+    reconciliation triage in PLAN 4.5: say what it looks like rather than making the user work
+    it out from the raw error.
+    """
+    # SChannel's wording ends in a full stop and OpenSSL's does not, so trim rather than end up
+    # with "..the trust provider.." on Windows only.
+    reason = str(error.verify_message or error).strip().rstrip(".")
+    return (
+        f"{base_url} presented a certificate kedge could not verify: "
+        f"{reason}. This is what a TLS-inspecting proxy looks like. "
+        f"kedge already checks the operating system's trust store, so either the proxy's root "
+        f"is not installed there, or it was installed for the browser only. To see who signed "
+        f"it: {tls.inspect_command(base_url)}. Then ask for that authority as a PEM and set "
+        f"`ca_bundle` under `[model]` in your kedge config. Turning verification off is not an "
+        f"option kedge offers -- see SECURITY.md."
+    )
 
 
 def _check_markers(results: list[dict[str, str]]) -> None:

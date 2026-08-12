@@ -370,13 +370,22 @@ class OpenAIClient:
         max_retries: int = 2,
         api: str = "auto",
         reasoning_effort: str | None = None,
+        ca_bundle: Path | None = None,
         client: Any | None = None,
     ) -> None:
         if client is None:
             from openai import AsyncOpenAI
 
+            from kedge import tls
+
+            # The SDK would otherwise build its own httpx client against certifi, which does not
+            # carry the root a TLS-inspecting proxy re-signs with (kedge.tls).
             client = AsyncOpenAI(
-                base_url=base_url, api_key=api_key, timeout=timeout, max_retries=max_retries
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                http_client=tls.async_client(ca_bundle=ca_bundle, timeout=timeout),
             )
         self._client = client
         self._use_responses = api != "chat_completions"
@@ -410,6 +419,7 @@ class OpenAIClient:
             max_retries=model.max_retries,
             api=model.api,
             reasoning_effort=model.reasoning_effort,
+            ca_bundle=model.ca_bundle,
         )
 
     async def stream(

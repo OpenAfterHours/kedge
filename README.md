@@ -43,6 +43,12 @@ to `~/.kedge/config.toml`; the key goes to the operating system's keyring and ne
 Until a key is stored, workbooks open in demo mode, where a scripted agent answers and nothing is
 sent to a model — so the analysis, the scaffold and the notebook all work with no endpoint at all.
 
+**Behind a corporate proxy**, kedge verifies the endpoint against your operating system's trust
+store rather than against Python's bundled `certifi`, so a TLS-inspecting proxy whose root your
+IT department has already installed just works. Where it does not, `kedge doctor` says which
+certificates are in play and what to do; the fix is `ca_bundle` under `[model]`, pointing at the
+proxy's root as a PEM. There is no option to disable verification (`SECURITY.md` says why).
+
 **Reasoning** is set in the same panel, and left unset by default. kedge prefers the responses API
 because it is the only one that carries a reasoning model's thinking across a tool call, and every
 kedge turn is tool calls. Neither that choice nor the reasoning setting can end a turn: an endpoint

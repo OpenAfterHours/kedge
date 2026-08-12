@@ -35,6 +35,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, ValidationError
 
+from kedge import tls
 from kedge.config import (
     KEYRING_SERVICE,
     PROJECT_CONFIG_FILENAME,
@@ -132,14 +133,19 @@ class ProbeBody(BaseModel):
 # ── the model list ───────────────────────────────────────────────────────────────────────────
 
 
-async def fetch_model_names(base_url: str, api_key: str) -> list[str]:
+async def fetch_model_names(
+    base_url: str, api_key: str, *, ca_bundle: Path | None = None
+) -> list[str]:
     """Return the model ids ``base_url`` offers, sorted.
 
     Raises:
-        httpx.HTTPError: The endpoint could not be reached or answered an error status.
+        httpx.HTTPError: The endpoint could not be reached or answered an error status. A
+            TLS-inspecting proxy shows up here as a ``ConnectError`` wrapping a certificate
+            failure; ``kedge doctor`` is what turns that into an explanation.
         ValueError: The endpoint answered something that was not JSON.
+        ConfigError: ``ca_bundle`` is set and unusable.
     """
-    async with httpx.AsyncClient(timeout=_PROBE_TIMEOUT) as http:
+    async with tls.async_client(ca_bundle=ca_bundle, timeout=_PROBE_TIMEOUT) as http:
         response = await http.get(
             f"{base_url}/models", headers={"Authorization": f"Bearer {api_key}"}
         )
@@ -363,7 +369,7 @@ async def probe(body: ProbeBody, request: Request) -> dict[str, Any]:
             return {"ok": False, "source": "no_key", "models": [], "detail": str(exc)}
 
     try:
-        names = await fetch_model_names(base_url, key)
+        names = await fetch_model_names(base_url, key, ca_bundle=loaded.config.model.ca_bundle)
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("probe of %s failed: %s", base_url, exc)
         return {

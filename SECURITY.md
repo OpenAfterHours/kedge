@@ -113,6 +113,37 @@ The endpoint itself is yours to choose and yours to trust. kedge speaks to whate
 OpenAI-compatible `base_url` is configured, over TLS if you give it an `https` URL and not if you
 do not.
 
+## How that one TLS connection is verified
+
+The model endpoint is the only thing kedge connects to over TLS. The marimo subprocess is plain
+HTTP on loopback, and the analyser never opens a socket at all. So there is exactly one trust
+decision here, and `src/kedge/tls.py` is the only module that makes it — enforced by
+`scripts/guardrails.py`, which fails the build on an outbound client built anywhere else.
+
+**kedge verifies against the operating system's trust store**, via `truststore`: SChannel on
+Windows, Security.framework on macOS, OpenSSL's default paths on Linux, supplemented with
+`certifi` so a stripped container with no distribution roots still has the public ones. This is
+deliberately not Python's default. `httpx` and the `openai` SDK both verify against `certifi`
+alone, which is a fixed list of public roots — so on a machine behind a TLS-inspecting proxy,
+where the connection is re-signed by a corporate root that IT has already pushed to the OS store,
+every model call fails with `unable to get local issuer certificate` and nothing in the message
+suggests that the machine itself trusts the certificate and only Python disagrees. Reading the OS
+store does not widen trust beyond what the machine's administrator has already established; it
+narrows the gap between what the browser accepts and what kedge accepts.
+
+**Where the root is not in the OS store**, `[model] ca_bundle` in config names a PEM to verify
+against instead. `kedge doctor` reports which of the two is in force, and turns a certificate
+failure into an explanation naming the likely cause and the command that identifies the signer.
+
+**There is no setting that disables verification, and a pull request adding one will be
+declined.** `verify=False` is the usual answer to this problem and it is the wrong one: it is
+invisible in a config file six months later, it applies to every future connection rather than
+the one that was failing, and on the interception proxies this exists for it discards the
+proxy's own guarantees along with everybody else's. `ca_bundle` says the same thing explicitly,
+narrowly, and in a form a reviewer can see. Nothing in kedge connects without verifying —
+including the diagnostics, which is why `doctor` hands you an `openssl s_client` command to read
+the issuer rather than completing an unverified handshake to read it for you.
+
 ## Code the model writes
 
 The agent generates polars code and kedge runs it in the marimo kernel. Every cell passes the

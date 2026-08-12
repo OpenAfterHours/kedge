@@ -274,7 +274,7 @@ async def models(request: Request) -> dict[str, Any]:
         }
 
     try:
-        names = await fetch_model_names(base_url, key)
+        names = await fetch_model_names(base_url, key, ca_bundle=workspace.config.model.ca_bundle)
     except (httpx.HTTPError, ValueError) as exc:
         logger.info("could not list models from %s: %s", base_url, exc)
         return {
