@@ -15,9 +15,12 @@ only for servers started **without** an auth token. kedge always launches with
 definition somebody else's.
 
 **A registry entry can never be driven.** The registry deliberately contains no auth token, and
-:class:`RegisteredServer` deliberately exposes no ``base_url``. Every kedge server requires a
-bearer token that only kedge holds, so there is no path from an entry read here to a request the
-kernel would accept. This module contains no HTTP client and imports none.
+:class:`RegisteredServer` deliberately exposes no ``base_url`` — the on-disk record does carry
+one (docs/marimo-api.md 7.4), and it is dropped on the way in rather than merely left unused.
+Every kedge server requires a bearer token that only kedge holds, so there is no path from an
+entry read here to a request the kernel would accept. This module contains no HTTP client and
+imports none: :mod:`kedge.marimo_http` is the only module that talks to a marimo server, and
+nothing here can hand it an address.
 
 What it is genuinely for: ``kedge doctor`` answering "something is already listening on the port
 I wanted" and "here is what else is running", with a pid the user can act on themselves.

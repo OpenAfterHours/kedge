@@ -240,7 +240,11 @@ def store_copy(root: Path, *, source: Path, sha256: str, received_at: datetime) 
     except OSError as exc:
         msg = f"could not copy the hand-in {source} into the store at {destination}: {exc}"
         raise StoreError(msg) from exc
-    logger.info("copied selected hand-in %s into the store", destination.name)
+    # Deliberately does not say "selected": the same copy serves a browser selection and a file
+    # that landed in the watched folder, and `kedge watch` printing "selected" beside an audit
+    # line that says "watched" is a small contradiction with no upside. Which source it was is
+    # recorded on the HandIn and shown in that audit line.
+    logger.info("copied hand-in %s into the store", destination.name)
     return destination
 
 
@@ -275,7 +279,11 @@ def _iter_index(root: Path) -> Iterator[HandIn]:
         return
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
+        # UnicodeDecodeError as well as OSError: kedge writes this file itself, as ASCII, so a
+        # byte that will not decode means the index has been corrupted from outside -- and a
+        # corrupt index must never stop a hand-in being received. Degrading to no history
+        # costs a duplicate copy in the store, which is the cheap end of the trade.
         logger.warning("could not read the hand-in index %s: %s", path, exc)
         return
     for number, line in enumerate(text.splitlines(), start=1):

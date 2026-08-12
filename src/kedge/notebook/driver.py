@@ -98,6 +98,9 @@ __all__ = [
 MARIMO_PIN = "0.23.15"
 """The marimo version this bridge was verified against (docs/marimo-api.md)."""
 
+_NOT_INSTALLED = "not installed"
+"""Stands in for a version string when marimo is absent, so the report is still a report."""
+
 RESULT_BEGIN = "<<<KEDGE-RESULT-BEGIN>>>"
 RESULT_END = "<<<KEDGE-RESULT-END>>>"
 
@@ -1035,10 +1038,24 @@ class BridgeReport:
         """Whether the installed marimo is the version the bridge was verified against."""
         return self.version == self.pinned
 
+    @property
+    def installed(self) -> bool:
+        """Whether marimo is installed at all, as opposed to installed and mismatched."""
+        return self.version != _NOT_INSTALLED
+
     def message(self) -> str:
         """A single message naming the version and listing every problem found."""
         if self.ok:
             return f"the marimo bridge matches marimo {self.version}"
+        if not self.installed:
+            # Worth its own sentence: this message is user-facing from `kedge open` and
+            # `kedge hub`, and the general form below would read "does not match the installed
+            # marimo not installed", which tells a user with a broken environment nothing.
+            return (
+                f"marimo is not installed, so kedge cannot open a notebook. "
+                f"Install it with `uv pip install marimo=={self.pinned}` -- that is the version "
+                f"kedge's bridge was verified against (docs/marimo-api.md)."
+            )
         listed = "\n".join(f"  - {problem}" for problem in self.problems)
         return (
             f"kedge's marimo bridge does not match the installed marimo {self.version} "
@@ -1075,7 +1092,7 @@ def check_bridge() -> BridgeReport:
         version = metadata.version("marimo")
     except metadata.PackageNotFoundError:
         return BridgeReport(
-            version="not installed", pinned=MARIMO_PIN, problems=("marimo is not installed",)
+            version=_NOT_INSTALLED, pinned=MARIMO_PIN, problems=("marimo is not installed",)
         )
 
     try:

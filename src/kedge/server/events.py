@@ -291,6 +291,7 @@ def parse_event(raw: Mapping[str, Any] | str | bytes) -> AnyEvent:
 # the encoder, and nothing else.
 
 OpenStep = Literal[
+    "bridge",
     "cleanup",
     "analysing",
     "planning",
@@ -303,6 +304,7 @@ OpenStep = Literal[
 """The stages of opening a workbook, in the order :mod:`kedge.server.hub` runs them."""
 
 OPEN_STEPS: tuple[OpenStep, ...] = (
+    "bridge",
     "cleanup",
     "analysing",
     "planning",

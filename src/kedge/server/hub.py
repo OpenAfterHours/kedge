@@ -547,6 +547,7 @@ async def _run_open(
             workspace = Workspace.for_workbook(workbook, user_directory=state.user_directory)
         workspace.ensure_dirs()
 
+        await _step_bridge(job)
         adopted = await _step_cleanup(workspace, job, reattach=reattach)
         analysis = await _step_analyse(workspace, job)
         plan = await _step_plan(workspace, job)
@@ -683,6 +684,43 @@ def _notebook_url(workspace: Workspace) -> str | None:
 
 
 # ── the steps ────────────────────────────────────────────────────────────────────────────────
+
+
+async def _step_bridge(job: OpenJob) -> None:
+    """Assert that the installed marimo still exposes the surface the bridge drives.
+
+    First, and before anything is spawned. ``marimo._code_mode`` is a private API, so a marimo
+    upgrade can take the notebook driver away without warning; PLAN 6.1 mitigation 5 asks for that
+    to surface as one clear message naming the version rather than as a ``TypeError`` from inside
+    a tool call halfway through a conversation. Until this step existed the only check on this
+    path sat inside :meth:`NotebookDriver.for_workspace` at ``_step_scaffold`` -- after a marimo
+    process had been started and a kernel session asserted -- where it was reported as a stepped
+    over warning.
+
+    Fatal, unlike scaffolding: a notebook kedge cannot drive is not a notebook, and opening one
+    anyway would hand the user a chat pane whose every tool call is going to fail.
+    :func:`check_bridge` is cached, so the driver's later call costs nothing.
+
+    Raises:
+        BridgeVersionError: If the installed marimo does not match the bridge.
+    """
+    from kedge.notebook.driver import verify_bridge
+
+    job.step("bridge", "running", "checking the installed marimo against kedge's notebook bridge")
+    try:
+        report = await run_in_threadpool(verify_bridge)
+    except KedgeError as exc:
+        job.step("bridge", "failed", str(exc))
+        raise
+    if report.version_matches_pin:
+        job.step("bridge", "ok", f"marimo {report.version} matches the verified bridge")
+    else:
+        job.step(
+            "bridge",
+            "ok",
+            f"marimo {report.version} still exposes everything the bridge needs, but it was "
+            f"verified against {report.pinned}",
+        )
 
 
 async def _step_cleanup(workspace: Workspace, job: OpenJob, *, reattach: bool) -> str | None:
@@ -870,13 +908,18 @@ async def _step_scaffold(workspace: Workspace, plan: Any, job: OpenJob) -> Any:
 
     from kedge.notebook.scaffold import scaffold_notebook
 
-    # `ty` flags this call, and it is right to: `scaffold.CellCreator.create_cell` is declared
-    # `-> str` while `driver.NotebookDriver.create_cell` returns a `MutationResult`, so the list
-    # that comes back holds results rather than cell ids. Only the count is used here, so the
-    # message is honest either way — but the seam is genuinely mismatched and the fix belongs in
-    # `kedge.notebook`, not here.
     try:
-        cells = await scaffold_notebook(plan, driver, handins_dir=workspace.handins_dir)
+        cells = await scaffold_notebook(
+            plan,
+            driver,
+            handins_dir=workspace.handins_dir,
+            # Both passed explicitly rather than left to the scaffold's defaults. It derives the
+            # workbook from the hand-in store's grandparent, which is only right while
+            # `ingest.store_dir` is unset -- and the reconciliation cell degrades to "not
+            # reconciled" when the path is wrong, which is safe but needlessly unhelpful.
+            workbook_path=workspace.workbook_path,
+            contract_path=workspace.contract_path,
+        )
     except (KedgeError, OSError) as exc:
         job.step("scaffolding", "failed", f"scaffolding plan v{plan.version} failed: {exc}")
         return driver

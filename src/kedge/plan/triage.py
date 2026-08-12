@@ -31,10 +31,12 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 
 from kedge.analysis.model import (
     ExcelPattern,
     ExtractionStatus,
+    Finding,
     FindingKind,
     Severity,
     SheetRole,
@@ -274,7 +276,7 @@ def triage(analysis: WorkbookAnalysis) -> TriageResult:
     blockers: list[Blocker] = []
     notes: list[str] = []
 
-    _check_format(analysis, blockers)
+    _check_format(analysis, blockers, notes)
     _check_vba(analysis, blockers)
     _check_circularity(analysis, blockers)
     _check_external_links(analysis, blockers)
@@ -317,8 +319,11 @@ def triage(analysis: WorkbookAnalysis) -> TriageResult:
 # ── individual checks ────────────────────────────────────────────────────────
 
 
-def _check_format(analysis: WorkbookAnalysis, blockers: list[Blocker]) -> None:
-    """`.xlsb` and `.xls` are refused outright: openpyxl cannot read either."""
+def _check_format(analysis: WorkbookAnalysis, blockers: list[Blocker], notes: list[str]) -> None:
+    """`.xlsb` and `.xls` are refused outright: openpyxl cannot read either.
+
+    A companion file kedge cannot read is a different matter, and is recorded as a note.
+    """
     file_format = analysis.workbook.file_format
     if file_format in ("xlsb", "xls"):
         blockers.append(
@@ -335,7 +340,17 @@ def _check_format(analysis: WorkbookAnalysis, blockers: list[Blocker]) -> None:
             )
         )
         return
-    if analysis.findings_of(FindingKind.UNSUPPORTED_FORMAT):
+    # UNSUPPORTED_FORMAT is raised for companion files too -- a legacy .doc procedure sitting
+    # beside the workbook earns one -- and reading that as "the workbook is unreadable" is a
+    # category error with a fatal penalty attached: documented.xlsx triaged STOP at 0.00
+    # convertible on the strength of a Word document nobody needed. Only a finding that names
+    # the workbook itself, or names nothing, is about the workbook.
+    unreadable = [
+        finding
+        for finding in analysis.findings_of(FindingKind.UNSUPPORTED_FORMAT)
+        if _is_about_the_workbook(finding, analysis)
+    ]
+    if unreadable:
         blockers.append(
             Blocker(
                 code=BlockerCode.UNSUPPORTED_FORMAT,
@@ -346,6 +361,31 @@ def _check_format(analysis: WorkbookAnalysis, blockers: list[Blocker]) -> None:
                 remediation="re-save as .xlsx in Excel and analyse that",
             )
         )
+        return
+
+    named = sorted(
+        {
+            Path(finding.location).name
+            for finding in analysis.findings_of(FindingKind.UNSUPPORTED_FORMAT)
+            if finding.location and not _is_about_the_workbook(finding, analysis)
+        }
+    )
+    if named:
+        # A note rather than a blocker: the workbook converts fine, so neither the score nor
+        # the verdict should move. What is lost is the documentation of *why* it does what it
+        # does, which is a real gap when the plan comes to explain a stage -- so it is said out
+        # loud rather than silently dropped (PLAN 1.5).
+        notes.append(
+            f"could not read {', '.join(named)} beside the workbook, so any process notes in "
+            f"it are missing from the analysis"
+        )
+
+
+def _is_about_the_workbook(finding: Finding, analysis: WorkbookAnalysis) -> bool:
+    """Whether a finding points at the workbook itself rather than a file beside it."""
+    if not finding.location:
+        return True
+    return Path(finding.location).name == analysis.workbook.filename
 
 
 def _check_vba(analysis: WorkbookAnalysis, blockers: list[Blocker]) -> None:

@@ -133,6 +133,22 @@ class Completer(Protocol):
         ...
 
 
+def _rejects_temperature(exc: Exception) -> bool:
+    """Whether a 400 is about ``temperature`` rather than about structured output.
+
+    The reasoning models answer an explicit temperature with *"Unsupported value: 'temperature'
+    does not support 0.2 with this model"* and name the parameter in ``error.param``. That field
+    is checked first because it is unambiguous; the message is a fallback for the proxies and
+    local servers that return a bare string.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict) and error.get("param") == "temperature":
+            return True
+    return "temperature" in str(exc).lower()
+
+
 class OpenAICompleter:
     """A :class:`Completer` backed by the OpenAI SDK against the configured endpoint.
 
@@ -140,6 +156,11 @@ class OpenAICompleter:
     remembered, because the endpoint is whatever the user configured: a hosted API, a local
     llama.cpp server, a proxy. Assuming ``response_format`` support and failing hard would make
     kedge unusable against half of them.
+
+    ``temperature`` is negotiated the same way and for the same reason. The reasoning models
+    accept only their default and reject any explicit value outright, so a rejection naming that
+    parameter drops it for the rest of the session rather than being misread as one more piece of
+    evidence that structured output is unsupported.
 
     Example:
         >>> completer = OpenAICompleter(base_url="https://api.example/v1", api_key="k", model="m")
@@ -164,25 +185,40 @@ class OpenAICompleter:
         self._model = model
         self.mode = "json_schema"
         """Current structured-output mode: ``json_schema``, ``json_object`` or ``text``."""
+        self.omit_temperature = False
+        """Whether the endpoint refused an explicit ``temperature`` and it is no longer sent."""
 
     def complete(self, request: CompletionRequest) -> str:
         """Send the request, degrading the structured-output mode on rejection."""
         from openai import BadRequestError, OpenAIError
 
         while True:
+            payload: dict[str, Any] = {
+                "model": request.model or self._model,
+                "messages": request.messages,
+                "response_format": self._response_format(request),
+            }
+            if not self.omit_temperature:
+                payload["temperature"] = request.temperature
             try:
-                response = self._client.chat.completions.create(
-                    model=request.model or self._model,
-                    messages=request.messages,  # ty: ignore[invalid-argument-type]
-                    temperature=request.temperature,
-                    response_format=self._response_format(request),  # ty: ignore[invalid-argument-type]
-                )
+                response = self._client.chat.completions.create(**payload)
             except BadRequestError as exc:
+                # Tested before the structured-output ladder, because it is the same exception
+                # type: without this, an endpoint that only accepts its default temperature burns
+                # three requests degrading a `response_format` it was perfectly happy with, and
+                # then reports the wrong cause.
+                if _rejects_temperature(exc) and not self.omit_temperature:
+                    self.omit_temperature = True
+                    logger.warning(
+                        "endpoint rejected an explicit temperature; sending its default instead"
+                    )
+                    continue
                 degraded = self._degrade()
                 if degraded is None:
                     msg = (
-                        f"the model endpoint rejected the request even without a response "
-                        f"format: {exc}"
+                        f"the model endpoint rejected the request with no fallback left "
+                        f"(no response format"
+                        f"{', no temperature' if self.omit_temperature else ''}): {exc}"
                     )
                     raise ProposalError(msg) from exc
                 logger.warning(

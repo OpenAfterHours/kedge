@@ -6,13 +6,21 @@ something, exactly one file needs correcting and the contract tests say which fu
 
 Verified against marimo 0.23.15 (docs/marimo-api.md, which is authoritative over PLAN 1.1-1.3):
 
-===========================  ====================================================================
-``GET /health``              unauthenticated; ``{"status": "healthy"}``
-``GET /sse?session_id=<id>`` creates the kernel session; it survives the stream closing
-``GET /api/sessions``        requires auth; ``{id: {"filename": str|None, "path": str|None}}``
-``GET /?file=<nb>``          serves ``<marimo-server-token data-token="...">`` for skew protection
+============================  ===================================================================
+``GET /health``               unauthenticated; ``{"status": "healthy"}``
+``GET /sse?session_id=<id>``  creates the kernel session; it survives the stream closing
+``GET /api/sessions``         requires auth; ``{id: {"filename": str|None, "path": str|None}}``
+``GET /?file=<nb>``           serves ``<marimo-server-token data-token="...">`` for skew protection
 ``POST /api/kernel/shutdown`` requires auth *and* the skew-protection server token
-===========================  ====================================================================
+``POST /api/kernel/execute``  requires auth; exempt from skew protection. **The one exception**
+============================  ===================================================================
+
+The execute endpoint is the exception, and a deliberate one: its reply is a streamed
+``text/event-stream`` consumed asynchronously, so the client for it is a class with a very
+different shape from the small synchronous calls here, and it lives in
+:mod:`kedge.notebook.kernel` (PLAN 6.1). :data:`EXECUTE_PATH` is still defined here, so that even
+that endpoint's URL is written down in one place and a bump that moves it is found from this
+file. Nothing else in kedge may open an HTTP connection to marimo.
 
 This module deliberately does not import marimo, spawn processes, or know what a
 :class:`~kedge.workspace.Workspace` is. It speaks HTTP to a base URL with a token.
@@ -41,8 +49,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EXECUTE_PATH",
     "MarimoHealthTimeoutError",
+    "MarimoLaunchError",
     "MarimoSessionNotFoundError",
+    "auth_headers",
     "bootstrap_session",
     "confirm_session",
     "fetch_server_token",
@@ -52,6 +63,15 @@ __all__ = [
     "wait_for_health",
 ]
 
+EXECUTE_PATH = "/api/kernel/execute"
+"""Where code is submitted to a session's kernel.
+
+Declared in marimo's ``_server/api/endpoints/execution.py`` -- not ``execute.py``, whatever
+PLAN 1.2 says -- and excluded from the OpenAPI schema, so nothing but this line and
+docs/marimo-api.md 5.1 records it. The request itself is built by
+:class:`kedge.notebook.kernel.KernelClient`, which imports the path from here.
+"""
+
 _IS_WINDOWS_PATHS = Path("A") == Path("a")
 """Whether path comparison on this platform is case-insensitive."""
 
@@ -60,8 +80,16 @@ _SERVER_TOKEN_PATTERN = re.compile(
 )
 
 
-class MarimoHealthTimeoutError(NotebookError):
-    """The marimo server did not answer ``GET /health`` within the allowed time."""
+class MarimoLaunchError(NotebookError):
+    """The marimo subprocess could not be started, or exited before becoming usable."""
+
+
+class MarimoHealthTimeoutError(MarimoLaunchError):
+    """The marimo server did not answer ``GET /health`` within the allowed time.
+
+    A subclass of :class:`MarimoLaunchError` because a server that never comes up is a failed
+    launch, and callers supervising a launch want to catch both with one name.
+    """
 
 
 class MarimoSessionNotFoundError(NotebookError):
@@ -93,7 +121,24 @@ def _http(client: httpx.Client | None, timeout: float | httpx.Timeout) -> Iterat
         yield owned
 
 
-def _auth_headers(token: str, session_id: str | None = None) -> dict[str, str]:
+def auth_headers(token: str, session_id: str | None = None) -> dict[str, str]:
+    """Return the headers that identify kedge to marimo.
+
+    Two names and no more: ``Authorization: Bearer <token>`` is the edit-mode credential, and
+    ``Marimo-Session-Id`` picks the session a request applies to. Public because
+    :class:`kedge.notebook.kernel.KernelClient` frames its request the same way and the framing
+    is marimo's, not kedge's -- a bump that renames either header is corrected here.
+
+    Args:
+        token: The ``--token-password`` the server was launched with.
+        session_id: The session to address, omitted when the request is server-wide.
+
+    Returns:
+        A fresh mutable mapping the caller may add to.
+
+    References:
+        docs/marimo-api.md 5.1 and 5.5.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     if session_id:
         headers["Marimo-Session-Id"] = session_id
@@ -159,6 +204,8 @@ def wait_for_health(
     Bounded by ``timeout``. If the subprocess exits while we are waiting, that is reported
     immediately rather than after the full timeout, with the tail of its log, because "marimo
     died on startup" and "marimo is slow to start" want very different responses from the user.
+    The two are told apart by type as well as by message: a death is a bare
+    :class:`MarimoLaunchError`, a timeout is :class:`MarimoHealthTimeoutError`.
     """
     deadline = time.monotonic() + timeout
     started = time.monotonic()
@@ -168,7 +215,7 @@ def wait_for_health(
                 f"marimo exited with code {process.returncode} before serving {base_url}/health."
                 f"{_log_tail(log_path)}"
             )
-            raise MarimoHealthTimeoutError(msg)
+            raise MarimoLaunchError(msg)
         if health_check(base_url, timeout=min(interval * 4, 2.0), client=client):
             elapsed = time.monotonic() - started
             logger.info("marimo is serving %s after %.1fs", base_url, elapsed)
@@ -203,7 +250,7 @@ def list_sessions(
         with _http(client, timeout) as http:
             response = http.get(
                 f"{base_url}/api/sessions",
-                headers=_auth_headers(token),
+                headers=auth_headers(token),
                 timeout=timeout,
             )
     except httpx.HTTPError as exc:
@@ -269,15 +316,16 @@ def bootstrap_session(
                 "GET",
                 f"{base_url}/sse",
                 params={"session_id": session_id},
-                headers=_auth_headers(token, session_id),
+                headers=auth_headers(token, session_id),
                 timeout=timeout,
             ) as response,
         ):
             if response.status_code != httpx.codes.OK:
                 msg = (
                     f"marimo refused the session bootstrap at {base_url}/sse with HTTP "
-                    f"{response.status_code}; the token may be wrong or the server may not be a "
-                    f"marimo edit server"
+                    f"{response.status_code}; the token may be wrong, or the server may not be a "
+                    f"marimo edit server at the version this module is verified against -- "
+                    f"GET /sse exists from 0.23.15 onwards and not before"
                 )
                 raise MarimoSessionNotFoundError(msg)
             # A fully buffered response needs no draining; a real SSE stream does.
@@ -407,7 +455,7 @@ def request_shutdown(
             base_url, token, notebook_path, timeout=timeout, client=client
         )
 
-    headers = _auth_headers(token, session_id)
+    headers = auth_headers(token, session_id)
     if server_token is not None:
         headers["Marimo-Server-Token"] = server_token
 

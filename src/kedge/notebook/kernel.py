@@ -21,6 +21,12 @@ of text, per the SSE specification, and must be rejoined with newlines — the p
 that. And the session must already exist: a freshly launched server has none, and this endpoint
 answers 500 until a transport has connected with the session id (docs/marimo-api.md 5.3), which
 is why :func:`_status_error` says so in as many words rather than reporting a bare 500.
+
+This is the **one** module besides :mod:`kedge.marimo_http` that opens an HTTP connection to
+marimo, and the exception is deliberate: an asynchronously streamed reply is a different animal
+from marimo_http's small synchronous calls, and folding it in would make that module two modules
+wearing one name. The endpoint's URL and its auth framing are still imported from there, so the
+"one file to correct after a marimo bump" promise holds for this endpoint too.
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ from typing import Any
 import httpx
 
 from kedge.errors import KernelError
+from kedge.marimo_http import EXECUTE_PATH, auth_headers
 from kedge.notebook.model import ExecResult
 
 logger = logging.getLogger(__name__)
@@ -48,8 +55,6 @@ __all__ = [
     "iter_sse_events",
     "result_from_events",
 ]
-
-EXECUTE_PATH = "/api/kernel/execute"
 
 DEFAULT_TIMEOUT_SECONDS = 180.0
 _CONNECT_TIMEOUT_SECONDS = 10.0
@@ -264,13 +269,16 @@ class KernelClient:
         return f"{self._base_url}{EXECUTE_PATH}"
 
     def headers(self) -> dict[str, str]:
-        """Return the request headers, including the bearer token."""
-        return {
-            "Marimo-Session-Id": self._session_id,
-            "Authorization": f"Bearer {self._token}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        """Return the request headers, including the bearer token.
+
+        The two marimo-specific names come from :func:`kedge.marimo_http.auth_headers`; the other
+        two are ordinary content negotiation. Notably absent is ``Marimo-Server-Token``: execute
+        is the only POST exempt from skew protection (docs/marimo-api.md 5.1).
+        """
+        headers = auth_headers(self._token, self._session_id)
+        headers["Content-Type"] = "application/json"
+        headers["Accept"] = "text/event-stream"
+        return headers
 
     async def execute(self, code: str, *, timeout: float | None = None) -> ExecResult:
         """Run ``code`` in the session's scratchpad and return the reassembled result.

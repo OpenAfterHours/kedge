@@ -341,7 +341,12 @@ def test_the_open_sequence_streams_a_step_at_a_time_and_ends_with_a_verdict(
 
     steps = [frame for frame in frames if frame["type"] == "open_progress"]
     reached = [frame["step"] for frame in steps]
-    assert reached[0] == "cleanup"
+    # The bridge preflight comes first, before a marimo is spawned: PLAN 6.1 mitigation 5 wants
+    # a private-API mismatch to be one clear message up front, not a TypeError from inside a
+    # tool call after the user has waited eight seconds for a notebook.
+    assert reached[0] == "bridge"
+    assert reached.index("bridge") < reached.index("launching")
+    assert "cleanup" in reached
     assert "analysing" in reached
     assert "planning" in reached
     assert "notebook" in reached
@@ -364,6 +369,44 @@ def test_the_open_sequence_streams_a_step_at_a_time_and_ends_with_a_verdict(
 
     assert frames[-1]["type"] == "error", "a launch that cannot happen must end the stream"
     assert "marimo is not being started" in frames[-1]["message"]
+    assert frames[-1]["recoverable"] is False
+
+
+def test_a_bridge_that_no_longer_matches_stops_the_open_before_anything_is_spawned(
+    client: TestClient, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PLAN 6.1 mitigation 5, on the path that actually spawns a process.
+
+    `marimo._code_mode` is private, so an upgrade can withdraw it. Until this step existed the
+    only check on this path lived inside `NotebookDriver.for_workspace` at the scaffolding step
+    -- after marimo had been started and a kernel session asserted -- and the `except KedgeError`
+    there downgraded it to a stepped-over warning. The user got a notebook they could not drive
+    and a chat pane whose every tool call would fail.
+    """
+    from kedge.notebook.driver import BridgeVersionError
+
+    spawned: list[object] = []
+
+    def _explode() -> None:
+        msg = "kedge's marimo bridge does not match the installed marimo 9.9.9"
+        raise BridgeVersionError(msg)
+
+    monkeypatch.setattr("kedge.notebook.driver.verify_bridge", _explode)
+    monkeypatch.setattr("kedge.lifecycle.launch_marimo", lambda *a, **k: spawned.append(a))
+    monkeypatch.setattr("kedge.lifecycle.register_teardown", lambda _workspace: None)
+
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    job_id = client.post("/api/hub/open", json={"key": key}).json()["job_id"]
+    frames = _frames(client.get(f"/api/hub/open/{job_id}").text)
+
+    steps = [frame for frame in frames if frame["type"] == "open_progress"]
+    failed = [frame for frame in steps if frame["state"] == "failed"]
+    assert [frame["step"] for frame in failed] == ["bridge"]
+    assert "9.9.9" in failed[0]["detail"]
+
+    assert not spawned, "no marimo may be started once the bridge is known not to match"
+    assert "analysing" not in [frame["step"] for frame in steps]
+    assert frames[-1]["type"] == "error"
     assert frames[-1]["recoverable"] is False
 
 

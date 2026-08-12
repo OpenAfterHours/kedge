@@ -56,6 +56,23 @@ Or, offline and standalone — the analyser is useful on its own:
 kedge inspect process.xlsx --out analysis.json --report report.html
 ```
 
+`docs/analyser-worked-example.md` walks that output line by line over two of the test fixtures —
+a clean pipeline and a deliberately hostile workbook — which is the quickest way to see what the
+analyser actually finds before pointing it at anything of your own.
+
+Once the notebook exists, hand-ins arrive through a watched folder rather than by hand:
+
+```bash
+kedge watch process.xlsx --dir \\share\inbox --once   # sweep and exit; for a scheduled task
+kedge watch process.xlsx                              # watch until Ctrl-C
+```
+
+Every file is copied into the workbook's managed store, hashed, dated and receipted, so "this run
+consumed this file" is a claim you can defend. `--once` is idempotent: a file already in the store
+is skipped by hash. `--dir` is relative to where you are standing; set `ingest.watch_dir` in a
+`kedge.toml` beside the workbook instead and it is relative to the workbook, so a scheduled sweep
+finds the same folder you did.
+
 ## Design notes
 
 - Generated code is **polars**, never pandas — enforced in the validation gate.
@@ -66,8 +83,11 @@ kedge inspect process.xlsx --out analysis.json --report report.html
 
 ## Contributing
 
-`CONVENTIONS.md` is binding — read it before opening a pull request. `CLAUDE.md` is the shortest
-useful orientation to the codebase, and `RELEASING.md` covers how a version tag becomes a release.
+`CONTRIBUTING.md` is the short version; `CONVENTIONS.md` is binding — read it before opening a
+pull request. `CLAUDE.md` is the shortest useful orientation to the codebase, `RELEASING.md`
+covers how a version tag becomes a release, and `SECURITY.md` describes the actual trust boundary
+(loopback, no auth, the machine rather than the account), which is worth reading before touching
+anything that binds a socket or logs a payload.
 
 ```bash
 uv sync

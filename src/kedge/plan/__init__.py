@@ -154,8 +154,13 @@ def load_analysis(
             msg = f"could not load the analysis at {path}: {exc}"
             raise PlanError(msg) from exc
 
+    # The function, not the module of the same name. `kedge.analysis.__init__` now re-exports
+    # `analyse` precisely so this is unambiguous, but the submodule path is kept here because it
+    # cannot become ambiguous again: before the re-export existed, `from kedge.analysis import
+    # analyse` bound the *module*, and that import succeeded and then failed at the call with
+    # "module object is not callable" -- a confusing way to discover a missing analyser.
     try:
-        from kedge.analysis import analyse  # ty: ignore[unresolved-import]
+        from kedge.analysis.analyse import analyse
     except ImportError as exc:
         msg = (
             f"no analysis found at {path}, and the analyser is not available in this "

@@ -43,9 +43,10 @@ jobs:
     name: ty (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Advisory on purpose. `ty check src/` reports 6 known diagnostics -- mostly mypy-dialect
-    # `# type: ignore` comments ty does not honour, plus a real one in plan/__init__.py. Clearing
-    # those is the prerequisite for deleting this line and letting the job gate merges.
+    # Advisory on purpose. `ty check src/` reports 3 known diagnostics, all of them mypy-dialect
+    # `# type: ignore` comments ty does not honour: regions.py:632 and watch.py:343-344. Each is
+    # catalogued in docs/ty-diagnostics.md with the one-line fix. Clearing them is the whole
+    # prerequisite for deleting this line and letting the job gate merges.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
@@ -76,8 +77,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --locked
       # The default addopts deselect `contract` and `llm`; this is unit plus corpus.
+      # Coverage is measured on one leg only. Four legs reporting four slightly different
+      # numbers -- the platform branches in `lifecycle` and `ingest/watch` differ by OS -- is
+      # noise, and a `fail_under` breach on one leg out of four reads as a flake rather than as
+      # the regression it is. `fail_under = 85` lives in pyproject.toml beside the measurement
+      # that set it.
       - name: pytest
+        if: matrix.os != 'ubuntu-latest' || matrix.python-version != '3.12'
         run: uv run pytest -q
+      - name: pytest with coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: uv run pytest -q --cov=src/kedge --cov-report=term-missing:skip-covered
 
   contract:
     name: contract (${{ matrix.os }})

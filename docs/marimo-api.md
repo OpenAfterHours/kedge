@@ -152,6 +152,16 @@ violation list rather than a kernel traceback.
 
 ## 5. HTTP kernel API
 
+> **Where this lives in kedge.** Everything in this section is implemented in
+> **`src/kedge/marimo_http.py`** and nowhere else — health polling, the `/sse` session bootstrap,
+> `GET /api/sessions`, the server-token scrape, and `POST /api/kernel/shutdown`. The one
+> deliberate exception is `POST /api/kernel/execute`, which `src/kedge/notebook/kernel.py` issues
+> itself because streaming the SSE response asynchronously is a different shape from the rest —
+> and even that module imports `EXECUTE_PATH` and `auth_headers` from `marimo_http`, so the URL
+> and the header names still have one home. `scripts/guardrails.py` enforces this
+> (CONVENTIONS.md non-negotiable 6). When the next marimo bump moves an endpoint, those two files
+> are the whole change.
+
 ### 5.1 Route
 
 `POST {base}/api/kernel/execute` — declared in **`_server/api/endpoints/execution.py`**

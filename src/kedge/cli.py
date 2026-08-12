@@ -8,8 +8,9 @@ of the sequence that follows.
 
 The rest of the commands exist because the milestones underneath are independently useful.
 ``inspect`` is an Excel archaeology tool that needs no model at all, ``reconcile`` is a diff
-between a notebook's output and the workbook's cached values, and ``config`` and ``doctor`` are
-the two things anyone debugging a local tool with this many moving parts asks for first.
+between a notebook's output and the workbook's cached values, ``watch`` is the unattended
+hand-in path with no browser anywhere near it, and ``config`` and ``doctor`` are the two things
+anyone debugging a local tool with this many moving parts asks for first.
 
 This is the only module in kedge permitted to print. Everything else logs.
 """
@@ -56,7 +57,50 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["app", "main"]
 
-app = typer.Typer(
+
+def _console_args() -> list[str]:
+    """The command line as it was typed, with ``~`` expanded and wildcards left alone.
+
+    click expands glob patterns in ``sys.argv`` for itself on Windows -- its
+    ``windows_expand_args`` -- because neither ``cmd.exe`` nor PowerShell does it for a native
+    program. That is a kindness for a *path* argument and a silent corruption of a *pattern*
+    one: ``kedge watch book.xlsx --glob "*.xlsx"``, run from the folder the workbook is in,
+    which is the normal place to run it from, reaches the command as ``--glob book.xlsx``,
+    sweeps the inbox for a file of that name, receives nothing, and exits 0. A flag that is
+    accepted and quietly rewritten is worse than no flag at all.
+
+    So the globbing is off (see :class:`_Cli`) and this puts back the one part of the expansion
+    no Windows shell does for us. Environment variables are deliberately not expanded: both
+    shells substitute their own before the process starts, so a second pass can only mangle a
+    filename that happens to contain a ``$``. Only an argument that is a home-relative path is
+    touched at all, so ``--glob "~$*.xlsx"`` -- the Excel lock files -- survives intact.
+    """
+    return [
+        str(Path(arg).expanduser()) if arg == "~" or arg.startswith(("~/", "~\\")) else arg
+        for arg in sys.argv[1:]
+    ]
+
+
+class _Cli(typer.Typer):
+    """The kedge app, reading its own argv so click does not glob it first.
+
+    The console script is ``kedge.cli:app``, so this is where the decision has to be made rather
+    than in a wrapper the entry point does not go through: anything calling the app with no
+    arguments -- the installed ``kedge``, the ``__main__`` block below -- gets
+    :func:`_console_args` instead of click's expansion of ``sys.argv``. Tests go through
+    ``CliRunner``, which always passes its arguments explicitly and so reaches neither; that is
+    exactly why the wildcard bug this prevents was invisible to a suite of fifty CLI tests, and
+    why the tests that cover it drive ``sys.argv`` instead.
+    """
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if not args:
+            kwargs.setdefault("args", _console_args())
+        kwargs.setdefault("windows_expand_args", False)
+        return super().__call__(*args, **kwargs)
+
+
+app = _Cli(
     name="kedge",
     help="Turn manual Excel processes into reviewable, reproducible marimo notebooks.",
     no_args_is_help=True,
@@ -169,6 +213,7 @@ def open(  # the verb is the interface; shadowing the builtin is local and harml
         raise _fail(f"no such workbook: {workbook}")
     if plan is not None and not plan.is_file():
         raise _fail(f"no such plan: {plan}")
+    _require_bridge()
     if port is not None:
         console.print(f"[dim]pinning marimo to port {port} instead of picking a free one[/dim]")
 
@@ -253,6 +298,7 @@ def hub(
     the progress streamed into the page instead of onto the terminal.
     """
     console = _console()
+    _require_bridge()
     create_hub_app = _resolve("kedge.server.app", "create_hub_app", "M3 (the server and UI)")
     run_server = _resolve("kedge.server.app", "run_server", "M3 (the server and UI)")
 
@@ -417,6 +463,147 @@ def _reconcile_exit_code(report: Any) -> int:
     return 0 if report.status else 1
 
 
+# ── watch ────────────────────────────────────────────────────────────────────────────────────
+
+
+@app.command()
+def watch(
+    workbook: Annotated[Path, typer.Argument(help="The workbook these hand-ins belong to.")],
+    directory: Annotated[
+        Path | None,
+        typer.Option("--dir", help="The folder to watch. Defaults to ingest.watch_dir."),
+    ] = None,
+    glob: Annotated[
+        str | None,
+        typer.Option("--glob", help="Filename pattern. Defaults to ingest.watch_glob."),
+    ] = None,
+    contract: Annotated[
+        str | None,
+        typer.Option("--contract", help="Record the contract these hand-ins should satisfy."),
+    ] = None,
+    once: Annotated[
+        bool, typer.Option("--once", help="Sweep the folder once and exit, for a scheduled run.")
+    ] = False,
+    settle: Annotated[
+        float | None,
+        typer.Option("--settle", help="Seconds a file must stop changing for before it is read."),
+    ] = None,
+) -> None:
+    """Receive hand-ins from a watched folder into the workbook's managed store (PLAN 2.8).
+
+    The production path. Drop and select are the interactive sources; a file landing in a shared
+    folder on a schedule is what the process actually looks like, and because a watched hand-in
+    arrives as a *path* it produces exactly the reproducible record a browser selection does.
+
+    ``--once`` sweeps and exits, which is the shape a scheduled task wants and is idempotent: a
+    file already in the store is skipped by hash rather than received twice. Without it the folder
+    is watched until Ctrl-C, sweeping once at the start so files already sitting there are picked
+    up too.
+
+    ``--dir`` is relative to where you are standing. A relative ``ingest.watch_dir`` is relative
+    to the workbook, so a sweep started by a scheduler finds the same folder you did.
+    """
+    if not workbook.is_file():
+        raise _fail(f"no such workbook: {workbook}")
+
+    console = _console()
+    workspace = _workspace_for(workbook)
+    ingest = workspace.config.ingest
+
+    folder_path = _watched_folder(workspace, directory)
+
+    scan_once = _resolve("kedge.ingest.watch", "scan_once", "M5 (hand-in intake)")
+    start_watching = _resolve("kedge.ingest.watch", "watch", "M5 (hand-in intake)")
+    default_settle = _resolve("kedge.ingest.watch", "DEFAULT_SETTLE_SECONDS", "M5 (hand-in intake)")
+
+    pattern = glob if glob is not None else ingest.watch_glob
+    settle_seconds = default_settle if settle is None else settle
+    received: list[Any] = []
+
+    def report(handin: Any) -> None:
+        # Called on the watcher thread once per hand-in. The audit line is the whole point of
+        # the managed store, so it is what the terminal shows: this run consumed this file.
+        received.append(handin)
+        console.print(f"  [green]hand-in[/green] {handin.audit_line()}")
+
+    console.print(f"[dim]store[/dim] {workspace.handins_dir}")
+    try:
+        if once:
+            for handin in scan_once(
+                folder_path,
+                store_dir=workspace.handins_dir,
+                glob=pattern,
+                contract=contract,
+                copy_on_select=ingest.copy_on_select,
+                dedupe=ingest.dedupe_by_hash,
+                settle_seconds=settle_seconds,
+            ):
+                report(handin)
+        else:
+            # Started before it is announced, and not the other way round: starting sweeps the
+            # folder, so a folder that is not there fails here. Printing first would tell the
+            # user we were watching something that does not exist and then contradict itself.
+            folder = start_watching(
+                folder_path,
+                report,
+                store_dir=workspace.handins_dir,
+                glob=pattern,
+                contract=contract,
+                copy_on_select=ingest.copy_on_select,
+                dedupe=ingest.dedupe_by_hash,
+                settle_seconds=settle_seconds,
+            )
+            console.print(
+                f"[green]watching[/green] {folder_path} for {pattern}; press Ctrl-C to stop"
+            )
+            _watch_until_stopped(console, folder)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    console.print(f"[bold]{len(received)}[/bold] hand-in(s) received")
+
+
+def _watched_folder(workspace: Workspace, override: Path | None) -> Path:
+    """Decide which folder ``kedge watch`` sweeps, from ``--dir`` or ``ingest.watch_dir``.
+
+    A flag is relative to where the user is standing; a setting is relative to the file that
+    carries it. ``watch_dir = "inbox"`` in the kedge.toml beside the workbook means the inbox
+    beside the workbook, whatever directory the scheduled task that runs the sweep happens to
+    start in -- which is the whole point of a setting over a flag, and is what the message
+    below promises when it sends the user to that file. It is the rule
+    :attr:`Workspace.handins_dir` already applies to the sibling ``ingest.store_dir``; the base
+    differs because a store is an artifact kedge generates, under the project directory, and an
+    inbox is somebody else's folder, beside the workbook.
+    """
+    if override is not None:
+        return override.expanduser()
+    configured = workspace.config.ingest.watch_dir
+    if configured is None:
+        raise _fail(
+            "no watched folder is configured. Set ingest.watch_dir in a kedge.toml beside the "
+            "workbook, or pass --dir."
+        )
+    configured = configured.expanduser()  # belt and braces: IngestConfig expands it too
+    if configured.is_absolute():
+        return configured
+    return workspace.workbook_path.parent / configured
+
+
+def _watch_until_stopped(console: Console, folder: Any) -> None:
+    """Park the main thread on a started watcher until Ctrl-C, then stop it cleanly.
+
+    watchdog runs on its own thread, so without this the command would return the instant it
+    started watching. Ctrl-C is the documented way out and is therefore not an error: the folder
+    is stopped, the count is printed, and the exit code stays 0.
+    """
+    try:
+        folder.wait()
+    except KeyboardInterrupt:
+        console.print("[dim]stopping[/dim]")
+    finally:
+        folder.stop()
+
+
 # ── contract ─────────────────────────────────────────────────────────────────────────────────
 
 
@@ -426,15 +613,31 @@ def contract_infer(
         Path, typer.Argument(help="A representative hand-in to infer a contract from.")
     ],
     out: Annotated[Path | None, typer.Option("--out", help="Write the contract YAML here.")] = None,
+    sheet: Annotated[
+        str | None,
+        typer.Option("--sheet", help="Worksheet to describe. Defaults to the first one."),
+    ] = None,
 ) -> None:
-    """Draft a hand-in contract from a real file, for the user to tighten (PLAN M5)."""
+    """Draft a hand-in contract from a real file, for the user to tighten (PLAN M5).
+
+    Drafted through :func:`kedge.contracts.infer.infer_with_notes` rather than :func:`infer`,
+    because the notes are what make the YAML worth reading: each column carries the evidence
+    the guess was made from, so tightening it is an edit rather than a rewrite.
+    """
     if not file.is_file():
         raise _fail(f"no such file: {file}")
-    infer = _resolve("kedge.contracts.infer", "infer_contract", "M5 (contracts)")
-    contract = infer(file)
+    infer_with_notes = _resolve("kedge.contracts.infer", "infer_with_notes", "M5 (contracts)")
+    write_yaml = _resolve("kedge.contracts.infer", "write_yaml", "M5 (contracts)")
     destination = out or file.with_suffix(".contract.yaml")
-    destination.write_text(contract, encoding="utf-8")
-    _console().print(f"[green]contract[/green] {destination}")
+    try:
+        contract, notes = infer_with_notes(file, sheet=sheet)
+        written = write_yaml(contract, destination, notes=notes)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+    _console().print(
+        f"[green]contract[/green] {written} "
+        f"[dim]({len(contract.columns)} column(s), drafted from {file.name})[/dim]"
+    )
 
 
 # ── config ───────────────────────────────────────────────────────────────────────────────────
@@ -571,6 +774,8 @@ def doctor(
         else:
             _check(results, "marimo", "ok", f"{marimo_version} matches the pin")
 
+    _check_bridge(results)
+
     try:
         loaded = _load()
     except KedgeError as exc:
@@ -631,6 +836,37 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+def _check_bridge(results: list[dict[str, str]]) -> None:
+    """Introspect marimo's private ``_code_mode`` surface (PLAN 6.1 mitigation 5).
+
+    The check above compares two version strings; this one goes and looks. It is the same
+    preflight ``kedge open`` runs before it spawns anything, so a bridge that would fail halfway
+    through a conversation is a red line here instead. The report names the installed version
+    and every method or parameter that has moved, because "marimo changed" is not actionable and
+    "``edit_cell()`` no longer accepts hide_code in 0.24.0" is.
+    """
+    from kedge.notebook import check_bridge
+
+    report = check_bridge()
+    if not report.ok:
+        _check(results, "marimo bridge", "fail", report.message())
+    elif not report.version_matches_pin:
+        _check(
+            results,
+            "marimo bridge",
+            "warn",
+            f"marimo {report.version} still exposes everything the bridge drives, but the bridge "
+            f"was verified against {report.pinned}; run `uv run pytest -m contract`",
+        )
+    else:
+        _check(
+            results,
+            "marimo bridge",
+            "ok",
+            f"marimo {report.version} exposes the private _code_mode surface kedge drives",
+        )
+
+
 def _check_keyring(results: list[dict[str, str]], config: Config) -> None:
     entry = config.model.api_key_ref
     status = api_key_status(config)
@@ -688,19 +924,24 @@ def _check_markers(results: list[dict[str, str]]) -> None:
 # ── helpers ──────────────────────────────────────────────────────────────────────────────────
 
 
-def _remember(workbook: Path) -> None:
-    """Record a workbook in the hub's registry, so the terminal and the browser agree.
+def _require_bridge() -> None:
+    """Refuse to go any further if the installed marimo no longer matches the bridge.
 
-    Best-effort by design. A workbook that will not register — an unwritable ``~/.kedge``, a file
-    that is not really OOXML — is not a reason to refuse to open it from the command line, where
-    the user has already said which file they mean.
+    PLAN 6.1 mitigation 5 asks for the assertion at startup, and this is startup: a marimo whose
+    private ``_code_mode`` surface has moved must produce one clear message naming the version
+    *before* a server is spawned and a conversation begun, not a ``TypeError`` from inside a tool
+    call twenty minutes later. The introspection is cached, so the driver's own call later in the
+    open sequence costs nothing.
+
+    Imported inside the function: ``kedge --help`` and ``kedge config`` have no business paying
+    for the notebook package's imports.
     """
-    from kedge.registry import WorkbookRegistry
+    from kedge.notebook import BridgeVersionError, verify_bridge
 
     try:
-        WorkbookRegistry.for_user().add(workbook)
-    except KedgeError as exc:
-        logger.debug("not registering %s for the hub: %s", workbook, exc)
+        verify_bridge()
+    except BridgeVersionError as exc:
+        raise _fail(str(exc)) from exc
 
 
 def _load(project_dir: Path | None = None) -> LoadedConfig:

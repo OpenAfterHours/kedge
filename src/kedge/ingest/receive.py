@@ -275,6 +275,17 @@ def _dedupe_path(root: Path, sha256: str, *, dedupe: bool) -> Path | None:
     existing = store.receipt_for_hash(root, sha256)
     if existing is None:
         return None
+    if not existing.path.is_relative_to(root):
+        # A receipt written with copy_on_select off records a path outside the store. Reusing
+        # it here would hand a caller who did ask for a managed copy a shared-drive path
+        # instead, quietly breaking the one invariant HandIn exists to hold (PLAN 2.8).
+        logger.debug(
+            "hand-in sha256:%s was last referenced in place at %s, so it is not a managed "
+            "copy to reuse",
+            sha256[:12],
+            existing.path,
+        )
+        return None
     logger.debug("hand-in sha256:%s is already stored at %s", sha256[:12], existing.path)
     return existing.path
 

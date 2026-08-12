@@ -12,7 +12,8 @@ Handlers are attached to the ``kedge`` namespace logger only, so importing kedge
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import sys
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -25,6 +26,34 @@ _HANDLER_NAME = "kedge-console"
 _FILE_HANDLER_NAME = "kedge-file"
 _FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
+
+
+class _StderrHandler(logging.StreamHandler):  # type: ignore[type-arg]
+    """A stream handler that resolves ``sys.stderr`` when it emits, not when it is built.
+
+    ``logging.StreamHandler()`` captures whatever ``sys.stderr`` is at construction and holds
+    that object forever. kedge configures logging once at entry, and by the time a record is
+    written that object may be gone: under pytest each test's capture buffer is closed at
+    teardown, so a record emitted from a watcher or server thread a moment later raised
+    ``ValueError: I/O operation on closed file`` and printed a ``--- Logging error ---`` block
+    into the middle of an otherwise green run. The same trap catches any embedder that
+    redirects stderr after importing kedge.
+
+    The standard library solves this the same way for its own last-resort handler
+    (``logging._StderrHandler``); this is that, named and documented.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @property
+    def stream(self) -> Any:
+        """Whatever ``sys.stderr`` is right now."""
+        return sys.stderr
+
+    @stream.setter
+    def stream(self, _value: Any) -> None:
+        """Ignored. ``StreamHandler.__init__`` assigns this, and the point is not to keep it."""
 
 
 def configure_logging(
@@ -55,7 +84,7 @@ def configure_logging(
             logger.removeHandler(existing)
             existing.close()
 
-    console = logging.StreamHandler()
+    console = _StderrHandler()
     console.name = _HANDLER_NAME
     console.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
     logger.addHandler(console)

@@ -74,13 +74,17 @@ __all__ = ["AnalysisOptions", "analyse"]
 
 
 def _kedge_version() -> str:
-    """The installed kedge version, or a placeholder when running from a source tree."""
-    try:
-        from importlib.metadata import PackageNotFoundError, version
+    """The version of the kedge that produced this analysis.
 
-        return version("kedge")
-    except (ImportError, PackageNotFoundError):  # pragma: no cover - packaging accident
-        return "0.0.0+unknown"
+    Read from :data:`kedge.__version__` rather than from installed distribution metadata,
+    because the two disagree in exactly the case where the stamp matters most: an editable
+    install whose metadata was written at ``uv sync`` time reports whatever version was current
+    then, so every analysis produced from a source tree would be attributed to the wrong
+    release. ``__version__`` is the code that actually ran.
+    """
+    from kedge import __version__
+
+    return __version__
 
 
 @dataclass(frozen=True, slots=True)
