@@ -190,8 +190,9 @@ _REASON_TEXT: dict[NotReconciledReason, str] = {
     NotReconciledReason.NO_CACHED_VALUES: (
         "The workbook holds no cached values for this range, so there is nothing to "
         "compare the Python output against. The output has NOT been checked and this is "
-        "NOT a pass. Open the workbook in Excel, let it recalculate, save it, and run "
-        "reconciliation again."
+        "NOT a pass. A workbook written by a tool rather than saved by Excel carries nothing "
+        "cached anywhere, so this may be the whole file rather than this one range. Open the "
+        "workbook in Excel, let it recalculate, save it, and run reconciliation again."
     ),
     NotReconciledReason.PARTIAL_CACHED_VALUES: (
         "Some rows in this range carry no cached value, so they could not be checked. The "

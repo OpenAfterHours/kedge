@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from functools import cache
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pytest
 
+from conftest import approved_plan_store
 from kedge.agent.context import (
     _EVICTED_SHORT_TAIL,
     _EVICTED_TAIL,
@@ -52,6 +55,10 @@ from kedge.server.events import DoneEvent
 
 CLEAN_CELL = "apply_haircuts = load_handin.join(reference_haircuts, on='asset_class', how='left')\n"
 PANDAS_CELL = "import pandas as pd\nframe = pd.read_excel('handin.xlsx')\n"
+
+_PLAN_DIRECTORY = TemporaryDirectory(prefix="kedge-plans-")
+"""Where `_plans_in_force` writes. Module-level so it outlives the tests and is removed with the
+interpreter, rather than a fixture threaded through `build`'s forty call sites."""
 
 _EVICTION_TAILS = (_EVICTED_TAIL, _EVICTED_SHORT_TAIL)
 """The wordings an eviction stub can end in.
@@ -165,12 +172,26 @@ def call(name: str, arguments: dict[str, Any], *, index: int = 0) -> list[ChatDe
     ]
 
 
+@cache
+def _plans_in_force() -> PlanStore:
+    """One store on disk holding an approved plan, shared by every loop built without one.
+
+    `propose_cell` and `edit_cell` are refused until a plan is in force, and most of what is
+    asserted here — the event choreography, the validation gate, the retry cap — needs to get past
+    that to reach its own subject. Built once and never written to again, so sharing it between
+    tests cannot couple them; `_PLAN_DIRECTORY` cleans itself up when the session ends.
+    """
+    return approved_plan_store(Path(_PLAN_DIRECTORY.name))
+
+
 def build(
     client: Any, *, driver: Any = None, context: ToolContext | None = None, **kwargs: Any
 ) -> KedgeAgent:
     return KedgeAgent(
         client=client,
-        context=context if context is not None else ToolContext(driver=driver),
+        context=context
+        if context is not None
+        else ToolContext(driver=driver, plans=_plans_in_force()),
         counter=TokenCounter(allow_download=False),
         system_prompt="SYSTEM PROMPT",
         **kwargs,

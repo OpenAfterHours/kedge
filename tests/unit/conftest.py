@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,6 +39,8 @@ from kedge.plan.model import (
     Stage,
     StageKind,
 )
+from kedge.plan.review import acknowledge_all_drops, approve
+from kedge.plan.store import PlanStore
 
 
 def make_operation(op_id: str = "calc_h2_h500", **overrides: Any) -> LogicalOperation:
@@ -193,6 +196,25 @@ def make_plan(**overrides: Any) -> ProcessPlan:
         created_at=overrides.pop("created_at", datetime(2026, 7, 24, 10, 0, tzinfo=UTC)),
         **overrides,
     )
+
+
+def make_approved_plan(**overrides: Any) -> ProcessPlan:
+    """The same plan, reviewed: every drop acknowledged and the approval recorded."""
+    return approve(acknowledge_all_drops(make_plan(**overrides), note="reviewed"), by="tests")
+
+
+def approved_plan_store(directory: Path, **overrides: Any) -> PlanStore:
+    """A real store on disk holding one approved plan.
+
+    The notebook-writing tools refuse until ``latest_approved()`` answers, so a test whose subject
+    is something else -- the caps, the validation gate, the staleness guard -- still needs a plan
+    in force to reach the behaviour it is about. It goes through :meth:`PlanStore.save` and
+    :func:`kedge.plan.review.approve` rather than a stub, so what the tools read is a plan that
+    was actually written and actually approved.
+    """
+    store = PlanStore(directory)
+    store.save(make_approved_plan(**overrides))
+    return store
 
 
 def make_finding(kind: FindingKind, severity: Severity = Severity.ERROR, **kw: Any) -> Finding:

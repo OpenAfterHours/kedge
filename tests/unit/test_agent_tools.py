@@ -19,7 +19,7 @@ import pytest
 from openpyxl import Workbook as OpenpyxlWorkbook
 from openpyxl import load_workbook
 
-from conftest import make_analysis, make_plan
+from conftest import approved_plan_store, make_analysis, make_plan
 from kedge.agent import tools as tools_module
 from kedge.agent.audit import OutboundLog
 from kedge.agent.context import CellFacts, NotebookState
@@ -37,7 +37,7 @@ from kedge.agent.tools import (
     tool_schemas,
     volatility_of,
 )
-from kedge.analysis.model import WorkbookAnalysis
+from kedge.analysis.model import CachedValueCoverage, WorkbookAnalysis
 from kedge.notebook.driver import MultiplyDefinedError, StaleCellError
 from kedge.notebook.model import (
     CellInfo,
@@ -147,8 +147,22 @@ def state() -> NotebookState:
 
 
 @pytest.fixture
-def registry(state: NotebookState) -> ToolRegistry:
-    tools = ToolRegistry(ToolContext(driver=FakeDriver()))
+def registry(state: NotebookState, tmp_path: Path) -> ToolRegistry:
+    return _notebook_tools(state, tmp_path)
+
+
+def _notebook_tools(
+    state: NotebookState, plans: Path, *, driver: Any = None, **context: Any
+) -> ToolRegistry:
+    """A registry that may write cells: a driver, and a plan the user has approved.
+
+    The approved plan is a default rather than something each test arranges, because
+    `propose_cell` and `edit_cell` are refused without one and almost nothing here is *about*
+    that. A test whose subject is the gate itself builds its own store and says so.
+    """
+    tools = ToolRegistry(
+        ToolContext(driver=driver or FakeDriver(), plans=approved_plan_store(plans), **context)
+    )
     tools.refresh(state)
     return tools
 
@@ -354,10 +368,11 @@ async def test_a_cell_body_with_raw_newlines_is_still_accepted(registry: ToolReg
 # ── notebook tools ───────────────────────────────────────────────────────────────────────────
 
 
-async def test_propose_cell_goes_through_the_validation_gate(state: NotebookState) -> None:
+async def test_propose_cell_goes_through_the_validation_gate(
+    state: NotebookState, tmp_path: Path
+) -> None:
     driver = FakeDriver()
-    tools = ToolRegistry(ToolContext(driver=driver))
-    tools.refresh(state)
+    tools = _notebook_tools(state, tmp_path, driver=driver)
     result = await tools.dispatch(
         "propose_cell",
         {"name": "loader", "code": "import pandas as pd\nframe = pd.DataFrame()\n"},
@@ -369,26 +384,173 @@ async def test_propose_cell_goes_through_the_validation_gate(state: NotebookStat
 
 
 async def test_propose_cell_reports_a_kernel_side_rejection_as_violations(
-    state: NotebookState,
+    state: NotebookState, tmp_path: Path
 ) -> None:
     message = "Multiply-defined names:\n  - 'pl' is already defined in cell 'AAaa' (imports)\n"
     driver = FakeDriver(fail=MultiplyDefinedError(message))
-    tools = ToolRegistry(ToolContext(driver=driver))
-    tools.refresh(state)
+    tools = _notebook_tools(state, tmp_path, driver=driver)
     result = await tools.dispatch("propose_cell", {"name": "second", "code": "value = 1\n"})
     assert not result.ok
     assert result.validated is False
     assert "'pl'" in result.violations[0]
 
 
-async def test_edit_cell_surfaces_staleness_as_a_retryable_result(state: NotebookState) -> None:
+async def test_edit_cell_surfaces_staleness_as_a_retryable_result(
+    state: NotebookState, tmp_path: Path
+) -> None:
     driver = FakeDriver(fail=StaleCellError("cell 'MJUe' changed since it was read"))
-    tools = ToolRegistry(ToolContext(driver=driver))
-    tools.refresh(state)
+    tools = _notebook_tools(state, tmp_path, driver=driver)
     result = await tools.dispatch("edit_cell", {"cell": "load_handin", "code": "value = 1\n"})
     assert not result.ok
     assert "list_cells" in result.text
     assert "resubmitting the same body" in result.text
+
+
+# ── the review gate on the writing tools ─────────────────────────────────────────────────────
+#
+# `scaffold_notebook` refuses an unapproved plan structurally and with no override, and its
+# docstring calls itself "the one place that consumes" approval. It was not: `propose_cell` and
+# `edit_cell` reach the same kernel and never looked at the plan at all, so the only thing between
+# a plan the user had declined and the cells implementing it was a sentence in the system prompt.
+# These are the tests for the gate that replaced the sentence.
+
+
+def _unapproved(directory: Path) -> PlanStore:
+    """A store holding a plan the model proposed and the user has not approved."""
+    store = PlanStore(directory)
+    store.save(make_plan())
+    return store
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("propose_cell", {"name": "apply_haircuts", "code": "apply_haircuts = 1\n"}),
+        ("edit_cell", {"cell": "load_handin", "code": "load_handin = 1\n"}),
+    ],
+)
+async def test_writing_a_cell_is_refused_until_the_user_has_approved_a_plan(
+    state: NotebookState, tmp_path: Path, tool: str, args: dict[str, str]
+) -> None:
+    driver = FakeDriver()
+    tools = ToolRegistry(
+        ToolContext(driver=driver, plans=_unapproved(tmp_path / "plans")),
+    )
+    tools.refresh(state)
+
+    result = await tools.dispatch(tool, args)
+
+    assert not result.ok
+    assert "propose_plan" in result.text, "the refusal has to say what to do instead"
+    assert driver.created == [] and driver.edited == [], "nothing reached the kernel"
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("propose_cell", {"name": "apply_haircuts", "code": "apply_haircuts = 1\n"}),
+        ("edit_cell", {"cell": "load_handin", "code": "load_handin = 1\n"}),
+    ],
+)
+async def test_an_approved_plan_lets_the_writing_tools_through(
+    state: NotebookState, tmp_path: Path, tool: str, args: dict[str, str]
+) -> None:
+    tools = _notebook_tools(state, tmp_path / "plans")
+
+    result = await tools.dispatch(tool, args)
+
+    assert result.ok, result.text
+    driver = tools.context.driver
+    assert driver.created or driver.edited
+
+
+async def test_the_writing_tools_are_refused_when_there_is_no_plan_store_at_all(
+    state: NotebookState,
+) -> None:
+    """No store is not a reason to proceed. Nothing can have been approved."""
+    driver = FakeDriver()
+    tools = ToolRegistry(ToolContext(driver=driver))
+    tools.refresh(state)
+
+    result = await tools.dispatch("propose_cell", {"name": "c", "code": "c = 1\n"})
+
+    assert not result.ok
+    assert "no plan store" in result.text
+    assert "propose_plan" in result.text
+    assert driver.created == []
+
+
+async def test_the_plan_refusal_does_not_read_as_something_to_retry(
+    state: NotebookState, tmp_path: Path
+) -> None:
+    """A decision the user has yet to make is not a transient failure.
+
+    The loop counts rejected drafts and re-prompts; a refusal a model reads as flaky spends the
+    rest of the turn resending the same cell rather than telling the user what it is waiting for.
+    """
+    tools = ToolRegistry(ToolContext(driver=FakeDriver(), plans=_unapproved(tmp_path / "plans")))
+    tools.refresh(state)
+
+    result = await tools.dispatch("propose_cell", {"name": "c", "code": "c = 1\n"})
+
+    assert "not a failure to retry" in result.text
+    assert result.summary == "refused: no approved plan is in force"
+
+
+async def test_the_plan_gate_comes_before_the_validation_gate(
+    state: NotebookState, tmp_path: Path
+) -> None:
+    """The most fundamental reason first, and the one the model cannot fix by rewriting the cell.
+
+    Reported the other way round, a model whose plan was declined is told its polars is wrong,
+    fixes it, and is refused for a reason it was never given — three times, into the retry cap.
+    """
+    tools = ToolRegistry(ToolContext(driver=FakeDriver(), plans=_unapproved(tmp_path / "plans")))
+    tools.refresh(state)
+
+    result = await tools.dispatch(
+        "propose_cell", {"name": "loader", "code": "import pandas as pd\nframe = pd.DataFrame()\n"}
+    )
+
+    assert not result.ok
+    assert "propose_plan" in result.text
+    assert result.violations == (), "the body was never validated, so there is nothing to fix"
+
+
+async def test_running_and_deleting_a_cell_are_not_gated_on_the_plan(
+    state: NotebookState,
+) -> None:
+    """The gate is on writing logic. Re-running existing code writes none, and a deletion already
+    stops and asks the user, which is a stronger control than this one."""
+    tools = ToolRegistry(ToolContext(driver=FakeDriver()))
+    tools.refresh(state)
+
+    ran = await tools.dispatch("run_cell", {"cell": "load_handin"})
+    deleted = await tools.dispatch("delete_cell", {"cell": "load_handin", "reason": "superseded"})
+
+    assert ran.ok, ran.text
+    assert "propose_plan" not in deleted.text
+    assert tools.pending_deletions[0].cell == "load_handin"
+
+
+async def test_a_later_unapproved_draft_does_not_retire_the_approval_in_force(
+    state: NotebookState, tmp_path: Path
+) -> None:
+    """The gate reads `latest_approved()`, which is what "in force" means everywhere else.
+
+    Read as `latest()` instead, proposing an amendment would stop the model working — the newest
+    plan on disk would be an unapproved one, and the approved plan it is still meant to be
+    implementing would stop counting.
+    """
+    store = approved_plan_store(tmp_path / "plans")
+    store.save_next(make_plan())
+    tools = ToolRegistry(ToolContext(driver=FakeDriver(), plans=store))
+    tools.refresh(state)
+
+    result = await tools.dispatch("propose_cell", {"name": "c", "code": "c = 1\n"})
+
+    assert store.latest() is not None and not store.latest().approval.approved
+    assert result.ok, result.text
 
 
 async def test_delete_cell_never_deletes(registry: ToolRegistry) -> None:
@@ -1430,12 +1592,32 @@ async def test_a_handle_is_kept_when_no_fingerprint_can_be_taken(workspace: Work
 
 
 def _write_calc_workbook(path: Path, values: list[float]) -> None:
+    """Column H as Excel left it, column K as a tool left it.
+
+    K holds formulas nothing has ever calculated, so it reads back with no cached value at all —
+    the state the whole file is in when it was written by a tool rather than saved by Excel, one
+    column wide. Having both in one workbook is what makes "no baseline" a question about a range
+    rather than about the file.
+    """
     book = OpenpyxlWorkbook()
     sheet = book.active
     sheet.title = "Calc"
     sheet["H1"] = "haircut_exposure"
+    sheet["K1"] = "doubled_exposure"
     for offset, value in enumerate(values, start=2):
         sheet[f"H{offset}"] = value
+        sheet[f"K{offset}"] = f"=H{offset}*2"
+    book.save(path)
+
+
+def _write_uncalculated_workbook(path: Path) -> None:
+    """A workbook no Excel has ever opened: formulas, and nothing cached behind any of them."""
+    book = OpenpyxlWorkbook()
+    sheet = book.active
+    sheet.title = "Calc"
+    sheet["H1"] = "haircut_exposure"
+    for row in range(2, 5):
+        sheet[f"H{row}"] = f"=ROW()*{row}"
     book.save(path)
 
 
@@ -1452,6 +1634,26 @@ def reconcilable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
     built = Workspace.for_workbook(workbook)
     built.ensure_dirs()
     return built
+
+
+@pytest.fixture
+def uncalculated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
+    """A workspace whose workbook carries no cached values anywhere."""
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "rwa_monthly.xlsx"
+    _write_uncalculated_workbook(workbook)
+    built = Workspace.for_workbook(workbook)
+    built.ensure_dirs()
+    return built
+
+
+def _no_coverage() -> WorkbookAnalysis:
+    """An analysis that says the workbook had nothing cached when it was last analysed."""
+    return make_analysis(
+        cached_values=CachedValueCoverage(
+            formula_cell_count=3, cached_present_count=0, coverage=0.0, status="absent"
+        )
+    )
 
 
 async def test_reconcile_passes_when_the_notebook_reproduces_the_workbook(
@@ -1507,3 +1709,135 @@ async def test_reconcile_says_so_when_the_notebook_will_not_run(
     assert not result.ok
     assert "NOT RECONCILED" in result.text
     assert "could not be run" in result.text
+
+
+# ── reconciliation and the analysis in memory ────────────────────────────────────────────────
+#
+# `context.analysis` is loaded once when the loop is built and never regenerated. A pre-check here
+# used to refuse the whole tool when it reported no coverage, which made the sequence kedge itself
+# prints — reconcile, be told there is no baseline, open the workbook in Excel, let it calculate,
+# save it, ask again — return the identical refusal for the problem the user had just fixed. The
+# baseline is read from the file as it is now, so the question belongs to the reconciler, which
+# asks it per range and has always answered it correctly.
+
+
+async def test_a_workbook_with_no_cached_values_is_never_reported_as_passed(
+    uncalculated: Workspace,
+) -> None:
+    """The invariant, whatever the route to it (CLAUDE.md non-negotiable 6).
+
+    The notebook's numbers here are not wrong. There is simply nothing in the file to check them
+    against, and "not checked" is the only honest report of that.
+    """
+    _write_notebook(uncalculated, [4.0, 9.0, 16.0])
+    tools = ToolRegistry(ToolContext(workspace=uncalculated))
+
+    result = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:H4"}
+    )
+
+    assert not result.ok
+    assert "NOT RECONCILED" in result.text
+    assert "PASSED" not in result.text
+    assert "no_cached_values" in result.text
+
+
+async def test_the_no_baseline_report_says_what_the_removed_pre_check_said(
+    uncalculated: Workspace,
+) -> None:
+    """The remedy the user acts on, and the diagnosis that makes sense of it.
+
+    The pre-check's one piece of content the reason's own explanation lacked was *why* a workbook
+    might have nothing cached. That moved into the explanation rather than justifying a stale
+    check that kept it.
+    """
+    _write_notebook(uncalculated, [4.0, 9.0, 16.0])
+    tools = ToolRegistry(ToolContext(workspace=uncalculated))
+
+    result = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:H4"}
+    )
+
+    assert "written by a tool rather than saved by Excel" in result.text
+    assert "Open the workbook in Excel, let it recalculate, save it" in result.text
+
+
+async def test_reconcile_reads_the_workbook_rather_than_an_analysis_that_predates_the_save(
+    reconcilable: Workspace,
+) -> None:
+    """The bug this replaced: the refusal survived the fix it asked for.
+
+    The analysis in memory still says the workbook has nothing cached, because it was taken before
+    the user opened it in Excel and saved it. The file disagrees, and the file is what is being
+    reconciled against.
+    """
+    _write_notebook(reconcilable, [1.0, 2.0, 3.0])
+    tools = ToolRegistry(ToolContext(workspace=reconcilable, analysis=_no_coverage()))
+
+    result = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:H4"}
+    )
+
+    assert result.ok, result.text
+    assert "PASSED" in result.text
+
+
+async def test_a_range_without_a_baseline_does_not_condemn_the_ranges_that_have_one(
+    reconcilable: Workspace,
+) -> None:
+    """The question is per range. One workbook, two answers, and neither is the other's."""
+    _write_notebook(reconcilable, [1.0, 2.0, 3.0])
+    tools = ToolRegistry(ToolContext(workspace=reconcilable))
+
+    cached = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:H4"}
+    )
+    uncached = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!K2:K4"}
+    )
+
+    assert cached.ok, cached.text
+    assert not uncached.ok
+    assert "no_cached_values" in uncached.text
+
+
+async def test_a_baseline_with_holes_in_it_is_not_signed_off_either(
+    reconcilable: Workspace,
+) -> None:
+    """Partial coverage is handled where whole-workbook coverage never was.
+
+    Every row that had a baseline matched, and the region is still NOT RECONCILED: a region cannot
+    be signed off on a baseline with holes in it. The removed pre-check only ever fired on a
+    workbook with nothing cached at all, so this case has always been the reconciler's, decided
+    per range and per row.
+    """
+    _write_notebook(reconcilable, [1.0])
+    tools = ToolRegistry(ToolContext(workspace=reconcilable))
+
+    result = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:K2"}
+    )
+
+    assert not result.ok
+    assert "partial_cached_values" in result.text
+    assert "PASSED" not in result.text
+
+
+async def test_a_stale_analysis_cannot_manufacture_a_pass_either(
+    uncalculated: Workspace,
+) -> None:
+    """The staleness runs both ways, and only one direction would be dangerous.
+
+    Here the analysis says the workbook is fully cached and the file says otherwise. The reconciler
+    reads the file, so this is NOT RECONCILED — a report that believed the analysis would be a
+    signed-off process with nothing behind it.
+    """
+    _write_notebook(uncalculated, [4.0, 9.0, 16.0])
+    tools = ToolRegistry(ToolContext(workspace=uncalculated, analysis=make_analysis()))
+
+    result = await tools.dispatch(
+        "reconcile", {"variable": "apply_haircuts", "reference": "Calc!H2:H4"}
+    )
+
+    assert not result.ok
+    assert "NOT RECONCILED" in result.text

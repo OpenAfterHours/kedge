@@ -486,9 +486,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="propose_cell",
         description=(
-            "Create a new named cell. The body is checked by the validation gate — syntax, the "
-            "marimo single-definition rule against the live graph, policy, and output style — "
-            "before it reaches the kernel. Violations come back to you to fix."
+            "Create a new named cell. Refused until the user has approved a plan. The body is "
+            "checked by the validation gate — syntax, the marimo single-definition rule against "
+            "the live graph, policy, and output style — before it reaches the kernel. Violations "
+            "come back to you to fix."
         ),
         properties={
             "name": _string("Cell name: a plain identifier, named after the business step."),
@@ -503,9 +504,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
     ToolSpec(
         name="edit_cell",
         description=(
-            "Replace a cell's full body. Partial edits do not exist. Refused unless the cell was "
-            "read at its current version, which is how the user's own edits are protected; if it "
-            "comes back stale, list_cells that cell and look at what they wrote before deciding."
+            "Replace a cell's full body. Partial edits do not exist. Refused until the user has "
+            "approved a plan, and refused unless the cell was read at its current version, which "
+            "is how the user's own edits are protected; if it comes back stale, list_cells that "
+            "cell and look at what they wrote before deciding."
         ),
         properties={
             "cell": _string("The cell id or name to replace."),
@@ -1320,8 +1322,62 @@ class ToolRegistry:
         text = "\n".join(lines) or "the notebook has no cells yet."
         return ToolResult.note(text, summary=f"{len(cells)} cell(s)", caps=self._context.caps)
 
+    async def _refuse_without_an_approved_plan(self) -> ToolResult | None:
+        """Refuse a write to the notebook that no approved plan authorises, or return None.
+
+        The tools' half of the review gate. :func:`kedge.notebook.scaffold.scaffold_notebook`
+        refuses an unapproved plan structurally and with no override, but it is not the only way a
+        cell is written: ``propose_cell`` and ``edit_cell`` reach the same kernel, and until this
+        existed the only thing between a plan the user had declined and forty cells implementing it
+        was prose in the system prompt. A control that matters is refused rather than discouraged
+        here, the same way the row caps, the validation gate and ``propose_plan``'s own refusals
+        are (PLAN 2.2).
+
+        ``latest_approved() is None`` is the predicate because that is what "a plan is in force"
+        means everywhere else in kedge -- the scaffolder, ``get_plan``, ``propose_plan``'s
+        already-approved refusal and the server's plan panel all read exactly this. No store at all
+        is the same answer for a stronger reason: nothing can have been approved.
+
+        A store that will not read raises :class:`~kedge.errors.KedgeError` out of here and
+        :meth:`dispatch` turns it into a failed result. That is the same outcome by a different
+        route, which is the point: there is no path through this that ends in a cell being written.
+
+        Returns:
+            The refusal to hand back, or ``None`` when a plan is in force and the caller may
+            proceed.
+        """
+        store = self._context.plans
+        approved = None if store is None else await asyncio.to_thread(store.latest_approved)
+        if approved is not None:
+            return None
+        opening = (
+            "no plan store is attached to this workspace, so nothing can have been approved"
+            if store is None
+            else "no plan has been approved for this workbook"
+        )
+        return ToolResult.note(
+            f"refused: {opening}, and nothing is written to the notebook before the plan is "
+            f"approved. That review is what the plan is for: it is where the decomposition is "
+            f"corrected while correcting it is still minutes rather than an afternoon of reading "
+            f"cells backwards. Work out what this workbook does, stage by stage, and send that "
+            f"account through `propose_plan` for the user to approve; if you have already proposed "
+            f"one, it is with them and the answer is to say so and wait, not to propose it again. "
+            f"Nothing about resending this cell will change this — it is a decision the user has "
+            f"yet to make, not a failure to retry.",
+            ok=False,
+            summary="refused: no approved plan is in force",
+        )
+
     async def _tool_propose_cell(self, args: Mapping[str, Any]) -> ToolResult:
         driver = self._require_driver()
+        # Ordered behind the driver and ahead of the validation gate. The driver is whether kedge
+        # can write a cell at all, which no amount of planning changes and which the model cannot
+        # fix; the plan is whether it may; validation is whether this particular body is fit to.
+        # Most fundamental first, and the same order `propose_plan` refuses in: the collaborator,
+        # then the standing, then the contents.
+        refusal = await self._refuse_without_an_approved_plan()
+        if refusal is not None:
+            return refusal
         name = str(args["name"])
         code = str(args["code"])
         report = self._validate(code, cell=None)
@@ -1344,6 +1400,13 @@ class ToolRegistry:
 
     async def _tool_edit_cell(self, args: Mapping[str, Any]) -> ToolResult:
         driver = self._require_driver()
+        # Gated on the same terms as `propose_cell`: replacing a cell's whole body is authoring
+        # logic, and a rewrite is exactly how a declined decomposition would arrive one cell at a
+        # time. `run_cell` and `delete_cell` are not gated -- re-running existing code writes no
+        # new logic, and a deletion already stops and asks the user.
+        refusal = await self._refuse_without_an_approved_plan()
+        if refusal is not None:
+            return refusal
         target = str(args["cell"])
         code = str(args["code"])
         report = self._validate(code, cell=target)
@@ -2182,6 +2245,20 @@ async def _reconcile(context: ToolContext, args: Mapping[str, Any]) -> ToolResul
     Every failure path here reports NOT RECONCILED and says why. It is the one place in kedge where
     an optimistic default would be actively dangerous (CLAUDE.md non-negotiable 6): a false "passed"
     is a signed-off process that does not reproduce its own numbers.
+
+    **There is deliberately no cached-value pre-check here.** One used to refuse outright when
+    ``context.analysis`` reported no coverage, and it was wrong three times over. The analysis is
+    loaded once when the loop is built and never regenerated, so it went on refusing after the user
+    had done the very thing the refusal asked for — open the workbook in Excel, let it calculate,
+    save it — which is the sequence kedge itself prints. It asked a workbook-wide question where
+    the one being answered is per-range. And it was redundant: :func:`kedge.reconcile.read_baseline`
+    reads the actual range from the file as it is now, and
+    :func:`kedge.reconcile.compare.reconcile_region` turns an absent baseline into a
+    ``NOT_RECONCILED`` region carrying :attr:`NotReconciledReason.NO_CACHED_VALUES`' own
+    explanation, which says what the pre-check said. Nothing weakens by removing it: a region with
+    no baseline cannot reach ``PASSED`` from any of the three checks that stand in its way -- the
+    absent-baseline branch, the zero-compared-rows branch, and ``RegionResult``'s own refusal to be
+    constructed as a pass without compared rows.
     """
     reference = str(args["reference"])
     variable = str(args["variable"])
@@ -2227,15 +2304,10 @@ async def _reconcile(context: ToolContext, args: Mapping[str, Any]) -> ToolResul
             "not reconciled: no workspace",
         )
 
+    # Read for the report header only, and never refused on: see the note in the docstring. It is
+    # the analysis as it was when the loop was built, so it may describe the workbook before the
+    # user recalculated and saved it; the baseline itself is read from the file as it is now.
     analysis = context.analysis
-    if analysis is not None and not analysis.cached_values.coverage:
-        return refuse(
-            "this workbook carries no cached Excel values, so there is no baseline at all. "
-            "openpyxl never calculates, so a workbook written by a tool rather than saved by "
-            "Excel has nothing cached. Ask the user to open it in Excel, let it calculate, and "
-            "save it.",
-            "not reconciled: no cached values",
-        )
 
     try:
         definitions = await asyncio.to_thread(notebook_definitions, workspace.notebook_path)
