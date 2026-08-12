@@ -768,14 +768,20 @@ def test_a_pid_that_cannot_be_running_is_reported_as_gone() -> None:
         (ProcessLookupError("no such process"), False),
         (PermissionError("not yours"), True),
         (OSError("something else entirely"), True),
+        (OverflowError("signed integer is greater than maximum"), False),
     ],
-    ids=["running", "gone", "someone-elses", "unknown"],
+    ids=["running", "gone", "someone-elses", "unknown", "too-big-for-pid_t"],
 )
 def test_the_posix_liveness_probe_reads_every_answer_conservatively(
     monkeypatch: pytest.MonkeyPatch, raises: Exception | None, expected: bool
 ) -> None:
     """Anything but "no such process" means "assume it is still there", which is the safe way
-    round: a false "gone" frees a port kedge then fails to bind."""
+    round: a false "gone" frees a port kedge then fails to bind.
+
+    The exception is a pid too large for a C ``pid_t``, which is not a conservative case at all:
+    it cannot name a live process, and it reaches here from a corrupted marker file rather than
+    from anything the kernel said. Windows never sees it -- ``OpenProcess`` takes a DWORD -- so
+    this parametrisation is the only thing that pins it."""
     monkeypatch.setattr(lifecycle, "_IS_WINDOWS", False)
 
     def _probe(_pid: int, _sig: int) -> None:

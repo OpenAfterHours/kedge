@@ -438,6 +438,13 @@ def _pid_exists(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    except OverflowError:
+        # Larger than a C pid_t, so it cannot name a live process. Worth catching rather than
+        # letting it escape: the pid comes from a marker file a previous run wrote, and a
+        # truncated or corrupted one must leave orphan recovery reporting "gone", not raising.
+        # Windows takes a DWORD and answers this case through OpenProcess, which is why the
+        # asymmetry only shows up here.
+        return False
     except PermissionError:
         return True
     except OSError:
