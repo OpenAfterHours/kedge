@@ -20,6 +20,12 @@ What is pinned and what is disposable is a fixed order, not a heuristic:
   disposable thing in the window and re-fetching it costs one call;
 * evicted next — whole turns, oldest first, replaced by a line in the digest.
 
+Two windows can hold the same turn. A turn that ends without an answer — the step budget ran out,
+the user pressed Stop — is lifted out with :meth:`ConversationWindow.suspend` and seeded back into
+the next turn's window by :meth:`ConversationWindow.resume`. The tool traffic that made the turn
+expensive is precisely what the server does not persist, so without that hand-off the model comes
+back having forgotten everything it just went and looked up.
+
 Counting is done with ``tiktoken`` where it is available. It is not always: the encodings are
 downloaded on first use, and a machine with no network — or a locked-down one — would otherwise
 turn a context budget into a hard failure. :class:`TokenCounter` degrades to a character
@@ -31,7 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -69,6 +75,8 @@ _CHARS_PER_TOKEN = 4
 _EVICTED_TOOL_RESULT = (
     "[tool result evicted to stay within the context budget — call the tool again if you need it]"
 )
+
+_UNANSWERED_TOOL_CALL = "[no result — the turn stopped before this call completed]"
 
 
 # ── token counting ───────────────────────────────────────────────────────────────────────────
@@ -575,6 +583,7 @@ class ConversationWindow:
         self._digest: str = ""
         self._messages: list[ContextMessage] = []
         self._turn = 0
+        self._resumed_at: int | None = None
 
     # ── population ───────────────────────────────────────────────────────────────────────
 
@@ -660,6 +669,81 @@ class ConversationWindow:
                 self.add_user(content)
             elif role == "assistant":
                 self.add_assistant(content)
+
+    # ── carrying a turn across a pause ───────────────────────────────────────────────────
+
+    def suspend(self) -> tuple[ContextMessage, ...]:
+        """Lift out the turn being built, so a later window can carry on from where it stopped.
+
+        A turn that ends before the model has answered — the step budget ran out, the user pressed
+        Stop — has usually spent most of its cost on tool calls, and :meth:`load_history` cannot
+        bring them back: the server persists prose, which is the right thing to persist and the
+        wrong thing to resume from. Handing these messages to the next window keeps the expensive
+        half of the turn instead of making the model re-read the workbook to rediscover what it
+        already knew.
+
+        Every tool call leaves here answered. A chat completion is rejected outright when an
+        assistant message carrying ``tool_calls`` is not followed by a result for each of them,
+        and a turn abandoned between dispatching a call and recording its result is exactly how
+        that happens, so anything unanswered is filled in with a note saying so.
+
+        A window that was itself resumed carries the whole span back out, not just its newest
+        turn. Work that survived one pause has to survive the second: a conversation that stops
+        three times is one piece of work, and a hand-off that only ever remembered the most recent
+        leg would quietly drop the first two. What limits the span is the budget rather than the
+        count — :meth:`compact` runs first and takes with it anything the window could no longer
+        afford.
+
+        Example:
+            >>> window = ConversationWindow(system="be useful", budget=100_000)
+            >>> window.begin_turn()
+            1
+            >>> window.add_user("convert the haircut lookup")
+            >>> window.add_assistant("", tool_calls=[{"id": "c1", "function": {"name": "probe"}}])
+            >>> [message.role for message in window.suspend()]
+            ['user', 'assistant', 'tool']
+        """
+        floor = self._turn if self._resumed_at is None else min(self._resumed_at, self._turn)
+        current = [message for message in self._messages if message.turn >= floor]
+        answered = {message.tool_call_id for message in current if message.kind == "tool_result"}
+        carried: list[ContextMessage] = []
+        for message in current:
+            carried.append(message)
+            if message.kind != "assistant":
+                continue
+            for call in message.tool_calls:
+                call_id = str(call.get("id") or "")
+                if not call_id or call_id in answered:
+                    continue
+                answered.add(call_id)
+                function = call.get("function") or {}
+                carried.append(
+                    ContextMessage(
+                        role="tool",
+                        content=_UNANSWERED_TOOL_CALL,
+                        turn=message.turn,
+                        kind="tool_result",
+                        tool_call_id=call_id,
+                        tool_name=str(function.get("name") or ""),
+                    )
+                )
+        return tuple(carried)
+
+    def resume(self, messages: Sequence[ContextMessage]) -> int:
+        """Seed the window with a suspended turn, tool traffic and all, and return its index.
+
+        The messages are re-dated into the turn they are resumed as rather than kept at the index
+        they were suspended from. A message inherits its age from its turn, and those tool results
+        are the reason the turn was carried at all, so leaving them at their original index would
+        have :meth:`_age_out_tool_results` throw away exactly what was preserved.
+
+        The index is remembered, so a window that pauses again hands back the whole resumed span
+        rather than only its last leg (:meth:`suspend`).
+        """
+        turn = self.begin_turn()
+        self._messages.extend(replace(message, turn=turn) for message in messages)
+        self._resumed_at = turn
+        return turn
 
     # ── assembly ─────────────────────────────────────────────────────────────────────────
 
@@ -781,6 +865,7 @@ class ConversationWindow:
         self._messages = []
         self._digest = ""
         self._turn = 0
+        self._resumed_at = None
 
     def __repr__(self) -> str:
         return (

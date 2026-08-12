@@ -17,6 +17,7 @@ from kedge.server.events import (
     ErrorEvent,
     EventBus,
     NotebookNotification,
+    PausedEvent,
     StatusEvent,
     TokenEvent,
     ToolCallEvent,
@@ -236,6 +237,7 @@ def test_only_notebook_relevant_events_are_mirrored() -> None:
         CellResultEvent(cell_id="a", ok=False, error="boom"),
         ValidationEvent(ok=False, violations=("multiply-defined name 'ead'",)),
         ErrorEvent(message="the kernel went away", recoverable=False),
+        PausedEvent(message="Say continue and I will pick it up.", steps=50),
         DoneEvent(turn_id="t1"),
     }
     ignored = {
@@ -249,6 +251,20 @@ def test_only_notebook_relevant_events_are_mirrored() -> None:
         assert notification_for(event) is not None, event.type
     for event in ignored:
         assert notification_for(event) is None, event.type
+
+
+def test_a_pause_is_mirrored_as_a_question_rather_than_a_failure() -> None:
+    """A turn waiting for a word has not gone wrong, and must not be dressed up as if it had."""
+    notification = notification_for(PausedEvent(message="Say continue.", steps=50))
+    assert notification is not None
+    assert notification.variant is None
+    assert "Say continue." in notification.description
+
+
+def test_a_paused_event_survives_the_wire() -> None:
+    event = PausedEvent(message="I have taken 50 steps.", steps=50)
+    restored = parse_event(json.loads(encode_sse(event).split("data: ", 1)[1]))
+    assert restored == event
 
 
 def test_failures_are_mirrored_as_danger() -> None:

@@ -11,6 +11,7 @@ import pytest
 from kedge import config as config_module
 from kedge.config import (
     KEYRING_SERVICE,
+    AgentConfig,
     ApiKeyStoreError,
     Config,
     ConfigFileError,
@@ -91,6 +92,13 @@ def test_defaults_load_when_no_config_files_exist(kedge_home: Path, project: Pat
     assert loaded.config.ingest.copy_on_select is True
     assert loaded.config.redaction.enabled is False
     assert loaded.origin("sampling.max_rows") == "default"
+
+
+def test_the_configured_step_budget_is_the_one_the_loop_defaults_to() -> None:
+    """Two defaults for one number is one too many, so they are pinned to each other."""
+    from kedge.agent.loop import DEFAULT_MAX_STEPS
+
+    assert AgentConfig().max_steps == DEFAULT_MAX_STEPS
 
 
 def test_user_config_overrides_defaults(kedge_home: Path, project: Path) -> None:

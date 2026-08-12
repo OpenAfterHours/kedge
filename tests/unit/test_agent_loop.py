@@ -363,14 +363,116 @@ async def test_validation_retries_are_capped_at_three() -> None:
     assert len(client.seen) == 3  # it stopped rather than spending the rest of the budget
 
 
-async def test_the_step_budget_stops_a_loop_that_never_answers() -> None:
+# ── the step budget, and carrying a turn across it ───────────────────────────────────────────
+
+
+async def test_the_step_budget_pauses_a_loop_that_never_answers() -> None:
     driver = FakeDriver()
     rounds = [[*call("list_cells", {}, index=0)] for _ in range(10)]
     events = await drive(build(ScriptedClient(rounds), driver=driver, max_steps=3))
-    assert [event.type for event in events].count("tool_call") == 3
-    errors = [event for event in events if event.type == "error"]
-    assert "all 3 steps" in errors[0].message
+    types = [event.type for event in events]
+    assert types.count("tool_call") == 3
+    paused = [event for event in events if event.type == "paused"]
+    assert len(paused) == 1
+    assert paused[0].steps == 3
+    assert "3 steps" in paused[0].message
+    # It is a question, not a failure: an error here is what makes a user start again.
+    assert not any(event.type == "error" for event in events)
+    assert types.count("done") == 1
+
+
+async def test_a_paused_turn_resumes_with_everything_it_had_learnt() -> None:
+    driver = FakeDriver()
+    rounds = [[*call("list_cells", {}, index=0)] for _ in range(10)]
+    agent = build(client := ScriptedClient(rounds), driver=driver, max_steps=2)
+    await drive(agent, "convert the haircut lookup")
+
+    # What the server would have persisted of that turn: the question, and no prose to speak of.
+    history = (
+        TurnMessage(role="user", content="convert the haircut lookup"),
+        TurnMessage(role="assistant", content="Looking."),
+    )
+    await drive(agent, "continue", history=history)
+
+    resumed = client.seen[2]
+    assert [message["role"] for message in resumed].count("tool") == 2
+    assert any(message.get("tool_calls") for message in resumed)
+    assert resumed[-1] == {"role": "user", "content": "continue"}
+    # The paused turn is carried whole rather than alongside the flattened record of itself.
+    opening = [m for m in resumed if m.get("content") == "convert the haircut lookup"]
+    assert len(opening) == 1
+    assert not any(message.get("content") == "Looking." for message in resumed)
+
+
+async def test_the_carried_turn_is_let_go_once_the_model_answers() -> None:
+    driver = FakeDriver()
+    agent = build(
+        client := ScriptedClient(
+            [
+                [*call("list_cells", {}, index=0)],
+                [*call("list_cells", {}, index=0)],
+                [ChatDelta(text="Here is the answer.")],
+                [ChatDelta(text="Anything else?")],
+            ]
+        ),
+        driver=driver,
+        max_steps=2,
+    )
+    await drive(agent, "convert the haircut lookup")
+    await drive(agent, "continue")
+    await drive(agent, "and now the overrides")
+
+    assert not any(message["role"] == "tool" for message in client.seen[-1])
+
+
+async def test_a_cancelled_turn_keeps_the_tool_results_it_paid_for() -> None:
+    """Stop is not "throw it away". The work is on the shelf when the user says what to do next."""
+
+    class StopAfterOneCall:
+        """Calls a tool, presses Stop during the next round trip, and answers the turn after."""
+
+        def __init__(self) -> None:
+            self.token = CancelToken()
+            self.rounds = 0
+            self.seen: list[list[dict[str, Any]]] = []
+
+        async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
+            del model, tools
+            self.seen.append([dict(message) for message in messages])
+            self.rounds += 1
+            if self.rounds > 2:
+                yield ChatDelta(text="Picking up where I left off.")
+                return
+            if self.rounds == 2:
+                self.token.cancel()
+            for delta in call("list_cells", {}, index=0):
+                yield delta
+
+    client = StopAfterOneCall()
+    agent = build(client, driver=FakeDriver())
+    request = TurnRequest(turn_id="t1", session_id="s1", message="convert the haircut lookup")
+    events = [event async for event in agent.run(request, cancel=client.token)]
     assert [event.type for event in events].count("done") == 1
+
+    await drive(agent, "use the cached values instead")
+    carried = client.seen[-1]
+    assert any(message["role"] == "tool" for message in carried)
+    # Every call the interrupted turn made is answered, or the endpoint rejects the request whole.
+    asked = {
+        tool_call["id"] for message in carried for tool_call in message.get("tool_calls") or ()
+    }
+    answered = {message["tool_call_id"] for message in carried if message["role"] == "tool"}
+    assert asked and asked == answered
+
+
+async def test_a_new_session_forgets_the_turn_that_was_held_for_it() -> None:
+    driver = FakeDriver()
+    rounds = [[*call("list_cells", {}, index=0)] for _ in range(10)]
+    agent = build(client := ScriptedClient(rounds), driver=driver, max_steps=2)
+    await drive(agent, "convert the haircut lookup")
+    agent.reset_session("s1")
+    await drive(agent, "start again")
+    assert not any(message["role"] == "tool" for message in client.seen[2])
 
 
 # ── context ──────────────────────────────────────────────────────────────────────────────────
@@ -509,6 +611,63 @@ def test_the_server_streams_this_loop_where_it_streamed_the_scripted_agent(
     recorded = logs[0].read_text(encoding="utf-8")
     assert '"tool":"read_range"' in recorded
     assert "0.02" not in recorded
+
+
+def test_a_paused_turn_resumes_through_the_server_with_what_it_had_learnt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pause and the resume as two real requests, against the history the server itself wrote.
+
+    The other tests hand the loop a history they made up. This one lets the server store it, which
+    is the version that has to agree: ``_history_before`` trims the server's flattened record of
+    the very turn the carried messages are about to put back whole.
+    """
+    from fastapi.testclient import TestClient
+    from openpyxl import Workbook as OpenpyxlWorkbook
+
+    from kedge.server.app import create_app
+    from kedge.server.sessions import SessionStore
+    from kedge.workspace import Workspace
+
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "process.xlsx"
+    book = OpenpyxlWorkbook()
+    sheet = book.active
+    sheet.title = "Calc"
+    sheet.append(["haircut"])
+    sheet.append([0.02])
+    book.save(workbook)
+
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+    reading = [
+        ChatDelta(text="Reading it.\n"),
+        *call("read_range", {"sheet": "Calc", "range": "A1:A2"}),
+    ]
+    client = ScriptedClient([reading, reading, [ChatDelta(text="Two rows, header on row 1.")]])
+    agent = KedgeAgent(
+        client=client,
+        context=ToolContext.for_workspace(workspace),
+        counter=TokenCounter(allow_download=False),
+        max_steps=2,
+    )
+    app = create_app(workspace, agent=agent, store=SessionStore(tmp_path / "sessions.sqlite"))
+
+    with TestClient(app) as http:
+        session = http.post("/api/sessions", json={"title": "smoke"}).json()["session"]["id"]
+        turns = f"/api/sessions/{session}/turns"
+        with http.stream("POST", turns, json={"message": "describe Calc"}) as response:
+            first = "".join(response.iter_text())
+        with http.stream("POST", turns, json={"message": "continue"}) as response:
+            second = "".join(response.iter_text())
+
+    assert "event: paused" in first
+    assert "event: paused" not in second
+
+    resumed = client.seen[2]
+    assert [message["role"] for message in resumed].count("tool") == 2
+    # Carried whole, not carried alongside the flattened record of the same turn.
+    assert [message.get("content") for message in resumed].count("describe Calc") == 1
 
 
 class EndpointRefusedError(KedgeError):

@@ -295,6 +295,90 @@ def test_reset_forgets_everything_including_the_digest() -> None:
     assert window.turn == 0
 
 
+def test_a_suspended_turn_carries_its_tool_traffic_into_another_window() -> None:
+    window = _window()
+    window.load_history([("user", "an older question"), ("assistant", "an older answer")])
+    window.begin_turn()
+    window.add_user("convert the haircut lookup")
+    window.add_assistant("Reading the sheet.", tool_calls=[{"id": "c1"}])
+    window.add_tool_result(tool_call_id="c1", name="sample_data", content="49,999 rows")
+
+    carried = window.suspend()
+    assert [message.kind for message in carried] == ["user", "assistant", "tool_result"]
+
+    resumed = _window()
+    resumed.resume(carried)
+    resumed.begin_turn()
+    resumed.add_user("continue")
+    rendered = resumed.assemble()
+    # The expensive half of the turn survived: the call and what it came back with.
+    assert any(message.get("tool_calls") for message in rendered)
+    assert {"role": "tool", "tool_call_id": "c1", "content": "49,999 rows"} in rendered
+    # And the older exchange did not come along; only the turn that was suspended.
+    assert not any(message.get("content") == "an older question" for message in rendered)
+
+
+def test_a_suspended_turn_answers_every_tool_call_it_carries() -> None:
+    """A call dispatched but never recorded is how a Stop lands, and the endpoint rejects it."""
+    window = _window()
+    window.begin_turn()
+    window.add_user("convert the haircut lookup")
+    window.add_assistant(
+        "",
+        tool_calls=[
+            {"id": "c1", "function": {"name": "sample_data"}},
+            {"id": "c2", "function": {"name": "reconcile"}},
+        ],
+    )
+    window.add_tool_result(tool_call_id="c1", name="sample_data", content="49,999 rows")
+
+    carried = window.suspend()
+    answered = {message.tool_call_id for message in carried if message.kind == "tool_result"}
+    assert answered == {"c1", "c2"}
+    unanswered = next(message for message in carried if message.tool_call_id == "c2")
+    assert "the turn stopped" in unanswered.content
+    assert unanswered.tool_name == "reconcile"
+
+
+def test_a_turn_suspended_twice_still_carries_its_first_leg() -> None:
+    window = _window()
+    window.begin_turn()
+    window.add_user("convert the haircut lookup")
+    window.add_tool_result(tool_call_id="c1", name="sample_data", content="the first leg")
+
+    second = _window()
+    second.resume(window.suspend())
+    second.begin_turn()
+    second.add_user("continue")
+    second.add_tool_result(tool_call_id="c2", name="probe", content="the second leg")
+
+    carried = second.suspend()
+    contents = [message.content for message in carried]
+    assert "the first leg" in contents, "work that survived one pause must survive the next"
+    assert "the second leg" in contents
+
+
+def test_a_resumed_tool_result_is_not_aged_out_for_being_old() -> None:
+    """The carry is re-dated. Left at the index it was suspended from it would read as ancient."""
+    window = _window()
+    window.begin_turn()
+    window.add_tool_result(tool_call_id="c1", name="sample_data", content="49,999 rows")
+    carried = window.suspend()
+
+    resumed = ConversationWindow(
+        system="SYSTEM",
+        budget=1_000_000,
+        counter=TokenCounter(allow_download=False),
+        evict_tool_results_after_turns=2,
+    )
+    resumed.load_history([("user", f"question {index}") for index in range(6)])
+    resumed.resume(carried)
+    resumed.begin_turn()
+    resumed.add_user("continue")
+    rendered = resumed.assemble()
+    assert any(message.get("content") == "49,999 rows" for message in rendered)
+
+
 def test_history_is_replayed_one_turn_per_exchange() -> None:
     window = _window()
     window.load_history([("user", "first"), ("assistant", "reply"), ("user", "second")])

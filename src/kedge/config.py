@@ -47,6 +47,7 @@ __all__ = [
     "KEYRING_SERVICE",
     "PROJECT_CONFIG_FILENAME",
     "USER_CONFIG_FILENAME",
+    "AgentConfig",
     "ApiKeyStoreError",
     "Config",
     "ConfigFileError",
@@ -168,6 +169,19 @@ class ModelConfig(_Section):
         return value.rstrip("/")
 
 
+class AgentConfig(_Section):
+    """How long one turn runs before the loop checks back in with the user."""
+
+    max_steps: int = Field(default=50, ge=1)
+    """Model round trips one turn takes before pausing to ask whether to carry on.
+
+    A check-in, not a wall: the paused turn's tool traffic is held and the next message resumes it
+    (``kedge.agent.loop.DEFAULT_MAX_STEPS``, which this default tracks). Raising it buys longer
+    unattended runs at the cost of a larger bill between check-ins, since every step re-sends the
+    context window.
+    """
+
+
 class ContextConfig(_Section):
     """Context window budget and the eviction knobs from PLAN M4."""
 
@@ -276,6 +290,7 @@ class Config(_Section):
     """The resolved configuration. Frozen; carries no secrets."""
 
     model: ModelConfig = Field(default_factory=ModelConfig)
+    agent: AgentConfig = Field(default_factory=AgentConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)

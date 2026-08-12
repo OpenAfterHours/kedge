@@ -481,6 +481,21 @@
         );
         break;
 
+      /* Not folded into "error". The turn is waiting for a word, not broken, and colouring it
+         like a failure is what makes a user start the conversation again from scratch — which
+         throws away the very context the pause exists to keep. */
+      case "paused":
+        view.addTrail(
+          trailItem({
+            kind: "Paused",
+            title: event.steps ? `after ${event.steps} steps` : null,
+            iconName: "i-stop",
+            tone: "accent",
+            detail: event.message,
+          }),
+        );
+        break;
+
       case "error":
         view.addTrail(
           trailItem({

@@ -2,9 +2,9 @@
 
 "The user is not sat there wondering what is happening" is a stated requirement, and PLAN M3 is
 explicit that an afterthought spinner will not satisfy it. So progress is a *vocabulary* rather
-than a boolean: ten event types covering prose, tool activity, cell operations, validation and
-completion, each carrying enough detail for the UI to say which tool ran, which cell was created,
-and what validation actually said.
+than a boolean: eleven event types covering prose, tool activity, cell operations, validation,
+pausing and completion, each carrying enough detail for the UI to say which tool ran, which cell
+was created, and what validation actually said.
 
 Every event is a pydantic model with a literal ``type``, gathered into a discriminated union so
 that serialising to SSE and parsing back are both total and typed. The wire form is one SSE
@@ -58,6 +58,7 @@ __all__ = [
     "OpenProgressEvent",
     "OpenReadyEvent",
     "OpenStep",
+    "PausedEvent",
     "Phase",
     "StatusEvent",
     "StepState",
@@ -240,6 +241,23 @@ class ValidationEvent(_BaseEvent):
     violations: tuple[str, ...] = ()
 
 
+class PausedEvent(_BaseEvent):
+    """The turn used its step budget and is asking whether to carry on.
+
+    Deliberately not an :class:`ErrorEvent`. Nothing went wrong, nothing was lost, and the loop
+    holds the turn's tool traffic so the next message resumes with everything it had learnt. A
+    turn that ends this way is waiting for a word, not reporting a failure, and the UI should say
+    so — telling a user their work has hit a problem when it has not is how people stop trusting
+    the trail.
+
+    ``steps`` is how many model round trips were spent getting here.
+    """
+
+    type: Literal["paused"] = "paused"
+    message: str
+    steps: int = 0
+
+
 class DoneEvent(_BaseEvent):
     """The turn finished. Always the last event of a turn."""
 
@@ -265,6 +283,7 @@ AnyEvent = (
     | CellRunningEvent
     | CellResultEvent
     | ValidationEvent
+    | PausedEvent
     | DoneEvent
     | ErrorEvent
 )
@@ -402,8 +421,9 @@ def notification_for(event: AnyEvent) -> NotebookNotification | None:
 
     Only the events that answer "did something happen to my notebook?" are mirrored. Streamed
     prose and tool chatter belong in the chat pane and would be noise in the notebook; a created
-    cell, a failed run, a rejected validation, an error, and the end of a turn are all things a
-    user watching the notebook pane needs to see without looking away.
+    cell, a failed run, a rejected validation, an error, a turn that has paused for an answer, and
+    the end of a turn are all things a user watching the notebook pane needs to see without
+    looking away.
     """
     if isinstance(event, CellCreatedEvent):
         return NotebookNotification(
@@ -423,6 +443,11 @@ def notification_for(event: AnyEvent) -> NotebookNotification | None:
             title=f"Validation rejected the change ({count})",
             description=first,
             variant="danger",
+        )
+    if isinstance(event, PausedEvent):
+        return NotebookNotification(
+            title="kedge is waiting for you",
+            description=event.message,
         )
     if isinstance(event, ErrorEvent):
         return NotebookNotification(

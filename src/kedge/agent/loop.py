@@ -31,6 +31,14 @@ without it leaves a half-written conversation on disk, and a turn that emits two
 Retries are capped. A cell rejected by the validation gate three times stops being a conversation
 the model can win on its own, so kedge surfaces it to the user rather than burning the rest of the
 budget rephrasing the same mistake.
+
+**A turn that stops without answering keeps what it learnt.** The step budget is a check-in, not a
+wall: at :data:`DEFAULT_MAX_STEPS` model round trips the loop pauses and asks whether to carry on,
+and the turn's tool traffic is held against the session and seeded into the next turn's window.
+The same applies to a Stop, and to a turn the validation cap ends. Only prose survives in the
+server's history, so without that hand-off a model that had just spent forty calls reading a
+workbook would come back to the next message knowing nothing about it — and would spend the
+forty again.
 """
 
 from __future__ import annotations
@@ -44,6 +52,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from kedge.agent.audit import outbound_log_for
 from kedge.agent.context import (
+    ContextMessage,
     ConversationWindow,
     NotebookState,
     TokenCounter,
@@ -61,6 +70,7 @@ from kedge.server.events import (
     CellRunningEvent,
     DoneEvent,
     ErrorEvent,
+    PausedEvent,
     StatusEvent,
     TokenEvent,
     ToolCallEvent,
@@ -99,8 +109,15 @@ __all__ = [
     "serve",
 ]
 
-DEFAULT_MAX_STEPS = 8
-"""How many model round trips one turn may take before kedge stops and says so."""
+DEFAULT_MAX_STEPS = 50
+"""How many model round trips one turn takes before kedge pauses and asks whether to carry on.
+
+A check-in rather than a wall, which is what makes it safe to set this high. A turn that reaches
+it keeps its tool traffic (:meth:`KedgeAgent._carry`) and the next message resumes it, so the
+budget costs a question rather than the work. Real conversions run long: eight steps was enough to
+read a sheet and propose one cell, and not enough to finish anything. Configurable as
+``[agent] max_steps``.
+"""
 
 _EDITING_TOOLS = frozenset({"propose_cell", "edit_cell", "delete_cell"})
 _RUNNING_TOOLS = frozenset({"run_cell", "probe", "reconcile"})
@@ -663,6 +680,8 @@ class KedgeAgent:
         self._tools = tool_schemas()
         self.registries: dict[str, ToolRegistry] = {}
         self._digests: dict[str, str] = {}
+        self._suspended: dict[str, tuple[ContextMessage, ...]] = {}
+        """Per session: the messages of a turn that stopped before the model answered."""
 
     # ── construction ─────────────────────────────────────────────────────────────────────
 
@@ -699,6 +718,7 @@ class KedgeAgent:
             model=workspace.config.model.model,
             context_config=workspace.config.context,
             system_prompt=system_prompt,
+            max_steps=workspace.config.agent.max_steps,
             analysis=resolved_analysis,
         )
 
@@ -742,6 +762,14 @@ class KedgeAgent:
     async def _turn(
         self, request: TurnRequest, cancel: CancelToken, meter: _Meter
     ) -> AsyncIterator[AnyEvent]:
+        """Work the turn to an answer, or to the point where it needs the user.
+
+        Every path out of the step loop other than the model answering leaves the window held for
+        the session, so the next message continues this turn rather than starting a colder one.
+        That is done in ``finally`` because the paths are not all returns: a Stop and a failing
+        endpoint both leave through an exception, and both have usually spent real work getting
+        wherever they got to.
+        """
         yield StatusEvent(phase="analysing")
         cancel.raise_if_cancelled()
 
@@ -750,45 +778,47 @@ class KedgeAgent:
         tools.refresh(state)
         window = self._window_for(request, state)
         attempts: dict[str, int] = {}
+        answered = False
 
-        for step in range(self._max_steps):
-            cancel.raise_if_cancelled()
-            yield StatusEvent(phase="thinking")
-
-            reply = _Reply()
-            messages = window.assemble()
-            meter.prompt = sum(self._counter.count_message(message) for message in messages)
-            async for event in self._complete(messages, request.model, cancel, reply):
-                yield event
-
-            window.add_assistant(
-                reply.content, tool_calls=[call.to_message() for call in reply.calls]
-            )
-            if not reply.calls:
-                logger.debug("turn %s finished after %d step(s)", request.turn_id, step + 1)
-                break
-
-            stop = False
-            for call in reply.calls:
+        try:
+            for step in range(self._max_steps):
                 cancel.raise_if_cancelled()
-                async for event in self._invoke(call, tools, window, request, attempts):
-                    if isinstance(event, ErrorEvent):
-                        stop = True
-                    yield event
-            if stop:
-                self._remember(request.session_id, window)
-                return
-        else:
-            yield ErrorEvent(
-                message=(
-                    f"I used all {self._max_steps} steps this turn without reaching an answer, so "
-                    f"I have stopped rather than keep going. Tell me which part to focus on and I "
-                    f"will pick it up from there."
-                ),
-                recoverable=True,
-            )
+                yield StatusEvent(phase="thinking")
 
-        self._remember(request.session_id, window)
+                reply = _Reply()
+                messages = window.assemble()
+                meter.prompt = sum(self._counter.count_message(message) for message in messages)
+                async for event in self._complete(messages, request.model, cancel, reply):
+                    yield event
+
+                window.add_assistant(
+                    reply.content, tool_calls=[call.to_message() for call in reply.calls]
+                )
+                if not reply.calls:
+                    logger.debug("turn %s finished after %d step(s)", request.turn_id, step + 1)
+                    answered = True
+                    return
+
+                stop = False
+                for call in reply.calls:
+                    cancel.raise_if_cancelled()
+                    async for event in self._invoke(call, tools, window, request, attempts):
+                        if isinstance(event, ErrorEvent):
+                            stop = True
+                        yield event
+                if stop:
+                    return
+
+            # The budget is spent but the work is not lost: the window goes on the shelf, the
+            # question goes to the user, and the pause is put to the model as its own last word so
+            # that "continue" reads as the answer to something it said rather than a non sequitur.
+            paused = _pause_message(self._max_steps)
+            window.add_assistant(paused)
+            logger.info("turn %s paused after its %d step budget", request.turn_id, self._max_steps)
+            yield PausedEvent(message=paused, steps=self._max_steps)
+        finally:
+            self._remember(request.session_id, window)
+            self._carry(request.session_id, window, answered=answered)
 
     async def _complete(
         self,
@@ -942,7 +972,20 @@ class KedgeAgent:
             ]
         )
         window.set_digest(self._digests.get(request.session_id, ""))
-        window.load_history((message.role, message.content) for message in request.history)
+
+        resumed = self._suspended.pop(request.session_id, None)
+        history = [(message.role, message.content) for message in request.history]
+        if resumed is not None:
+            history = _history_before(history, resumed)
+        window.load_history(history)
+        if resumed is not None:
+            window.resume(resumed)
+            logger.info(
+                "session %s resumes a paused turn: %d messages carried, %d of them tool results",
+                request.session_id,
+                len(resumed),
+                sum(1 for message in resumed if message.kind == "tool_result"),
+            )
         window.begin_turn()
         window.add_user(request.message)
         return window
@@ -973,9 +1016,32 @@ class KedgeAgent:
             self._digests[session_id] = window.compact()
             logger.info("compacted session %s to a digest", session_id)
 
+    def _carry(self, session_id: str, window: ConversationWindow, *, answered: bool) -> None:
+        """Hold an unfinished turn's tool traffic for the next message, or let it go.
+
+        Held only when there is something in it worth holding. A turn that stopped before the
+        model called anything has nothing the server's own history will not replay, and carrying
+        an empty shell would mean trimming a turn out of history to make room for less than it
+        said (:func:`_history_before`).
+        """
+        if answered:
+            self._suspended.pop(session_id, None)
+            return
+        carried = window.suspend()
+        if not any(message.kind == "tool_result" for message in carried):
+            self._suspended.pop(session_id, None)
+            return
+        self._suspended[session_id] = carried
+        logger.info(
+            "session %s is holding %d messages from an unfinished turn for the next one",
+            session_id,
+            len(carried),
+        )
+
     def reset_session(self, session_id: str) -> None:
-        """Forget a session's digest and its tool registry. The ``/new`` path."""
+        """Forget a session's digest, its held turn and its tool registry. The ``/new`` path."""
         self._digests.pop(session_id, None)
+        self._suspended.pop(session_id, None)
         self.registries.pop(session_id, None)
 
     async def aclose(self) -> None:
@@ -985,6 +1051,47 @@ class KedgeAgent:
 
     def __repr__(self) -> str:
         return f"KedgeAgent(model={self._model!r}, sessions={len(self.registries)})"
+
+
+def _pause_message(steps: int) -> str:
+    """What a turn says when it reaches its step budget.
+
+    Phrased as a question with a default, because that is what it is. The reassurance about
+    nothing being lost is load-bearing rather than politeness: a user who believes the turn has
+    been thrown away starts again from the beginning, which is the expensive thing this exists to
+    avoid.
+    """
+    return (
+        f"I have taken {steps} steps on this turn without finishing, so I have paused to check "
+        f"with you rather than keep going on my own. Nothing is lost — everything I have read and "
+        f"run so far is still here. Say 'continue' and I will pick up exactly where I stopped, or "
+        f"tell me what to do differently and I will take it from there."
+    )
+
+
+def _history_before(
+    history: Sequence[tuple[str, str]], resumed: Sequence[ContextMessage]
+) -> list[tuple[str, str]]:
+    """Drop the persisted record of the turn ``resumed`` carries, which is about to replace it.
+
+    The server stores a turn as one user message and the prose that answered it, so a paused turn
+    is already in history — flattened, with the tool calls that motivated the prose gone and the
+    interleaving with them gone too. The carried messages are that same turn intact, so the record
+    is replaced rather than kept alongside and read twice.
+
+    Left alone if the opening message cannot be found, which means history is not what the paused
+    turn was built from. Two copies of a turn is a poor context; a turn silently truncated to
+    resolve a disagreement about which one is real is a worse one.
+    """
+    opener = next((message.content for message in resumed if message.kind == "user"), None)
+    if opener is None:
+        return list(history)
+    for index in range(len(history) - 1, -1, -1):
+        role, content = history[index]
+        if role == "user" and content == opener:
+            return list(history[:index])
+    logger.debug("the resumed turn does not appear in history; keeping every message of it")
+    return list(history)
 
 
 def _safe_arguments(raw: str) -> dict[str, Any]:
