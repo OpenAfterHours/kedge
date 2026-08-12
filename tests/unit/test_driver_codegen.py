@@ -534,7 +534,7 @@ def test_the_driver_satisfies_the_shared_bridge_protocol() -> None:
         base_url="http://127.0.0.1:2718",
         token="secret",
         session_id="kedge-test",
-        verify=False,
+        check_bridge=False,
     )
     assert isinstance(built, NotebookBridge)
 
@@ -544,7 +544,7 @@ def test_the_driver_never_puts_the_token_in_its_repr() -> None:
         base_url="http://127.0.0.1:2718",
         token="super-secret-token",
         session_id="kedge-test",
-        verify=False,
+        check_bridge=False,
     )
     assert "super-secret-token" not in repr(built)
 

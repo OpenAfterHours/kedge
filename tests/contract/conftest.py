@@ -157,7 +157,7 @@ class LiveMarimo:
             base_url=self.base_url,
             token=self.token,
             session_id=self.session_id,
-            verify=True,
+            check_bridge=True,
         )
 
 

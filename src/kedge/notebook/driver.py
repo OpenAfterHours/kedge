@@ -1216,7 +1216,7 @@ class NotebookDriver:
         ...     base_url="http://127.0.0.1:2718",
         ...     token="secret",
         ...     session_id="kedge-1",
-        ...     verify=False,
+        ...     check_bridge=False,
         ... )
         >>> driver.session_id
         'kedge-1'
@@ -1229,10 +1229,25 @@ class NotebookDriver:
         token: str,
         session_id: str,
         client: KernelClient | None = None,
-        verify: bool = True,
+        check_bridge: bool = True,
         timeout: float | None = None,
     ) -> None:
-        if verify:
+        """Build a driver.
+
+        Args:
+            base_url: The marimo server kedge owns, always loopback.
+            token: The per-launch token that server was started with.
+            session_id: The session every submission runs in.
+            client: A transport to use instead of building one. The test seam.
+            check_bridge: Run :func:`verify_bridge` first, so a marimo whose private API has
+                moved fails here, naming the version, rather than mid-conversation (PLAN 6.1
+                mitigation 5). Nothing to do with TLS -- this connection is loopback HTTP and
+                presents no certificate. Certificate trust lives in :mod:`kedge.tls`, which is
+                why this is not called ``verify``: one codebase cannot afford two meanings of
+                that word.
+            timeout: Seconds to allow a submission, or ``None`` for the default.
+        """
+        if check_bridge:
             verify_bridge()
         self._kernel = client or KernelClient(
             base_url,
@@ -1242,8 +1257,12 @@ class NotebookDriver:
         )
 
     @classmethod
-    def for_workspace(cls, workspace: Workspace, *, verify: bool = True) -> NotebookDriver:
+    def for_workspace(cls, workspace: Workspace, *, check_bridge: bool = True) -> NotebookDriver:
         """Build a driver for the marimo server ``workspace`` owns.
+
+        Args:
+            workspace: The workspace holding the marimo session to drive.
+            check_bridge: As :meth:`__init__`. The private-API preflight, not TLS.
 
         Raises:
             WorkspaceError: No server is attached to the workspace.
@@ -1261,7 +1280,7 @@ class NotebookDriver:
             base_url=session.base_url,
             token=session.token,
             session_id=session.session_id,
-            verify=verify,
+            check_bridge=check_bridge,
         )
 
     @property
