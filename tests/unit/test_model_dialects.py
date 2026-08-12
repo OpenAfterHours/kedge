@@ -27,6 +27,7 @@ from kedge.agent.loop import (
     AgentError,
     OpenAIClient,
     _describe,
+    _status_detail,
     responses_delta,
     responses_input,
     responses_tools,
@@ -363,7 +364,9 @@ async def test_a_refusal_that_is_not_about_reasoning_is_raised() -> None:
         responses_events=[_text_event("never reached")],
     )
 
-    with pytest.raises(BadRequestError):
+    # Raised as an AgentError rather than the SDK's own: the loop reports a KedgeError as
+    # recoverable, and the endpoint's complaint has to survive into the message either way.
+    with pytest.raises(AgentError, match="unknown model 'nope'"):
         await _drain(_client(sdk, reasoning_effort="high"))
 
 
@@ -451,7 +454,7 @@ async def test_chat_completions_gives_up_once_the_ladder_is_exhausted() -> None:
 
     sdk = AlwaysRefuses(responses_errors=[_status_error(NotFoundError, 404, "Not Found")])
 
-    with pytest.raises(BadRequestError):
+    with pytest.raises(AgentError, match="reasoning is not supported here at all"):
         await _drain(_client(sdk, reasoning_effort="high"), tools=TOOLS)
     assert [p.get("reasoning_effort") for p in sdk.chat_payloads] == ["high", "none", None]
 
@@ -474,7 +477,8 @@ async def test_a_pinned_responses_endpoint_does_not_fall_back() -> None:
         chat_chunks=[_chat_chunk("should not be used")],
     )
 
-    with pytest.raises(NotFoundError):
+    # And the message says the pin is why, rather than sending the user to check base_url.
+    with pytest.raises(AgentError, match="pinned to `responses`"):
         await _drain(_client(sdk, api="responses"))
     assert not sdk.chat_payloads
 
@@ -545,3 +549,101 @@ async def test_an_exception_with_no_message_is_named_rather_than_left_dangling()
     # What produced the trailing "ReadTimeout: ." in the chat pane.
     assert _describe(httpx.ReadTimeout("")) == "ReadTimeout"
     assert _describe(ValueError("no columns")) == "ValueError: no columns"
+
+
+# ── refusals ─────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("kind", "status", "expected"),
+    [
+        ("RateLimitError", 429, "rate limiting"),
+        ("InternalServerError", 503, "its own side"),
+        ("AuthenticationError", 401, "API key"),
+        ("PermissionDeniedError", 403, "API key"),
+        ("BadRequestError", 400, "does not retry a refusal"),
+    ],
+)
+async def test_a_refusal_is_recoverable_and_says_whose_problem_it_is(
+    kind: str, status: int, expected: str
+) -> None:
+    # Left raw these reach the loop's catch-all, which reports every exception as unrecoverable --
+    # and app.js renders that as "Fatal". A rate limit is the most recoverable thing there is.
+    import openai
+
+    sdk = FakeSDK(responses_errors=[_status_error(getattr(openai, kind), status, "endpoint says")])
+
+    with pytest.raises(AgentError) as caught:
+        await _drain(_client(sdk))
+
+    assert isinstance(caught.value, KedgeError)
+    message = str(caught.value)
+    assert expected in message
+    assert "endpoint says" in message
+
+
+async def test_a_transient_refusal_says_the_waiting_is_already_done() -> None:
+    # "Ask again" reads as advice to wait. The SDK has already spent the wait, so say so.
+    from openai import RateLimitError
+
+    sdk = FakeSDK(responses_errors=[_status_error(RateLimitError, 429, "slow down")])
+
+    with pytest.raises(AgentError, match="already retried 3 times"):
+        await _drain(_client(sdk, max_retries=3))
+
+
+async def test_a_refusal_the_negotiation_declined_is_explained_rather_than_re_raised_raw() -> None:
+    # _recover() declines a 400 that is not about the dialect or about reasoning. That path used
+    # to re-raise the SDK error untouched, and an unknown model name is the commonest way to hit it.
+    from openai import BadRequestError
+
+    sdk = FakeSDK(
+        responses_errors=[
+            _status_error(BadRequestError, 400, "The model `gpt-5.6-terra` does not exist")
+        ]
+    )
+
+    with pytest.raises(AgentError) as caught:
+        await _drain(_client(sdk))
+
+    message = str(caught.value)
+    assert "gpt-5.6-terra" in message
+    assert "`model` under `[model]`" in message
+    assert not sdk.chat_payloads
+
+
+async def test_a_refusal_quotes_the_endpoints_prose_rather_than_the_sdks_wrapper() -> None:
+    # The SDK's message is 'Error code: 429 - {the whole body as a repr}'. Quoting that hands the
+    # user a Python dict literal to read.
+    from openai import RateLimitError
+
+    body = {"error": {"message": "Limit 30000 TPM. Retry after 12s.", "type": "tokens"}}
+    request = httpx.Request("POST", "http://127.0.0.1:1/v1/responses")
+    exc = RateLimitError(
+        f"Error code: 429 - {body!r}", response=httpx.Response(429, request=request), body=body
+    )
+
+    assert _status_detail(exc) == "Limit 30000 TPM. Retry after 12s"
+
+    with pytest.raises(AgentError) as caught:
+        await _drain(_client(FakeSDK(responses_errors=[exc])))
+
+    message = str(caught.value)
+    assert "Limit 30000 TPM. Retry after 12s." in message
+    assert "'error':" not in message
+    assert ".." not in message
+
+
+async def test_a_refusal_that_returns_an_error_page_does_not_fill_the_chat_pane() -> None:
+    # A gateway answering with HTML has no business being quoted in full.
+    from openai import InternalServerError
+
+    body = {"error": {"message": "<html>" + "x" * 5_000 + "</html>"}}
+    request = httpx.Request("POST", "http://127.0.0.1:1/v1/responses")
+    exc = InternalServerError(
+        "Error code: 502", response=httpx.Response(502, request=request), body=body
+    )
+
+    detail = _status_detail(exc)
+    assert len(detail) < 400
+    assert detail.endswith("[truncated]")
