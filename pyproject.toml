@@ -30,6 +30,13 @@ dependencies = [
     "polars==1.43.2",
     "fastexcel>=0.12",          # calamine engine behind pl.read_excel
     "python-docx>=1.1",
+    # Windows ships no IANA time-zone database, and `zoneinfo` has no fallback without this.
+    # Not a nicety: polars materialising a tz-aware datetime column calls `zoneinfo` from Rust
+    # and *unwraps* the result, so a missing database is a `pyo3_runtime.PanicException` rather
+    # than an exception -- uncatchable by the analyser's degrade-gracefully handlers and by the
+    # ingest reader's `_READ_ERRORS`. One tz-aware column in a parquet hand-in would take the
+    # kernel down. Reproduce without it: `pl.DataFrame({"t": [datetime.now(UTC)]})["t"].to_list()`.
+    "tzdata; sys_platform == 'win32'",
     # ── models & config ──────────────────────────────────────────────
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
@@ -85,7 +92,17 @@ packages = ["src/kedge"]
 [tool.hatch.build.targets.sdist]
 # The sdist is what a distributor builds from, so it carries the tests and the fixture corpus
 # the tests assert against -- but none of the working notes.
-include = ["src", "tests", "utils", "README.md", "LICENSE", "CONVENTIONS.md", "pyproject.toml"]
+include = [
+    "src",
+    "tests",
+    "utils",
+    "README.md",
+    "LICENSE",
+    "CONVENTIONS.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "pyproject.toml",
+]
 
 [tool.ruff]
 line-length = 100
@@ -154,3 +171,18 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.coverage.run]
 source = ["src/kedge"]
 branch = true
+
+[tool.coverage.report]
+# Measured at 88% (statement + branch) over unit + corpus on 2026-08-12. The floor sits three
+# points under that: far enough that ordinary churn -- a new module landing before its tests, a
+# platform branch only one CI leg reaches -- does not fail the build, close enough that a real
+# regression does. A whole module losing its tests moves the total by more than three points.
+# Raise it as the number rises; do not lower it to make a build pass.
+fail_under = 85
+# `if TYPE_CHECKING:` blocks and `@overload` stubs cannot execute at runtime, so counting them
+# against the total measures nothing. `raise NotImplementedError` is deliberately NOT excluded:
+# the only one in `src/` is `cli._resolve`'s milestone shim, which is a real, tested path.
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "@(typing\\.)?overload",
+]
