@@ -1,4 +1,4 @@
-"""Enforce the two import invariants `CONVENTIONS.md` calls non-negotiable.
+"""Enforce the import and boundary invariants `CONVENTIONS.md` calls non-negotiable.
 
 Both are written down as greps, and both are wrong as greps. ``import pandas`` appears in
 `agent/validate.py` docstrings, in the `scaffold.py` message raised when generated code tries it,
@@ -14,6 +14,17 @@ Note that `notebook/driver.py` does import ``marimo._code_mode`` for real, twice
 still has the shape kedge assumes (PLAN 6.1 mitigation 5). Introspecting an API requires importing
 it. The enforceable rule is the one CONVENTIONS.md leads with: **exactly one module**, and that
 module is `driver.py`.
+
+The third rule is the same shape one layer out. ``kedge.marimo_http`` is the single point of
+contact for marimo's HTTP API, so that a marimo release moving an endpoint costs one file rather
+than a hunt; ``notebook/kernel.py`` is the one deliberate exception, because streaming
+``POST /api/kernel/execute`` asynchronously is a different shape from the rest, and even it
+imports the path and the headers from `marimo_http`. Enforced by looking for the ``/api/kernel/``
+prefix in live string literals -- docstrings excluded, since half a dozen of them name the
+endpoints in order to explain the boundary. It is deliberately narrower than the prose invariant:
+``/health`` and ``/sse`` are too generic to ban (kedge's own server serves ``/api/health``), so a
+new module could still health-poll marimo without tripping this. The two authenticated POSTs are
+the ones that matter, and they are covered.
 
 Run directly, or via CI::
 
@@ -39,6 +50,11 @@ PANDAS_ROOTS = ("src", "tests", "utils")
 BANNED_MODULE = "marimo._code_mode"
 CODE_MODE_ROOTS = ("src",)
 CODE_MODE_HOME = "src/kedge/notebook/driver.py"
+
+# CONVENTIONS.md 6: marimo's HTTP API is spoken by one module, with one named exception.
+KERNEL_API_PREFIX = "/api/kernel/"
+KERNEL_API_ROOTS = ("src",)
+KERNEL_API_HOMES = ("src/kedge/marimo_http.py", "src/kedge/notebook/kernel.py")
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +142,61 @@ def _check(
     return breaches
 
 
+def _docstring_ids(tree: ast.AST) -> set[int]:
+    """The identities of every string constant that is a docstring rather than a value.
+
+    This codebase leans hard on the attribute-docstring idiom -- a bare string literal after an
+    assignment -- as well as ordinary module, class and function docstrings, and all of them
+    discuss marimo's endpoints freely. Prose about a boundary is not a crossing of it.
+    """
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        # `ast.IfExp` and friends carry a single expression under `body`, not a statement list.
+        if not isinstance(body, list):
+            continue
+        for statement in body:
+            if (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Constant)
+                and isinstance(statement.value.value, str)
+            ):
+                found.add(id(statement.value))
+    return found
+
+
+def _check_kernel_api() -> list[Breach]:
+    """Collect every live string literal naming a marimo kernel endpoint outside its two homes."""
+    rule = (
+        f"marimo's HTTP API is spoken by {KERNEL_API_HOMES[0]} alone, with "
+        f"{KERNEL_API_HOMES[1]} as the one deliberate exception "
+        "(CONVENTIONS.md non-negotiable 6)"
+    )
+    breaches: list[Breach] = []
+    for path in _python_files(KERNEL_API_ROOTS):
+        if path.relative_to(REPO_ROOT).as_posix() in KERNEL_API_HOMES:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue  # already reported by the import checks, which parse the same files
+        docstrings = _docstring_ids(tree)
+        breaches.extend(
+            Breach(
+                path=path,
+                line=node.lineno,
+                statement=f"string literal contains {KERNEL_API_PREFIX!r}",
+                rule=rule,
+            )
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and KERNEL_API_PREFIX in node.value
+            and id(node) not in docstrings
+        )
+    return breaches
+
+
 def main() -> int:
     """Report every breach and return a process exit code."""
     breaches = [
@@ -141,6 +212,7 @@ def main() -> int:
             "(CONVENTIONS.md non-negotiable 2)",
             home=CODE_MODE_HOME,
         ),
+        *_check_kernel_api(),
     ]
 
     if breaches:
@@ -150,7 +222,10 @@ def main() -> int:
         print("\nSee CONVENTIONS.md. These are not style preferences; they are load-bearing.")
         return 1
 
-    print(f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}.")
+    print(
+        f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}; "
+        f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}."
+    )
     return 0
 
 
