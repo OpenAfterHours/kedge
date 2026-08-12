@@ -133,11 +133,39 @@ class AgentError(KedgeError):
 
 
 @dataclass(frozen=True, slots=True)
+class Usage:
+    """What one completion actually cost, as the endpoint counted it.
+
+    kedge's own :class:`~kedge.agent.context.TokenCounter` is an estimate over a fixed encoding,
+    which is the wrong one for most current models and cannot see the thing that matters most on a
+    50-step turn: how much of the prompt was served from the endpoint's cache. So the endpoint's
+    own numbers are preferred wherever it volunteers them.
+
+    Example:
+        >>> Usage(prompt=8_000, completion=120, cached=7_800).total
+        8120
+    """
+
+    prompt: int = 0
+    completion: int = 0
+    cached: int = 0
+    """Prompt tokens the endpoint served from cache. Part of ``prompt``, not additional to it."""
+
+    @property
+    def total(self) -> int:
+        """Prompt plus completion, cache or no cache."""
+        return self.prompt + self.completion
+
+
+@dataclass(frozen=True, slots=True)
 class ChatDelta:
-    """One fragment of a streamed completion: prose, or a piece of a tool call.
+    """One fragment of a streamed completion: prose, a piece of a tool call, or the usage report.
 
     Tool calls arrive spread across many chunks — the id and the function name once, the arguments
     a few characters at a time — so ``index`` is what stitches them back together.
+
+    A delta carrying ``usage`` carries nothing else: both dialects report the count once, at the
+    end, in an envelope of its own.
 
     Example:
         >>> ChatDelta(text="the haircut lookup ").text
@@ -149,6 +177,7 @@ class ChatDelta:
     call_id: str | None = None
     name: str | None = None
     arguments: str = ""
+    usage: Usage | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,7 +319,42 @@ def responses_delta(event: Any) -> ChatDelta | None:
                 call_id=getattr(item, "call_id", None),
                 name=getattr(item, "name", None),
             )
+    if kind in ("response.completed", "response.incomplete"):
+        # Incomplete as well as completed: a turn cut off by a length limit still cost what it
+        # cost, and dropping its numbers would silently understate the expensive turns.
+        usage = _usage_of(getattr(event, "response", None))
+        return None if usage is None else ChatDelta(usage=usage)
     return None
+
+
+def _usage_of(reported: Any) -> Usage | None:
+    """Read a usage report off either dialect's envelope, or ``None`` if there is not one.
+
+    The two dialects disagree on every name -- responses says ``input_tokens`` where chat
+    completions says ``prompt_tokens`` -- and plenty of OpenAI-compatible endpoints report a
+    subset, or nothing at all. Read through ``getattr`` and treat every field as optional: a
+    partial report is still better than kedge's own estimate, and a missing one must not raise.
+
+    Args:
+        reported: The object carrying the counts -- a chunk, or a responses envelope.
+
+    Returns:
+        The counts, or ``None`` when the endpoint said nothing.
+    """
+    usage = getattr(reported, "usage", None)
+    if usage is None:
+        return None
+    prompt = getattr(usage, "input_tokens", None)
+    if prompt is None:
+        prompt = getattr(usage, "prompt_tokens", 0)
+    completion = getattr(usage, "output_tokens", None)
+    if completion is None:
+        completion = getattr(usage, "completion_tokens", 0)
+    details = getattr(usage, "input_tokens_details", None) or getattr(
+        usage, "prompt_tokens_details", None
+    )
+    cached = getattr(details, "cached_tokens", 0) or 0
+    return Usage(prompt=int(prompt or 0), completion=int(completion or 0), cached=int(cached))
 
 
 def chat_deltas(chunk: Any) -> list[ChatDelta]:
@@ -300,6 +364,11 @@ def chat_deltas(chunk: Any) -> list[ChatDelta]:
     envelope, and ``index`` is the only thing tying a call's name to the arguments that follow.
     """
     deltas: list[ChatDelta] = []
+    # The usage chunk is the last one and carries no choices, so this is not an else: an endpoint
+    # that puts usage on a chunk that also has content must have both read.
+    usage = _usage_of(chunk)
+    if usage is not None:
+        deltas.append(ChatDelta(usage=usage))
     for choice in chunk.choices or ():
         delta = choice.delta
         if delta is None:
@@ -322,6 +391,16 @@ def chat_deltas(chunk: Any) -> list[ChatDelta]:
 def _mentions_reasoning(exc: Exception) -> bool:
     """Whether a refusal was about the reasoning parameter rather than the request as a whole."""
     return "reasoning" in str(exc).lower()
+
+
+def _mentions_stream_options(exc: Exception) -> bool:
+    """Whether a refusal was about the usage report kedge asked for.
+
+    Narrow on purpose. An endpoint that has never heard of ``stream_options`` names it; anything
+    that does not is a complaint about the request, and dropping the usage report would not fix it.
+    """
+    text = str(exc).lower()
+    return "stream_options" in text or "include_usage" in text
 
 
 def _missing_route(exc: Exception) -> bool:
@@ -416,6 +495,11 @@ class OpenAIClient:
         self._max_retries = max_retries
         """Kept for the same reason. The SDK exhausts these before kedge sees a 429 or a 5xx, so a
         message that does not say so invites the user to sit and wait for a retry already spent."""
+
+        self._include_usage = True
+        """Whether chat completions is still being asked for a usage report. Dropped permanently
+        if the endpoint refuses the parameter: the count is worth one round trip to discover and
+        nothing at all to lose, since kedge's own estimate stands in for it."""
 
         self._use_responses = api != "chat_completions"
         self._pinned = api != "auto"
@@ -620,15 +704,23 @@ class OpenAIClient:
     def _recover(self, exc: Exception) -> bool:
         """Adjust for a refusal and report whether the request is worth sending again.
 
-        False for anything that is not about the dialect or about reasoning, because degrading
-        around every 400 would turn a real complaint -- an unknown model, a malformed schema --
-        into a turn that silently did nothing and said why to nobody.
+        False for anything that is not about the dialect, the usage report or reasoning, because
+        degrading around every 400 would turn a real complaint -- an unknown model, a malformed
+        schema -- into a turn that silently did nothing and said why to nobody.
         """
         if self._use_responses and not self._pinned and _missing_route(exc):
             logger.info(
                 "the endpoint has no responses API (%s); using chat completions from here on", exc
             )
             self._use_responses = False
+            return True
+        if self._include_usage and _mentions_stream_options(exc):
+            logger.info(
+                "the endpoint does not accept stream_options (%s); kedge will estimate token "
+                "counts instead of reading them",
+                exc,
+            )
+            self._include_usage = False
             return True
         if not _mentions_reasoning(exc):
             return False
@@ -690,6 +782,9 @@ class OpenAIClient:
         effort = self._chat_ladder[self._chat_rung]
         if effort is not None:
             payload["reasoning_effort"] = effort
+        if self._include_usage:
+            # Chat completions reports usage only when asked; responses reports it unprompted.
+            payload["stream_options"] = {"include_usage": True}
         return await self._client.chat.completions.create(**payload)
 
     async def aclose(self) -> None:
@@ -706,19 +801,80 @@ class _Reply:
 
     content: str = ""
     calls: list[PendingToolCall] = field(default_factory=list)
+    usage: Usage | None = None
 
 
 @dataclass(slots=True)
 class _Meter:
-    """Approximate token accounting for one turn, reported on the ``DoneEvent``."""
+    """Token accounting for one turn, reported on the ``DoneEvent``.
+
+    Two tallies, kept apart. The estimate is kedge's own count over a fixed encoding and is always
+    available; the report is the endpoint's, is authoritative, and is the only one that can see
+    what the cache served. Whichever is used, it accumulates **per step** -- a turn is up to
+    ``max_steps`` completions and each one re-sends the whole prompt, so a single step's figure
+    understates the turn by as much as that multiple.
+    """
 
     prompt: int = 0
+    """Estimated prompt tokens, summed across the turn's steps."""
+
     output: int = 0
+    """Estimated output tokens, summed across the turn's steps."""
+
+    reported_prompt: int = 0
+    reported_output: int = 0
+    reported_cached: int = 0
+    steps: int = 0
+    steps_reported: int = 0
+
+    pending_prompt: int = 0
+    pending_output: int = 0
+    """This step's estimate, held back until the step ends and it is known whether the endpoint
+    reported its own. Exactly one of the two tallies takes each step; counting both would double
+    it."""
+
+    def stage_prompt(self, tokens: int) -> None:
+        """Record what this step's prompt was estimated to cost."""
+        self.pending_prompt = tokens
+
+    def stage_output(self, tokens: int) -> None:
+        """Add to what this step's output has been estimated to cost so far."""
+        self.pending_output += tokens
+
+    def record(self, usage: Usage | None) -> None:
+        """Close one step, taking the endpoint's numbers over kedge's estimate where there are."""
+        self.steps += 1
+        if usage is None:
+            self.prompt += self.pending_prompt
+            self.output += self.pending_output
+        else:
+            self.steps_reported += 1
+            self.reported_prompt += usage.prompt
+            self.reported_output += usage.completion
+            self.reported_cached += usage.cached
+        self.pending_prompt = 0
+        self.pending_output = 0
+
+    @property
+    def measured(self) -> bool:
+        """Whether every step of the turn came back with the endpoint's own numbers."""
+        return self.steps_reported > 0 and self.steps_reported == self.steps
 
     @property
     def total(self) -> int:
-        """Prompt plus output."""
-        return self.prompt + self.output
+        """Prompt plus output for the whole turn, reported where reported and estimated elsewhere.
+
+        A step abandoned part-way -- cancelled, or ended by a failing endpoint -- never closes, so
+        its estimate is added from the staging fields rather than lost.
+        """
+        return (
+            self.prompt
+            + self.output
+            + self.reported_prompt
+            + self.reported_output
+            + self.pending_prompt
+            + self.pending_output
+        )
 
 
 async def _abandon_if_cancelled[T](work: Awaitable[T], cancel: CancelToken) -> T:
@@ -875,7 +1031,7 @@ class KedgeAgent:
         try:
             async for event in self._turn(request, cancel, meter):
                 if isinstance(event, TokenEvent):
-                    meter.output += self._counter.count(event.text)
+                    meter.stage_output(self._counter.count(event.text))
                 yield event
         except asyncio.CancelledError:
             if not cancel.cancelled:
@@ -894,6 +1050,7 @@ class KedgeAgent:
                 ),
                 recoverable=False,
             )
+        _log_spend(request.turn_id, meter)
         yield DoneEvent(turn_id=request.turn_id, tokens_used=meter.total)
 
     # ── one turn ─────────────────────────────────────────────────────────────────────────
@@ -926,9 +1083,12 @@ class KedgeAgent:
 
                 reply = _Reply()
                 messages = window.assemble()
-                meter.prompt = sum(self._counter.count_message(message) for message in messages)
+                # token_total is the same count over the same messages, already memoised by the
+                # window -- recounting the rendered list here was a third full tokenisation.
+                meter.stage_prompt(window.token_total())
                 async for event in self._complete(messages, request.model, cancel, reply):
                     yield event
+                meter.record(reply.usage)
 
                 window.add_assistant(
                     reply.content, tool_calls=[call.to_message() for call in reply.calls]
@@ -983,6 +1143,8 @@ class KedgeAgent:
                 except StopAsyncIteration:
                     break
                 cancel.raise_if_cancelled()
+                if delta.usage is not None:
+                    reply.usage = delta.usage
                 if delta.text:
                     reply.content += delta.text
                     yield TokenEvent(text=delta.text)
@@ -1102,12 +1264,19 @@ class KedgeAgent:
             counter=self._counter,
             evict_tool_results_after_turns=evict_after,
         )
+        # Least volatile first. A prompt cache keys on the prefix, so anything placed ahead of a
+        # block that changes is cached and anything behind it is not: the workbook analysis and
+        # the plan hold still for a whole session, while the registry and the notebook state
+        # change the moment a cell is created. Ordering them the other way round -- as this did --
+        # pushed up to 1,400 tokens of analysis out of the cached prefix on every turn that
+        # touched the notebook. It reads better this way too: the workbook, the plan, then where
+        # the notebook has got to.
         window.set_pinned(
             [
-                state.registry.render(),
-                state.render(),
                 build_analysis_block(self._analysis),
                 build_plan_block(self._plan()),
+                state.registry.render(),
+                state.render(),
             ]
         )
         window.set_digest(self._digests.get(request.session_id, ""))
@@ -1244,6 +1413,38 @@ def _describe(exc: Exception) -> str:
     """
     detail = str(exc).strip()
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _log_spend(turn_id: str, meter: _Meter) -> None:
+    """Record what the turn cost, and how much of the prompt the endpoint served from cache.
+
+    At INFO because it is the number anyone tuning the context window needs and there is nowhere
+    else to read it: the ``DoneEvent`` carries a single total, and the cache hit rate -- the one
+    figure that says whether a 50-step turn is expensive or nearly free -- is not in it at all.
+    """
+    if meter.steps_reported:
+        share = 100.0 * meter.reported_cached / max(meter.reported_prompt, 1)
+        logger.info(
+            "turn %s spent %d tokens over %d step(s): %d prompt (%d cached, %.0f%%), %d output%s",
+            turn_id,
+            meter.total,
+            meter.steps,
+            meter.reported_prompt,
+            meter.reported_cached,
+            share,
+            meter.reported_output,
+            "" if meter.measured else f"; {meter.steps - meter.steps_reported} step(s) estimated",
+        )
+        return
+    logger.info(
+        "turn %s spent about %d tokens over %d step(s): %d prompt, %d output. The endpoint "
+        "reported no usage, so these are kedge's own estimate and say nothing about caching.",
+        turn_id,
+        meter.total,
+        meter.steps,
+        meter.prompt + meter.pending_prompt,
+        meter.output + meter.pending_output,
+    )
 
 
 def _status_detail(exc: Exception, limit: int = 300) -> str:

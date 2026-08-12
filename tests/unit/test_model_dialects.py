@@ -26,8 +26,10 @@ import pytest
 from kedge.agent.loop import (
     AgentError,
     OpenAIClient,
+    Usage,
     _describe,
     _status_detail,
+    _usage_of,
     responses_delta,
     responses_input,
     responses_tools,
@@ -647,3 +649,86 @@ async def test_a_refusal_that_returns_an_error_page_does_not_fill_the_chat_pane(
     detail = _status_detail(exc)
     assert len(detail) < 400
     assert detail.endswith("[truncated]")
+
+
+# ── what it cost ─────────────────────────────────────────────────────────────────────────────
+
+
+def _chat_usage_chunk(prompt: int, completion: int, cached: int = 0) -> SimpleNamespace:
+    """The last chunk of a chat-completions stream: usage, and no choices at all."""
+    return SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(
+            prompt_tokens=prompt,
+            completion_tokens=completion,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+        ),
+    )
+
+
+def _completed_event(prompt: int, completion: int, cached: int = 0) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=prompt,
+                output_tokens=completion,
+                input_tokens_details=SimpleNamespace(cached_tokens=cached),
+            )
+        ),
+    )
+
+
+async def test_chat_completions_is_asked_for_the_usage_report() -> None:
+    # It reports only when asked. Responses reports unprompted, which is why this is one-sided.
+    sdk = FakeSDK(chat_chunks=[_chat_chunk("hi")])
+    await _drain(_client(sdk, api="chat_completions"))
+    assert sdk.chat_payloads[0]["stream_options"] == {"include_usage": True}
+
+
+async def test_an_endpoint_that_refuses_the_usage_report_is_asked_again_without_it() -> None:
+    # kedge is pointed at whatever the user has, and plenty of gateways have never heard of
+    # stream_options. The count is worth one round trip to discover and nothing to lose.
+    from openai import BadRequestError
+
+    class RefusesUsage(FakeSDK):
+        async def _create_chat(self, **payload: Any) -> _Stream:
+            self.chat_payloads.append(payload)
+            if "stream_options" in payload:
+                raise _status_error(BadRequestError, 400, "unknown parameter 'stream_options'")
+            return _Stream([_chat_chunk("hello")])
+
+    sdk = RefusesUsage()
+    deltas = await _drain(_client(sdk, api="chat_completions"))
+
+    assert [delta.text for delta in deltas] == ["hello"]
+    assert "stream_options" not in sdk.chat_payloads[-1]
+
+
+async def test_both_dialects_report_the_same_shape_of_count() -> None:
+    # The wire names disagree -- input_tokens against prompt_tokens -- and the loop must not care.
+    chat = await _drain(
+        _client(FakeSDK(chat_chunks=[_chat_usage_chunk(9_000, 40, 8_600)]), api="chat_completions")
+    )
+    responses = await _drain(
+        _client(FakeSDK(responses_events=[_completed_event(9_000, 40, 8_600)]))
+    )
+
+    expected = Usage(prompt=9_000, completion=40, cached=8_600)
+    assert [delta.usage for delta in chat if delta.usage] == [expected]
+    assert [delta.usage for delta in responses if delta.usage] == [expected]
+
+
+async def test_a_turn_cut_off_by_a_length_limit_still_reports_what_it_spent() -> None:
+    # Dropping an incomplete turn's numbers would silently understate the expensive turns.
+    event = _completed_event(12_000, 4_000)
+    event.type = "response.incomplete"
+    deltas = await _drain(_client(FakeSDK(responses_events=[event])))
+    assert [delta.usage.prompt for delta in deltas if delta.usage] == [12_000]
+
+
+def test_an_endpoint_that_reports_nothing_is_not_an_error() -> None:
+    # Most local endpoints report a subset or nothing. A missing field is a zero, never a raise.
+    assert _usage_of(SimpleNamespace()) is None
+    assert _usage_of(SimpleNamespace(usage=None)) is None
+    assert _usage_of(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10))) == Usage(prompt=10)

@@ -414,3 +414,58 @@ def test_tool_messages_render_in_the_chat_completions_shape() -> None:
     )
     rendered: dict[str, Any] = message.to_openai()
     assert rendered == {"role": "tool", "tool_call_id": "c1", "content": "6 cells"}
+
+
+# ── counting ─────────────────────────────────────────────────────────────────────────────────
+
+
+class _CountingCounter(TokenCounter):
+    """A counter that records how often it was actually asked to tokenise something."""
+
+    def __init__(self) -> None:
+        super().__init__(allow_download=False)
+        self.calls = 0
+
+    def count_message(self, message: dict[str, Any]) -> int:
+        self.calls += 1
+        return super().count_message(message)
+
+
+def test_fitting_a_window_counts_each_message_once_rather_than_once_per_pass() -> None:
+    # Eviction walks the window repeatedly. Re-tokenising every message on every walk made
+    # fitting a full context quadratic in tiktoken calls, which is latency on every single step.
+    counter = _CountingCounter()
+    window = ConversationWindow(system="SYSTEM", budget=500, counter=counter)
+    for index in range(40):
+        window.begin_turn()
+        window.add_user(f"question {index}")
+        window.add_assistant("", tool_calls=[{"id": f"c{index}"}])
+        window.add_tool_result(tool_call_id=f"c{index}", name="sample_data", content="x" * 400)
+
+    counter.calls = 0
+    report = window.fit()
+
+    assert report.acted
+    # 120 messages plus the head and the digest. Quadratic would be thousands.
+    assert counter.calls <= 200
+
+
+def test_a_cached_count_is_not_reused_once_the_message_is_evicted() -> None:
+    # The placeholder is far smaller than what it replaces, so a cache that ignored the flip would
+    # report the window as still over budget and evict everything else to no purpose.
+    counter = TokenCounter(allow_download=False)
+    message = ContextMessage(
+        role="tool", content="x" * 4_000, turn=1, kind="tool_result", tool_call_id="c1"
+    )
+    full = message.tokens(counter)
+    message.evicted = True
+    assert message.tokens(counter) < full
+
+
+def test_the_head_is_recounted_when_the_pinned_blocks_change() -> None:
+    window = _window()
+    window.begin_turn()
+    window.add_user("go")
+    before = window.token_total()
+    window.set_pinned(["## Live notebook state\n" + "load_handin (MJUe)\n" * 50])
+    assert window.token_total() > before
