@@ -19,11 +19,12 @@ from typing import Any
 import pytest
 
 from kedge.agent.context import TokenCounter
-from kedge.agent.loop import ChatDelta, KedgeAgent
+from kedge.agent.loop import ChatDelta, KedgeAgent, Usage
 from kedge.agent.tools import ToolContext
 from kedge.errors import KedgeError
 from kedge.notebook.model import CellInfo, CellRef, GraphNode, GraphView, MutationResult
 from kedge.server.agent_seam import AgentLoop, CancelToken, TurnMessage, TurnRequest
+from kedge.server.events import DoneEvent
 
 CLEAN_CELL = "apply_haircuts = load_handin.join(reference_haircuts, on='asset_class', how='left')\n"
 PANDAS_CELL = "import pandas as pd\nframe = pd.read_excel('handin.xlsx')\n"
@@ -675,3 +676,73 @@ class EndpointRefusedError(KedgeError):
 
     def __init__(self) -> None:
         super().__init__("the model endpoint refused the request: no API key is configured")
+
+
+# ── what a turn cost ─────────────────────────────────────────────────────────────────────────
+
+
+def _done(events: list[Any]) -> Any:
+    return next(event for event in events if isinstance(event, DoneEvent))
+
+
+async def test_the_turn_total_is_the_whole_turn_rather_than_its_last_step() -> None:
+    # Every step re-sends the whole prompt, so a turn is the sum of its steps. Assigning the
+    # latest step's figure understated a long turn by as much as that multiple.
+    one = await drive(build(ScriptedClient([[ChatDelta(text="done")]]), driver=FakeDriver()))
+    three = await drive(
+        build(
+            ScriptedClient(
+                [
+                    call("list_cells", {}),
+                    call("list_cells", {}, index=1),
+                    [ChatDelta(text="done")],
+                ]
+            ),
+            driver=FakeDriver(),
+        )
+    )
+    assert _done(three).tokens_used > 2 * _done(one).tokens_used
+
+
+async def test_the_endpoints_own_count_is_preferred_to_kedges_estimate() -> None:
+    # kedge counts with a fixed encoding that is wrong for most current models, and cannot see
+    # the cache at all. Where the endpoint reports, its numbers are the ones that are used.
+    reported = Usage(prompt=9_000, completion=40, cached=8_600)
+    events = await drive(
+        build(ScriptedClient([[ChatDelta(text="done"), ChatDelta(usage=reported)]]))
+    )
+    assert _done(events).tokens_used == reported.total
+
+
+async def test_a_step_the_endpoint_did_not_report_still_contributes_its_estimate() -> None:
+    # Mixed is possible. The reported step must not also be estimated, and the silent one must
+    # not vanish.
+    reported = Usage(prompt=5_000, completion=10)
+    events = await drive(
+        build(
+            ScriptedClient(
+                [call("list_cells", {}), [ChatDelta(text="done"), ChatDelta(usage=reported)]]
+            ),
+            driver=FakeDriver(),
+        )
+    )
+    total = _done(events).tokens_used
+    assert total > reported.total
+
+
+async def test_the_pinned_blocks_are_ordered_least_volatile_first() -> None:
+    # A prompt cache keys on the prefix: whatever sits ahead of a block that changes stays cached
+    # and whatever sits behind it does not. The analysis and the plan hold still for a session;
+    # the registry and the notebook state change the moment a cell is created.
+    client = ScriptedClient([[ChatDelta(text="done")]])
+    await drive(build(client, driver=FakeDriver()))
+
+    head = client.seen[0][0]["content"]
+    order = [
+        head.index("## Workbook analysis"),
+        head.index("## Process plan"),
+        head.index("## Name registry"),
+        head.index("## Live notebook state"),
+    ]
+    assert order == sorted(order)
+    assert head.index("SYSTEM PROMPT") < order[0]

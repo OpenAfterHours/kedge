@@ -115,6 +115,17 @@ including the contract tests. `ty` is advisory there until its three known diagn
   429, a 5xx and a refusal the dialect negotiation declined all land. Quote the endpoint's prose
   from `body["error"]["message"]`, never the SDK's `message`: that one is
   `"Error code: 429 - {repr of the whole body}"`.
+- A turn is up to `[agent] max_steps` completions and **every one re-sends the whole prompt** —
+  around 8,000 tokens of system prompt, tool schemas and pinned blocks before the conversation.
+  Two consequences. `_window_for` pins **least volatile first** (analysis, plan, registry, state)
+  because a prompt cache keys on the prefix, so anything ahead of a block that changes stays
+  cached and anything behind it does not; reordering that list is a silent cost regression. And
+  `_Meter` accumulates **per step** — a single step's figure understates a turn by up to
+  `max_steps`.
+- Chat completions reports token usage only if asked (`stream_options={"include_usage": True}`,
+  dropped from the ladder in `_recover` if the endpoint refuses it); responses reports it
+  unprompted on `response.completed`. Prefer it over `TokenCounter`, which is an estimate over a
+  fixed `cl100k_base` and cannot see `cached_tokens` at all.
 - Excel's `ROUND` collapses the operand to **15 significant decimal digits** before rounding
   half-away-from-zero. Missing this is a one-penny error that propagates.
 - marimo's two file inputs return different things: `mo.ui.file` gives bytes with no path,

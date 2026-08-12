@@ -524,6 +524,25 @@ class ContextMessage:
     tool_calls: tuple[dict[str, Any], ...] = ()
     evicted: bool = False
 
+    _tokens: tuple[bool, int] | None = field(default=None, init=False, compare=False, repr=False)
+    """The cached ``(evicted, count)`` pair. Keyed on ``evicted`` because that is the only field
+    that changes after a message is added, and it changes what ``to_openai`` renders. Not an init
+    field, so :func:`dataclasses.replace` starts a copy with an empty cache rather than an
+    inherited one."""
+
+    def tokens(self, counter: TokenCounter) -> int:
+        """Return this message's cost, counting it only when the answer is not already known.
+
+        Eviction walks the window repeatedly, and re-tokenising every message on every pass made
+        fitting a full window quadratic in tiktoken calls rather than in additions.
+        """
+        cached = self._tokens
+        if cached is not None and cached[0] == self.evicted:
+            return cached[1]
+        count = counter.count_message(self.to_openai())
+        self._tokens = (self.evicted, count)
+        return count
+
     def to_openai(self) -> dict[str, Any]:
         """Render as the chat-completions message shape."""
         if self.role == "tool":
@@ -584,6 +603,8 @@ class ConversationWindow:
         self._messages: list[ContextMessage] = []
         self._turn = 0
         self._resumed_at: int | None = None
+        self._head_tokens: tuple[str, int] | None = None
+        self._digest_tokens: tuple[str, int] | None = None
 
     # ── population ───────────────────────────────────────────────────────────────────────
 
@@ -754,21 +775,47 @@ class ConversationWindow:
         return self._render()
 
     def _render(self) -> list[dict[str, Any]]:
-        head = "\n\n".join((self._system, *self._pinned))
-        messages: list[dict[str, Any]] = [{"role": "system", "content": head}]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self._head()}]
         if self._digest:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": "## Earlier in this conversation (compacted)\n\n" + self._digest,
-                }
-            )
+            messages.append({"role": "system", "content": self._digest_message()})
         messages.extend(message.to_openai() for message in self._messages)
         return messages
 
+    def _head(self) -> str:
+        return "\n\n".join((self._system, *self._pinned))
+
+    def _digest_message(self) -> str:
+        return "## Earlier in this conversation (compacted)\n\n" + self._digest
+
+    def _fixed_tokens(self) -> int:
+        """The cost of the system head and the digest, counted only when either has changed.
+
+        The head is the largest single message in the window and the one that changes least often
+        -- once per turn, when the pinned blocks are rebuilt -- so counting it on every pass of
+        eviction was most of the work for none of the information.
+        """
+        head = self._head()
+        if self._head_tokens is None or self._head_tokens[0] != head:
+            self._head_tokens = (
+                head,
+                self._counter.count_message({"role": "system", "content": head}),
+            )
+        total = self._head_tokens[1]
+        if not self._digest:
+            return total
+        digest = self._digest_message()
+        if self._digest_tokens is None or self._digest_tokens[0] != digest:
+            self._digest_tokens = (
+                digest,
+                self._counter.count_message({"role": "system", "content": digest}),
+            )
+        return total + self._digest_tokens[1]
+
     def token_total(self) -> int:
         """The token cost of the window as it currently stands."""
-        return sum(self._counter.count_message(message) for message in self._render())
+        return self._fixed_tokens() + sum(
+            message.tokens(self._counter) for message in self._messages
+        )
 
     # ── eviction ─────────────────────────────────────────────────────────────────────────
 
@@ -791,15 +838,24 @@ class ConversationWindow:
 
         evicted = 0
         summarised = 0
+        # Tracked incrementally rather than recomputed: evicting one message changes the total by
+        # exactly that message's delta, and asking the whole window again for every candidate is
+        # what made fitting a large context quadratic.
+        running = before
         for message in self._messages:
-            if self.token_total() <= self._budget:
+            if running <= self._budget:
                 break
             if message.kind == "tool_result" and not message.evicted:
+                was = message.tokens(self._counter)
                 message.evicted = True
+                running += message.tokens(self._counter) - was
                 evicted += 1
 
-        while self.token_total() > self._budget and self._can_drop_a_turn():
+        # Dropping a turn folds it into the digest, so the fixed part moves too and the running
+        # total has to be taken afresh. There are few of these; there are many of the above.
+        while running > self._budget and self._can_drop_a_turn():
             summarised += self._drop_oldest_turn()
+            running = self.token_total()
 
         after = self.token_total()
         report = EvictionReport(
