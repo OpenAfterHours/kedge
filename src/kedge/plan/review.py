@@ -804,9 +804,13 @@ def diff_plans(before: ProcessPlan, after: ProcessPlan) -> PlanDiff:
 def render_diff(diff: PlanDiff) -> str:
     """Render a :class:`PlanDiff` as plain text."""
     lines = [f"Plan v{diff.before_version} -> v{diff.after_version}"]
-    if diff.is_empty:
+    if diff.is_empty and not diff.approval_changed:
         lines.append("  no material changes")
         return "\n".join(lines)
+    # `is_empty` deliberately ignores approval — the two versions really are materially
+    # identical — but an approval is the single most important event in a plan's history, so
+    # returning "no material changes" and saying nothing else would hide the only thing that
+    # happened.
 
     for stage_id in diff.added_stages:
         lines.append(f"  + stage {stage_id}")
