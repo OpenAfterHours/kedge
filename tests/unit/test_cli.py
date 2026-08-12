@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from typer.testing import CliRunner
 from kedge import cli
 from kedge import config as config_module
 from kedge.cli import app
+from kedge.notebook import BridgeReport
 from kedge.reconcile import ReconciliationStatus
 
 SECRET = "sk-must-never-be-printed-0123456789"
@@ -20,6 +23,14 @@ SECRET = "sk-must-never-be-printed-0123456789"
 runner = CliRunner()
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+WATCH_MODULE = importlib.import_module("kedge.ingest.watch")
+"""The watched-folder module, fetched the long way round.
+
+``kedge.ingest`` re-exports the ``watch`` *function*, which shadows the submodule of the same
+name -- so ``import kedge.ingest.watch as m``, and monkeypatch's dotted string form, both bind
+the function instead of the module. Patching a name inside the module needs the module itself.
+"""
 
 
 def unstyled(output: str) -> str:
@@ -33,6 +44,17 @@ def unstyled(output: str) -> str:
     under CI, where ``FORCE_COLOR`` is set.
     """
     return _ANSI.sub("", output)
+
+
+def flattened(output: str) -> str:
+    """Unstyled output with every run of whitespace collapsed to one space.
+
+    For asserting on a *phrase*. rich word-wraps at the console width, so a sentence that reads
+    ``the watched folder ... does not exist`` on screen may carry a newline in the middle of it,
+    and the length of a `tmp_path` decides where. Collapsing the whitespace makes the assertion
+    about the message rather than about the terminal.
+    """
+    return " ".join(unstyled(output).split())
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +82,34 @@ def workbook(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def inbox(tmp_path: Path) -> Path:
+    """The folder another team drops hand-ins into."""
+    directory = tmp_path / "inbox"
+    directory.mkdir()
+    return directory
+
+
+def moved_bridge() -> BridgeReport:
+    """A report from a marimo whose private API has shifted under kedge."""
+    return BridgeReport(
+        version="0.24.0",
+        pinned=cli.MARIMO_PIN,
+        problems=("AsyncCodeModeContext.edit_cell() no longer accepts hide_code",),
+    )
+
+
+def pretend_bridge(monkeypatch: pytest.MonkeyPatch, report: BridgeReport) -> None:
+    """Point every route to the preflight at one fixed report.
+
+    ``kedge.notebook`` re-exports ``check_bridge``, and ``verify_bridge`` calls the copy in
+    ``kedge.notebook.driver``. Patching one and not the other proves nothing: `doctor` would
+    read the fake report and `open` the real one.
+    """
+    monkeypatch.setattr("kedge.notebook.check_bridge", lambda: report)
+    monkeypatch.setattr("kedge.notebook.driver.check_bridge", lambda: report)
+
+
 # ── help and version ─────────────────────────────────────────────────────────────────────────
 
 
@@ -67,7 +117,7 @@ def test_help_lists_every_command() -> None:
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ("open", "hub", "inspect", "reconcile", "contract", "config", "doctor"):
+    for command in ("open", "hub", "inspect", "reconcile", "watch", "contract", "config", "doctor"):
         assert command in result.output
 
 
@@ -85,7 +135,9 @@ def test_version_reports_the_package_and_the_marimo_pin() -> None:
     assert "0.23.15" in result.output
 
 
-@pytest.mark.parametrize("command", ["open", "hub", "inspect", "reconcile", "config", "doctor"])
+@pytest.mark.parametrize(
+    "command", ["open", "hub", "inspect", "reconcile", "watch", "config", "doctor"]
+)
 def test_each_command_has_help(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
 
@@ -162,7 +214,7 @@ def test_doctor_runs_and_reports_each_check() -> None:
     result = runner.invoke(app, ["doctor", "--no-network"])
 
     assert result.exit_code == 0
-    for check in ("python", "marimo", "config", "keyring", "marker files"):
+    for check in ("python", "marimo", "marimo bridge", "config", "keyring", "marker files"):
         assert check in result.output
 
 
@@ -173,7 +225,15 @@ def test_doctor_json_is_machine_readable() -> None:
     payload = json.loads(result.output)
     assert payload["ok"] is True
     names = {check["check"] for check in payload["checks"]}
-    assert {"python", "marimo", "config", "keyring", "user directory", "marker files"} <= names
+    assert {
+        "python",
+        "marimo",
+        "marimo bridge",
+        "config",
+        "keyring",
+        "user directory",
+        "marker files",
+    } <= names
 
 
 def test_doctor_warns_about_a_missing_keyring_entry() -> None:
@@ -214,6 +274,51 @@ def test_doctor_fails_when_the_marimo_pin_does_not_match(monkeypatch: pytest.Mon
     assert "0.23.15" in marimo_check["detail"]
 
 
+def test_doctor_introspects_the_private_marimo_api_the_bridge_depends_on() -> None:
+    """PLAN 6.1 mitigation 5, run rather than merely built.
+
+    The `marimo` check above compares two version strings. This one imports ``_code_mode`` and
+    looks at it, which is the only thing that catches a surface that moved without the version
+    kedge pins moving with it.
+    """
+    result = runner.invoke(app, ["doctor", "--no-network", "--json"])
+
+    bridge = next(c for c in json.loads(result.output)["checks"] if c["check"] == "marimo bridge")
+    assert bridge["status"] == "ok"
+    assert cli.MARIMO_PIN in bridge["detail"]
+
+
+def test_doctor_fails_and_names_the_marimo_version_when_the_bridge_has_moved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ "marimo changed" is not actionable; "edit_cell() lost hide_code in 0.24.0" is."""
+    pretend_bridge(monkeypatch, moved_bridge())
+
+    result = runner.invoke(app, ["doctor", "--no-network", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    bridge = next(c for c in payload["checks"] if c["check"] == "marimo bridge")
+    assert bridge["status"] == "fail"
+    assert "0.24.0" in bridge["detail"]
+    assert "edit_cell" in bridge["detail"]
+
+
+def test_doctor_only_warns_when_an_unpinned_marimo_still_has_the_shape_kedge_drives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A version kedge has not verified against is worth saying; it is not a broken install."""
+    pretend_bridge(monkeypatch, BridgeReport(version="0.24.0", pinned=cli.MARIMO_PIN))
+
+    result = runner.invoke(app, ["doctor", "--no-network", "--json"])
+
+    assert result.exit_code == 0
+    bridge = next(c for c in json.loads(result.output)["checks"] if c["check"] == "marimo bridge")
+    assert bridge["status"] == "warn"
+    assert "0.24.0" in bridge["detail"]
+
+
 def test_doctor_reports_a_workspace_for_a_named_workbook(workbook: Path) -> None:
     result = runner.invoke(app, ["doctor", "--no-network", "--json", "--workbook", str(workbook)])
 
@@ -233,6 +338,7 @@ def test_doctor_reports_a_workspace_for_a_named_workbook(workbook: Path) -> None
     [
         ["open", "absent.xlsx"],
         ["inspect", "absent.xlsx"],
+        ["watch", "absent.xlsx"],
         ["contract", "infer", "absent.csv"],
     ],
 )
@@ -276,16 +382,27 @@ def test_inspect_writes_a_self_contained_report(workbook: Path, tmp_path: Path) 
     assert "<title>" in html
 
 
-def test_a_command_whose_milestone_has_not_landed_names_the_owing_module(workbook: Path) -> None:
-    """Nothing silently no-ops; an unimplemented command says whose it is."""
-    result = runner.invoke(app, ["contract", "infer", str(workbook)])
+def test_a_command_whose_milestone_has_not_landed_names_the_owing_module() -> None:
+    """Nothing silently no-ops; an unimplemented command says whose it is.
 
-    if isinstance(result.exception, NotImplementedError):
-        message = str(result.exception)
-        assert "kedge." in message
-        assert "M5" in message
-    else:  # The milestone landed; the shim is gone, which is the point of the shim.
-        assert result.exception is None, result.output
+    Asserted against `_resolve` itself rather than against whichever command still has a shim.
+    Every command this test used to reach through has since been implemented -- which is the
+    point of the shim, and also how the test kept being rewritten. The mechanism is the durable
+    subject: it must name the module, the milestone and the file that owes the work.
+    """
+    with pytest.raises(NotImplementedError) as caught:
+        cli._resolve("kedge.contracts.infer", "infer_the_whole_thing", "M5 (contracts)")
+
+    message = str(caught.value)
+    assert "kedge.contracts.infer.infer_the_whole_thing" in message
+    assert "M5 (contracts)" in message
+    assert "src/kedge/contracts/infer.py" in message
+
+
+def test_a_shim_for_a_module_that_does_not_exist_says_so_the_same_way() -> None:
+    """The other half: an absent module, not merely an absent attribute in a present one."""
+    with pytest.raises(NotImplementedError, match="M9 \\(not a milestone\\)"):
+        cli._resolve("kedge.does_not_exist", "anything", "M9 (not a milestone)")
 
 
 def test_reconcile_never_reports_passed_when_it_could_not_run(
@@ -309,14 +426,64 @@ def test_reconcile_never_reports_passed_when_it_could_not_run(
     assert "passed" not in statuses
 
 
-def test_contract_infer_names_the_module_that_owes_the_implementation(tmp_path: Path) -> None:
+def test_contract_infer_writes_a_commented_draft_that_validates_its_own_source(
+    tmp_path: Path,
+) -> None:
+    """The whole point of a draft: it passes against the file it was drafted from.
+
+    Regression, and a sharp one. The command resolved `kedge.contracts.infer.infer_contract`,
+    which has never existed -- the module exports `infer`, `infer_with_notes` and `write_yaml`
+    -- so every invocation died with `NotImplementedError`. The scaffolded notebook tells the
+    user to run this exact command when it finds no contract, so a broken command made that
+    guidance a dead end.
+    """
     handin = tmp_path / "cwd" / "handin.csv"
-    handin.write_text("a,b\n1,2\n", encoding="utf-8")
+    handin.parent.mkdir(parents=True, exist_ok=True)
+    handin.write_text("id,amount\n1,10.5\n2,20.25\n", encoding="utf-8")
+    destination = tmp_path / "contract.yaml"
+
+    result = runner.invoke(app, ["contract", "infer", str(handin), "--out", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    assert destination.is_file()
+    body = destination.read_text(encoding="utf-8")
+    assert "# Contract:" in body  # the commentary, not just the model
+    assert "id" in body and "amount" in body
+
+    from kedge.contracts import load
+    from kedge.contracts.validate import validate_frame
+    from kedge.ingest import read_data
+
+    contract = load(destination)
+    frame, layout = read_data(handin, sheet=contract.sheet, header_row=contract.header_row)
+    report = validate_frame(frame, contract, handin_name=handin.name, layout=layout)
+    assert report.ok, report.summary_line()
+
+
+def test_contract_infer_defaults_its_output_beside_the_hand_in(tmp_path: Path) -> None:
+    handin = tmp_path / "cwd" / "handin.csv"
+    handin.parent.mkdir(parents=True, exist_ok=True)
+    handin.write_text("id,amount\n1,10.5\n", encoding="utf-8")
 
     result = runner.invoke(app, ["contract", "infer", str(handin)])
 
-    assert isinstance(result.exception, NotImplementedError)
-    assert "M5" in str(result.exception)
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "cwd" / "handin.contract.yaml").is_file()
+
+
+def test_contract_infer_reports_a_file_it_cannot_describe_rather_than_tracebacking(
+    tmp_path: Path,
+) -> None:
+    """A file with no columns is a `_fail`, not a stack trace: it names what went wrong."""
+    handin = tmp_path / "cwd" / "empty.csv"
+    handin.parent.mkdir(parents=True, exist_ok=True)
+    handin.write_text("", encoding="utf-8")
+
+    result = runner.invoke(app, ["contract", "infer", str(handin)])
+
+    assert result.exit_code == 1
+    assert "error" in flattened(result.output)
+    assert not (tmp_path / "cwd" / "empty.contract.yaml").exists()
 
 
 def test_open_runs_the_same_sequence_the_hub_runs(
@@ -455,6 +622,319 @@ def test_a_project_config_beside_the_workbook_is_picked_up(workbook: Path) -> No
 
     payload = json.loads(result.output)
     assert payload["values"]["sampling.max_rows"]["value"] == 7
+
+
+# ── the bridge preflight ─────────────────────────────────────────────────────────────────────
+
+
+def test_open_refuses_before_it_spawns_anything_when_the_bridge_has_moved(
+    workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PLAN 6.1 mitigation 5, at the entry point it was written for.
+
+    Without this the same mismatch surfaces as a TypeError from inside a tool call, after the
+    analysis, the scaffold, a spawned marimo and several minutes of conversation.
+    """
+    pretend_bridge(monkeypatch, moved_bridge())
+    reached: list[str] = []
+
+    async def _capture(*_args, **_kwargs):
+        reached.append("open sequence started")
+        raise SystemExit(0)
+
+    monkeypatch.setattr("kedge.server.hub.open_workbook", _capture)
+
+    result = runner.invoke(app, ["open", str(workbook), "--no-browser"])
+
+    assert result.exit_code == 1
+    assert reached == [], "nothing may be spawned once the preflight has failed"
+    output = flattened(result.output)
+    assert "0.24.0" in output, "the error has to name the marimo that is actually installed"
+    assert cli.MARIMO_PIN in output
+
+
+def test_hub_refuses_before_it_starts_the_server_when_the_bridge_has_moved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hub spawns marimo too -- from the page rather than the terminal, but just as far in."""
+    pretend_bridge(monkeypatch, moved_bridge())
+    served: list[str] = []
+    monkeypatch.setattr("kedge.server.app.run_server", lambda *_a, **_k: served.append("served"))
+
+    result = runner.invoke(app, ["hub", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert served == []
+    assert "0.24.0" in flattened(result.output)
+
+
+# ── watch ────────────────────────────────────────────────────────────────────────────────────
+
+
+class _StubFolder:
+    """A started watcher that never sees a file, and optionally takes a Ctrl-C while waiting."""
+
+    def __init__(self, *, interrupt: bool = False) -> None:
+        self._interrupt = interrupt
+        self.stopped = False
+
+    def wait(self, *, timeout_seconds: float | None = None) -> bool:
+        del timeout_seconds
+        if self._interrupt:
+            raise KeyboardInterrupt
+        return True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_watch_says_which_setting_to_fill_in_when_no_folder_is_configured(workbook: Path) -> None:
+    """``ingest.watch_dir`` is optional, so an unset one is a message rather than a traceback."""
+    result = runner.invoke(app, ["watch", str(workbook)])
+
+    assert result.exit_code == 1
+    output = flattened(result.output)
+    assert "ingest.watch_dir" in output
+    assert "--dir" in output
+
+
+def test_watch_names_the_folder_that_is_not_there(workbook: Path, tmp_path: Path) -> None:
+    argv = ["watch", str(workbook), "--dir", str(tmp_path / "not-there"), "--once"]
+
+    result = runner.invoke(app, argv)
+
+    assert result.exit_code == 1
+    assert "does not exist" in flattened(result.output)
+
+
+def test_watch_once_receives_what_is_already_sitting_in_the_folder(
+    workbook: Path, inbox: Path
+) -> None:
+    """The sweep with no filesystem watcher at all: what a scheduled task runs (PLAN 2.8)."""
+    (inbox / "exposures.xlsx").write_bytes(b"a,b\n1,2\n")
+
+    result = runner.invoke(
+        app, ["watch", str(workbook), "--dir", str(inbox), "--once", "--settle", "0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "1 hand-in(s) received" in output
+    assert "watched" in output and "exposures.xlsx" in output, "the audit line is the point"
+    copies = list(workbook.parent.rglob("*exposures.xlsx"))
+    assert len(copies) == 1, "the hand-in must be copied into the managed store"
+    assert "handins" in copies[0].parts
+
+
+def test_watch_once_twice_over_does_not_receive_the_same_hand_in_again(
+    workbook: Path, inbox: Path
+) -> None:
+    """Idempotence is what makes an hourly scheduled sweep safe to leave running."""
+    (inbox / "exposures.xlsx").write_bytes(b"a,b\n1,2\n")
+    argv = ["watch", str(workbook), "--dir", str(inbox), "--once", "--settle", "0"]
+
+    first = runner.invoke(app, argv)
+    second = runner.invoke(app, argv)
+
+    assert "1 hand-in(s) received" in flattened(first.output)
+    assert "0 hand-in(s) received" in flattened(second.output)
+
+
+def test_watch_takes_the_folder_and_the_pattern_from_the_project_config(
+    workbook: Path, inbox: Path
+) -> None:
+    """A watched folder is a property of the process, so it belongs in kedge.toml, not a flag."""
+    (workbook.parent / "kedge.toml").write_text(
+        f'[ingest]\nwatch_dir = "{inbox.as_posix()}"\nwatch_glob = "*.csv"\n', encoding="utf-8"
+    )
+    (inbox / "exposures.csv").write_bytes(b"a,b\n1,2\n")
+    (inbox / "ignored.xlsx").write_bytes(b"a,b\n3,4\n")
+
+    result = runner.invoke(app, ["watch", str(workbook), "--once", "--settle", "0"])
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "exposures.csv" in output
+    assert "ignored.xlsx" not in output
+
+
+def test_a_relative_watch_dir_is_relative_to_the_workbook_not_to_the_shell(
+    workbook: Path, inbox: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scheduled sweep starts in whatever directory the scheduler chose, and must still work.
+
+    ``ingest.watch_dir = "inbox"`` is exactly what the "set it in a kedge.toml beside the
+    workbook" message invites, and resolving it against the process working directory made the
+    setting work from the project folder and quietly find nothing from anywhere else.
+    """
+    beside_the_workbook = workbook.parent / "inbox"
+    beside_the_workbook.mkdir()
+    (beside_the_workbook / "exposures.xlsx").write_bytes(b"a,b\n1,2\n")
+    (workbook.parent / "kedge.toml").write_text('[ingest]\nwatch_dir = "inbox"\n', encoding="utf-8")
+    # `inbox` is a decoy of the same name in the directory the command is run from, and empty.
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["watch", str(workbook), "--once", "--settle", "0"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 hand-in(s) received" in flattened(result.output)
+    assert not list(inbox.iterdir()), "the folder beside the shell must not have been touched"
+
+
+def test_a_relative_dir_flag_is_relative_to_the_shell(
+    workbook: Path, inbox: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the rule: a flag means what it means where it was typed."""
+    (inbox / "exposures.xlsx").write_bytes(b"a,b\n1,2\n")
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(
+        app, ["watch", str(workbook), "--dir", "inbox", "--once", "--settle", "0"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "1 hand-in(s) received" in flattened(result.output)
+
+
+def test_watch_hands_the_configured_store_and_pattern_to_the_watcher(
+    workbook: Path, inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The event-driven path is a thin wrapper, and it has to be given the same settings.
+
+    Including the two booleans: with both defaulting to True in ``watch()`` itself, dropping
+    them here would leave the config quietly ignored on this path and every test still green.
+    """
+    (workbook.parent / "kedge.toml").write_text(
+        "[ingest]\ncopy_on_select = false\ndedupe_by_hash = false\n", encoding="utf-8"
+    )
+    captured: dict[str, object] = {}
+
+    def _start(directory: Path, _on_handin: object, **kwargs: object) -> object:
+        captured["directory"] = directory
+        captured.update(kwargs)
+        return _StubFolder()
+
+    monkeypatch.setattr(WATCH_MODULE, "watch", _start)
+    runner.invoke(app, ["watch", str(workbook), "--dir", str(inbox), "--contract", "exposures"])
+
+    assert captured["directory"] == inbox
+    assert captured["glob"] == "*.xlsx"
+    assert captured["contract"] == "exposures"
+    assert Path(str(captured["store_dir"])).name == "handins"
+    assert captured["copy_on_select"] is False
+    assert captured["dedupe"] is False
+
+
+def test_watch_does_not_announce_a_folder_it_could_not_start_watching(
+    workbook: Path, tmp_path: Path
+) -> None:
+    """The reassuring line comes after the watcher is up, so it is never contradicted below it."""
+    result = runner.invoke(app, ["watch", str(workbook), "--dir", str(tmp_path / "not-there")])
+
+    assert result.exit_code == 1
+    output = flattened(result.output)
+    assert "does not exist" in output
+    assert "watching" not in output, "it never started, so it must not say that it did"
+
+
+def test_watch_stops_the_watcher_when_the_user_interrupts(
+    workbook: Path, inbox: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C is how a watch is meant to end, so it exits 0 and leaves no observer thread."""
+    folder = _StubFolder(interrupt=True)
+    monkeypatch.setattr(WATCH_MODULE, "watch", lambda *_a, **_k: folder)
+
+    result = runner.invoke(app, ["watch", str(workbook), "--dir", str(inbox)])
+
+    assert result.exit_code == 0
+    assert folder.stopped, "the observer thread must not outlive the command"
+    assert "0 hand-in(s) received" in flattened(result.output)
+
+
+# ── the real command line ────────────────────────────────────────────────────────────────────
+#
+# Everything above goes through CliRunner, which hands click a list of arguments. The console
+# script does not: click reads `sys.argv` itself, and on Windows it rewrites what it finds there
+# before any kedge code sees it. That is a whole class of bug no CliRunner test can reach, so
+# these three drive the real argv instead.
+
+
+def test_a_glob_pattern_reaches_the_command_exactly_as_it_was_typed(
+    workbook: Path, inbox: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: click globbed `--glob` against the current directory and swallowed the result.
+
+    ``kedge watch book.xlsx --glob "*.xlsx"`` is normally run from the folder the workbook is in
+    -- which by definition contains a match -- so click's Windows argv expansion turned the
+    pattern into ``process.xlsx``, the sweep found no file of that name in the inbox, and the
+    command reported nothing received and exited 0.
+    """
+    (inbox / "exposures.xlsx").write_bytes(b"a,b\n1,2\n")
+    assert list(Path.cwd().glob("*.xlsx")) == [workbook], "the cwd must hold the tempting match"
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)  # typer replaces it; put it back after
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "kedge",
+            "watch",
+            str(workbook),
+            "--dir",
+            str(inbox),
+            "--once",
+            "--settle",
+            "0",
+            "--glob",
+            "*.xlsx",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        app()
+
+    assert exit_info.value.code == 0
+    assert "1 hand-in(s) received" in flattened(capsys.readouterr().out)
+    stored = [path for path in workbook.parent.rglob("*exposures.xlsx") if "handins" in path.parts]
+    assert len(stored) == 1, "the hand-in the pattern matched must be in the managed store"
+
+
+def test_the_command_line_expands_a_home_directory_but_not_a_wildcard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Turning click's expansion off must not cost the one part of it that was worth having.
+
+    No Windows shell expands ``~`` for a native program, so kedge does it; both shells expand
+    their own variables and neither expands wildcards, so kedge does neither.
+    """
+    monkeypatch.setattr(
+        sys, "argv", ["kedge", "watch", "~/book.xlsx", "--glob", "*.xlsx", "--contract", "~$a.xlsx"]
+    )
+
+    expanded = cli._console_args()
+
+    assert expanded[1] == str(Path.home() / "book.xlsx")
+    assert expanded[3] == "*.xlsx"
+    assert expanded[5] == "~$a.xlsx", "an Excel lock-file pattern is not a home directory"
+
+
+def test_the_entry_point_uses_that_expansion_and_not_clicks(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the app really does read its argv through it, or `~` would stop working on Windows.
+
+    Nothing in the home directory is touched: the file does not exist, and the point is the
+    path kedge says it could not find.
+    """
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(sys, "argv", ["kedge", "inspect", "~/no-such-workbook.xlsx"])
+
+    with pytest.raises(SystemExit) as exit_info:
+        app()
+
+    assert exit_info.value.code == 1
+    reported = flattened(capsys.readouterr().err)
+    assert "no such workbook" in reported
+    assert "~" not in reported, "the home directory was not expanded on the way in"
 
 
 def test_reconcile_exit_code_folds_on_status_not_on_the_passed_list() -> None:

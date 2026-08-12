@@ -19,6 +19,10 @@ watcher at all, which is what a scheduled run wants, is trivially testable, and 
 fallback when watchdog's platform backend misbehaves. The event-driven
 :class:`WatchedFolder` is a convenience on top of the same code path, not an alternative to
 it.
+
+``kedge watch <workbook>`` is the entry point onto both: ``--once`` calls
+:func:`scan_once`, and without it the command starts a :class:`WatchedFolder` and parks on
+:meth:`WatchedFolder.wait` until Ctrl-C.
 """
 
 from __future__ import annotations
@@ -55,6 +59,7 @@ DEFAULT_SETTLE_SECONDS = 2.0
 
 _DEFAULT_POLL_SECONDS = 0.25
 _DEFAULT_STABLE_TIMEOUT = 300.0
+_WAIT_TICK_SECONDS = 0.5
 
 
 class WatchError(IngestError):
@@ -228,6 +233,7 @@ class WatchedFolder:
         glob: str = "*.xlsx",
         contract: str | None = None,
         copy_on_select: bool = True,
+        dedupe: bool = True,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
     ) -> None:
         self.directory = directory
@@ -235,9 +241,11 @@ class WatchedFolder:
         self.glob = glob
         self.contract = contract
         self.copy_on_select = copy_on_select
+        self.dedupe = dedupe
         self.settle_seconds = settle_seconds
         self._observer: object | None = None
         self._lock = threading.Lock()
+        self._stopped = threading.Event()
 
     def sweep(self) -> list[HandIn]:
         """Run one scan now, serialised against the watcher thread."""
@@ -248,6 +256,7 @@ class WatchedFolder:
                 glob=self.glob,
                 contract=self.contract,
                 copy_on_select=self.copy_on_select,
+                dedupe=self.dedupe,
                 settle_seconds=self.settle_seconds,
             )
 
@@ -263,6 +272,7 @@ class WatchedFolder:
         if self._observer is not None:
             msg = f"already watching {self.directory}"
             raise WatchError(msg)
+        self._stopped.clear()
 
         try:
             from watchdog.events import FileSystemEventHandler
@@ -296,10 +306,38 @@ class WatchedFolder:
         self._observer = observer
         logger.info("watching %s for %s", self.directory, self.glob)
 
+    def wait(self, *, timeout_seconds: float | None = None) -> bool:
+        """Block until the watcher is stopped, and say whether it was.
+
+        watchdog does its work on its own thread, so a caller with nothing else to do -- the
+        ``kedge watch`` command is exactly that -- needs somewhere to park. The wait is taken
+        in short slices rather than one long one because a console delivers Ctrl-C by
+        interrupting the main thread, and a main thread parked in a single indefinite wait is
+        the shape that has historically swallowed it on Windows.
+
+        Args:
+            timeout_seconds: Give up waiting after this long. ``None`` waits indefinitely,
+                which is what the command line does; ``0`` asks the question without waiting
+                at all.
+
+        Returns:
+            True once the watcher has been stopped, False if the timeout ran out first.
+        """
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+        while True:
+            remaining = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+            if self._stopped.wait(
+                _WAIT_TICK_SECONDS if remaining is None else min(_WAIT_TICK_SECONDS, remaining)
+            ):
+                return True
+            if remaining is not None and remaining <= 0:
+                return False
+
     def stop(self, *, timeout_seconds: float = 5.0) -> None:
         """Stop watching. Safe to call when not started, and safe to call twice."""
         observer = self._observer
         self._observer = None
+        self._stopped.set()
         if observer is None:
             return
         observer.stop()  # type: ignore[attr-defined]
@@ -320,6 +358,8 @@ def watch(
     store_dir: Path,
     glob: str = "*.xlsx",
     contract: str | None = None,
+    copy_on_select: bool = True,
+    dedupe: bool = True,
     settle_seconds: float = DEFAULT_SETTLE_SECONDS,
 ) -> WatchedFolder:
     """Start watching a folder and return the handle that stops it again.
@@ -330,6 +370,8 @@ def watch(
         store_dir: The managed store root.
         glob: Pattern matched against filenames.
         contract: Name of the contract these hand-ins are expected to satisfy.
+        copy_on_select: Copy into the store rather than referencing in place.
+        dedupe: Skip files whose bytes are already stored.
         settle_seconds: How long each file must hold still before it is read.
 
     Returns:
@@ -343,6 +385,8 @@ def watch(
         store_dir=store_dir,
         glob=glob,
         contract=contract,
+        copy_on_select=copy_on_select,
+        dedupe=dedupe,
         settle_seconds=settle_seconds,
     )
     folder.start(on_handin)
