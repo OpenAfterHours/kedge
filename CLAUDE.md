@@ -103,6 +103,12 @@ including the contract tests. `ty` is advisory there until its three known diagn
 - `edit_cell` raises `StaleCellError` unless the cell was read at its current version — and
   `repr(ctx.cells)` silently records reads for every cell, disarming the guard. Never log it.
 - `create_cell` defaults `hide_code=True`. kedge always passes `False`.
+- The `openai` SDK translates transport errors around the **request only**. With `stream=True` it
+  has already returned by the time the body is drained, so a stall mid-answer surfaces as a raw
+  `httpx.ReadTimeout` — carrying an empty message, since httpx maps it from a bare `TimeoutError`.
+  `OpenAIClient.stream` catches it. Note also that `[model] timeout_seconds` is httpx's gap
+  *between reads*, not a budget for the whole answer: an endpoint that goes quiet while a
+  reasoning model thinks trips it while working perfectly.
 - Excel's `ROUND` collapses the operand to **15 significant decimal digits** before rounding
   half-away-from-zero. Missing this is a one-penny error that propagates.
 - marimo's two file inputs return different things: `mo.ui.file` gives bytes with no path,

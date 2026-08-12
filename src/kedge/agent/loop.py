@@ -50,6 +50,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
+import httpx
+
 from kedge.agent.audit import outbound_log_for
 from kedge.agent.context import (
     ContextMessage,
@@ -405,6 +407,12 @@ class OpenAIClient:
                 http_client=tls.async_client(ca_bundle=ca_bundle, timeout=timeout),
             )
         self._client = client
+        self._base_url = base_url
+        self._timeout = timeout
+        """Seconds the endpoint may stay silent before the answer is abandoned. Kept for the error
+        message rather than for the wire: a timeout the user cannot connect to a setting they can
+        change is a dead end, and this one is reached during ordinary use."""
+
         self._use_responses = api != "chat_completions"
         self._pinned = api != "auto"
         self._reasoning_effort = reasoning_effort
@@ -452,31 +460,83 @@ class OpenAIClient:
         ``stream=True`` the SDK has already sent the request and seen the status by the time it
         hands back an iterator, so a refusal arrives here, before a single fragment has been
         yielded. That is what makes retrying safe — nothing downstream has seen a partial turn.
-        """
-        from openai import BadRequestError, NotFoundError
 
-        while True:
-            responses = self._use_responses
-            try:
-                stream = (
-                    await self._open_responses(model, messages, tools)
-                    if responses
-                    else await self._open_chat(model, messages, tools)
-                )
-            except (BadRequestError, NotFoundError) as exc:
-                if self._recover(exc):
-                    continue
-                raise
-            if responses:
-                async for event in stream:
-                    delta = responses_delta(event)
-                    if delta is not None:
-                        yield delta
-            else:
-                async for chunk in stream:
-                    for delta in chat_deltas(chunk):
-                        yield delta
-            return
+        Transport failures are translated around *both*, because the SDK only wraps them around the
+        request. Once it hands back the iterator, draining the body is ordinary httpx, so a stall
+        mid-answer arrives as a bare :class:`httpx.ReadTimeout` — whose message is empty, since it
+        is mapped from a bare ``TimeoutError`` — and the loop's catch-all could only report it as
+        "The turn stopped unexpectedly: ReadTimeout:". Neither half of that tells the user that a
+        setting they own governs it.
+
+        Raises:
+            AgentError: The endpoint timed out, or the connection to it failed. Both are
+                recoverable: the loop reports them and leaves the conversation intact.
+        """
+        from openai import APIConnectionError, APITimeoutError, BadRequestError, NotFoundError
+
+        try:
+            while True:
+                responses = self._use_responses
+                try:
+                    stream = (
+                        await self._open_responses(model, messages, tools)
+                        if responses
+                        else await self._open_chat(model, messages, tools)
+                    )
+                except (BadRequestError, NotFoundError) as exc:
+                    if self._recover(exc):
+                        continue
+                    raise
+                if responses:
+                    async for event in stream:
+                        delta = responses_delta(event)
+                        if delta is not None:
+                            yield delta
+                else:
+                    async for chunk in stream:
+                        for delta in chat_deltas(chunk):
+                            yield delta
+                return
+        # Ordered subclass-first, twice over: APITimeoutError is an APIConnectionError, and
+        # httpx.TimeoutException is an httpx.TransportError.
+        except (APITimeoutError, httpx.TimeoutException) as exc:
+            logger.warning("the model endpoint at %s timed out", self._base_url)
+            raise self._timed_out() from exc
+        except (APIConnectionError, httpx.TransportError) as exc:
+            logger.warning("the connection to %s failed: %r", self._base_url, exc)
+            raise self._unreachable(exc) from exc
+
+    def _timed_out(self) -> AgentError:
+        """Explain a timeout in terms of the setting that governs it.
+
+        The distinction the message spends a sentence on is the one that makes this look like a
+        bug: ``timeout_seconds`` is the gap httpx allows *between reads*, not a budget for the
+        whole answer. An endpoint that streams steadily never approaches it however long it takes,
+        and one that says nothing while a reasoning model thinks trips it while working perfectly.
+        """
+        return AgentError(
+            f"the model endpoint at {self._base_url} sent nothing for {self._timeout:g}s, so the "
+            f"answer was abandoned. That limit is the silence allowed between fragments, not a "
+            f"budget for the whole answer, so an endpoint that stays quiet while a reasoning "
+            f"model thinks reaches it without anything being wrong. Raise `timeout_seconds` "
+            f"under `[model]` in your kedge config, or lower `reasoning_effort`. Nothing was "
+            f"left half-written -- ask again to retry."
+        )
+
+    def _unreachable(self, exc: Exception) -> AgentError:
+        """Explain a connection that never opened, or died part-way through an answer.
+
+        ``kedge doctor`` is named rather than second-guessed here: a certificate rejected by a
+        TLS-inspecting proxy arrives as an ordinary ``ConnectError``, and doctor is the one place
+        that unwraps it and says what to do about it (:func:`kedge.tls.certificate_error`).
+        """
+        detail = str(exc).strip() or type(exc).__name__
+        return AgentError(
+            f"the connection to the model endpoint at {self._base_url} failed: {detail}. Any "
+            f"answer in flight was abandoned, but nothing was left half-written. Run `kedge "
+            f"doctor` to check the endpoint is reachable and its certificate verifies, then ask "
+            f"again."
+        )
 
     def _recover(self, exc: Exception) -> bool:
         """Adjust for a refusal and report whether the request is worth sending again.
@@ -750,7 +810,7 @@ class KedgeAgent:
             logger.exception("turn %s raised", request.turn_id)
             yield ErrorEvent(
                 message=(
-                    f"The turn stopped unexpectedly: {type(exc).__name__}: {exc}. The notebook has "
+                    f"The turn stopped unexpectedly: {_describe(exc)}. The notebook has "
                     f"not been left half-changed — every notebook edit is a single atomic flush."
                 ),
                 recoverable=False,
@@ -1092,6 +1152,19 @@ def _history_before(
             return list(history[:index])
     logger.debug("the resumed turn does not appear in history; keeping every message of it")
     return list(history)
+
+
+def _describe(exc: Exception) -> str:
+    """Name an exception for a user whose only view of it is the chat pane.
+
+    Plenty of what reaches the catch-all carries no message at all -- every httpx timeout mapped
+    from a bare ``TimeoutError`` among them -- and interpolating one of those into a sentence gets
+    the user "The turn stopped unexpectedly: ReadTimeout: .", which reads like a second bug on top
+    of the first. Where there is no message, the type name is the whole of what can honestly be
+    said, so it is the whole of what is said.
+    """
+    detail = str(exc).strip()
+    return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
 
 
 def _safe_arguments(raw: str) -> dict[str, Any]:

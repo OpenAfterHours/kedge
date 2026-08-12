@@ -8,6 +8,11 @@ The negotiation is the part worth pinning. kedge is pointed at whatever the user
 things it cannot know in advance -- whether ``/responses`` exists at all, and whether the model
 will accept a reasoning setting -- are exactly the two that used to end a turn with a raw 400 in
 the chat pane.
+
+The transport tests at the foot pin the same property one layer down. The SDK translates a timeout
+around the *request* and not around the body, so a stall part-way through an answer used to arrive
+as a bare ``httpx.ReadTimeout`` and reach the user as "The turn stopped unexpectedly: ReadTimeout:"
+-- a sentence with no cause in it, no remedy, and nothing to search for.
 """
 
 from __future__ import annotations
@@ -18,7 +23,15 @@ from typing import Any
 import httpx
 import pytest
 
-from kedge.agent.loop import OpenAIClient, responses_delta, responses_input, responses_tools
+from kedge.agent.loop import (
+    AgentError,
+    OpenAIClient,
+    _describe,
+    responses_delta,
+    responses_input,
+    responses_tools,
+)
+from kedge.errors import KedgeError
 
 # ── fakes ────────────────────────────────────────────────────────────────────────────────────
 
@@ -59,6 +72,13 @@ def _chat_chunk(text: str) -> SimpleNamespace:
 
 
 class _Stream:
+    """An opened stream. An exception among the events is raised where it sits.
+
+    That is how a stall part-way through an answer is expressed, and the position matters: by the
+    time the body is being drained the SDK's error translation is behind us, so what the loop
+    actually meets is a raw httpx exception rather than an ``APIError``.
+    """
+
     def __init__(self, events: list[Any]) -> None:
         self._events = events
 
@@ -68,7 +88,10 @@ class _Stream:
     async def __anext__(self) -> Any:
         if not self._events:
             raise StopAsyncIteration
-        return self._events.pop(0)
+        event = self._events.pop(0)
+        if isinstance(event, Exception):
+            raise event
+        return event
 
 
 class FakeSDK:
@@ -454,3 +477,71 @@ async def test_a_pinned_responses_endpoint_does_not_fall_back() -> None:
     with pytest.raises(NotFoundError):
         await _drain(_client(sdk, api="responses"))
     assert not sdk.chat_payloads
+
+
+# ── transport ────────────────────────────────────────────────────────────────────────────────
+
+
+async def test_a_stall_part_way_through_an_answer_names_the_setting_that_governs_it() -> None:
+    # The one that reached users as "The turn stopped unexpectedly: ReadTimeout:". The SDK wraps
+    # timeouts around the *request*; draining the body is ordinary httpx, so this arrives raw --
+    # and with an empty message, because httpx maps it from a bare TimeoutError.
+    sdk = FakeSDK(responses_events=[_text_event("here is what I fo"), httpx.ReadTimeout("")])
+
+    with pytest.raises(AgentError) as caught:
+        await _drain(_client(sdk, timeout=90.0))
+
+    message = str(caught.value)
+    assert "90s" in message
+    assert "timeout_seconds" in message
+    assert "reasoning_effort" in message
+    # The turn is reported and retried, not lost: KedgeError is what the loop treats as
+    # recoverable, and a bare ReadTimeout is not one.
+    assert isinstance(caught.value, KedgeError)
+
+
+async def test_a_timeout_opening_the_stream_is_explained_the_same_way() -> None:
+    # Here the SDK *has* translated it, into APITimeoutError. Same cause, same remedy, so the same
+    # message -- the user should not have to care which side of the first byte they landed on.
+    from openai import APITimeoutError
+
+    request = httpx.Request("POST", "http://127.0.0.1:1/v1/responses")
+    sdk = FakeSDK(responses_errors=[APITimeoutError(request=request)])
+
+    with pytest.raises(AgentError, match="timeout_seconds"):
+        await _drain(_client(sdk))
+
+
+async def test_a_timeout_is_not_mistaken_for_an_endpoint_without_the_responses_route() -> None:
+    # Degrading the dialect over a network problem would pin the blame on the endpoint's shape and
+    # leave the user chasing a fallback that was never the issue.
+    sdk = FakeSDK(
+        responses_events=[httpx.ReadTimeout("")],
+        chat_chunks=[_chat_chunk("should not be used")],
+    )
+
+    with pytest.raises(AgentError):
+        await _drain(_client(sdk))
+    assert not sdk.chat_payloads
+
+
+async def test_a_dropped_connection_points_at_doctor_rather_than_at_the_timeout() -> None:
+    # A connection that dies mid-answer is not a timeout and telling the user to raise one would
+    # send them the wrong way. doctor is what unwraps a proxy's certificate failure.
+    sdk = FakeSDK(
+        responses_events=[_text_event("partial"), httpx.RemoteProtocolError("peer closed")]
+    )
+
+    with pytest.raises(AgentError) as caught:
+        await _drain(_client(sdk))
+
+    message = str(caught.value)
+    assert "kedge doctor" in message
+    assert "peer closed" in message
+    assert "timeout_seconds" not in message
+
+
+async def test_an_exception_with_no_message_is_named_rather_than_left_dangling() -> None:
+    # What produced the trailing "ReadTimeout: ." in the chat pane.
+    assert _describe(httpx.ReadTimeout("")) == "ReadTimeout"
+    assert _describe(ValueError("no columns")) == "ValueError: no columns"
