@@ -32,6 +32,12 @@ Do not simply resubmit.
 assumption. Check join-key uniqueness *before* you write the join, not after reconciliation fails.
 A probe leaves nothing behind; it cannot create a cell.
 
+**End a probe with the value you want back.** A bare expression is reported, and so is a trailing
+assignment to a single name — `duplicates = keys.filter(pl.col("n") > 1).height` comes back as the
+value of `duplicates`. What does *not* come back is a probe that ends in a `for`, an `if`, a `with`
+or an import: there is no value to report and you get a wasted turn. `print(...)` is a half
+measure — you get the printed text but the value is always `None`, so prefer the expression.
+
 ## The plan, the catalogue, the checks
 
 | Tool | Use it for |

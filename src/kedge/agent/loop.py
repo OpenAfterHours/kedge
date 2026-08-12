@@ -413,6 +413,10 @@ class OpenAIClient:
         message rather than for the wire: a timeout the user cannot connect to a setting they can
         change is a dead end, and this one is reached during ordinary use."""
 
+        self._max_retries = max_retries
+        """Kept for the same reason. The SDK exhausts these before kedge sees a 429 or a 5xx, so a
+        message that does not say so invites the user to sit and wait for a retry already spent."""
+
         self._use_responses = api != "chat_completions"
         self._pinned = api != "auto"
         self._reasoning_effort = reasoning_effort
@@ -468,11 +472,23 @@ class OpenAIClient:
         "The turn stopped unexpectedly: ReadTimeout:". Neither half of that tells the user that a
         setting they own governs it.
 
+        A refusal the negotiation cannot absorb is translated the same way and for the same
+        reason. Left raw it reaches the loop's catch-all, which reports every exception as
+        unrecoverable — and the chat pane renders that as **Fatal**. A rate limit is the most
+        recoverable thing an endpoint can say.
+
         Raises:
-            AgentError: The endpoint timed out, or the connection to it failed. Both are
-                recoverable: the loop reports them and leaves the conversation intact.
+            AgentError: The endpoint timed out, the connection to it failed, or it refused the
+                request outright. All are recoverable: the loop reports them and leaves the
+                conversation intact.
         """
-        from openai import APIConnectionError, APITimeoutError, BadRequestError, NotFoundError
+        from openai import (
+            APIConnectionError,
+            APIStatusError,
+            APITimeoutError,
+            BadRequestError,
+            NotFoundError,
+        )
 
         try:
             while True:
@@ -505,6 +521,12 @@ class OpenAIClient:
         except (APIConnectionError, httpx.TransportError) as exc:
             logger.warning("the connection to %s failed: %r", self._base_url, exc)
             raise self._unreachable(exc) from exc
+        # Last, because BadRequestError and NotFoundError are APIStatusError too: this is where
+        # they land once _recover has declined them.
+        except APIStatusError as exc:
+            status = getattr(exc, "status_code", 0)
+            logger.warning("%s refused the request with HTTP %s: %s", self._base_url, status, exc)
+            raise self._refused(model, int(status), _status_detail(exc)) from exc
 
     def _timed_out(self) -> AgentError:
         """Explain a timeout in terms of the setting that governs it.
@@ -536,6 +558,63 @@ class OpenAIClient:
             f"answer in flight was abandoned, but nothing was left half-written. Run `kedge "
             f"doctor` to check the endpoint is reachable and its certificate verifies, then ask "
             f"again."
+        )
+
+    def _refused(self, model: str, status: int, detail: str) -> AgentError:
+        """Explain a status the endpoint answered with, in terms of who can act on it.
+
+        The split is by who has to do something. A 429 or a 5xx is the endpoint's own state and
+        the user's part is to ask again; a 401 is a key they hold; a 400 is a request that will be
+        refused identically however many times it is sent, so saying "try again" would be wrong.
+
+        The retry count is named wherever the SDK has already spent it. Otherwise "ask again"
+        reads as advice to wait, when the waiting is done.
+        """
+        spent = (
+            f" The SDK already retried {self._max_retries} times before you saw this."
+            if self._max_retries
+            else ""
+        )
+        if status == 429:
+            return AgentError(
+                f"the model endpoint at {self._base_url} is rate limiting kedge (HTTP 429): "
+                f"{detail}.{spent} The limit is the endpoint's, not kedge's, so the only remedy "
+                f"is to leave it a moment and ask again. Nothing was left half-written."
+            )
+        if status >= 500:
+            return AgentError(
+                f"the model endpoint at {self._base_url} failed on its own side (HTTP {status}): "
+                f"{detail}.{spent} That is the endpoint or a gateway in front of it rather than "
+                f"anything about your request, so ask again. Nothing was left half-written."
+            )
+        if status in (401, 403):
+            return AgentError(
+                f"the model endpoint at {self._base_url} rejected kedge's API key (HTTP "
+                f"{status}): {detail}. Set a working key in the settings pane, or under `[model]` "
+                f"in your kedge config, and ask again. `kedge doctor --network` checks a key "
+                f"without spending a turn."
+            )
+        if status == 404:
+            # A 404 only reaches here when the fallback could not run: either the dialect is
+            # pinned, or the route that is missing is not the one negotiation knows how to avoid.
+            remedy = (
+                "`api` is pinned to `responses` under `[model]` in your kedge config, so kedge "
+                "did not fall back to chat completions. Unpin it to let kedge negotiate, or "
+                "check the endpoint really serves that route"
+                if self._pinned and self._use_responses
+                else "Check `base_url` under `[model]` in your kedge config -- it should be the "
+                "root the endpoint serves, usually ending `/v1`"
+            )
+            return AgentError(
+                f"the model endpoint at {self._base_url} has no route for this request (HTTP "
+                f"404): {detail}. {remedy}."
+            )
+        return AgentError(
+            f"the model endpoint at {self._base_url} refused the request for model {model!r} "
+            f"(HTTP {status}): {detail}. kedge does not retry a refusal, because the same request "
+            f"would be refused the same way. The usual cause is a model the endpoint does not "
+            f"serve; check `model` under `[model]` in your kedge config against what "
+            f"`kedge doctor --network` lists."
         )
 
     def _recover(self, exc: Exception) -> bool:
@@ -1165,6 +1244,36 @@ def _describe(exc: Exception) -> str:
     """
     detail = str(exc).strip()
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+
+
+def _status_detail(exc: Exception, limit: int = 300) -> str:
+    """The endpoint's own words for why it refused, without the wrapper around them.
+
+    The SDK's ``message`` on a status error is ``"Error code: 429 - {repr of the whole body}"``,
+    so quoting it hands the user a Python dict literal to read. The body almost always carries the
+    prose under ``error.message``; that is what is quoted, and only if it is missing does the
+    wrapper get used.
+
+    Args:
+        exc: The status error the SDK raised.
+        limit: Characters to keep. A gateway that returns an HTML error page has no business
+            filling the chat pane with it.
+
+    Returns:
+        One line, never empty, with any trailing full stop removed so the sentence it is quoted
+        into does not end in two of them.
+    """
+    body = getattr(exc, "body", None)
+    text = ""
+    if isinstance(body, dict):
+        error = body.get("error")
+        candidate = error.get("message") if isinstance(error, dict) else body.get("message")
+        text = str(candidate or "")
+    text = text.strip() or str(getattr(exc, "message", "") or "").strip() or str(exc).strip()
+    collapsed = " ".join(text.split()) or type(exc).__name__
+    if len(collapsed) > limit:
+        collapsed = f"{collapsed[:limit].rstrip()} [truncated]"
+    return collapsed.rstrip(" .")
 
 
 def _safe_arguments(raw: str) -> dict[str, Any]:

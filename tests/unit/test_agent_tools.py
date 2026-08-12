@@ -54,6 +54,7 @@ class FakeDriver:
         self.edited: list[tuple[str, str]] = []
         self.probes: list[str] = []
         self.deleted: list[str] = []
+        self.probe_result: ProbeResult | None = None
         self._fail = fail
 
     async def read_graph(self) -> GraphView:
@@ -109,6 +110,8 @@ class FakeDriver:
 
     async def probe(self, code: str) -> ProbeResult:
         self.probes.append(code)
+        if self.probe_result is not None:
+            return self.probe_result
         return ProbeResult(ok=True, value_repr=f"['{SENTINEL}']", value_type="list")
 
 
@@ -346,6 +349,28 @@ async def test_an_over_long_probe_is_refused(registry: ToolRegistry) -> None:
     result = await registry.dispatch("probe", {"code": "x" * 5_000})
     assert not result.ok
     assert "wants to be a cell" in result.text
+
+
+async def test_a_probe_with_no_value_says_how_to_ask_again(registry: ToolRegistry) -> None:
+    # "nothing" is not an answer the model can act on; it has to be told what to change.
+    registry.context.driver.probe_result = ProbeResult(ok=True)
+    result = await registry.dispatch("probe", {"code": "import polars as pl"})
+    assert not result.ok
+    assert "bare expression" in result.text
+    assert result.summary == "probe returned nothing"
+
+
+async def test_a_printing_probe_leads_with_what_it_printed(registry: ToolRegistry) -> None:
+    # print(...) binds None. The printed text is the answer, so it must not sit under a header
+    # that reads as an empty result.
+    registry.context.driver.probe_result = ProbeResult(
+        ok=True, value_repr="None", value_type="NoneType", stdout=f"shape: (1, 1)\n{SENTINEL}\n"
+    )
+    result = await registry.dispatch("probe", {"code": "print(load_handin)"})
+    assert result.ok
+    assert result.text.startswith("stdout:")
+    assert SENTINEL in result.text
+    assert result.summary == "probe printed output"
 
 
 # ── degradation ──────────────────────────────────────────────────────────────────────────────

@@ -99,6 +99,16 @@ _MAX_SAMPLE_COLUMNS = 40
 _PROBE_CODE_LIMIT = 4_000
 _DEFAULT_HEADER_ROW = 1
 
+_PROBE_NO_VALUE = (
+    "no value: the probe ended in a block, a loop or an import, so there was nothing to report. "
+    "End it with the value you want back — either a bare expression such as `frame.height` or an "
+    "assignment to a single name, whose value is reported for you."
+)
+_PROBE_PRINTED = (
+    "(the probe's last expression evaluated to None, which is what `print(...)` returns. The "
+    "printed text above is the whole answer; end with a bare expression to get a value too.)"
+)
+
 
 # ── caps ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -490,7 +500,11 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "cell that depends on them — and to get an aggregate that is never truncated."
         ),
         properties={
-            "code": _string("Python source. If it ends in an expression, that value is returned.")
+            "code": _string(
+                "Python source. End it with the value you want back: a bare expression such as "
+                "`frame.height`, or an assignment to a single name, whose value is reported for "
+                "you. A trailing `print(...)` returns the printed text but no value."
+            )
         },
         required=("code",),
     ),
@@ -1120,16 +1134,34 @@ class ToolRegistry:
                 ok=False,
                 summary="probe failed",
             )
+        console = result.stdout.strip()
+        block = f"stdout:\n{console}" if console else ""
+        if result.value_repr is None:
+            # Nothing was bound, so whatever the code printed is the only result there is. Say how
+            # to ask again rather than reporting an empty answer the model cannot act on.
+            return ToolResult.note(
+                f"{_PROBE_NO_VALUE}\n\n{block}" if console else _PROBE_NO_VALUE,
+                ok=bool(console),
+                summary="probe printed output but returned no value"
+                if console
+                else "probe returned nothing",
+                row_count=1 if console else 0,
+                caps=self._context.caps,
+            )
+        if result.value_type == "NoneType" and console:
+            # A probe ending in print(...) binds None. The printed text is the real answer, so it
+            # leads; burying it under a "type: NoneType" header reads as an empty result.
+            return ToolResult.note(
+                f"{block}\n\n{_PROBE_PRINTED}",
+                summary="probe printed output",
+                row_count=1,
+                caps=self._context.caps,
+            )
         marker = "  [value repr was truncated by the kernel]" if result.truncated else ""
-        body = (
-            result.value_repr
-            if result.value_repr is not None
-            else "(no value; the code ended in a statement)"
-        )
-        console = f"\n\nstdout:\n{result.stdout}" if result.stdout.strip() else ""
+        tail = f"\n\n{block}" if console else ""
         return ToolResult.note(
-            f"type: {result.value_type or 'None'}{marker}\n{body}{console}",
-            summary=f"probe returned {result.value_type or 'nothing'}",
+            f"type: {result.value_type}{marker}\n{result.value_repr}{tail}",
+            summary=f"probe returned {result.value_type}",
             row_count=1,
             caps=self._context.caps,
         )

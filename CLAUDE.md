@@ -109,6 +109,12 @@ including the contract tests. `ty` is advisory there until its three known diagn
   `OpenAIClient.stream` catches it. Note also that `[model] timeout_seconds` is httpx's gap
   *between reads*, not a budget for the whole answer: an endpoint that goes quiet while a
   reasoning model thinks trips it while working perfectly.
+- Anything reaching the agent loop's catch-all is reported as **unrecoverable**, and `app.js`
+  renders that as "Fatal". So every model-endpoint failure must leave `OpenAIClient.stream` as an
+  `AgentError` — `stream` translates transport errors *and* `APIStatusError`, which is where a
+  429, a 5xx and a refusal the dialect negotiation declined all land. Quote the endpoint's prose
+  from `body["error"]["message"]`, never the SDK's `message`: that one is
+  `"Error code: 429 - {repr of the whole body}"`.
 - Excel's `ROUND` collapses the operand to **15 significant decimal digits** before rounding
   half-away-from-zero. Missing this is a one-penny error that propagates.
 - marimo's two file inputs return different things: `mo.ui.file` gives bytes with no path,
