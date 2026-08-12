@@ -80,6 +80,46 @@ def test_an_edit_to_an_approved_plan_resets_it_to_draft() -> None:
     assert edited.approval.at is None
 
 
+def test_an_edit_to_a_rejected_plan_carries_the_rejection_forward() -> None:
+    """A rejection is not a state an unrelated edit may clear.
+
+    `reject` says a rejected plan can never be approved and a new one must be proposed. If
+    `_revise` reset the state to DRAFT, adding a sentence to a rejected decomposition would erase
+    the only record that it was turned down and re-arm `approve` against the whole of it.
+    """
+    rejected = reject(_clean_plan(), by="phil", reason="the decomposition is wrong")
+
+    amended = add_question(rejected, "should the FX rate source be named?")
+
+    assert amended.approval.state is ApprovalState.REJECTED
+    assert amended.approval.by == "phil", "who rejected it, and why, survives the edit"
+    assert amended.approval.note == "the decomposition is wrong"
+    assert amended.version == rejected.version + 1
+
+
+def test_a_rejection_cannot_be_laundered_into_an_approval_by_an_unrelated_edit() -> None:
+    """The invariant behind F1: one approved sentence must not put a rejected plan into force."""
+    rejected = reject(_clean_plan(), by="phil", reason="split the haircut stage first")
+
+    amended = edit_stage(rejected, "apply_haircuts", notes="Approved amendment: name the source")
+
+    assert any("rejected" in blocker for blocker in amended.approval_blockers())
+    with pytest.raises(PlanNotApprovableError, match="propose a new one"):
+        approve(amended, by="phil")
+
+
+def test_a_plan_proposed_afresh_from_a_rejected_one_starts_clean() -> None:
+    """The escape hatch: propose a new plan rather than editing the rejected one into force."""
+    rejected = reject(_clean_plan(), by="phil", reason="wrong shape")
+
+    fresh = ProcessPlan.from_draft(
+        rejected.to_draft(), workbook=rejected.workbook, workbook_sha256=rejected.workbook_sha256
+    )
+
+    assert fresh.approval.state is ApprovalState.DRAFT
+    assert approve(fresh, by="phil").approval.approved
+
+
 def test_an_edit_bumps_the_version_and_records_what_it_came_from() -> None:
     plan = _clean_plan()
     edited = edit_stage(plan, "apply_haircuts", notes="checked against the Ref sheet")
@@ -521,6 +561,139 @@ def test_a_plan_asked_for_changes_can_still_be_approved_once_it_is_edited() -> N
     assert approve(edited, by="phil").approval.approved
 
 
+def test_a_rejection_cannot_be_laundered_into_an_approval_by_requesting_changes() -> None:
+    """The route round the gate that `_revise` closed and these two verbs did not.
+
+    `request_changes` writes approval without going through `_revise`, so it was the one edit that
+    could take a plan out of REJECTED — and a plan in CHANGES_REQUESTED approves cleanly. Alice's
+    rejection, and her reason for it, disappeared and Mallory's approval put the whole of the
+    turned-down decomposition into force.
+    """
+    rejected = reject(_clean_plan(), by="alice", reason="the override step is a judgement call")
+
+    with pytest.raises(PlanNotApprovableError):
+        request_changes(rejected, by="mallory", note="hmm")
+
+    assert rejected.approval.state is ApprovalState.REJECTED
+    assert rejected.approval.by == "alice"
+    with pytest.raises(PlanNotApprovableError, match="propose a new one"):
+        approve(rejected, by="mallory")
+
+
+def test_sending_a_rejected_plan_back_for_changes_names_who_rejected_it_and_why() -> None:
+    """ "Rejected" with nobody attached tells the caller to argue with the tool, not the rejector."""
+    rejected = reject(_clean_plan(), by="alice", reason="the override step is a judgement call")
+
+    with pytest.raises(PlanNotApprovableError) as caught:
+        request_changes(rejected, by="mallory", note="hmm")
+
+    message = str(caught.value)
+    assert "alice" in message
+    assert "the override step is a judgement call" in message
+    assert "terminal" in message
+    assert "propose a new one" in message
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        pytest.param(lambda plan: approve(plan, by="mallory"), id="approve"),
+        pytest.param(
+            lambda plan: request_changes(plan, by="mallory", note="hmm"), id="request_changes"
+        ),
+    ],
+)
+def test_no_review_verb_moves_a_plan_back_out_of_rejection(decision) -> None:
+    """Enumerated deliberately: a new approval verb that forgets the guard fails here."""
+    rejected = reject(_clean_plan(), by="alice", reason="the decomposition is wrong")
+    with pytest.raises(PlanNotApprovableError):
+        decision(rejected)
+
+
+def test_rejecting_a_plan_twice_leaves_it_rejected() -> None:
+    """A rejection is terminal, not a lock against saying so again."""
+    once = reject(_clean_plan(), by="alice", reason="the decomposition is wrong")
+    twice = reject(once, by="bob", reason="agreed, and the drop list is wrong too")
+    assert twice.approval.state is ApprovalState.REJECTED
+    assert twice.approval.by == "bob"
+
+
+# ── withdrawing an approval is deliberate, or it does not happen ──────────────
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        pytest.param(lambda plan: reject(plan, by="mallory", reason="I disagree"), id="reject"),
+        pytest.param(
+            lambda plan: request_changes(plan, by="mallory", note="think again"),
+            id="request_changes",
+        ),
+    ],
+)
+def test_un_approving_a_plan_is_refused_unless_it_is_asked_for_explicitly(decision) -> None:
+    """A notebook may already have been scaffolded from the approved plan.
+
+    Quietly taking the approval away leaves that notebook in force with nothing on the plan
+    saying it ever was, so the withdrawal has to be asked for by name.
+    """
+    approved = _approved(_clean_plan())
+
+    with pytest.raises(PlanNotApprovableError) as caught:
+        decision(approved)
+
+    message = str(caught.value)
+    assert "phil" in message, "who approved it, so the withdrawer knows whose decision it is"
+    assert "withdraw_approval" in message
+    assert approved.approval.approved
+
+
+def test_a_deliberate_withdrawal_records_the_approval_it_overturned() -> None:
+    """The rejection is written over the approval at the same version, so if the note does not
+    carry the withdrawn approval nothing does."""
+    approved = _approved(_clean_plan())
+
+    rejected = reject(
+        approved, by="alice", reason="the haircut stage is wrong", withdraw_approval=True
+    )
+
+    assert rejected.approval.state is ApprovalState.REJECTED
+    assert rejected.approval.by == "alice"
+    assert rejected.approval.note is not None
+    assert "the haircut stage is wrong" in rejected.approval.note
+    assert "withdraws the approval given by phil" in rejected.approval.note
+
+
+def test_a_deliberate_withdrawal_can_also_send_an_approved_plan_back_for_changes() -> None:
+    approved = _approved(_clean_plan())
+
+    returned = request_changes(
+        approved, by="alice", note="split the haircut stage", withdraw_approval=True
+    )
+
+    assert returned.approval.state is ApprovalState.CHANGES_REQUESTED
+    assert returned.approval.note is not None
+    assert "withdraws the approval given by phil" in returned.approval.note
+
+
+def test_withdrawing_an_approval_nobody_ever_gave_is_not_asked_for() -> None:
+    """The flag guards approved plans only; a draft is turned down with no ceremony."""
+    plan = _clean_plan()
+    assert reject(plan, by="alice", reason="wrong shape").approval.state is ApprovalState.REJECTED
+    assert (
+        request_changes(plan, by="alice", note="split it").approval.state
+        is ApprovalState.CHANGES_REQUESTED
+    )
+
+
+def test_re_approving_an_approved_plan_is_not_a_withdrawal() -> None:
+    """Approval is the safe direction, and the flag has nothing to do with it."""
+    approved = _approved(_clean_plan())
+    again = approve(approved, by="bob", note="checked a second time")
+    assert again.approval.by == "bob"
+    assert again.approval.approved
+
+
 # =============================================================================
 # REVIEW WARNINGS
 # =============================================================================
@@ -553,10 +726,10 @@ def test_unanswered_questions_warn_but_never_block() -> None:
     assert plan.is_approvable
 
 
-def test_a_low_convertible_claim_points_the_reviewer_at_the_blockers() -> None:
+def test_a_low_convertible_score_points_the_reviewer_at_the_blockers() -> None:
     plan = _clean_plan(assessment=Assessment(convertible=0.4, blockers=["heavy VBA"]))
     warnings = review_warnings(plan)
-    assert any("only claims to convert 40%" in warning for warning in warnings)
+    assert any("triage scores only 40%" in warning for warning in warnings)
 
 
 def test_a_partial_plan_with_no_checkpoints_asks_whether_judgement_became_code() -> None:

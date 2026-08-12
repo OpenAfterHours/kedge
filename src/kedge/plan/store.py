@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from kedge.plan.model import PlanError, ProcessPlan
 
@@ -91,8 +92,59 @@ def plan_from_yaml(text: str) -> ProcessPlan:
         raise PlanStoreError(msg)
     try:
         return ProcessPlan.model_validate(raw)
+    except ValidationError as exc:
+        msg = f"plan file is not a valid process plan; {_summarise(exc)}"
+        raise PlanStoreError(msg) from exc
     except ValueError as exc:
         msg = f"plan file is not a valid process plan: {exc}"
+        raise PlanStoreError(msg) from exc
+
+
+_SHOWN_PROBLEMS = 5
+
+
+def _summarise(exc: ValidationError) -> str:
+    """One line per problem: where it is, and what is wrong with it.
+
+    pydantic's own rendering is five stanzas and a documentation URL per error, which is the right
+    thing for a developer and the wrong thing for somebody who has just hand-edited a YAML file
+    and wants to know which key to fix. The location is kept because that is what names the
+    field — ``stages.0.confidance`` — and the count is kept because a user told only the first
+    problem will fix it and be told the second.
+    """
+    problems = exc.errors(include_url=False)
+    lines = [
+        f"  - {'.'.join(str(part) for part in problem['loc']) or '(top level)'}: {problem['msg']}"
+        for problem in problems[:_SHOWN_PROBLEMS]
+    ]
+    if len(problems) > _SHOWN_PROBLEMS:
+        lines.append(f"  (+{len(problems) - _SHOWN_PROBLEMS} more)")
+    plural = "problem" if len(problems) == 1 else "problems"
+    return "\n".join([f"{len(problems)} {plural}:", *lines])
+
+
+def _read(path: Path) -> str:
+    """Read a plan file as UTF-8, or say why it could not be read.
+
+    Both failure modes have to be named here, because they are not related by type.
+    ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so an ``except OSError`` around
+    :meth:`~pathlib.Path.read_text` lets it straight through — and it is a realistic failure, not a
+    theoretical one: this file invites hand-editing, it is written with ``allow_unicode`` so
+    non-ASCII in a stage note is normal, and an editor saving it back as cp1252 with a pound sign
+    or an o-slash in that note produces exactly this.
+    """
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        msg = (
+            f"could not read the plan file {path}: it is not valid UTF-8 (byte "
+            f"0x{exc.object[exc.start]:02x} at position {exc.start}). Plan files are written as "
+            f"UTF-8 and must be saved back as UTF-8 — an editor that saved this one as cp1252 or "
+            f"latin-1 would do this. Re-save it as UTF-8, or restore it from version control."
+        )
+        raise PlanStoreError(msg) from exc
+    except OSError as exc:
+        msg = f"could not read the plan file {path}: {exc}"
         raise PlanStoreError(msg) from exc
 
 
@@ -153,18 +205,15 @@ class PlanStore:
         """Load one version.
 
         Raises:
-            PlanStoreError: when that version is not present, or will not parse.
+            PlanStoreError: when that version is not present, is not readable as UTF-8, or will
+                not parse.
         """
         path = self.path_for(version)
         if not path.is_file():
             available = ", ".join(str(item) for item in self.versions()) or "none"
             msg = f"no plan version {version} in {self.directory} (available: {available})"
             raise PlanStoreError(msg)
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            msg = f"could not read the plan file {path}: {exc}"
-            raise PlanStoreError(msg) from exc
+        text = _read(path)
         try:
             return plan_from_yaml(text)
         except PlanStoreError as exc:
@@ -194,39 +243,45 @@ class PlanStore:
 
     # ── writing ──────────────────────────────────────────────────────────
 
-    def save(self, plan: ProcessPlan, *, overwrite: bool = False) -> Path:
+    def save(self, plan: ProcessPlan) -> Path:
         """Write a plan at its own version number.
 
         History is retained, not overwritten: saving over a version whose content differs is
-        refused unless ``overwrite`` is set. Re-saving byte-identical content is a no-op, so an
+        refused, with no way to ask otherwise. Re-saving byte-identical content is a no-op, so an
         idempotent pipeline does not need to check first.
+
+        There was an ``overwrite`` escape hatch here, for recording an approval against a version
+        already on disk. It looked reasonable — an approval is a decision *about* a version rather
+        than a new one — and it destroyed the change record: approve, request changes, approve
+        again left one line on disk and no trace that the first two decisions happened, including
+        the one that silently un-approved a plan a notebook may already have been scaffolded from.
+        A single approval slot cannot hold a history. Every decision goes to :meth:`save_next` now,
+        and :func:`kedge.plan.review.render_diff` already renders two versions differing only in
+        approval state.
 
         Args:
             plan: The plan to write, at ``plan.version``.
-            overwrite: Permit replacing a differing file at that version. Used when an approval
-                is recorded against a version that is already on disk.
 
         Returns:
             The path written.
 
         Raises:
-            PlanStoreError: when the version exists with different content and ``overwrite`` is
-                not set, or the write fails.
+            PlanStoreError: when the version exists with different content, when the file already
+                at that version cannot be read back to compare against, or when the write fails.
         """
         path = self.path_for(plan.version)
         text = plan_to_yaml(plan)
         if path.is_file():
-            existing = path.read_text(encoding="utf-8")
+            existing = _read(path)
             if existing == text:
                 return path
-            if not overwrite:
-                msg = (
-                    f"plan version {plan.version} already exists at {path} with different "
-                    f"content; plan history is retained rather than overwritten. Save at "
-                    f"version {self.next_version()} instead, or pass overwrite=True if you are "
-                    f"recording an approval against this same version."
-                )
-                raise PlanStoreError(msg)
+            msg = (
+                f"plan version {plan.version} already exists at {path} with different content; "
+                f"plan history is retained rather than overwritten. Save at version "
+                f"{self.next_version()} instead — including when what changed is only an "
+                f"approval, because a version's decision record is the versions around it."
+            )
+            raise PlanStoreError(msg)
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             temporary = path.with_suffix(".tmp")

@@ -441,16 +441,23 @@ kbd {
 }
 
 /* ── pending decisions ──────────────────────────────────────────────────────────────────
-   The user's half of `delete_cell` and `amend_plan`. Deliberately above the transcript and
-   outside it: these outlive the turn that produced them, and a request to destroy a cell must
-   not scroll away behind the next three messages. */
+   The user's half of `delete_cell`, `propose_plan` and `amend_plan`. Deliberately above the
+   transcript and outside it: these outlive the turn that produced them, and a request to destroy
+   a cell -- or a whole process plan to review -- must not scroll away behind the next three
+   messages. */
 
+/* Capped as well as unshrinkable. `flex: 0 0 auto` alone let three decisions -- a deletion, an
+   amendment and a twenty-question plan -- grow the panel past the viewport and push the composer
+   and the decision buttons off the bottom of the screen, which is a decision the user cannot
+   reach. The cap leaves the transcript and the composer their share and scrolls the panel. */
 .pending {
   display: flex;
   flex-direction: column;
   gap: 8px;
   margin: 10px 14px 0;
   flex: 0 0 auto;
+  max-height: 62vh;
+  overflow-y: auto;
 }
 
 .decision {
@@ -484,15 +491,72 @@ kbd {
   color: var(--text);
 }
 
+/* A proposed plan is longer than the other two decisions and is meant to be read in full, so it
+   scrolls within its own card rather than pushing the transcript off the screen. The cap belongs
+   here rather than on `.decision-stages`: the questions, the drops, the review warnings and the
+   approval blockers are all appended to the body *after* the stage list, so capping the stages
+   alone left everything that follows them free to grow the card until the buttons were off the
+   bottom of the screen -- and the questions and blockers are the part that most deserves reading
+   before deciding. */
+.decision-body {
+  max-height: 42vh;
+  overflow-y: auto;
+}
 .decision-body p { margin: 3px 0; font-size: 12.5px; }
 .decision-warn { color: var(--danger); font-weight: 560; }
 .decision-muted { color: var(--text-faint); }
+
+/* What stops the plan being approved at all, and what stops it being proved right. Both outrank
+   a warning: one is a refusal the user will otherwise meet after clicking, the other is
+   non-negotiable 6 -- a plan with no baseline is not a plan that passed. */
+.decision-blocker {
+  color: var(--danger);
+  font-weight: 620;
+  border-left: 2px solid var(--danger);
+  padding-left: 7px;
+}
+
+.decision-section {
+  margin-top: 9px !important;
+  font-size: 10.5px !important;
+  font-weight: 640;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.decision-stages {
+  margin: 4px 0 3px;
+  padding-left: 16px;
+  font-size: 12.5px;
+}
+.decision-stages li { margin: 6px 0; }
+.decision-stages li > div { margin-top: 1px; }
+.decision-stage-id { font-family: var(--font-mono); font-weight: 560; }
+.decision-assumes { color: var(--text-muted); }
+.decision-asks { color: var(--warn); font-weight: 560; }
 
 .decision-actions {
   display: flex;
   gap: 7px;
   margin-top: 9px;
 }
+
+/* The affirmative half of a decision. `danger-button` on "Approve this plan" styled the accepting
+   choice as the destructive one while "Discard it" sat quiet beside it, which points the eye at
+   the wrong button. Deletions keep `danger-button`; proposals and amendments get this. */
+.primary-button {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 560;
+  padding: 3px 11px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: var(--accent-text);
+  cursor: pointer;
+}
+.primary-button:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 
 .danger-button {
   font: inherit;

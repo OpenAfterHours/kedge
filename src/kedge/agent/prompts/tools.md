@@ -43,10 +43,15 @@ measure — you get the printed text but the value is always `None`, so prefer t
 | Tool | Use it for |
 |---|---|
 | `get_plan` | the approved process plan — your standing instructions |
+| `propose_plan` | author the first plan, once you have read enough to defend one |
 | `amend_plan` | propose a change to it. Requires the user's approval, exactly like the original |
 | `reconcile` | compare a notebook variable against the workbook's cached Excel values |
 | `list_utils` | the catalogue of reusable functions. Reuse rather than reinvent |
 | `get_knowledge` | a context pack: table grains, join keys, conventions, glossary, gotchas |
+
+`propose_plan` refuses on two counts, so neither is a matter of judgement: until you have read
+this workbook through the tools above, and once a plan has been approved — a change to a plan
+someone signed off goes through `amend_plan`, one change at a time, so they can judge it.
 
 ## Caps — every value-returning tool
 

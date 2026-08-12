@@ -13,8 +13,26 @@ from __future__ import annotations
 import re
 
 from kedge.agent.prompts import PROMPTS_DIR, SYSTEM_PARTS, build_system_prompt, load_prompt
+from kedge.agent.tools import tool_names
 
 _EMOJI = re.compile("[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f000-\U0001f0ff⬀-⯿]")
+_SEPARATOR = re.compile(r"^:?-{3,}:?$")
+
+
+def _tables(text: str) -> list[list[list[str]]]:
+    """Split a markdown document into its tables, each a list of rows of cells."""
+    tables: list[list[list[str]]] = []
+    rows: list[list[str]] = []
+    for line in text.splitlines():
+        if line.startswith("|"):
+            rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+            continue
+        if rows:
+            tables.append(rows)
+            rows = []
+    if rows:
+        tables.append(rows)
+    return tables
 
 
 def test_every_declared_part_exists_on_disk() -> None:
@@ -88,6 +106,39 @@ def test_tool_prompt_warns_that_results_are_a_slice() -> None:
     assert "100 rows" in tools
     assert "32KB" in tools
     assert "delete" in tools.lower() and "confirm" in tools.lower()
+
+
+def test_every_tool_the_model_is_offered_is_described_in_the_prompt() -> None:
+    """A tool the schemas offer and the prompt never mentions is one nobody chose to add."""
+    tools = load_prompt("tools.md")
+    for name in tool_names():
+        assert f"`{name}`" in tools, f"{name} is on the tool surface but absent from tools.md"
+
+
+def test_the_tool_tables_are_tables_rather_than_something_that_looks_like_one() -> None:
+    """Markdown fails silently, and a broken table is read by the model as a broken table.
+
+    Inserting a paragraph between two rows ends the table there and starts a second, headerless
+    one — so the rows below it lose the column meanings entirely. That is invisible in the source,
+    costs nothing to assert, and happened the first time `propose_plan` was documented.
+    """
+    tables = _tables(load_prompt("tools.md"))
+    assert tables, "tools.md has no tables at all"
+    for table in tables:
+        assert len(table) >= 3, f"{table[0]} begins a run of rows too short to be a table"
+        header, separator, *body = table
+        assert all(_SEPARATOR.match(cell) for cell in separator), (
+            f"the table headed {header} has no separator row, so it is not a table"
+        )
+        assert body, f"the table headed {header} has a header and no rows"
+        assert all(len(row) == len(header) for row in table), (
+            f"the table headed {header} has rows of differing widths"
+        )
+
+    documented = {row[0].strip("`") for table in tables for row in table[2:]}
+    assert set(tool_names()) <= documented, (
+        f"not described in a tools.md table: {sorted(set(tool_names()) - documented)}"
+    )
 
 
 def test_prompts_contain_no_emoji() -> None:

@@ -111,6 +111,38 @@ def test_a_hand_edited_plan_with_a_broken_stage_graph_is_refused() -> None:
         plan_from_yaml(yaml.safe_dump(raw))
 
 
+def test_a_plan_that_fails_validation_is_summarised_rather_than_dumped_verbatim() -> None:
+    """A hand-editing user gets a list of what is wrong, not pydantic's five-part dump with a
+    documentation URL under each one."""
+    raw = yaml.safe_load(plan_to_yaml(make_plan()))
+    raw["version"] = 0
+    raw["stages"][0]["confidance"] = "high"
+    del raw["workbook"]
+
+    with pytest.raises(PlanStoreError) as caught:
+        plan_from_yaml(yaml.safe_dump(raw))
+
+    message = str(caught.value)
+    assert "errors.pydantic.dev" not in message, "the links are noise to somebody editing YAML"
+    assert "3 problems" in message
+    assert "stages.0.confidance" in message
+    assert "workbook" in message
+
+
+def test_only_the_first_few_validation_problems_are_listed() -> None:
+    """A file edited into the wrong shape entirely should not print a screenful."""
+    raw = yaml.safe_load(plan_to_yaml(make_plan()))
+    for index in range(9):
+        raw[f"invented_{index}"] = "x"
+
+    with pytest.raises(PlanStoreError) as caught:
+        plan_from_yaml(yaml.safe_dump(raw))
+
+    message = str(caught.value)
+    assert "9 problems" in message
+    assert "(+4 more)" in message
+
+
 # =============================================================================
 # PATHS AND VERSIONS
 # =============================================================================
@@ -201,6 +233,34 @@ def test_a_plan_file_that_cannot_be_read_at_all_names_the_path(
         store.load(1)
 
 
+def test_a_plan_file_that_is_not_utf_8_says_so_rather_than_raising_a_traceback(
+    store: PlanStore,
+) -> None:
+    """Realistic rather than theoretical: the header invites hand-editing, the file is written
+    with `allow_unicode`, and a Windows editor saving cp1252 with a pound sign in a note
+    produces exactly this. `UnicodeDecodeError` is a `ValueError`, so `except OSError` misses it.
+    """
+    store.save(_at(1))
+    store.path_for(1).write_bytes(plan_to_yaml(_at(1)).encode("cp1252").replace(b"lookup", b"\xf8"))
+
+    with pytest.raises(PlanStoreError) as caught:
+        store.load(1)
+
+    message = str(caught.value)
+    assert "plan-v001.yaml" in message
+    assert "UTF-8" in message
+    assert "0xf8" in message, "which byte, so the user can find it"
+
+
+def test_saving_over_a_plan_file_that_is_not_utf_8_names_the_file_too(store: PlanStore) -> None:
+    """`save` reads the file at that version to decide whether anything changed."""
+    store.save(_at(1))
+    store.path_for(1).write_bytes(b"# a plan saved as cp1252: \xa3\n")
+
+    with pytest.raises(PlanStoreError, match="UTF-8"):
+        store.save(_at(1, draft=make_draft(summary="a different summary")))
+
+
 def test_latest_is_the_highest_version_not_the_most_recently_written(store: PlanStore) -> None:
     store.save(_at(3))
     store.save(_at(1))
@@ -265,14 +325,19 @@ def test_overwriting_a_version_with_different_content_is_refused_and_says_what_t
     assert "Save at version 2 instead" in message
 
 
-def test_overwrite_is_permitted_when_recording_an_approval_against_the_same_version(
-    store: PlanStore,
-) -> None:
-    """Approval does not bump the version, so it lands on top of the file already there."""
+def test_an_approval_cannot_be_written_over_the_version_it_approves(store: PlanStore) -> None:
+    """The decision record is the versions, so a decision may not land on top of another.
+
+    `save` used to take `overwrite=True` for exactly this, on the reading that an approval is a
+    decision about a version rather than a new one. That erased whatever decision was already
+    recorded there: approve, request changes, approve again left one line on disk and no trace of
+    the two before it -- including the one that un-approved a plan a notebook may already have
+    been scaffolded from.
+    """
     store.save(_at(1))
-    store.save(_at(1, approved=True), overwrite=True)
-    reloaded = store.load(1)
-    assert reloaded.approval.approved
+    with pytest.raises(PlanStoreError, match="a version's decision record is the versions around"):
+        store.save(_at(1, approved=True))
+    assert store.load(1).approval.approved is False, "the draft on disk is untouched"
 
 
 def test_no_temporary_file_is_left_behind(store: PlanStore) -> None:

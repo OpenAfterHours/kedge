@@ -40,7 +40,14 @@ from typing import TYPE_CHECKING, Any, Protocol
 from pydantic import ValidationError
 
 from kedge.analysis.model import ColumnProfile, LogicalOperation, WorkbookAnalysis
-from kedge.plan.model import PlanDraft, PlanError, ProcessPlan
+from kedge.plan.model import (
+    Assessment,
+    DroppedRange,
+    OpenQuestion,
+    PlanDraft,
+    PlanError,
+    ProcessPlan,
+)
 from kedge.plan.triage import TriageResult, triage
 
 if TYPE_CHECKING:
@@ -61,6 +68,7 @@ __all__ = [
     "build_messages",
     "build_proposal_context",
     "completer_from_config",
+    "describe_errors",
     "load_prompt",
     "parse_draft",
     "plan_json_schema",
@@ -654,12 +662,32 @@ def _strictify(schema: dict[str, Any]) -> dict[str, Any]:
 # =============================================================================
 
 
-def parse_draft(text: str) -> PlanDraft:
-    """Load a model response into a :class:`PlanDraft`.
+def parse_draft(text: str, *, assessment: Assessment | None = None) -> PlanDraft:
+    """Load a model response into a :class:`PlanDraft`, stripping what is not the model's to say.
 
     Tolerant of the two things models do to JSON regardless of instructions: wrapping it in a
     markdown fence, and adding a sentence before it. Anything beyond that is a validation error
     and becomes a repair instruction.
+
+    This is also the one seam where kedge takes fields back off the model. ``assessment`` was the
+    first — a plan that says ``0.9`` because the model felt confident is precisely the notebook
+    that looks more complete than it is — and :func:`_strip_human_decisions` is the rest:
+    a drop's acknowledgement and an open question's answer both record what a *reviewer* decided,
+    and ``unacknowledged_drops`` is the only structural blocker a plan has. A model that could set
+    it could sign off its own deletions and land them as ``[confirmed]`` on the review card. Both
+    the CLI proposal path and the chat ``propose_plan`` tool come through here, so one strip
+    covers both.
+
+    Args:
+        text: The raw assistant message.
+        assessment: An assessment computed elsewhere. When given it *replaces* whatever the
+            response carried, so a caller that scores convertibility deterministically — see
+            :meth:`~kedge.plan.triage.TriageResult.as_assessment` — need not ask the model for a
+            figure at all, and is not tripped up by one it volunteered anyway.
+
+    Returns:
+        The draft, with every drop reduced to its range and reason and every open question to its
+        question and context.
 
     Raises:
         ValidationError: from pydantic, carrying the messages the retry loop feeds back.
@@ -673,16 +701,56 @@ def parse_draft(text: str) -> PlanDraft:
             msg = f"the model returned no JSON object: {candidate[:200]!r}"
             raise ProposalError(msg)
         candidate = candidate[start : end + 1]
+    if assessment is None:
+        try:
+            return _strip_human_decisions(PlanDraft.model_validate_json(candidate))
+        except ValidationError:
+            raise
+        except ValueError as exc:  # malformed JSON that pydantic could not even tokenise
+            msg = f"the model returned text that is not valid JSON: {exc}"
+            raise ProposalError(msg) from exc
     try:
-        return PlanDraft.model_validate_json(candidate)
-    except ValidationError:
-        raise
-    except ValueError as exc:  # malformed JSON that pydantic could not even tokenise
+        payload = json.loads(candidate)
+    except ValueError as exc:
         msg = f"the model returned text that is not valid JSON: {exc}"
         raise ProposalError(msg) from exc
+    if not isinstance(payload, dict):
+        msg = f"the model returned a {type(payload).__name__} where a JSON object was expected"
+        raise ProposalError(msg)
+    return _strip_human_decisions(PlanDraft.model_validate({**payload, "assessment": assessment}))
 
 
-def _describe_errors(exc: ValidationError) -> str:
+def _strip_human_decisions(draft: PlanDraft) -> PlanDraft:
+    """Rebuild the fields a reviewer owns from their defaults, keeping what the model proposed.
+
+    Applied after validation rather than to the raw JSON, so a response that is malformed still
+    fails the way the retry loop expects and the model is still told about a field it invented —
+    ``extra="forbid"`` is a repair instruction, and silently dropping keys here would cost it.
+
+    A drop keeps its ``range`` and ``reason``; an open question keeps its ``question`` and
+    ``context``. Everything else on both — ``acknowledged``, ``accepted``, ``note``,
+    ``acknowledged_at``, ``answer``, ``answered_at`` — is a record of a decision only
+    :mod:`kedge.plan.review` may write, on an explicit user action.
+    """
+    return draft.model_copy(
+        update={
+            "dropped": [
+                DroppedRange(range=drop.range, reason=drop.reason) for drop in draft.dropped
+            ],
+            "open_questions": [
+                OpenQuestion(question=question.question, context=question.context)
+                for question in draft.open_questions
+            ],
+        }
+    )
+
+
+def describe_errors(exc: ValidationError) -> str:
+    """Render a pydantic failure as the repair instruction a model can act on.
+
+    One line per error, capped at twenty: past that the response is wrong in kind rather than in
+    detail, and a longer list teaches the model nothing the first twenty did not.
+    """
     lines = []
     for error in exc.errors()[:20]:
         location = ".".join(str(part) for part in error["loc"]) or "(root)"
@@ -708,6 +776,12 @@ def propose_plan(
     version: int = 1,
 ) -> ProcessPlan:
     """Propose a process plan for an analysed workbook. One LLM call, plus repairs.
+
+    The convertibility figure on the plan that comes back is triage's, never the model's own:
+    whatever the response claimed is replaced on the way through :func:`parse_draft`, exactly as
+    the chat ``propose_plan`` tool does it. Both paths therefore write the same kind of number,
+    which is the whole point of that field — :meth:`~kedge.plan.triage.TriageResult.as_assessment`
+    explains why a model has nothing to score its own decomposition against.
 
     Args:
         analysis: The complete workbook analysis. Its summary, column profiles and logical
@@ -742,6 +816,9 @@ def propose_plan(
 
     messages = build_messages(analysis, assessment, seed_plan=seed_plan)
     schema = plan_json_schema()
+    # Computed once, outside the retry loop, and handed to every attempt: the figure is a property
+    # of the workbook, so it cannot depend on which attempt happened to parse.
+    scored = assessment.as_assessment()
     failures: list[str] = []
 
     for attempt in range(1, max(1, max_attempts) + 1):
@@ -760,9 +837,9 @@ def propose_plan(
             )
         )
         try:
-            draft = parse_draft(text)
+            draft = parse_draft(text, assessment=scored)
         except (ValidationError, ProposalError) as exc:
-            detail = _describe_errors(exc) if isinstance(exc, ValidationError) else str(exc)
+            detail = describe_errors(exc) if isinstance(exc, ValidationError) else str(exc)
             failures.append(f"attempt {attempt}: {detail}")
             logger.warning("proposal attempt %d did not validate: %s", attempt, detail)
             if attempt >= max_attempts:

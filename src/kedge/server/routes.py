@@ -15,13 +15,14 @@ for the notebook mirror and any attached monitor, and into an accumulator that b
 assistant message when the turn ends. The accumulator runs in a ``finally`` block, so a turn that
 is cancelled or that dies mid-stream still leaves a coherent transcript.
 
-Two endpoints here are the user's half of decisions the model is not allowed to make on its own.
-``delete_cell`` and ``amend_plan`` do not act: they record a request and tell the model plainly
-that nothing has happened (``kedge.agent.tools``). ``/api/pending`` surfaces those requests and
-``/api/pending/...`` acts on them, so the recorded intent has somewhere to go other than a log
-file. Confirming a deletion runs it through the same notebook driver the agent would have used;
-approving an amendment writes a new plan version through :mod:`kedge.plan.store`. Neither can be
-reached without an explicit request from the browser, which is the whole of PLAN 2.2's gate.
+Three of the tools here are decisions the model is not allowed to make on its own, and this module
+is the user's half of them. ``delete_cell``, ``propose_plan`` and ``amend_plan`` do not act: they
+record a request and tell the model plainly that nothing has happened (``kedge.agent.tools``).
+``/api/pending`` surfaces those requests and ``/api/pending/...`` acts on them, so the recorded
+intent has somewhere to go other than a log file. Confirming a deletion runs it through the same
+notebook driver the agent would have used; approving a proposal or an amendment writes a plan
+version through :mod:`kedge.plan.store`. None of them can be reached without an explicit request
+from the browser, which is the whole of PLAN 2.2's gate.
 """
 
 from __future__ import annotations
@@ -352,11 +353,44 @@ def patch_session(session_id: str, body: PatchSessionBody, request: Request) -> 
 
 
 @router.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str, request: Request) -> dict[str, Any]:
-    """Delete a session and its messages."""
+async def delete_session(session_id: str, request: Request) -> dict[str, Any]:
+    """Delete a session, its messages, and everything the agent still holds about it.
+
+    The rows were only ever half of it. The agent keeps a per-session digest, the tool traffic of
+    the last turn and the session's :class:`~kedge.agent.tools.ToolRegistry` — whose result cache
+    holds sampled workbook rows — and that state now survives essentially every turn rather than
+    only a paused one, for the lifetime of the process. Deleting the conversation and leaving it
+    resident would mean a user who removed a conversation still had its sampled data in memory,
+    and ``SECURITY.md`` is explicit that the sensitivity of the workbook is the sensitivity of the
+    conversation.
+
+    The registry is closed rather than only dropped. Dropping it leaves an open workbook handle —
+    a zip archive and two openpyxl views of the user's file — to be collected whenever the
+    interpreter gets round to it; ``aclose`` releases it now. It is best-effort: a handle that
+    will not close is a warning, never a reason a conversation cannot be deleted.
+
+    The delete succeeds whether or not an agent is attached. A session can be deleted from the hub
+    with no workbook open and no model configured, and answering 409 there would be refusing to
+    delete a conversation because there is nobody to tell.
+    """
     state = get_state(request)
-    if not state.store.delete_session(session_id):
+    if not await run_in_threadpool(state.store.delete_session, session_id):
         raise HTTPException(status_code=404, detail=f"No chat session with id {session_id!r}.")
+
+    registry = _registry_for(state, session_id)
+    aclose = getattr(registry, "aclose", None)
+    if callable(aclose):
+        try:
+            await aclose()
+        except Exception:  # pragma: no cover - a stuck handle must not block the delete
+            logger.warning("could not close the tool registry for session %s", session_id)
+
+    forget = getattr(state.agent, "reset_session", None)
+    if callable(forget):
+        forget(session_id)
+        logger.info("cleared the agent's held state for deleted session %s", session_id)
+    else:
+        logger.debug("no agent state to clear for deleted session %s", session_id)
     return {"deleted": session_id}
 
 
@@ -512,10 +546,15 @@ async def monitor(request: Request) -> StreamingResponse:
 
 # ── decisions the model is not allowed to make ───────────────────────────────────────────────
 #
-# `delete_cell` and `amend_plan` both record and refuse: the tool appends to the registry's
-# pending list, tells the model plainly that nothing has happened, and returns. Until now there
-# was no way for the user to say yes, which made both of them write-only. These four routes are
-# the other half.
+# `delete_cell`, `propose_plan` and `amend_plan` all record and refuse: the tool appends to the
+# registry's pending list, tells the model plainly that nothing has happened, and returns. Until
+# these routes existed there was no way for the user to say yes, which made them write-only.
+#
+# The two plan routes divide the ground `propose_plan` and `amend_plan` divide in the tool layer.
+# Approving a proposal writes the plan the model authored, whole, and only where no plan has been
+# approved yet; approving an amendment writes one recorded change against the plan that is in
+# force. Neither can become the other, which is what keeps a replacement decomposition from
+# arriving as though it were an edit.
 #
 # The registries hang off the agent loop, keyed by chat session (`KedgeAgent.registries`). The
 # server reads that attribute and requires nothing else of the loop, so the scripted stand-in —
@@ -540,10 +579,183 @@ def _registry_for(state: ServerState, session_id: str) -> Any:
     return registries.get(session_id)
 
 
+def _proposal_payload(
+    index: int,
+    plan: Any,
+    *,
+    analysis: Any = None,
+    triage_result: Any = None,
+    analysis_stale: bool | None = None,
+) -> dict[str, Any]:
+    """Render a proposed plan for review in the chat pane.
+
+    Enough of it to *decide* on, which is more than an amendment needs: an amendment is one
+    sentence and its rationale, where a proposal is the whole decomposition and approving it
+    unblocks the notebook.
+
+    The bar is :func:`kedge.plan.review.render_plan` — what the CLI puts in front of a reviewer
+    before the same decision — and anything the card omits is something the user is being asked to
+    approve unseen. So a stage carries its assumptions ("what a reviewer checks first", per the
+    field's own docstring), its dependencies, the analysis operations it claims and the pattern it
+    translates; a checkpoint carries the *question* it will ask, which is the whole content of the
+    control rather than a note that one exists.
+
+    Three things here are not on the plan at all and have to be computed:
+
+    - :func:`~kedge.plan.review.review_warnings`, which carries the only automatic check that the
+      decomposition covers the workbook — operations claimed by no stage, and operation ids that
+      are not in the analysis. Without an ``analysis`` those two cannot run and the card says so
+      rather than showing a shorter list as though it were complete.
+    - :meth:`~kedge.plan.model.ProcessPlan.approval_blockers`, pre-flighted so the button can say
+      what clicking it will actually do. A plan with an unacknowledged drop lands as a *draft*,
+      and learning that afterwards is learning it too late.
+    - the triage **verdict**. Both proposal paths now refuse a ``STOP`` outright, so a plan
+      reaching this card has already cleared that bar; showing the verdict is the second line of
+      defence rather than the only one, and ``proceed_with_care`` is the case it earns its place
+      on.
+
+    Verification blockers are kept apart from conversion blockers rather than folded into one
+    list. "1.00 convertible" with "cannot be reconciled" as a trailing clause inverts the emphasis
+    of the one rule that matters most (non-negotiable 6): a plan with no baseline is not a plan
+    that passed.
+    """
+    conversion_blockers = list(plan.assessment.blockers)
+    verification_blockers: list[str] = []
+    if triage_result is not None:
+        verification_blockers = [
+            blocker.render() for blocker in triage_result.verification_blockers
+        ]
+        # `Assessment.blockers` is `TriageResult.blocker_lines()`, which is conversion blockers
+        # followed by verification ones. Splitting them by the same rendering they were built
+        # from keeps the card from stating a verification blocker twice, once de-emphasised.
+        conversion_blockers = [
+            blocker for blocker in conversion_blockers if blocker not in verification_blockers
+        ]
+
+    return {
+        "index": index,
+        "version": plan.version,
+        "based_on_version": plan.based_on_version,
+        "summary": plan.summary,
+        "convertible": plan.assessment.convertible,
+        "blockers": conversion_blockers,
+        "verification_blockers": verification_blockers,
+        "verdict": triage_result.verdict.value if triage_result is not None else None,
+        "complexity": triage_result.complexity if triage_result is not None else None,
+        "reconcilable": triage_result.reconcilable if triage_result is not None else None,
+        "stages": [
+            {
+                "id": stage.id,
+                "kind": stage.kind.value,
+                "intent": stage.intent,
+                "confidence": stage.confidence.value,
+                "sources": list(stage.sources),
+                "depends_on": list(stage.depends_on),
+                "assumptions": list(stage.assumptions),
+                "operations": list(stage.operations),
+                "excel_pattern": stage.excel_pattern.value if stage.excel_pattern else None,
+                "notes": stage.notes,
+                "checkpoint": _checkpoint_payload(stage),
+            }
+            for stage in plan.ordered_stages()
+        ],
+        "open_questions": [
+            {"question": question.question, "context": question.context}
+            for question in plan.open_questions
+        ],
+        "dropped": [{"range": drop.range, "reason": drop.reason} for drop in plan.dropped],
+        "warnings": _review_warnings(plan, analysis, triage_result),
+        "warnings_complete": analysis is not None,
+        "approval_blockers": plan.approval_blockers(),
+        "unacknowledged_drops": len(plan.unacknowledged_drops),
+        "analysis_stale": analysis_stale,
+    }
+
+
+def _checkpoint_payload(stage: Any) -> dict[str, Any] | None:
+    """The question a checkpoint stage will ask, or ``None`` for an automated stage.
+
+    ``render_plan`` prints ``asks: Have this month's overrides been agreed with Risk?`` where the
+    card said ", not automated". The question *is* the control; a card that omits it is asking the
+    user to approve a decision point without showing them the decision.
+    """
+    if not stage.is_checkpoint:
+        return None
+    checkpoint = stage.effective_checkpoint()
+    return {
+        "question": checkpoint.question,
+        "options": list(checkpoint.options),
+        "guidance": checkpoint.guidance,
+        "require_note": checkpoint.require_note,
+    }
+
+
+def _review_warnings(plan: Any, analysis: Any, triage_result: Any) -> list[str]:
+    """Run the review warnings, degrading to an empty list rather than taking the panel down."""
+    from kedge.plan.review import review_warnings
+
+    try:
+        return review_warnings(plan, analysis, triage_result=triage_result)
+    except Exception:  # pragma: no cover - a warning that raises must not hide the plan
+        logger.exception("could not compute review warnings for plan v%s", plan.version)
+        return []
+
+
+def _triage_for(analysis: Any) -> Any:
+    """Score the analysis the proposal was written against, or ``None`` when there is none.
+
+    Recomputed at render time rather than carried on the pending proposal: triage is
+    deterministic and offline, so the answer is the same one the tool got, and the alternative is
+    a field on a dataclass this module does not own.
+    """
+    if analysis is None:
+        return None
+    from kedge.plan.triage import triage
+
+    return triage(analysis)
+
+
+def _analysis_is_stale(workspace: Any) -> bool | None:
+    """Whether the workbook has been saved since the analysis the plan was scored from was written.
+
+    A plan records a triage score stamped "Scored deterministically from the analysis, not
+    estimated." If the user has saved the workbook from Excel since, that is a reading of a file
+    that no longer exists, and the figure on the card is about a different workbook. Cheap to
+    detect and worth saying out loud.
+
+    Returns ``None`` — "cannot tell" — when there is no workspace or either file is missing, which
+    is not the same answer as "current" and must not be rendered as one.
+    """
+    if workspace is None:
+        return None
+    try:
+        workbook = Path(workspace.workbook_path)
+        analysis_file = Path(workspace.analysis_path)
+        if not workbook.is_file() or not analysis_file.is_file():
+            return None
+        return workbook.stat().st_mtime_ns > analysis_file.stat().st_mtime_ns
+    except (OSError, AttributeError):
+        return None
+
+
 def _pending_payload(registry: Any) -> dict[str, Any]:
     if registry is None:
-        return {"deletions": [], "amendments": []}
+        return {"proposals": [], "deletions": [], "amendments": []}
+    context = getattr(registry, "context", None)
+    analysis = getattr(context, "analysis", None) if registry.pending_proposals else None
+    triage_result = _triage_for(analysis)
+    stale = _analysis_is_stale(getattr(context, "workspace", None))
     return {
+        "proposals": [
+            _proposal_payload(
+                index,
+                item.plan,
+                analysis=analysis,
+                triage_result=triage_result,
+                analysis_stale=stale,
+            )
+            for index, item in enumerate(registry.pending_proposals)
+        ],
         "deletions": [
             {
                 "index": index,
@@ -672,6 +884,59 @@ def approve_amendment(
     return {**result, "pending": _pending_payload(registry)}
 
 
+@router.post("/api/sessions/{session_id}/pending/proposals/{index}")
+def approve_proposal(
+    session_id: str,
+    index: int,
+    body: DecisionBody,
+    request: Request,
+) -> dict[str, Any]:
+    """Write a proposed process plan as a new plan version.
+
+    The counterpart of :func:`approve_amendment`, and the same gate: ``propose_plan`` authored a
+    plan and said plainly that it was not in force; this is the user reading it and deciding. What
+    is written is the plan exactly as the model authored it — ``generated_by: llm`` with the model
+    id — saved through :class:`~kedge.plan.store.PlanStore` at the next free version so an earlier
+    draft is superseded rather than overwritten.
+
+    Approval is recorded on it only when the plan is approvable on its own terms. A plan whose
+    dropped ranges nobody has acknowledged lands as a **draft** with the blockers reported, for the
+    same reason an amendment does: ``approve`` refusing is the gate working.
+    """
+    state = get_state(request)
+    _require_session(state, session_id)
+    registry = _registry_for(state, session_id)
+    pending = _pop_pending(registry, "pending_proposals", index)
+
+    store = getattr(registry.context, "plans", None)
+    if store is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This session has no plan store, so there is nowhere to write the plan.",
+        )
+    try:
+        result = _write_proposal(store, pending, note=body.note)
+    except KedgeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    logger.info("user approved a proposed plan in session %s", session_id)
+    return {**result, "pending": _pending_payload(registry)}
+
+
+@router.delete("/api/sessions/{session_id}/pending/proposals/{index}")
+def dismiss_proposal(session_id: str, index: int, request: Request) -> dict[str, Any]:
+    """Decline a proposed plan. Nothing is written and the proposal is dropped."""
+    state = get_state(request)
+    _require_session(state, session_id)
+    registry = _registry_for(state, session_id)
+    pending = _pop_pending(registry, "pending_proposals", index)
+    logger.info("user declined a proposed plan in session %s", session_id)
+    return {
+        "dismissed": pending.plan.summary or f"plan with {len(pending.plan.stages)} stage(s)",
+        "pending": _pending_payload(registry),
+    }
+
+
 @router.delete("/api/sessions/{session_id}/pending/amendments/{index}")
 def dismiss_amendment(session_id: str, index: int, request: Request) -> dict[str, Any]:
     """Decline an amendment. The approved plan is unchanged and the proposal is dropped."""
@@ -702,6 +967,52 @@ def _pop_pending(registry: Any, attribute: str, index: int) -> Any:
     return items.pop(index)
 
 
+def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> dict[str, Any]:
+    """Save the proposed plan, approving it where it is approvable on its own terms.
+
+    The store is re-read here rather than trusted from the tool call. ``propose_plan`` refused if a
+    plan was already approved, but that was a decision taken during a turn and this is a click
+    that can arrive minutes later, with an amendment approved in between. The check is cheap and
+    the thing it protects — that a whole replacement decomposition never displaces an approved plan
+    without going through amendment review — is the point of the tool refusing at all.
+    """
+    from kedge.plan.review import PlanNotApprovableError, approve
+    from kedge.plan.store import PlanStoreError
+
+    in_force = store.latest_approved()
+    if in_force is not None:
+        msg = (
+            f"plan v{in_force.version} was approved for this workbook after this one was "
+            f"proposed, so writing it would replace an approved plan wholesale rather than amend "
+            f"it. The proposal has been cleared. Ask kedge to raise what it wanted changed as an "
+            f"amendment, or edit the approved plan directly."
+        )
+        raise PlanStoreError(msg)
+
+    plan = proposal.plan
+    approved = False
+    blockers: list[str] = []
+    try:
+        # The user's note, or nothing. Falling back to the plan's own summary would put the
+        # model's prose in the field a reader takes months later as the reviewer's account of
+        # what they checked -- written by the thing being reviewed. An absent note is honest; a
+        # borrowed one is not.
+        plan = approve(plan, by="user", note=note)
+        approved = True
+    except PlanNotApprovableError:
+        blockers = plan.approval_blockers()
+
+    stamped, path = store.save_next(plan)
+    return {
+        "version": stamped.version,
+        "based_on_version": stamped.based_on_version,
+        "approved": approved,
+        "blockers": blockers,
+        "path": str(path),
+        "stages": len(stamped.stages),
+    }
+
+
 def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[str, Any]:
     """Derive, save and — where it is approvable — approve the amended plan.
 
@@ -714,17 +1025,20 @@ def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[st
 
     Every write goes through the public review functions, so the version bump, the provenance
     chain and the approval reset are the ones every other plan edit gets.
+
+    **The plan amended is the approved one, or there is none.** An amendment card shows one
+    sentence and its rationale, so approving one may only put one sentence into force. Reached
+    through ``latest_approved() or latest()`` it did not: with a rejected or never-approved plan on
+    disk, approving "mention the FX rate source" wrote a new version carrying that plan's entire
+    stage list, approved, on the strength of a card that showed a sentence. A decomposition nobody
+    approved has to be reviewed as a decomposition.
     """
     from kedge.plan.review import PlanNotApprovableError, add_question, approve, edit_stage
     from kedge.plan.store import PlanStoreError
 
-    plan = store.latest_approved() or store.latest()
+    plan = store.latest_approved()
     if plan is None:
-        msg = (
-            "there is no plan on disk to amend. Ask kedge to propose one first — an amendment to "
-            "nothing is a plan, and a plan needs reviewing in full."
-        )
-        raise PlanStoreError(msg)
+        raise PlanStoreError(_nothing_to_amend(store.latest()))
 
     stage = plan.stage(amendment.stage) if amendment.stage else None
     if stage is not None:
@@ -737,7 +1051,8 @@ def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[st
     approved = False
     blockers: list[str] = []
     try:
-        amended = approve(amended, by="user", note=note or amendment.change)
+        # As in `_write_proposal`: the amendment's own text is not the reviewer's account of it.
+        amended = approve(amended, by="user", note=note)
         approved = True
     except PlanNotApprovableError:
         blockers = amended.approval_blockers()
@@ -751,3 +1066,27 @@ def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[st
         "path": str(path),
         "stage": amendment.stage if stage is not None else None,
     }
+
+
+def _nothing_to_amend(latest: Any) -> str:
+    """Explain why there is nothing for this amendment to attach to.
+
+    Two cases, and they read differently to the person holding the card. An empty store is "there
+    is no plan"; a store whose newest version was rejected, or was never approved, is "there is a
+    plan and it is not in force" — and the second needs to say why approving one sentence against
+    it is refused, or the refusal looks like an obstruction rather than the gate.
+    """
+    if latest is None:
+        return (
+            "there is no plan on disk to amend. Ask kedge to propose one first — an amendment to "
+            "nothing is a plan, and a plan needs reviewing in full."
+        )
+    return (
+        f"plan v{latest.version} is the newest on disk and its approval state is "
+        f"'{latest.approval.state.value}', so no plan is in force and there is nothing to amend. "
+        f"An amendment is one change approved against a decomposition that was already reviewed; "
+        f"approving this one would put the whole of v{latest.version} — "
+        f"{len(latest.stages)} stage(s) nobody has approved — into force behind it. Review "
+        f"v{latest.version} in full and approve it, or ask kedge to propose a new plan. The "
+        f"amendment has been cleared."
+    )

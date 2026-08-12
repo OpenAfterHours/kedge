@@ -2,8 +2,16 @@
 
 This module is the approval gate. **Nothing is written to the notebook before the plan is
 approved**, and that is enforced structurally rather than by convention: approval is state on the
-plan, every edit here resets it to ``DRAFT``, and :mod:`kedge.notebook.scaffold` refuses a plan
-whose ``approval.state`` is not ``APPROVED``. There is no separate flag to forget to check.
+plan, every edit here resets it to ``DRAFT`` — except a rejection, which is carried forward
+because it is terminal — and :mod:`kedge.notebook.scaffold` refuses a plan whose
+``approval.state`` is not ``APPROVED``. There is no separate flag to forget to check.
+
+There are two chokepoints and everything goes through one of them. Content edits go through
+:func:`_revise`, which bumps the version and resets approval; review decisions go through
+:func:`_decide`, which does neither and refuses the two transitions that would defeat the gate —
+out of ``REJECTED`` at all, and out of ``APPROVED`` without the withdrawal being asked for by
+name. A verb that writes ``approval`` itself is a verb that can forget one of those, which is how
+:func:`request_changes` came to be a route round a rejection.
 
 Every edit returns a **new plan at the next version**. Plans are frozen, so an edit cannot
 happen by accident, and the version history is what makes "when the process changes next
@@ -86,6 +94,16 @@ def _revise(plan: ProcessPlan, **changes: Any) -> ProcessPlan:
     against one decomposition must not survive a change to it, or the gate protects nothing.
     Revalidation runs in full, so an edit that breaks the stage graph fails here rather than in
     the scaffolder.
+
+    **A rejection is carried forward instead.** ``REJECTED`` is the one terminal state — "a
+    rejected plan can never be approved; propose a new one" (:func:`reject`) — and resetting it to
+    ``DRAFT`` here disarmed the guard in
+    :meth:`~kedge.plan.model.ProcessPlan.approval_blockers` that says so. A one-sentence edit to a
+    decomposition the user turned down would then be approvable, and approving that one sentence
+    would put the whole of the rejected plan into force. The rejector and their reason travel with
+    it, because "why was this turned down" outlives the version it was turned down at. The way
+    forward from a rejection is a *new* plan: :meth:`~kedge.plan.model.ProcessPlan.from_draft`
+    starts at ``DRAFT``, so re-seeding from ``to_draft()`` is unaffected.
     """
     raw = plan.model_dump(mode="python")
     raw.update(changes)
@@ -93,7 +111,8 @@ def _revise(plan: ProcessPlan, **changes: Any) -> ProcessPlan:
     raw["based_on_version"] = plan.version
     raw["created_at"] = datetime.now(UTC)
     raw["generated_by"] = "human"
-    raw["approval"] = Approval().model_dump(mode="python")
+    if plan.approval.state is not ApprovalState.REJECTED:
+        raw["approval"] = Approval().model_dump(mode="python")
     return ProcessPlan.model_validate(raw)
 
 
@@ -421,6 +440,82 @@ def acknowledge_all_drops(plan: ProcessPlan, *, note: str | None = None) -> Proc
 # =============================================================================
 
 
+def _decide(
+    plan: ProcessPlan,
+    *,
+    state: ApprovalState,
+    by: str,
+    note: str | None,
+    doing: str,
+    withdraw_approval: bool = False,
+) -> ProcessPlan:
+    """Return the plan carrying a new review decision. Content and version are untouched.
+
+    This is the approval-side twin of :func:`_revise`, and the only place a review verb writes
+    ``approval``. A verb that builds its own :class:`Approval` is a verb that can forget a guard,
+    which is exactly how :func:`request_changes` came to be able to take a plan *out* of
+    ``REJECTED``.
+
+    Two transitions are refused.
+
+    **Out of ``REJECTED``.** It is the one terminal state — "a rejected plan can never be
+    approved; propose a new one" (:func:`reject`) — and any route out of it launders a rejection
+    into an approval, because ``CHANGES_REQUESTED`` approves cleanly. Sending a rejected plan back
+    for changes and approving what comes back would put the whole of the turned-down
+    decomposition into force with the rejector and their reason erased. :func:`_revise` carries a
+    rejection forward across a content edit for the same reason.
+
+    **Out of ``APPROVED``, unless ``withdraw_approval`` is set.** A notebook may already have been
+    scaffolded from the approved plan, and a decision does not bump the version, so the withdrawal
+    replaces the approval on the only version there is. Quietly is therefore the one way it must
+    not happen: asked for by name it is allowed, it is logged, and the approval it overturns is
+    written into the note, so the plan itself still says an approval was given and taken away
+    however the caller chooses to store it.
+    """
+    current = plan.approval
+    if current.state is ApprovalState.REJECTED and state is not ApprovalState.REJECTED:
+        because = f" (reason: {current.note})" if current.note else ""
+        msg = (
+            f"cannot {doing}: it was rejected {_attribution(current)}{because}. A rejection is "
+            f"terminal — a rejected plan can never be approved — so propose a new one rather "
+            f"than moving this one back into review."
+        )
+        raise PlanNotApprovableError(msg)
+
+    withdrawing = current.state is ApprovalState.APPROVED and state is not ApprovalState.APPROVED
+    if withdrawing and not withdraw_approval:
+        msg = (
+            f"cannot {doing}: it is approved {_attribution(current)}, and a notebook may already "
+            f"have been scaffolded from it. Pass withdraw_approval=True to withdraw that approval "
+            f"deliberately; the approval it overturns is recorded on the plan when you do."
+        )
+        raise PlanNotApprovableError(msg)
+    if withdrawing:
+        record = f"withdraws the approval given {_attribution(current)}"
+        note = f"{note}; {record}" if note else record
+        logger.warning(
+            "plan v%d for %s: approval by %s withdrawn by %s",
+            plan.version,
+            plan.workbook,
+            current.by,
+            by,
+        )
+
+    return plan.model_copy(
+        update={"approval": Approval(state=state, by=by, at=datetime.now(UTC), note=note)}
+    )
+
+
+def _attribution(approval: Approval) -> str:
+    """Who took a decision and when, in the form ``by phil at 2026-07-24 10:00``.
+
+    Degrades to whatever of that was actually recorded: a plan hand-edited on disk can carry a
+    state with no name against it.
+    """
+    who = f"by {approval.by}" if approval.by else "by an unnamed reviewer"
+    return f"{who} at {approval.at:%Y-%m-%d %H:%M}" if approval.at is not None else who
+
+
 def approve(plan: ProcessPlan, *, by: str, note: str | None = None) -> ProcessPlan:
     """Approve the plan, unlocking the scaffolder.
 
@@ -428,44 +523,79 @@ def approve(plan: ProcessPlan, *, by: str, note: str | None = None) -> ProcessPl
 
     Raises:
         PlanNotApprovableError: listing every outstanding blocker, chiefly unacknowledged drops.
+            A rejected plan is blocked here too, and says to propose a new one.
     """
     blockers = plan.approval_blockers()
     if blockers:
         joined = "\n".join(f"  - {blocker}" for blocker in blockers)
         msg = f"this plan cannot be approved yet:\n{joined}"
         raise PlanNotApprovableError(msg)
-    approved = plan.model_copy(
-        update={
-            "approval": Approval(
-                state=ApprovalState.APPROVED, by=by, at=datetime.now(UTC), note=note
-            )
-        }
+    approved = _decide(
+        plan, state=ApprovalState.APPROVED, by=by, note=note, doing="approve this plan"
     )
     logger.info("plan v%d for %s approved by %s", plan.version, plan.workbook, by)
     return approved
 
 
-def request_changes(plan: ProcessPlan, *, by: str, note: str) -> ProcessPlan:
-    """Mark the plan as needing changes, without editing it."""
-    return plan.model_copy(
-        update={
-            "approval": Approval(
-                state=ApprovalState.CHANGES_REQUESTED, by=by, at=datetime.now(UTC), note=note
-            )
-        }
+def request_changes(
+    plan: ProcessPlan, *, by: str, note: str, withdraw_approval: bool = False
+) -> ProcessPlan:
+    """Mark the plan as needing changes, without editing it.
+
+    Unlike a rejection this is not terminal — the plan can be revised and approved — which is
+    precisely why it may not be used on a *rejected* plan: ``CHANGES_REQUESTED`` approves cleanly,
+    so that route would launder a rejection into an approval.
+
+    Args:
+        plan: The plan to send back.
+        by: Who is asking for changes.
+        note: What needs to change. Required: "changes requested" with nothing said is not a
+            review.
+        withdraw_approval: Required to send an *approved* plan back, because doing so takes an
+            approval away from a plan a notebook may already have been scaffolded from.
+
+    Raises:
+        PlanNotApprovableError: when the plan was rejected, or is approved and the withdrawal was
+            not asked for.
+    """
+    return _decide(
+        plan,
+        state=ApprovalState.CHANGES_REQUESTED,
+        by=by,
+        note=note,
+        doing="send this plan back for changes",
+        withdraw_approval=withdraw_approval,
     )
 
 
-def reject(plan: ProcessPlan, *, by: str, reason: str) -> ProcessPlan:
-    """Reject the plan outright. A rejected plan can never be approved; propose a new one."""
+def reject(
+    plan: ProcessPlan, *, by: str, reason: str, withdraw_approval: bool = False
+) -> ProcessPlan:
+    """Reject the plan outright. A rejected plan can never be approved; propose a new one.
+
+    Args:
+        plan: The plan being turned down.
+        by: Who is rejecting it.
+        reason: Why. It travels with the plan, because "why was this turned down" outlives the
+            version it was turned down at.
+        withdraw_approval: Required to reject an *approved* plan. Rejecting one silently would
+            take the approval away from a plan a notebook may already have been scaffolded from,
+            and leave nothing anywhere saying it had ever been given.
+
+    Raises:
+        PlanNotApprovableError: when the plan is approved and the withdrawal was not asked for.
+            Rejecting an already-rejected plan is allowed; it stays rejected.
+    """
+    rejected = _decide(
+        plan,
+        state=ApprovalState.REJECTED,
+        by=by,
+        note=reason,
+        doing="reject this plan",
+        withdraw_approval=withdraw_approval,
+    )
     logger.info("plan v%d for %s rejected by %s: %s", plan.version, plan.workbook, by, reason)
-    return plan.model_copy(
-        update={
-            "approval": Approval(
-                state=ApprovalState.REJECTED, by=by, at=datetime.now(UTC), note=reason
-            )
-        }
-    )
+    return rejected
 
 
 # =============================================================================
@@ -515,13 +645,13 @@ def review_warnings(
         warnings.append(f"{len(unanswered)} open question(s) still unanswered")
     if plan.assessment.convertible < 0.6:
         warnings.append(
-            f"the plan only claims to convert {plan.assessment.convertible:.0%} of the logic; "
+            f"triage scores only {plan.assessment.convertible:.0%} of the logic as convertible; "
             f"read assessment.blockers before approving"
         )
     if not plan.checkpoints and plan.assessment.convertible < 0.9:
         warnings.append(
-            "no checkpoint stages on a plan that does not claim full coverage — is a judgement "
-            "call being translated into code that was never really code?"
+            "no checkpoint stages on a plan that is not scored as fully convertible — is a "
+            "judgement call being translated into code that was never really code?"
         )
     if analysis is not None:
         planned = {op for stage in plan.stages for op in stage.operations}
@@ -562,7 +692,9 @@ def render_plan(
     """
     lines: list[str] = [
         f"Process plan v{plan.version} for {plan.workbook}",
-        f"  created {plan.created_at:%Y-%m-%d %H:%M} by {plan.generated_by}"
+        # Stamped UTC, so say UTC. This is read months later beside an approval time, and an
+        # unmarked timestamp is one the reader has to guess the zone of.
+        f"  created {plan.created_at.astimezone(UTC):%Y-%m-%d %H:%M} UTC by {plan.generated_by}"
         + (f" ({plan.llm_model})" if plan.llm_model else "")
         + f"    approval: {plan.approval.state.value}",
     ]

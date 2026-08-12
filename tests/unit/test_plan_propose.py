@@ -390,6 +390,77 @@ def test_a_plan_whose_stage_graph_is_broken_is_rejected_here_not_in_the_scaffold
 
 
 # =============================================================================
+# FIELDS THAT ARE A HUMAN'S DECISION, NOT THE MODEL'S
+# =============================================================================
+#
+# `assessment` was the first of these and `parse_draft(..., assessment=)` is the seam that
+# overrides it. The same reasoning applies to every field that records something a *reviewer*
+# decided: a drop's acknowledgement, and an open question's answer. `unacknowledged_drops` is the
+# only structural blocker on a plan — the thing standing between "kedge silently deleted six
+# columns" and a bug report — so a model that can set it can sign off its own deletions.
+
+
+def _draft_with_signed_off_drop(**extra: Any) -> str:
+    raw = json.loads(make_draft().model_dump_json())
+    raw["dropped"] = [
+        {
+            "range": "Calc!AK:AP",
+            "reason": "unused",
+            "acknowledged": True,
+            "accepted": True,
+            "note": "signed off by the analyst",
+            "acknowledged_at": "2026-08-12T09:00:00Z",
+        }
+    ]
+    raw.update(extra)
+    return json.dumps(raw)
+
+
+@pytest.mark.parametrize("assessment", [None, Assessment(convertible=0.7)])
+def test_a_model_cannot_acknowledge_its_own_dropped_ranges(assessment) -> None:
+    """Parametrised over both paths: the CLI proposal and the chat tool go through one seam."""
+    draft = parse_draft(_draft_with_signed_off_drop(), assessment=assessment)
+
+    drop = draft.dropped[0]
+    assert drop.range == "Calc!AK:AP", "the proposal itself survives"
+    assert drop.reason == "unused"
+    assert drop.acknowledged is False, "a signature no human made is not a signature"
+    assert drop.note is None
+    assert drop.acknowledged_at is None
+
+
+def test_a_drop_the_model_signed_off_still_blocks_approval() -> None:
+    """The end of the chain: the forged acknowledgement must not clear `approval_blockers`."""
+    draft = parse_draft(_draft_with_signed_off_drop())
+    plan = ProcessPlan.from_draft(draft, workbook="w.xlsx", workbook_sha256="0" * 64)
+
+    assert plan.unacknowledged_drops
+    assert any("Calc!AK:AP" in blocker for blocker in plan.approval_blockers())
+
+
+@pytest.mark.parametrize("assessment", [None, Assessment(convertible=0.7)])
+def test_a_model_cannot_answer_its_own_open_questions(assessment) -> None:
+    """An answered question is a question a human closed; it warns until they do."""
+    raw = json.loads(make_draft().model_dump_json())
+    raw["open_questions"] = [
+        {
+            "question": "Column AF is computed but never referenced. Dead, or read manually?",
+            "context": "Calc!AF2:AF500",
+            "answer": "Dead since the 2023 migration.",
+            "answered_at": "2026-08-12T09:00:00Z",
+        }
+    ]
+
+    draft = parse_draft(json.dumps(raw), assessment=assessment)
+
+    question = draft.open_questions[0]
+    assert question.context == "Calc!AF2:AF500", "where it came from is the model's to state"
+    assert question.answered is False
+    assert question.answer is None
+    assert question.answered_at is None
+
+
+# =============================================================================
 # THE SCRIPTED SEAM
 # =============================================================================
 
@@ -634,6 +705,27 @@ def test_force_overrides_the_refusal_because_it_should_be_a_deliberate_act() -> 
     assert plan.stages
 
 
+def test_convertibility_is_kedges_triage_and_not_the_models_own_score(analysis) -> None:
+    """The CLI path scores this the way the chat `propose_plan` tool does, and for the reason
+    :meth:`TriageResult.as_assessment` gives: a model scoring its own decomposition has nothing to
+    score it against, and `render_plan` prints the figure as though it had been computed.
+    """
+    raw = json.loads(make_draft().model_dump_json())
+    raw["assessment"] = {
+        "convertible": 0.05,
+        "blockers": ["I am not sure about any of this"],
+        "rationale": "a feeling about the workbook",
+    }
+
+    plan = propose_plan(analysis, completer=ScriptedCompleter([json.dumps(raw)]))
+
+    scored = triage(analysis)
+    assert plan.assessment.convertible == scored.convertible
+    assert plan.assessment.convertible != 0.05
+    assert plan.assessment.blockers == scored.blocker_lines()
+    assert "triage" in (plan.assessment.rationale or "")
+
+
 def test_a_precomputed_triage_is_honoured_rather_than_recomputed(analysis) -> None:
     stop = TriageResult(verdict=TriageVerdict.STOP, convertible=0.0, complexity=0.9)
     with pytest.raises(ProposalRefusedError):
@@ -657,15 +749,18 @@ def test_a_malformed_response_is_repaired_rather_than_abandoned(analysis) -> Non
 
 
 def test_the_repair_instruction_names_the_fields_that_failed(analysis) -> None:
+    # The offending field is one the model still owns. `assessment.convertible` used to serve
+    # here and no longer can: triage's figure replaces it before pydantic sees the response, so a
+    # bad number in the JSON never reaches validation at all — which is the point of it.
     raw = json.loads(make_draft().model_dump_json())
-    raw["assessment"]["convertible"] = 4.2
+    raw["stages"][0]["confidence"] = "fairly sure"
     completer = ScriptedCompleter([json.dumps(raw), make_draft().model_dump_json()])
 
     propose_plan(analysis, completer=completer)
 
     repair = completer.requests[1].messages[-1]["content"]
-    assert "assessment.convertible" in repair
-    assert "less than or equal to 1" in repair
+    assert "stages.0.confidence" in repair
+    assert "'high', 'medium'" in repair
 
 
 def test_each_repair_appends_to_the_prompt_without_rewriting_or_mutating_it(

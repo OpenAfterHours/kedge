@@ -5,7 +5,7 @@ part that decides what a model is allowed to do to a notebook.
 
 Four modules, four jobs:
 
-* :mod:`kedge.agent.tools` — the fifteen tools, and the row and payload caps every value-returning
+* :mod:`kedge.agent.tools` — the sixteen tools, and the row and payload caps every value-returning
   one of them passes through. The caps are structural: a tool cannot return a payload except via
   :meth:`~kedge.agent.tools.ToolRegistry.dispatch`, which caps it and audits it.
 * :mod:`kedge.agent.validate` — the five-stage gate that runs before any generated code reaches the

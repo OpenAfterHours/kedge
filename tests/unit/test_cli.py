@@ -7,11 +7,13 @@ import json
 import re
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 
+from conftest import make_draft
 from kedge import cli
 from kedge import config as config_module
 from kedge.cli import app
@@ -30,6 +32,14 @@ WATCH_MODULE = importlib.import_module("kedge.ingest.watch")
 ``kedge.ingest`` re-exports the ``watch`` *function*, which shadows the submodule of the same
 name -- so ``import kedge.ingest.watch as m``, and monkeypatch's dotted string form, both bind
 the function instead of the module. Patching a name inside the module needs the module itself.
+"""
+
+ANALYSE_MODULE = importlib.import_module("kedge.analysis.analyse")
+"""The analyser module, fetched the same way round and for the same reason as ``WATCH_MODULE``.
+
+``kedge.analysis`` re-exports ``analyse``, so the dotted string ``kedge.analysis.analyse``
+resolves to the function. `kedge.plan.load_analysis` imports the name off the module, so that is
+what a test wanting to prove the analyser did *not* run has to patch.
 """
 
 
@@ -117,7 +127,17 @@ def test_help_lists_every_command() -> None:
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ("open", "hub", "inspect", "reconcile", "watch", "contract", "config", "doctor"):
+    for command in (
+        "open",
+        "hub",
+        "inspect",
+        "plan",
+        "reconcile",
+        "watch",
+        "contract",
+        "config",
+        "doctor",
+    ):
         assert command in result.output
 
 
@@ -136,7 +156,7 @@ def test_version_reports_the_package_and_the_marimo_pin() -> None:
 
 
 @pytest.mark.parametrize(
-    "command", ["open", "hub", "inspect", "reconcile", "watch", "config", "doctor"]
+    "command", ["open", "hub", "inspect", "plan", "reconcile", "watch", "config", "doctor"]
 )
 def test_each_command_has_help(command: str) -> None:
     result = runner.invoke(app, [command, "--help"])
@@ -340,6 +360,10 @@ def test_doctor_reports_a_workspace_for_a_named_workbook(workbook: Path) -> None
         ["inspect", "absent.xlsx"],
         ["watch", "absent.xlsx"],
         ["contract", "infer", "absent.csv"],
+        ["plan", "propose", "absent.xlsx"],
+        ["plan", "show", "absent.xlsx"],
+        ["plan", "approve", "absent.xlsx"],
+        ["plan", "history", "absent.xlsx"],
     ],
 )
 def test_a_missing_input_file_is_reported_before_anything_else_happens(argv: list[str]) -> None:
@@ -622,6 +646,1070 @@ def test_a_project_config_beside_the_workbook_is_picked_up(workbook: Path) -> No
 
     payload = json.loads(result.output)
     assert payload["values"]["sampling.max_rows"]["value"] == 7
+
+
+# ── plan ─────────────────────────────────────────────────────────────────────────────────────
+#
+# `propose` is exercised offline throughout, against `ScriptedCompleter`. That fake lives in the
+# library rather than in this suite precisely so the whole path -- context, prompt, parse,
+# validate, assemble, save -- runs with no endpoint; a CLI test that stubbed `run_plan` itself
+# would prove nothing about the command's own wiring, which is the part that was missing.
+
+
+def plans_under(workbook: Path) -> list[Path]:
+    """Every saved plan version beside a workbook, in version order."""
+    return sorted(workbook.parent.rglob("plan-v*.yaml"))
+
+
+def latest_plan_text(workbook: Path) -> str:
+    return plans_under(workbook)[-1].read_text(encoding="utf-8")
+
+
+def write_workbook(path: Path, *, rate: float = 1.5) -> Path:
+    """A real workbook, with enough in it that triage says proceed.
+
+    `rate` varies the data so two workbooks written this way differ in content, and therefore in
+    digest -- which is what a check on workbook identity has to be tested against. Two files with
+    the same bytes are the same workbook under two names, and that is a different question.
+    """
+    from openpyxl import Workbook
+
+    book = Workbook()
+    data = book.active
+    data.title = "Data"
+    data["A1"], data["B1"] = "id", "amount"
+    for row in range(2, 12):
+        data.cell(row=row, column=1, value=row)
+        data.cell(row=row, column=2, value=row * rate)
+    calculation = book.create_sheet("Calc")
+    calculation["A1"] = "doubled"
+    for row in range(2, 12):
+        calculation.cell(row=row, column=1, value=f"=Data!B{row}*2")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    book.save(path)
+    return path
+
+
+def change_the_workbook(path: Path) -> None:
+    """Edit a workbook in place, so it no longer hashes to what an artifact recorded for it."""
+    from openpyxl import load_workbook
+
+    book = load_workbook(path)
+    book["Data"]["A20"] = "a column somebody added after the plan was written"
+    book.save(path)
+
+
+@pytest.fixture
+def planned_workbook(tmp_path: Path) -> Path:
+    """The workbook every plan test converts.
+
+    The `workbook` fixture is an empty file, which triage refuses outright -- correct, and
+    useless for reaching the path that actually produces a plan.
+    """
+    return write_workbook(tmp_path / "cwd" / "process.xlsx")
+
+
+@pytest.fixture
+def other_workbook(tmp_path: Path) -> Path:
+    """A second, different workbook, in a directory of its own.
+
+    Kept away from `planned_workbook`'s directory on purpose: `plans_under` globs a workbook's
+    parent, so a second project directory beside the first would make "nothing was written"
+    unassertable.
+    """
+    return write_workbook(tmp_path / "elsewhere" / "beta.xlsx", rate=2.25)
+
+
+@pytest.fixture
+def offline_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer `kedge plan propose` from a scripted response instead of an endpoint."""
+    from kedge.plan.propose import scripted_from_plan
+
+    monkeypatch.setattr(
+        "kedge.plan.completer_from_config", lambda _config: scripted_from_plan(make_draft())
+    )
+
+
+def propose(workbook: Path) -> None:
+    """Put one draft plan on disk, failing the test loudly if that did not work."""
+    result = runner.invoke(app, ["plan", "propose", str(workbook)])
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize(
+    "verb", ["propose", "show", "approve", "acknowledge", "reject", "request-changes", "history"]
+)
+def test_each_plan_verb_has_help(verb: str) -> None:
+    result = runner.invoke(app, ["plan", verb, "--help"])
+
+    assert result.exit_code == 0
+
+
+def test_propose_has_no_way_of_approving_in_the_same_breath() -> None:
+    """The gate is the product, so the absence of the flag that would defeat it is a test.
+
+    Proposing and approving in one command would put a decomposition into force without anyone
+    having read it, which is the single thing the plan artifact exists to prevent (PLAN 2.2).
+    """
+    result = runner.invoke(app, ["plan", "propose", "--help"])
+
+    output = unstyled(result.output)
+    assert "--approve" not in output
+    assert "--dry-run" in output
+
+
+def test_propose_writes_a_draft_and_nothing_more(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    saved = plans_under(planned_workbook)
+    assert [path.name for path in saved] == ["plan-v001.yaml"]
+    assert "state: draft" in saved[0].read_text(encoding="utf-8")
+    assert "kedge plan approve" in flattened(result.output)
+
+
+def test_propose_dry_run_writes_nothing_at_all(
+    planned_workbook: Path, offline_model: None, isolated_home: Path
+) -> None:
+    """PLAN 7 step 4 judges `propose` across the corpus with this, so it is load-bearing.
+
+    Not merely "no plan file": no project directory beside the workbook, and nothing under
+    `~/.kedge` either. A sweep over somebody's workbooks that leaves a `.kedge` folder beside each
+    one is not a read-only sweep, and neither is one that leaves a trail in the machine-wide
+    directory instead.
+    """
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "STAGES" in result.output, "the plan is still rendered; only the write is skipped"
+    assert plans_under(planned_workbook) == []
+    assert list(planned_workbook.parent.glob("*.kedge")) == []
+    assert list(isolated_home.rglob("*")) == [], "KEDGE_HOME is untouched too"
+
+
+def test_propose_json_carries_the_triage_the_warnings_and_the_plan(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook), "--dry-run", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["stopped"] is False
+    assert payload["saved_to"] is None, "--dry-run saved nothing, and must say so"
+    assert payload["triage"]["verdict"]
+    assert payload["plan"]["approval"]["state"] == "draft"
+    assert [stage["id"] for stage in payload["plan"]["stages"]]
+
+
+def test_propose_analyses_the_workbook_when_none_has_been_saved(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """`load_analysis`'s fallback branch, on the command line rather than in a unit test.
+
+    That branch shipped a live `TypeError` for a while -- `from kedge.analysis import analyse`
+    bound the *module*, not the function -- and survived because nothing ran it
+    (`docs/ty-diagnostics.md` 5). `kedge inspect` does not go through it; this does.
+    """
+    assert not list(planned_workbook.parent.rglob("analysis.json"))
+
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook), "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert "STAGES" in result.output
+
+
+def test_propose_uses_the_analysis_it_is_handed_rather_than_analysing_again(
+    planned_workbook: Path, tmp_path: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accepted `--analysis` that is quietly ignored would be worse than no flag at all."""
+    saved = tmp_path / "analysis.json"
+    assert (
+        runner.invoke(app, ["inspect", str(planned_workbook), "--out", str(saved)]).exit_code == 0
+    )
+
+    def _refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the saved analysis must be preferred over re-analysing")
+
+    # The module, not the re-exported function of the same name: `kedge.analysis` exports
+    # `analyse`, so monkeypatch's dotted string form resolves `kedge.analysis.analyse` to the
+    # function and never reaches the module the planner imports from.
+    monkeypatch.setattr(ANALYSE_MODULE, "analyse", _refuse)
+
+    result = runner.invoke(
+        app, ["plan", "propose", str(planned_workbook), "--analysis", str(saved), "--dry-run"]
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_propose_names_an_analysis_file_that_is_not_there(planned_workbook: Path) -> None:
+    result = runner.invoke(
+        app, ["plan", "propose", str(planned_workbook), "--analysis", "absent.json"]
+    )
+
+    assert result.exit_code == 1
+    assert "no such analysis" in flattened(result.output)
+
+
+def test_propose_stops_when_triage_says_stop_and_does_not_exit_zero(
+    workbook: Path, offline_model: None
+) -> None:
+    """An honest refusal is a legitimate result -- and must not read as success to a script."""
+    result = runner.invoke(app, ["plan", "propose", str(workbook)])
+
+    assert result.exit_code == cli.TRIAGE_REFUSED
+    assert plans_under(workbook) == []
+    assert "--force" in flattened(result.output), "the way past a refusal has to be named"
+
+
+def test_a_triage_refusal_does_not_look_like_a_broken_invocation(
+    workbook: Path, offline_model: None
+) -> None:
+    """ "This workbook should not be converted" and "no such workbook" are different answers.
+
+    Both were exit 1, so a script sweeping a folder could not tell an editorial judgement from a
+    typo in a path or a missing API key. `PlanRun.stopped` models a refusal as a result; the exit
+    code has to as well.
+    """
+    refused = runner.invoke(app, ["plan", "propose", str(workbook)])
+    broken = runner.invoke(app, ["plan", "propose", "absent.xlsx"])
+
+    assert cli.TRIAGE_REFUSED == 2
+    assert refused.exit_code == 2
+    assert broken.exit_code == 1
+
+
+def test_forcing_past_a_stop_verdict_still_only_produces_a_draft(
+    workbook: Path, offline_model: None
+) -> None:
+    result = runner.invoke(app, ["plan", "propose", str(workbook), "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert "state: draft" in latest_plan_text(workbook)
+
+
+def test_show_renders_the_plan_and_what_stands_between_it_and_approval(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "show", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "STAGES" in output
+    assert "cannot be approved yet" in output
+    assert "Calc!AK:AP" in output, "the unacknowledged drop is the blocker; it has to be named"
+
+
+def test_show_can_render_a_superseded_version(planned_workbook: Path, offline_model: None) -> None:
+    """History is retained rather than overwritten, so it has to be readable."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "show", str(planned_workbook), "--version", "1"])
+
+    assert result.exit_code == 0, result.output
+    assert "Process plan v1" in flattened(result.output)
+
+
+def test_show_names_a_version_that_is_not_there(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "show", str(planned_workbook), "--version", "9"])
+
+    assert result.exit_code == 1
+    assert "no plan version 9" in flattened(result.output)
+
+
+def test_approve_refuses_while_a_drop_is_unacknowledged_and_says_what_would_clear_it(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """The blocker that matters most: a drop nobody signed off (PLAN 2.2).
+
+    Every blocker is listed, not just the first -- a user told only the first will fix it, retry,
+    and be told the second -- and each one comes with the command that clears it.
+    """
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    assert result.exit_code == 1
+    output = flattened(result.output)
+    assert "cannot be approved" in output
+    assert "Calc!AK:AP" in output
+    assert "kedge plan acknowledge" in output
+    assert "state: draft" in latest_plan_text(planned_workbook), "nothing was approved"
+
+
+def test_acknowledging_the_drops_is_what_lets_an_approval_through(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    acknowledged = runner.invoke(
+        app, ["plan", "acknowledge", str(planned_workbook), "--all", "--note", "read and agreed"]
+    )
+    approved = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    assert acknowledged.exit_code == 0, acknowledged.output
+    assert approved.exit_code == 0, approved.output
+    saved = plans_under(planned_workbook)
+    assert [path.name for path in saved] == [
+        "plan-v001.yaml",
+        "plan-v002.yaml",
+        "plan-v003.yaml",
+    ], "an edit is a new version, a decision is a new version, and neither replaces what it names"
+    assert "state: draft" in saved[0].read_text(encoding="utf-8")
+    approved_text = saved[2].read_text(encoding="utf-8")
+    assert "state: approved" in approved_text
+    assert "by: phil" in approved_text
+    assert "based_on_version: 2" in approved_text, "the decision says which version it was about"
+
+
+def test_approving_the_plan_already_in_force_records_nothing(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """Idempotent, and quiet about it.
+
+    Every other decision is a new version because it is a change of mind worth reading later.
+    Approving what is already approved is not one: the only difference between the version it
+    would write and the version before it is a timestamp, and a history of those says nothing.
+    """
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+    runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+    before = [path.name for path in plans_under(planned_workbook)]
+
+    again = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "mallory"])
+
+    assert again.exit_code == 0, again.output
+    assert "already approved" in flattened(again.output)
+    assert [path.name for path in plans_under(planned_workbook)] == before
+    latest = plans_under(planned_workbook)[-1].read_text(encoding="utf-8")
+    assert "by: phil" in latest, "the reviewer of record is unchanged"
+    assert "mallory" not in latest, "a second name is not recorded by approving twice"
+
+
+def test_an_approval_records_who_gave_it_without_having_to_be_told(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """kedge is single-user and local, so `--by` defaults rather than nagging.
+
+    An approval with no name against it would make the audit trail worse than the spreadsheet
+    it replaced, so the default is the operating system's user. Pinned against a known name
+    rather than against `cli._reviewer(None)`: checking the function against itself would pass
+    just as happily if it returned a constant.
+    """
+    monkeypatch.setattr(cli.getpass, "getuser", lambda: "philm")
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    assert "by: philm" in latest_plan_text(planned_workbook)
+    assert cli._reviewer("  phil  ") == "phil", "an explicit --by wins, trimmed"
+
+
+def test_a_name_nobody_typed_is_not_recorded_as_though_somebody_had(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`getpass.getuser()` reads the environment before it asks the OS, so it is a weak claim.
+
+    `USER=mallory kedge plan approve` records mallory with no privilege at all; under CI the same
+    default records `runner`, and in a container `root`. Making `--by` mandatory would turn the
+    audit trail into paperwork somebody types `x` into, so the default stays and the *record*
+    carries the difference instead: months later, "philm" and "philm, because the shell said so"
+    are not the same claim.
+    """
+    for variable in ("LOGNAME", "USER", "LNAME", "USERNAME"):
+        monkeypatch.setenv(variable, "mallory")  # the four `getpass` consults, in its own order
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    inferred = runner.invoke(app, ["plan", "approve", str(planned_workbook)])
+    body = latest_plan_text(planned_workbook)
+
+    assert inferred.exit_code == 0, inferred.output
+    assert "by: mallory (inferred from the OS user)" in body
+    assert body.count("inferred from the OS user") == 1, (
+        "the marker belongs to the claim about who reviewed it, not to the reviewer's own note"
+    )
+
+
+def test_a_reviewer_who_names_themselves_is_recorded_verbatim(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """The other half of the same claim: a name somebody typed carries no hedge."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    assert result.exit_code == 0, result.output
+    body = latest_plan_text(planned_workbook)
+    assert "by: phil\n" in body
+    assert "inferred" not in body
+
+
+def test_refusing_a_drop_keeps_the_range_and_keeps_approval_blocked(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """Confirming and refusing are different outcomes, and both must be reachable.
+
+    Refusing a drop means the range has to be kept, which leaves no stage consuming it -- so
+    approval stays blocked until somebody says which stage should. Treating a refusal as an
+    acknowledgement would be exactly the quiet hole the gate exists to prevent.
+    """
+    propose(planned_workbook)
+
+    refused = runner.invoke(
+        app,
+        [
+            "plan",
+            "acknowledge",
+            str(planned_workbook),
+            "--range",
+            "Calc!AK:AP",
+            "--reject",
+            "--note",
+            "the desk still reads it",
+        ],
+    )
+    blocked = runner.invoke(app, ["plan", "approve", str(planned_workbook)])
+
+    assert refused.exit_code == 0, refused.output
+    assert "blocker(s) still stand" in flattened(refused.output)
+    assert blocked.exit_code == 1
+    assert "must be kept" in flattened(blocked.output)
+
+
+def test_acknowledge_names_the_drops_the_plan_actually_proposes(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(
+        app, ["plan", "acknowledge", str(planned_workbook), "--range", "Sheet1!ZZ:ZZ"]
+    )
+
+    assert result.exit_code == 1
+    output = flattened(result.output)
+    assert "no dropped range" in output
+    assert "Calc!AK:AP" in output, "saying which ranges it does propose is the useful half"
+
+
+@pytest.mark.parametrize("extra", [[], ["--range", "Calc!AK:AP", "--all"]])
+def test_acknowledge_wants_exactly_one_of_range_and_all(
+    planned_workbook: Path, offline_model: None, extra: list[str]
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), *extra])
+
+    assert result.exit_code == 1
+    assert "exactly one" in flattened(result.output)
+
+
+def test_acknowledge_will_not_refuse_every_drop_in_one_go(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """`--all` confirms; refusing is per-range because each refusal raises its own question."""
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all", "--reject"])
+
+    assert result.exit_code == 1
+    assert "--reject" in flattened(result.output)
+
+
+def test_reject_records_who_turned_it_down_and_why(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(
+        app,
+        [
+            "plan",
+            "reject",
+            str(planned_workbook),
+            "--by",
+            "phil",
+            "--reason",
+            "the override step is a judgement call, not a stage",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = latest_plan_text(planned_workbook)
+    assert "state: rejected" in body
+    assert "by: phil" in body
+    assert "judgement call" in body, "the reason is the point of the verb"
+
+
+def test_a_rejected_plan_can_never_then_be_approved(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """REJECTED is the one terminal state. The way forward is a new plan, not an approval."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "reject", str(planned_workbook), "--reason", "wrong shape"])
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook)])
+
+    assert result.exit_code == 1
+    output = flattened(result.output)
+    assert "rejected" in output
+    assert "kedge plan propose" in output
+
+
+def test_reject_will_not_run_without_a_reason(planned_workbook: Path) -> None:
+    result = runner.invoke(app, ["plan", "reject", str(planned_workbook)])
+
+    assert result.exit_code != 0
+    assert "--reason" in unstyled(result.output)
+
+
+def test_request_changes_records_the_note_without_closing_the_plan_off(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    propose(planned_workbook)
+
+    result = runner.invoke(
+        app,
+        [
+            "plan",
+            "request-changes",
+            str(planned_workbook),
+            "--by",
+            "phil",
+            "--note",
+            "split the haircut stage in two",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = latest_plan_text(planned_workbook)
+    assert "state: changes_requested" in body
+    assert "by: phil" in body
+    assert "split the haircut stage in two" in body
+
+
+def test_history_lists_every_version_with_its_approval_state(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """`PlanStore.history()` is the change record, and until now it had no surface at all."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+    runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    result = runner.invoke(app, ["plan", "history", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "draft" in output and "approved" in output
+    assert output.index("v1") < output.index("v2"), "oldest first, so the newest is where you land"
+    assert "phil" in output
+
+
+def test_history_does_not_credit_a_human_edit_to_the_model(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """`human (gpt-4o)` under a column headed *author* reads as "a human wrote this, with GPT-4o".
+
+    Every review edit goes through `kedge.plan.review`, which sets `generated_by="human"` and
+    leaves `llm_model` exactly where the model left it. The version the model did write says so on
+    its own row.
+    """
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "history", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "human (" not in output
+    assert "llm (" in output, "the version a model did write still names it"
+
+
+def test_a_versions_author_names_the_model_only_where_one_wrote_it() -> None:
+    from conftest import make_plan
+
+    written = make_plan(generated_by="llm", llm_model="gpt-4o")
+    edited = make_plan(generated_by="human", llm_model="gpt-4o")
+
+    assert cli._plan_author(written) == "llm (gpt-4o)"
+    assert cli._plan_author(edited) == "human"
+
+
+def test_history_says_which_zone_it_is_printing_times_in(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """The store writes UTC. Unlabelled, every reader takes the column for local time -- and a
+    plan approved at 23:40 UTC then belongs to the wrong day for most of the world."""
+    propose(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "history", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    assert "created (UTC)" in flattened(result.output)
+
+
+def test_a_timestamp_in_another_zone_is_still_printed_in_utc() -> None:
+    tokyo = datetime(2026, 7, 24, 8, 40, tzinfo=timezone(timedelta(hours=9)))
+
+    assert cli._stamp(tokyo) == "2026-07-23 23:40"
+
+
+def test_an_approval_state_this_cli_has_no_colour_for_still_renders() -> None:
+    """A fifth `ApprovalState` must not turn `kedge plan history` into a KeyError over a colour."""
+    from kedge.plan.model import ApprovalState
+
+    assert {state.value for state in ApprovalState} <= set(cli._APPROVAL_STYLE), (
+        "every state kedge has today should be styled; the fallback is for the one it does not"
+    )
+    assert cli._approval_cell("quarantined") == "quarantined"
+
+
+# ── plan: the record of a decision ───────────────────────────────────────────────────────────
+
+
+def test_every_approval_decision_on_a_version_is_kept(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """Three reviewers, three decisions, three files. Not one surviving line.
+
+    Recording a decision over the version it names destroys every earlier decision on it. The
+    dangerous step is the middle one: a plan a notebook may already have been scaffolded from
+    would be un-approved with nothing left on disk saying it ever had been.
+    """
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    alice = runner.invoke(
+        app,
+        [
+            "plan",
+            "approve",
+            str(planned_workbook),
+            "--by",
+            "alice",
+            "--note",
+            "checked the haircut lookup",
+        ],
+    )
+    bob = runner.invoke(
+        app,
+        [
+            "plan",
+            "request-changes",
+            str(planned_workbook),
+            "--by",
+            "bob",
+            "--note",
+            "actually no",
+            "--withdraw-approval",
+        ],
+    )
+    carol = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "carol", "--yes"])
+
+    assert [alice.exit_code, bob.exit_code, carol.exit_code] == [0, 0, 0], [
+        result.output for result in (alice, bob, carol)
+    ]
+    saved = [path.read_text(encoding="utf-8") for path in plans_under(planned_workbook)]
+    assert len(saved) == 5, "propose, acknowledge, and one file per decision"
+    assert "state: approved" in saved[2] and "by: alice" in saved[2]
+    assert "checked the haircut lookup" in saved[2], "alice's note is still there to read"
+    assert "state: changes_requested" in saved[3] and "by: bob" in saved[3]
+    assert "state: approved" in saved[4] and "by: carol" in saved[4]
+
+
+def test_an_approved_plan_cannot_be_sent_back_by_accident(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """The library refuses it; the command line has to say so as a message, not a traceback."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+    runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "alice"])
+
+    result = runner.invoke(
+        app, ["plan", "request-changes", str(planned_workbook), "--note", "second thoughts"]
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = flattened(result.output)
+    assert "--withdraw-approval" in output, "the flag that would allow it has to be named"
+    assert "state: approved" in latest_plan_text(planned_workbook), "nothing was withdrawn"
+
+
+def test_a_rejected_plan_cannot_be_moved_back_into_review(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """REJECTED is terminal, and the refusal has to arrive as a message rather than a traceback.
+
+    The route out of a rejection was the laundering hole: `changes_requested` approves cleanly, so
+    reject, then request-changes, then approve put the whole of a turned-down decomposition into
+    force. `--withdraw-approval` is deliberately *not* offered here -- it does not apply to a
+    rejection, and naming it would send the user round a loop ending in this same message.
+    """
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "reject", str(planned_workbook), "--reason", "wrong shape"])
+
+    result = runner.invoke(
+        app, ["plan", "request-changes", str(planned_workbook), "--note", "one more look"]
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), "a refusal is a message, not a traceback"
+    output = flattened(result.output)
+    assert "rejected" in output
+    assert "--withdraw-approval" not in output, "the flag is not the way out of a rejection"
+    assert "state: rejected" in latest_plan_text(planned_workbook)
+
+
+# ── plan: proposing over a plan already in force ─────────────────────────────────────────────
+
+
+def a_different_draft() -> object:
+    """The same plan with one stage's intent changed, so a diff of it has something to say."""
+    draft = make_draft()
+    return make_draft(
+        stages=[
+            stage.model_copy(update={"intent": "Read exposures from the hand-in, netted"})
+            if stage.id == "load_handin"
+            else stage
+            for stage in draft.stages
+        ]
+    )
+
+
+def reproposes(monkeypatch: pytest.MonkeyPatch, draft: object) -> None:
+    """Point the next `plan propose` at a different decomposition."""
+    from kedge.plan.propose import scripted_from_plan
+
+    monkeypatch.setattr(
+        "kedge.plan.completer_from_config", lambda _config: scripted_from_plan(draft)
+    )
+
+
+def approved_plan(workbook: Path, *, by: str = "alice") -> None:
+    """Get one approved plan onto disk: propose, acknowledge the drop, approve."""
+    propose(workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(workbook), "--all"])
+    result = runner.invoke(app, ["plan", "approve", str(workbook), "--by", by, "--yes"])
+    assert result.exit_code == 0, result.output
+
+
+def test_proposing_over_an_approved_plan_shows_what_would_change(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second proposal is a whole replacement decomposition, and it must not arrive unseen.
+
+    Refusing it is the chat tool's answer, and it works there because `amend_plan` is the thing to
+    redirect to. There is no `amend` verb here, so refusing would leave hand-editing YAML as the
+    only way forward, and would break the batch route PLAN 7 step 4 judges the corpus with. The
+    diff is the answer instead -- `diff_plans` and `render_diff` were fully written and called
+    from nowhere in `src/`.
+    """
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook)])
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "plan v3 is approved and in force" in output
+    assert "by alice" in output
+    assert "Plan v3 -> v4" in output, "the diff names the version this would replace"
+    assert "load_handin" in output and "intent" in output
+    assert [path.name for path in plans_under(planned_workbook)][-1] == "plan-v004.yaml"
+
+
+def test_the_json_form_of_a_proposal_says_what_it_would_replace(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A script reading JSON gets the same warning the terminal does, or it gets none at all."""
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook), "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["replaces_approved_version"] == 3
+    assert "load_handin" in payload["diff_from_approved"]
+
+
+def test_a_dry_run_over_an_approved_plan_replaces_nothing_and_says_so(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing was written, so nothing is being replaced and there is no diff to draw."""
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook), "--dry-run", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["saved_to"] is None
+    assert payload["replaces_approved_version"] is None
+    assert payload["diff_from_approved"] is None
+
+
+def test_approving_over_an_approved_plan_shows_the_diff_and_asks_first(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The last cheap moment to notice a replaced decomposition is while somebody is standing there.
+
+    Answering no records nothing at all: the plan in force stays the one that was reviewed.
+    """
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    declined = runner.invoke(
+        app, ["plan", "approve", str(planned_workbook), "--by", "mallory"], input="n\n"
+    )
+
+    assert declined.exit_code == 1
+    output = flattened(declined.output)
+    assert "plan v3 is already approved" in output
+    assert "Plan v3 -> v5" in output
+    assert "load_handin" in output, "what differs is shown, not just that something does"
+    assert [path.name for path in plans_under(planned_workbook)] == [
+        f"plan-v00{version}.yaml" for version in (1, 2, 3, 4, 5)
+    ], "nothing was recorded"
+    assert "state: draft" in latest_plan_text(planned_workbook)
+
+
+def test_a_confirmed_replacement_is_approved_as_asked(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirming is not a refusal in disguise: the newer decomposition does go into force."""
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    accepted = runner.invoke(
+        app, ["plan", "approve", str(planned_workbook), "--by", "mallory"], input="y\n"
+    )
+
+    assert accepted.exit_code == 0, accepted.output
+    body = latest_plan_text(planned_workbook)
+    assert "state: approved" in body
+    assert "by: mallory" in body
+
+
+def test_a_script_can_approve_a_replacement_without_a_terminal(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--yes` exists because a prompt with nothing on stdin is an abort, not a default."""
+    approved_plan(planned_workbook)
+    reproposes(monkeypatch, a_different_draft())
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "ci", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "state: approved" in latest_plan_text(planned_workbook)
+
+
+def test_the_first_approval_of_all_is_not_interrupted_by_a_question(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """Nothing is being replaced when nothing is approved yet, so nothing is asked.
+
+    Without stdin a prompt would abort, so an unwanted one is not a papercut -- it is a command
+    that stops working.
+    """
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    assert result.exit_code == 0, result.output
+    assert "already approved" not in flattened(result.output)
+
+
+# ── plan: whose workbook is this ─────────────────────────────────────────────────────────────
+
+
+def test_propose_refuses_an_analysis_taken_from_a_different_workbook(
+    planned_workbook: Path, other_workbook: Path, tmp_path: Path, offline_model: None
+) -> None:
+    """A plan takes its whole identity from its analysis, and nothing downstream re-checks it.
+
+    Accepted, this files a plan under alpha's project directory saying `workbook: beta.xlsx` with
+    beta's digest -- so `kedge plan show alpha.xlsx` prints a plan for beta while the approval
+    prints alpha, and `workbook_sha256`, documented as tying a plan to the exact file it was
+    written for, is read nowhere in `src/`.
+    """
+    elsewhere = tmp_path / "beta-analysis.json"
+    inspected = runner.invoke(app, ["inspect", str(other_workbook), "--out", str(elsewhere)])
+    assert inspected.exit_code == 0, inspected.output
+
+    result = runner.invoke(
+        app, ["plan", "propose", str(planned_workbook), "--analysis", str(elsewhere)]
+    )
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    output = flattened(result.output)
+    assert "beta.xlsx" in output and "process.xlsx" in output
+    assert "kedge inspect" in output, "the way out is to write the right analysis"
+    assert plans_under(planned_workbook) == [], "nothing claiming to be beta was written"
+
+
+def test_propose_warns_but_proceeds_on_an_analysis_of_a_workbook_that_has_since_changed(
+    planned_workbook: Path, tmp_path: Path, offline_model: None
+) -> None:
+    """Same file, older facts. Re-planning after a workbook changes is a legitimate thing to do."""
+    saved = tmp_path / "analysis.json"
+    assert (
+        runner.invoke(app, ["inspect", str(planned_workbook), "--out", str(saved)]).exit_code == 0
+    )
+    change_the_workbook(planned_workbook)
+
+    result = runner.invoke(
+        app, ["plan", "propose", str(planned_workbook), "--analysis", str(saved), "--dry-run"]
+    )
+
+    assert result.exit_code == 0, result.output
+    output = flattened(result.output)
+    assert "out of date" in output
+    assert "STAGES" in output, "warned, not refused"
+
+
+def test_approve_warns_when_the_workbook_has_moved_on_since_the_plan(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """Approving in silence against a file that has changed is the part that is not legitimate."""
+    propose(planned_workbook)
+    runner.invoke(app, ["plan", "acknowledge", str(planned_workbook), "--all"])
+    change_the_workbook(planned_workbook)
+
+    result = runner.invoke(app, ["plan", "approve", str(planned_workbook), "--by", "phil"])
+
+    assert result.exit_code == 0, result.output
+    assert "has changed since plan v2" in flattened(result.output)
+    assert "state: approved" in latest_plan_text(planned_workbook), "a warning, not a refusal"
+
+
+def test_an_error_that_names_an_excel_range_prints_all_of_it(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """rich reads square brackets as markup, and an external reference is exactly that shape.
+
+    `[budget.xlsx]nope!A1` renders as `nope!A1` unescaped -- so the user is told to name a range
+    whose name they have just been shown a truncated version of.
+    """
+    propose(planned_workbook)
+
+    result = runner.invoke(
+        app, ["plan", "acknowledge", str(planned_workbook), "--range", "[budget.xlsx]nope!A1"]
+    )
+
+    assert result.exit_code == 1
+    assert "[budget.xlsx]nope!A1" in flattened(result.output)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["show"],
+        ["approve"],
+        ["acknowledge", "--all"],
+        ["reject", "--reason", "no"],
+        ["request-changes", "--note", "no"],
+        ["history"],
+    ],
+)
+def test_a_review_verb_with_no_plan_saved_says_how_to_make_one(
+    planned_workbook: Path, argv: list[str]
+) -> None:
+    result = runner.invoke(app, ["plan", argv[0], str(planned_workbook), *argv[1:]])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit), "a missing plan is a message, not a traceback"
+    output = flattened(result.output)
+    assert "no process plan saved" in output
+    assert "kedge plan propose" in output
+
+
+def test_a_hand_edited_plan_that_will_not_parse_names_the_file(
+    planned_workbook: Path, offline_model: None
+) -> None:
+    """The store's YAML is explicitly a file users may edit, so a typo in it must be a message."""
+    propose(planned_workbook)
+    plans_under(planned_workbook)[0].write_text("stages: [\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["plan", "show", str(planned_workbook)])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "plan-v001.yaml" in flattened(result.output)
+
+
+def test_every_review_verb_works_with_no_model_endpoint_at_all(
+    planned_workbook: Path, offline_model: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only `propose` needs an LLM (PLAN M2). Somebody approving a plan on a train must not.
+
+    Proved rather than asserted. No API key exists in any of these tests (`no_real_keyring`), and
+    the model seam is additionally replaced with something that raises, so a review verb that
+    reached for a completer would fail here rather than quietly working on a developer's machine.
+    """
+    propose(planned_workbook)
+
+    def _explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a review verb must never reach for a model endpoint")
+
+    monkeypatch.setattr("kedge.plan.completer_from_config", _explode)
+    monkeypatch.setattr("kedge.plan.propose.completer_from_config", _explode)
+    monkeypatch.setattr("kedge.plan.propose.OpenAICompleter", _explode)
+    monkeypatch.setattr("kedge.config.get_api_key", _explode)
+
+    verbs = [
+        ["show"],
+        ["history"],
+        ["acknowledge", "--all"],
+        ["approve", "--by", "phil"],
+        # Each of these runs against the plan the one before it approved, and taking an approval
+        # back is a deliberate act in `kedge.plan.review` rather than something a verb does on the
+        # way past.
+        ["request-changes", "--note", "one more look", "--withdraw-approval"],
+        ["reject", "--reason", "second thoughts"],
+    ]
+    results = [
+        runner.invoke(app, ["plan", argv[0], str(planned_workbook), *argv[1:]]) for argv in verbs
+    ]
+
+    assert [result.exit_code for result in results] == [0] * len(verbs), [
+        result.output for result in results
+    ]
+
+
+def test_propose_is_the_one_verb_that_does_need_the_endpoint(planned_workbook: Path) -> None:
+    """No `offline_model` here. Without it the claim above would be vacuous.
+
+    With no key in the keyring the proposal stops before it spends anything, and says which
+    keyring entry to fill in rather than raising a `MissingApiKeyError` at the user.
+    """
+    result = runner.invoke(app, ["plan", "propose", str(planned_workbook)])
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, SystemExit)
+    assert "keyring" in flattened(result.output)
+    assert plans_under(planned_workbook) == []
 
 
 # ── the bridge preflight ─────────────────────────────────────────────────────────────────────

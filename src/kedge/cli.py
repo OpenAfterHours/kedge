@@ -7,10 +7,12 @@ new one can be added by browsing or dropping. Neither replaces the other and the
 of the sequence that follows.
 
 The rest of the commands exist because the milestones underneath are independently useful.
-``inspect`` is an Excel archaeology tool that needs no model at all, ``reconcile`` is a diff
-between a notebook's output and the workbook's cached values, ``watch`` is the unattended
-hand-in path with no browser anywhere near it, and ``config`` and ``doctor`` are the two things
-anyone debugging a local tool with this many moving parts asks for first.
+``inspect`` is an Excel archaeology tool that needs no model at all, ``plan`` is the whole review
+gate on the command line — propose, read, acknowledge the drops, approve — for people who would
+rather not do that in a chat window, ``reconcile`` is a diff between a notebook's output and the
+workbook's cached values, ``watch`` is the unattended hand-in path with no browser anywhere near
+it, and ``config`` and ``doctor`` are the two things anyone debugging a local tool with this many
+moving parts asks for first.
 
 This is the only module in kedge permitted to print. Everything else logs.
 """
@@ -18,6 +20,7 @@ This is the only module in kedge permitted to print. Everything else logs.
 from __future__ import annotations
 
 import asyncio
+import getpass
 import json
 import logging
 import ssl
@@ -25,13 +28,15 @@ import sys
 import webbrowser
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import httpx
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from kedge import __version__, tls
@@ -53,6 +58,10 @@ from kedge.lifecycle import (
 )
 from kedge.observability import configure_logging
 from kedge.workspace import Workspace, iter_markers
+
+if TYPE_CHECKING:
+    from kedge.analysis.model import WorkbookAnalysis
+    from kedge.plan import PlanRun, PlanStore, ProcessPlan
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +125,32 @@ contract_app = typer.Typer(
 )
 app.add_typer(contract_app)
 
+plan_app = typer.Typer(
+    name="plan",
+    help="Propose, review and approve a workbook's process plan.",
+    no_args_is_help=True,
+    add_completion=False,
+)
+app.add_typer(plan_app)
+
 
 def _console(*, stderr: bool = False) -> Console:
     return Console(stderr=stderr, highlight=False)
 
 
+def _plain(value: object) -> str:
+    """Text rich must render verbatim: a range, a path, a filename, a name somebody typed.
+
+    ``Console.print`` reads square brackets as markup, so anything Excel or a user authored has to
+    be escaped on the way in or part of it disappears. Excel's external references are exactly the
+    shape rich's tag regex accepts — ``[budget.xlsx]Sheet1!A1`` renders as ``Sheet1!A1``, and a
+    message telling somebody to name a range they can no longer see is worse than no message.
+    """
+    return escape(str(value))
+
+
 def _fail(message: str) -> typer.Exit:
-    _console(stderr=True).print(f"[bold red]error[/bold red] {message}")
+    _console(stderr=True).print(f"[bold red]error[/bold red] {_plain(message)}")
     return typer.Exit(code=1)
 
 
@@ -353,6 +381,807 @@ def inspect(
         typer.echo(analysis.model_dump_json(indent=2))
     else:
         _console().print(f"[green]analysis[/green] {destination}")
+
+
+# ── plan ─────────────────────────────────────────────────────────────────────────────────────
+#
+# Seven verbs rather than one, because the approval gate is the whole point (PLAN 2.2).
+# ``propose`` writes a **draft** and stops there; approving is a separate, deliberate act; and a
+# plan that proposes dropping a range cannot be approved until somebody has said something about
+# each drop, which is why ``acknowledge`` is a command rather than a hand edit of the YAML.
+# There is deliberately no ``--approve`` flag on ``propose``: proposing and approving in one
+# breath is exactly the gate this project exists to keep shut.
+#
+# Only ``propose`` needs a model endpoint. Every review verb is offline — PLAN M2 makes that a
+# property of the design ("steps 1, 3 and 4 need no LLM"), and it is what lets somebody approve a
+# plan on a train. Nothing below reaches :func:`kedge.plan.propose.completer_from_config`, which
+# is the one function that wants a base URL and a key from the keyring.
+#
+# Exit codes are part of the surface, because ``plan propose`` has two different non-zero
+# answers. ``2`` means triage refused: this workbook should not be converted, which
+# :class:`~kedge.plan.PlanRun` models as a legitimate result rather than a failure. ``1`` is every
+# ordinary failure — no such workbook, no API key, an analysis that will not load. A script that
+# cannot tell the two apart either treats "do not convert this" as a crash or treats a crash as an
+# editorial opinion.
+#
+# Imported directly rather than through :func:`_resolve`. The shim exists for a module a
+# milestone has not landed yet, and it converts any ImportError or AttributeError into "not
+# implemented yet" — for a module that *is* implemented that turns a real breakage, or a typo in
+# an attribute name, into a confident lie. Not hypothetical: ``contract infer`` resolved
+# ``infer_contract``, a name that has never existed, and every invocation died as "not implemented
+# yet" until a test caught it. The imports sit inside the commands so ``kedge --help`` and
+# ``kedge config`` do not pay for the plan models, exactly as :func:`_require_bridge` already
+# does for the notebook package.
+
+
+TRIAGE_REFUSED = 2
+"""The exit code for "this workbook should not be converted", as distinct from a failure."""
+
+
+@plan_app.command("propose")
+def plan_propose(
+    workbook: Annotated[Path, typer.Argument(help="The Excel workbook to plan.")],
+    analysis: Annotated[
+        Path | None,
+        typer.Option("--analysis", help="Plan from this analysis.json instead of the saved one."),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the plan without saving anything.")
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Propose even when triage says stop.")
+    ] = False,
+    reseed: Annotated[
+        bool,
+        typer.Option(
+            "--reseed/--no-reseed",
+            help="Offer the most recent saved plan to the model as a worked example.",
+        ),
+    ] = True,
+    max_attempts: Annotated[
+        int, typer.Option("--max-attempts", help="Attempts, including validation repairs.")
+    ] = 3,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the triage, the warnings and the plan as JSON.")
+    ] = False,
+) -> None:
+    """Triage a workbook and propose a process plan for it. The only verb that needs a model.
+
+    What lands on disk is a **draft**. Approving it is a separate act — `kedge plan approve` —
+    because the value of a plan is that a human read the decomposition while correcting it was
+    still cheap (PLAN 2.2).
+
+    ``--dry-run`` writes nothing at all, which is what makes judging `propose` across a corpus of
+    dissimilar workbooks cheap (PLAN 7 step 4): run it over five of them and read the plans.
+
+    Proposing over a plan that is already approved is allowed — this is the batch route, and the
+    way to amend a plan by hand is to edit it, not to be refused — but the diff against the
+    approved one is printed, so no decomposition ever displaces another one unseen.
+
+    Exit codes: 0 when a plan was proposed, 2 when triage refused — a legitimate answer rather
+    than a failure — and 1 for an ordinary failure such as no such workbook or no API key.
+    """
+    workspace = _plan_workspace(workbook)
+    facts = _explicit_analysis(workspace, workbook, analysis) if analysis is not None else None
+    in_force = _plan_in_force(_plan_store(workspace))
+
+    from kedge.plan import run_plan
+
+    try:
+        run = run_plan(
+            workspace.workbook_path,
+            analysis=facts,
+            analysis_path=analysis,
+            workspace=workspace,
+            dry_run=dry_run,
+            force=force,
+            reseed=reseed,
+            max_attempts=max_attempts,
+        )
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    # Nothing was written on a dry run, so nothing is being replaced and there is no diff to draw.
+    replaced = in_force if run.saved_to is not None else None
+    if as_json:
+        typer.echo(json.dumps(_plan_run_payload(run, replaced=replaced), indent=2, default=str))
+    else:
+        _print_plan_run(run, replaced=replaced)
+    if run.stopped:
+        raise typer.Exit(code=TRIAGE_REFUSED)
+
+
+def _print_plan_run(run: PlanRun, *, replaced: ProcessPlan | None) -> None:
+    """Draw a proposal: the triage and the plan, then the warnings, then where it went."""
+    console = _console()
+    typer.echo(run.render())
+    if run.stopped:
+        console.print("\n[dim]triage refused; --force proposes anyway[/dim]")
+        return
+    if run.warnings:
+        console.print(f"\n[yellow]{len(run.warnings)} review warning(s)[/yellow]")
+        for warning in run.warnings:
+            typer.echo(f"  - {warning}")
+    if run.saved_to is None:
+        console.print("\n[dim]--dry-run: nothing was written[/dim]")
+        return
+    console.print(f"\n[green]plan[/green] {_plain(run.saved_to)}")
+    console.print(
+        "[dim]this is a draft; nothing reaches the notebook until "
+        "`kedge plan approve` is given[/dim]"
+    )
+    if replaced is not None and run.plan is not None:
+        console.print(
+            f"\n[yellow]plan v{replaced.version} is approved and in force[/yellow] "
+            f"[dim](by {_plain(replaced.approval.by or 'nobody named')})[/dim]"
+        )
+        console.print(
+            f"[dim]approving v{run.plan.version} would put this decomposition in its place; "
+            f"what differs:[/dim]"
+        )
+        typer.echo(_replacement_diff(replaced, run.plan))
+
+
+def _replacement_diff(approved: ProcessPlan, draft: ProcessPlan) -> str:
+    """What a new proposal would change about the plan currently in force.
+
+    The chat tool refuses this outright and points at ``amend_plan``; the command line has no
+    amend verb to redirect to, so refusing here would leave hand-editing YAML as the only way
+    forward, and would break the batch route PLAN 7 step 4 judges the corpus with. Showing the
+    diff is the answer instead — it is what the user needed either way, and
+    :func:`~kedge.plan.review.render_diff` already has a case for two versions that differ only in
+    approval state, which is exactly what a re-proposal of an unchanged process produces.
+    """
+    from kedge.plan.review import diff_plans, render_diff
+
+    return render_diff(diff_plans(approved, draft))
+
+
+def _plan_run_payload(run: PlanRun, *, replaced: ProcessPlan | None) -> dict[str, Any]:
+    """The machine-readable form of a proposal: what triage decided, and the plan itself."""
+    return {
+        "workbook": str(run.workbook),
+        "stopped": run.stopped,
+        "triage": {
+            "verdict": run.triage.verdict.value,
+            "convertible": run.triage.convertible,
+            "complexity": run.triage.complexity,
+            "blockers": run.triage.blocker_lines(),
+        },
+        "saved_to": str(run.saved_to) if run.saved_to is not None else None,
+        "warnings": list(run.warnings),
+        "plan": run.plan.model_dump(mode="json") if run.plan is not None else None,
+        # A script reading JSON gets the same warning the terminal does: this draft, if approved,
+        # displaces a decomposition somebody already signed off.
+        "replaces_approved_version": replaced.version if replaced is not None else None,
+        "diff_from_approved": (
+            _replacement_diff(replaced, run.plan)
+            if replaced is not None and run.plan is not None
+            else None
+        ),
+    }
+
+
+@plan_app.command("show")
+def plan_show(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose plan to render.")],
+    version: Annotated[
+        int | None, typer.Option("--version", help="Render this version instead of the latest.")
+    ] = None,
+) -> None:
+    """Render a saved plan, its review warnings, and whatever stands between it and approval.
+
+    Offline. A plan already on disk is read, rendered and assessed with no model call at all.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _require_plan(store, workbook, version=version)
+
+    from kedge.plan import render_plan
+
+    typer.echo(render_plan(plan, analysis=_saved_analysis(workspace)))
+    _console().print(f"\n[dim]{_plain(store.path_for(plan.version))}[/dim]")
+
+
+@plan_app.command("approve")
+def plan_approve(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose latest plan to approve.")],
+    by: Annotated[
+        str | None, typer.Option("--by", help="Who is approving. Defaults to the OS user.")
+    ] = None,
+    note: Annotated[
+        str | None, typer.Option("--note", help="What was checked, or why this is right.")
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Do not ask before replacing an approved plan."),
+    ] = False,
+) -> None:
+    """Approve the latest plan, unlocking the scaffolder. Nothing is scaffolded before this.
+
+    Goes through :func:`kedge.plan.review.approve`, so every approval blocker runs: a plan
+    proposing a drop nobody has acknowledged is refused here, with the list and what would clear
+    each one, rather than approved quietly.
+
+    When another version is already approved, the diff against it is printed and confirmed before
+    anything is recorded — this is the moment the user is standing there, and it is the last one
+    at which correcting a replaced decomposition is cheap. ``--yes`` is for scripts.
+
+    The plan's own version is not bumped, because an approval is a decision about a version rather
+    than a new one. The *record* of the decision is a new file all the same, so an earlier
+    decision on the same version is still there to read.
+
+    Approving the plan already in force is a no-op that succeeds. Nothing has changed, so there is
+    no decision to record, and writing a version whose only difference from the one before it is a
+    timestamp fills the history with entries that say nothing. To record a *different* reviewer
+    against the same decomposition, withdraw the approval first — that is a real change of mind
+    and the history should show one.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _require_plan(store, workbook)
+    _warn_if_the_workbook_moved_on(plan, workbook)
+    if plan.approval.approved:
+        _console().print(
+            f"[green]already approved[/green] plan v{plan.version} for {_plain(workbook.name)}, "
+            f"by {_plain(plan.approval.by or 'someone unrecorded')}"
+            + (f" at {_stamp(plan.approval.at)} UTC" if plan.approval.at else "")
+            + " [dim]nothing recorded[/dim]"
+        )
+        return
+    if plan.is_approvable:
+        _confirm_replacing_the_plan_in_force(store, plan, assume_yes=yes)
+
+    from kedge.plan.review import PlanNotApprovableError, approve
+
+    try:
+        approved = approve(plan, by=_reviewer(by), note=note)
+    except PlanNotApprovableError as exc:
+        _report_blockers(plan, workbook)
+        raise typer.Exit(code=1) from exc
+
+    stored, path = _record_plan(store, approved)
+    _console().print(
+        f"[green]approved[/green] plan v{plan.version} for {_plain(workbook.name)}, "
+        f"by {_plain(stored.approval.by)} [dim]recorded as v{stored.version} {_plain(path)}[/dim]"
+    )
+
+
+@plan_app.command("acknowledge")
+def plan_acknowledge(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose plan proposes the drops.")],
+    range_: Annotated[
+        str | None,
+        typer.Option("--range", help="One dropped range, exactly as the plan writes it."),
+    ] = None,
+    all_drops: Annotated[
+        bool, typer.Option("--all", help="Confirm every outstanding drop at once.")
+    ] = False,
+    reject_drop: Annotated[
+        bool,
+        typer.Option("--reject", help="Refuse the drop instead: the range must be kept."),
+    ] = False,
+    note: Annotated[
+        str | None, typer.Option("--note", help="Your reason. Recorded either way.")
+    ] = None,
+) -> None:
+    """Confirm or refuse the ranges a plan proposes to drop, so approval can proceed.
+
+    An unacknowledged drop blocks approval, because silent removal is indistinguishable from a
+    bug. Refusing one is not the same as ignoring it: ``--reject`` keeps the range and raises an
+    open question asking which stage consumes it, which keeps approval blocked until somebody
+    answers (PLAN 2.2). Both outcomes are recorded against the drop, with the note.
+    """
+    if all_drops == (range_ is not None):
+        raise _fail("pass exactly one of --range and --all")
+    if all_drops and reject_drop:
+        raise _fail("--reject refuses one named drop; pass --range with it")
+
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _require_plan(store, workbook)
+    if all_drops and not plan.unacknowledged_drops:
+        raise _fail(f"plan v{plan.version} for {workbook.name} has no unacknowledged drops")
+
+    from kedge.plan.review import acknowledge_all_drops, acknowledge_drop
+
+    try:
+        revised = (
+            acknowledge_all_drops(plan, note=note)
+            if all_drops
+            else acknowledge_drop(plan, str(range_), accepted=not reject_drop, note=note)
+        )
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    stored, path = _record_plan(store, revised)
+    console = _console()
+    outcome = "refused; the range must be kept" if reject_drop else "confirmed"
+    typer.echo(f"acknowledged {'every outstanding drop' if all_drops else range_}: {outcome}")
+    console.print(f"[green]plan[/green] v{stored.version} [dim]{_plain(path)}[/dim]")
+    _print_remaining_blockers(stored, workbook)
+
+
+@plan_app.command("reject")
+def plan_reject(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose latest plan to reject.")],
+    reason: Annotated[str, typer.Option("--reason", help="Why the decomposition was turned down.")],
+    by: Annotated[
+        str | None, typer.Option("--by", help="Who is rejecting. Defaults to the OS user.")
+    ] = None,
+    withdraw_approval: Annotated[
+        bool,
+        typer.Option(
+            "--withdraw-approval", help="Reject a plan that is approved, taking the approval back."
+        ),
+    ] = False,
+) -> None:
+    """Reject a plan outright. Terminal: a rejected plan can never be approved.
+
+    The reason is required and travels with the plan, because "why was this turned down" outlives
+    the version it was turned down at — and an edit to a rejected plan carries the rejection
+    forward rather than quietly resetting it to draft. The way on is a new proposal.
+
+    Rejecting a plan that is *approved* needs ``--withdraw-approval``, because a notebook may
+    already have been scaffolded from it. The approval that is overturned is recorded on the plan.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _require_plan(store, workbook)
+
+    from kedge.plan.review import PlanNotApprovableError, reject
+
+    try:
+        rejected = reject(
+            plan, by=_reviewer(by), reason=reason, withdraw_approval=withdraw_approval
+        )
+    except PlanNotApprovableError as exc:
+        raise _decision_refused(exc, plan, "--withdraw-approval") from exc
+
+    stored, path = _record_plan(store, rejected)
+    _console().print(
+        f"[red]rejected[/red] plan v{plan.version} for {_plain(workbook.name)}, "
+        f"by {_plain(stored.approval.by)} [dim]recorded as v{stored.version} {_plain(path)}[/dim]"
+    )
+    typer.echo(f"  reason: {reason}")
+    _console().print(
+        f'[dim]propose a new one with `kedge plan propose "{_plain(workbook)}"`; this one cannot '
+        f"be approved[/dim]"
+    )
+
+
+@plan_app.command("request-changes")
+def plan_request_changes(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose latest plan to send back.")],
+    note: Annotated[str, typer.Option("--note", help="What needs to change, and why.")],
+    by: Annotated[
+        str | None, typer.Option("--by", help="Who is asking. Defaults to the OS user.")
+    ] = None,
+    withdraw_approval: Annotated[
+        bool,
+        typer.Option(
+            "--withdraw-approval",
+            help="Send back a plan that is approved, taking the approval back.",
+        ),
+    ] = False,
+) -> None:
+    """Send a plan back for changes without editing it and without closing it off.
+
+    Unlike a rejection this is not terminal: the plan can still be revised and approved. The note
+    is required, because "changes requested" with nothing said is not a review.
+
+    Sending back a plan that is *approved* needs ``--withdraw-approval``, because a notebook may
+    already have been scaffolded from it. The approval that is overturned is recorded on the plan.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _require_plan(store, workbook)
+
+    from kedge.plan.review import PlanNotApprovableError, request_changes
+
+    try:
+        returned = request_changes(
+            plan, by=_reviewer(by), note=note, withdraw_approval=withdraw_approval
+        )
+    except PlanNotApprovableError as exc:
+        raise _decision_refused(exc, plan, "--withdraw-approval") from exc
+
+    stored, path = _record_plan(store, returned)
+    _console().print(
+        f"[yellow]changes requested[/yellow] on plan v{plan.version} for "
+        f"{_plain(workbook.name)}, by {_plain(stored.approval.by)} "
+        f"[dim]recorded as v{stored.version} {_plain(path)}[/dim]"
+    )
+    typer.echo(f"  note: {note}")
+
+
+_APPROVAL_STYLE = {
+    "draft": "dim",
+    "changes_requested": "yellow",
+    "approved": "green",
+    "rejected": "red",
+}
+
+
+def _approval_cell(state: str) -> str:
+    """One approval state as a table cell, styled where this CLI knows the state.
+
+    Looked up rather than indexed: :class:`~kedge.plan.model.ApprovalState` is a schema another
+    module owns, and a fifth member arriving must not turn `kedge plan history` into a KeyError
+    over a colour.
+    """
+    style = _APPROVAL_STYLE.get(state, "")
+    return f"[{style}]{state}[/{style}]" if style else _plain(state)
+
+
+def _plan_author(plan: ProcessPlan) -> str:
+    """Who wrote a version: the model that generated it, or the human who edited it.
+
+    The model id is shown only for a version a model actually produced. Every review edit goes
+    through :func:`kedge.plan.review._revise`, which sets ``generated_by="human"`` and leaves
+    ``llm_model`` exactly where it was, so joining the two unconditionally rendered
+    ``human (gpt-4o)`` under a column headed *author* — which reads as a claim that a human wrote
+    it with GPT-4o. The model that wrote the version this one was derived from is on its own row.
+    """
+    if plan.generated_by == "llm" and plan.llm_model:
+        return f"{plan.generated_by} ({_plain(plan.llm_model)})"
+    return plan.generated_by
+
+
+def _stamp(moment: datetime) -> str:
+    """A plan timestamp, in UTC because that is how the store writes them.
+
+    Rendered without the zone it was in, ``created`` reads as local time to everybody who looks at
+    it, and a plan approved at 23:40 UTC belongs to the wrong day for most of the world.
+    """
+    return f"{moment.astimezone(UTC) if moment.tzinfo else moment:%Y-%m-%d %H:%M}"
+
+
+@plan_app.command("history")
+def plan_history(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose plan history to list.")],
+) -> None:
+    """Every saved version of a plan, oldest first. The change record (PLAN 2.2).
+
+    History is retained rather than overwritten, so when the process changes next quarter this is
+    the list the diff is taken across.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    try:
+        history = store.history()
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+    if not history:
+        raise _fail(_no_plan_message(workbook))
+
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("version")
+    table.add_column("created (UTC)")
+    table.add_column("author")
+    table.add_column("stages", justify="right")
+    table.add_column("approval")
+    table.add_column("by")
+    for plan in history:
+        table.add_row(
+            f"v{plan.version}",
+            _stamp(plan.created_at),
+            _plan_author(plan),
+            str(len(plan.stages)),
+            _approval_cell(plan.approval.state.value),
+            _plain(plan.approval.by or ""),
+        )
+    console = _console()
+    console.print(table)
+    console.print(f"[dim]{_plain(store.directory)}[/dim]")
+
+
+# ── plan helpers ─────────────────────────────────────────────────────────────────────────────
+
+
+def _plan_workspace(workbook: Path) -> Workspace:
+    """The workspace for a plan command, refusing a workbook that is not there."""
+    if not workbook.is_file():
+        raise _fail(f"no such workbook: {workbook}")
+    return _workspace_for(workbook)
+
+
+def _plan_store(workspace: Workspace) -> PlanStore:
+    from kedge.plan import PlanStore
+
+    return PlanStore.for_workspace(workspace)
+
+
+def _no_plan_message(workbook: Path) -> str:
+    return (
+        f"no process plan saved for {workbook.name}. Propose one with "
+        f'`kedge plan propose "{workbook}"`, or ask kedge in the chat to propose one.'
+    )
+
+
+def _require_plan(store: PlanStore, workbook: Path, *, version: int | None = None) -> ProcessPlan:
+    """The plan a review verb acts on: a named version, or the latest saved.
+
+    A workbook with no plan, or a version that is not there, is a message naming the command that
+    would write one — never a traceback, and never the empty rendering of nothing.
+    """
+    try:
+        plan = store.load(version) if version is not None else store.latest()
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+    if plan is None:
+        raise _fail(_no_plan_message(workbook))
+    return plan
+
+
+def _decision_refused(exc: Exception, plan: ProcessPlan, flag: str) -> typer.Exit:
+    """A review refusal from :mod:`kedge.plan.review`, in the command line's own vocabulary.
+
+    That module is library code shared with the web routes, so it names the keyword argument that
+    would allow what it just refused — ``withdraw_approval=True``, which is not a thing anybody
+    can type at a shell. The flag is named here rather than by rewriting its message, so rewording
+    there cannot silently leave this pointing at nothing.
+
+    It is named only where it is the answer. :func:`~kedge.plan.review._decide` refuses two
+    transitions and only one of them has a way past: an approval can be withdrawn deliberately, a
+    rejection is terminal, and offering the flag there would send the user round a loop ending in
+    the same message.
+    """
+    from kedge.plan.model import ApprovalState
+
+    if plan.approval.state is ApprovalState.APPROVED:
+        return _fail(f"{exc}\n  on the command line, ask for that with {flag}")
+    return _fail(str(exc))
+
+
+def _plan_in_force(store: PlanStore) -> ProcessPlan | None:
+    """The approved plan for this workbook, or None when there is not one.
+
+    Reading it walks the whole history, so a hand-edited version that will not parse surfaces
+    here as much as anywhere else — as a message naming the file, never a traceback.
+    """
+    try:
+        return store.latest_approved()
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+
+def _record_plan(store: PlanStore, plan: ProcessPlan) -> tuple[ProcessPlan, Path]:
+    """Write a reviewed plan at the next free version. Never over a version already on disk.
+
+    Every review outcome is recorded the same way, edits and approval decisions alike. The model
+    semantics do differ — :func:`~kedge.plan.review.approve` deliberately does not bump the
+    version, because an approval is a decision *about* a version rather than a new one — but the
+    store is a record of decisions, not of versions, and writing a decision over the file it names
+    destroys every earlier decision on that version. Three reviewers in a row left one surviving
+    line and nothing on disk showing the other two happened, the dangerous one being a
+    `request-changes` that silently un-approved a plan a notebook may already have been scaffolded
+    from.
+
+    :meth:`PlanStore.save_next` renumbers and sets ``based_on_version``, so the chain still says
+    which version each decision was taken against, and the artifacts are byte-identical to the
+    ones the chat path writes — it records every approval through the same method
+    (``server/routes.py``).
+    """
+    try:
+        return store.save_next(plan)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+
+_INFERRED = " (inferred from the OS user)"
+"""What is appended to a reviewer name nobody actually typed. See :func:`_reviewer`."""
+
+
+def _reviewer(explicit: str | None) -> str:
+    """Who is recording a review decision: ``--by`` when given, the OS user when not.
+
+    kedge is single-user and local (SECURITY.md), so there is exactly one plausible answer and
+    demanding it on every command would turn an audit trail into paperwork people type ``x`` into.
+    The default stays. But the two answers are not the same claim and must not read as though they
+    were: ``getpass.getuser()`` consults ``LOGNAME``, ``USER``, ``LNAME`` and ``USERNAME`` before
+    it asks the operating system, so on 3.13 it is settable by anyone who can set an environment
+    variable — ``USER=mallory kedge plan approve`` records mallory — and under CI it says
+    ``runner``, in a container ``root``.
+
+    So an inferred name is recorded as ``philm (inferred from the OS user)``. The marker goes in
+    ``approval.by``, because that is the field carrying the identity claim and the identity is
+    what is uncertain; the note belongs to the reviewer's own account of what they checked, and
+    machine provenance in it would be read months later as something a person wrote.
+
+    The web routes have no OS user to read at all — a browser on loopback cannot say who is at it
+    — and record the literal ``"user"``; that is the fallback here too when the OS will not say.
+    ``getpass.getuser()`` raised more than ``OSError`` before 3.13, hence the wider catch.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    try:
+        name = getpass.getuser()
+    except (OSError, ImportError, KeyError):  # pragma: no cover - platform dependent
+        logger.debug("could not read the OS user; recording the decision as 'user'")
+        name = "user"
+    return f"{name}{_INFERRED}"
+
+
+def _confirm_replacing_the_plan_in_force(
+    store: PlanStore, plan: ProcessPlan, *, assume_yes: bool
+) -> None:
+    """Show what approving this plan changes about the one in force, and ask before recording it.
+
+    Approval is the moment the user is standing there, which makes it the last cheap moment to
+    notice that the decomposition about to take effect is not the one reviewed last time. Nothing
+    is asked when no plan is approved yet, or when the version being approved is the one already
+    in force.
+    """
+    in_force = _plan_in_force(store)
+    if in_force is None or in_force.version == plan.version:
+        return
+
+    console = _console()
+    console.print(
+        f"[yellow]plan v{in_force.version} is already approved[/yellow] "
+        f"[dim](by {_plain(in_force.approval.by or 'nobody named')})[/dim]; approving "
+        f"v{plan.version} puts a different decomposition in force. What differs:"
+    )
+    typer.echo(_replacement_diff(in_force, plan))
+    if assume_yes or typer.confirm(f"Approve v{plan.version} in place of v{in_force.version}?"):
+        return
+    console.print(
+        f"[dim]nothing was recorded; plan v{in_force.version} stays the one in force[/dim]"
+    )
+    raise typer.Exit(code=1)
+
+
+def _explicit_analysis(workspace: Workspace, workbook: Path, path: Path) -> WorkbookAnalysis:
+    """Load an analysis named with ``--analysis``, refusing one taken from a different workbook.
+
+    A plan takes its whole identity from the analysis it was written against — ``workbook`` and
+    ``workbook_sha256`` both — so an analysis of another file lands a plan in this workbook's
+    project directory claiming to be for that one. ``kedge plan show alpha.xlsx`` then prints
+    "plan for beta.xlsx" while the approval prints "for alpha.xlsx", and nothing downstream
+    catches it: ``workbook_sha256`` is documented as tying a plan to the exact file it was written
+    for and is read nowhere in ``src/``.
+
+    The digest decides, not the filename: two workbooks are routinely called ``monthly.xlsx``.
+    A digest that differs while the filename matches is the *same* workbook, changed since the
+    analysis was taken, which is a legitimate thing to be doing badly — a warning, not a refusal.
+    """
+    if not path.is_file():
+        raise _fail(f"no such analysis: {path}")
+
+    from kedge.plan import load_analysis
+
+    try:
+        facts = load_analysis(workbook, analysis_path=path, workspace=workspace)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    digest = _digest_of(workbook)
+    if digest is None or facts.workbook.sha256 == digest:
+        return facts
+    if facts.workbook.filename.casefold() == workbook.name.casefold():
+        _console().print(
+            f"[yellow]warning[/yellow] the analysis at {_plain(path)} was taken from a different "
+            f"copy of {_plain(workbook.name)} than the one on disk; the plan will be written "
+            f"against facts that are already out of date. Re-run `kedge inspect` first if that "
+            f"matters."
+        )
+        return facts
+    raise _fail(
+        f"the analysis at {path} describes {facts.workbook.filename}, not {workbook.name}. "
+        f"A plan takes its workbook identity from its analysis, so this would file a plan for "
+        f'{facts.workbook.filename} under {workbook.name}. Run `kedge inspect "{workbook}"` to '
+        f"write the analysis this workbook's plan should be built from."
+    )
+
+
+def _warn_if_the_workbook_moved_on(plan: ProcessPlan, workbook: Path) -> None:
+    """Say so when the file no longer matches the one the plan was written for.
+
+    A warning rather than a refusal: re-planning after a workbook changes is legitimate, and the
+    decomposition may be exactly right for the new file. Approving in silence against a file that
+    has moved on is the part that is not — and since nothing downstream reads ``workbook_sha256``
+    back, this is the only place the tie is checked at all.
+    """
+    digest = _digest_of(workbook)
+    if digest is None or digest == plan.workbook_sha256:
+        return
+    _console().print(
+        f"[yellow]warning[/yellow] {_plain(workbook.name)} has changed since plan v{plan.version} "
+        f"was written for it: the recorded sha256 no longer matches the file on disk. Approving "
+        f"records a decision about a decomposition of the earlier file."
+    )
+
+
+def _digest_of(workbook: Path) -> str | None:
+    """The workbook's SHA-256, or None when the file will not give one up.
+
+    Goes through the analyser's own :func:`~kedge.analysis.workbook.read_identity` rather than
+    hashing here, so the CLI and the artifacts it compares agree on what a workbook's digest is by
+    construction. A file that cannot be read is not this function's problem to report: the
+    analyser will have more to say about it, and a review verb must not fail over a hash.
+    """
+    from kedge.analysis.workbook import read_identity
+
+    try:
+        return read_identity(workbook).sha256
+    except (OSError, ValueError) as exc:
+        logger.debug("could not read the identity of %s: %s", workbook, exc)
+        return None
+
+
+def _saved_analysis(workspace: Workspace) -> WorkbookAnalysis | None:
+    """The analysis already on disk, or None. Never analyses.
+
+    `plan show` is better with one — an operation claimed by no stage is a review warning that
+    needs the facts to spot — but showing a plan is a *review* action, so it must not silently
+    spend the seconds an analysis costs, and a corrupt artifact must not stop a plan being read.
+    """
+    from kedge.analysis.model import WorkbookAnalysis
+
+    path = workspace.analysis_path
+    if not path.is_file():
+        return None
+    try:
+        return WorkbookAnalysis.model_validate_json(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("ignoring the analysis at %s: %s", path, exc)
+        return None
+
+
+def _report_blockers(plan: ProcessPlan, workbook: Path) -> None:
+    """Print every outstanding approval blocker, each with what would clear it.
+
+    All of them, not the first: a user told only the first will fix it, retry, and be told the
+    second — which is the reasoning :class:`~kedge.plan.review.PlanNotApprovableError` carries.
+    """
+    _console(stderr=True).print(
+        f"[bold red]error[/bold red] plan v{plan.version} for {_plain(workbook.name)} "
+        f"cannot be approved"
+    )
+    for blocker in plan.approval_blockers():
+        typer.echo(f"  - {blocker}", err=True)
+        typer.echo(f"      clear it: {_blocker_remedy(plan, blocker, workbook)}", err=True)
+
+
+def _blocker_remedy(plan: ProcessPlan, blocker: str, workbook: Path) -> str:
+    """The command or edit that would clear one approval blocker.
+
+    Matched back to the drop it names rather than re-deriving the blocker list here, so the two
+    cannot drift apart; anything unrecognised falls back to the general advice rather than
+    guessing.
+    """
+    from kedge.plan.model import ApprovalState
+
+    for drop in plan.dropped:
+        if repr(drop.range) not in blocker:
+            continue
+        if drop.rejected:
+            return (
+                f"the drop was refused, so {drop.range} has to be kept: name it in a stage's "
+                f"`sources` in the plan file, or acknowledge it again without --reject"
+            )
+        return (
+            f'kedge plan acknowledge "{workbook}" --range "{drop.range}"'
+            f"   (add --reject to keep the range instead)"
+        )
+    if plan.approval.state is ApprovalState.REJECTED:
+        return f'kedge plan propose "{workbook}" — a rejected plan is terminal'
+    return f'kedge plan show "{workbook}"'
+
+
+def _print_remaining_blockers(plan: ProcessPlan, workbook: Path) -> None:
+    """Say what still stands after a review edit, so the next step is never a guess."""
+    blockers = plan.approval_blockers()
+    console = _console()
+    if not blockers:
+        console.print(
+            f'[dim]nothing blocks approval now; `kedge plan approve "{_plain(workbook)}"`[/dim]'
+        )
+        return
+    console.print(f"[yellow]{len(blockers)} blocker(s) still stand[/yellow]")
+    for blocker in blockers:
+        typer.echo(f"  - {blocker}")
 
 
 # ── reconcile ────────────────────────────────────────────────────────────────────────────────

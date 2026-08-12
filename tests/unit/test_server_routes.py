@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
+import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,11 +18,28 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from conftest import make_plan
+from conftest import make_analysis, make_draft, make_operation, make_plan
 from kedge import config as config_module
-from kedge.agent.tools import PendingAmendment, PendingDeletion, ToolContext, ToolRegistry
-from kedge.plan.review import acknowledge_all_drops, approve
+from kedge.agent.context import TokenCounter
+from kedge.agent.loop import KedgeAgent
+from kedge.agent.tools import (
+    PendingAmendment,
+    PendingDeletion,
+    PendingProposal,
+    ToolContext,
+    ToolRegistry,
+)
+from kedge.analysis.model import CachedValueCoverage, WorkbookAnalysis
+from kedge.plan.model import DroppedRange, ProcessPlan, Stage
+from kedge.plan.review import (
+    acknowledge_all_drops,
+    add_stage,
+    approve,
+    reject,
+    request_changes,
+)
 from kedge.plan.store import PlanStore
+from kedge.plan.triage import triage
 from kedge.server import routes as routes_module
 from kedge.server.agent_seam import CancelToken, ScriptedAgent, TurnRequest
 from kedge.server.app import ServerError, create_app, require_loopback
@@ -315,6 +334,66 @@ def test_an_unknown_session_is_a_404_naming_the_id(client: TestClient) -> None:
     response = client.get("/api/sessions/nope")
     assert response.status_code == 404
     assert "nope" in response.json()["detail"]
+
+
+class _ClosableRegistry:
+    """A registry that records being closed. The route needs nothing else of one."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_deleting_a_session_clears_what_the_agent_still_holds(
+    workspace: Workspace, tmp_path: Path
+) -> None:
+    """The rows were only ever half of it.
+
+    The agent keeps a digest, the tool traffic of the last turn and the session's tool registry,
+    and the held turn is now populated on essentially every turn rather than only a paused one —
+    a couple of hundred messages of sampled workbook rows, resident for the life of the process.
+    A user who deletes a conversation and still has its sampled data in memory is the leak
+    `SECURITY.md` is about: the sensitivity of the workbook is the sensitivity of the conversation.
+
+    The private dicts are reached for deliberately. They are what `reset_session` names, and a
+    rename that quietly stopped clearing one of them should fail here rather than in a memory dump.
+    """
+    agent = KedgeAgent(
+        client=SimpleNamespace(),
+        context=ToolContext(),
+        counter=TokenCounter(allow_download=False),
+        system_prompt="SYSTEM PROMPT",
+    )
+    app = create_app(workspace, agent=agent, store=SessionStore(tmp_path / "sessions.sqlite"))
+    with TestClient(app) as client:
+        session_id = _new_session(client)
+        registry = _ClosableRegistry()
+        agent.registries[session_id] = registry
+        held = agent._suspended
+        digests = agent._digests
+        held[session_id] = ["sampled rows from Calc!A1:H500"]
+        digests[session_id] = "a summary of the conversation so far"
+
+        assert client.delete(f"/api/sessions/{session_id}").status_code == 200
+
+        assert agent.registries == {}, "the tool registry and its result cache are gone"
+        assert held == {}, "so is the held turn, which is where the sampled rows live"
+        assert digests == {}
+        assert registry.closed is True, "the workbook handle is released, not merely dropped"
+
+
+def test_deleting_a_session_succeeds_when_no_agent_is_attached(client: TestClient) -> None:
+    """Sessions are deleted from the hub with no workbook open and no model configured.
+
+    Answering 409 there would be refusing to delete a conversation because there is nobody to
+    tell about it. The demo agent has no per-session state at all, and the delete is unaffected.
+    """
+    session_id = _new_session(client)
+
+    assert client.delete(f"/api/sessions/{session_id}").status_code == 200
+    assert client.get("/api/sessions").json()["sessions"] == []
 
 
 def test_a_session_snapshots_the_notebook_and_notices_when_it_moves(
@@ -659,6 +738,7 @@ def test_a_session_with_no_registry_reports_no_pending_decisions(
     session_id = _new_session(client)
 
     assert client.get(f"/api/sessions/{session_id}/pending").json() == {
+        "proposals": [],
         "deletions": [],
         "amendments": [],
     }
@@ -805,11 +885,22 @@ def test_an_approved_amendment_lands_approved_so_the_gate_is_completed_not_bypas
 def test_an_amendment_to_a_plan_that_cannot_be_approved_lands_as_a_draft_with_the_blockers(
     pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
 ) -> None:
-    """`approve` refusing is the gate working, not an error to route around."""
+    """`approve` refusing is the gate working, not an error to route around.
+
+    The plan on disk is approved — nothing else is amendable — but carries a drop nobody has
+    acknowledged, which is what a hand-edit of the YAML looks like. The plan file is a review
+    artifact users are invited to edit, so a plan that is approved and no longer approvable is a
+    state the route has to survive.
+    """
     client, registries = pending_client
     session_id = _new_session(client)
     store = PlanStore(tmp_path / "plans")
-    store.save(make_plan())  # unapproved, with an unacknowledged dropped range
+    approved = approve(acknowledge_all_drops(make_plan(), note="read"), by="phil")
+    store.save(
+        approved.model_copy(
+            update={"dropped": [DroppedRange(range="Calc!BB:BD", reason="added by hand")]}
+        )
+    )
     registry = _tool_registry(plans=store)
     registry.pending_amendments.append(
         PendingAmendment(rationale="because", change="something", stage=None)
@@ -858,3 +949,475 @@ def test_approving_an_amendment_with_no_plan_on_disk_explains_rather_than_500s(
 
     assert response.status_code == 422
     assert "no plan on disk" in response.json()["detail"]
+
+
+# ── an amendment amends what is in force, and nothing else ───────────────────────────────────
+#
+# An amendment card shows one sentence. Approving it must therefore put one sentence into force,
+# never a decomposition the user has not read: the plan it is written against has to be the
+# *approved* one. Reached through `latest_approved() or latest()` it was not, and approving
+# "mention the FX rate source" against a rejected v2 wrote v3 approved carrying the whole of v2.
+
+
+@pytest.mark.parametrize(
+    ("state", "prepare"),
+    [
+        pytest.param("draft", lambda plan: plan, id="draft"),
+        pytest.param(
+            "changes_requested",
+            lambda plan: request_changes(plan, by="phil", note="split the haircut stage"),
+            id="changes_requested",
+        ),
+        pytest.param(
+            "rejected",
+            lambda plan: reject(plan, by="phil", reason="the decomposition is wrong"),
+            id="rejected",
+        ),
+    ],
+)
+def test_an_amendment_refuses_against_a_plan_that_is_not_in_force(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+    tmp_path: Path,
+    state: str,
+    prepare,
+) -> None:
+    """One approved sentence must not carry an unread decomposition into force with it."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    store.save(prepare(acknowledge_all_drops(make_plan(), note="read")))
+    before = store.versions()
+    registry = _tool_registry(plans=store)
+    registry.pending_amendments.append(
+        PendingAmendment(rationale="the rate moved", change="mention the FX rate source")
+    )
+    registries[session_id] = registry
+
+    response = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={})
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert state in detail, "the user is told which state the plan is actually in"
+    assert "in full" in detail
+    assert store.versions() == before, "nothing was written"
+
+
+def test_an_amendment_against_the_approved_plan_still_works(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """The other half of the parametrised refusal: the gate closes on everything but `approved`."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = _approved_plan_store(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    registry.pending_amendments.append(
+        PendingAmendment(rationale="the rate moved", change="mention the FX rate source")
+    )
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={}).json()
+
+    assert payload["approved"] is True
+
+
+def test_an_amendment_never_writes_a_later_unapproved_version_into_force(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """`latest()` is not `latest_approved()`: v2 being newer does not make it reviewed."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    approved = approve(acknowledge_all_drops(make_plan(), note="read"), by="phil")
+    store.save(approved)
+    superseding = add_stage(
+        approved, Stage(id="a_stage_nobody_reviewed", intent="Invented after approval")
+    )
+    store.save(superseding)
+    registry = _tool_registry(plans=store)
+    registry.pending_amendments.append(
+        PendingAmendment(rationale="the rate moved", change="mention the FX rate source")
+    )
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={}).json()
+
+    written = store.load(payload["version"])
+    assert "a_stage_nobody_reviewed" not in written.stage_ids
+    assert written.stage_ids == approved.stage_ids
+
+
+# ── the user's half of propose_plan ──────────────────────────────────────────────────────────
+#
+# `propose_plan` authors a whole plan and writes nothing. These routes are where the user reads it
+# and decides, and what is asserted is the same gate the amendment routes assert: approval writes
+# a *version* through the store, a plan that is not approvable on its own terms lands as a draft
+# with its blockers said out loud, and nothing at all reaches disk without a request from the
+# browser. One thing more is asserted here that has no amendment equivalent — that a proposal
+# cannot be written over a plan approved after it was made, which is the refusal in the tool
+# holding at the other end of the wait.
+
+
+def _proposed_plan(**overrides: object) -> ProcessPlan:
+    """A plan as `propose_plan` records it: authored by the model, unapproved."""
+    return make_plan(generated_by="llm", llm_model="gpt-5.6-terra", **overrides)
+
+
+def test_a_recorded_proposal_is_surfaced_as_a_plan_the_user_can_read(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    client, registries = pending_client
+    session_id = _new_session(client)
+    registry = _tool_registry()
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan()))
+    registries[session_id] = registry
+
+    proposal = client.get(f"/api/sessions/{session_id}/pending").json()["proposals"][0]
+
+    assert proposal["index"] == 0
+    assert [stage["id"] for stage in proposal["stages"]] == [
+        "load_handin",
+        "apply_haircuts",
+        "manual_overrides",
+        "write_output",
+    ]
+    assert any(stage["checkpoint"] for stage in proposal["stages"])
+    assert proposal["open_questions"], "an open question the user never sees is not a question"
+    assert proposal["dropped"] == [
+        {"range": "Calc!AK:AP", "reason": "no downstream refs, all zero since 2023"}
+    ]
+
+
+def test_approving_a_proposal_writes_the_plan_the_model_authored(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(
+        PendingProposal(plan=_proposed_plan(draft=acknowledge_all_drops(make_plan()).to_draft()))
+    )
+    registries[session_id] = registry
+
+    response = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approved"] is True
+    written = store.load(payload["version"])
+    assert written.approval.approved is True
+    assert written.generated_by == "llm", "the history shows where this plan came from"
+    assert written.llm_model == "gpt-5.6-terra"
+    assert registry.pending_proposals == []
+
+
+def test_an_approval_note_is_the_reviewers_or_nobodys(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """`approval.note` reads months later as the reviewer's account of what they checked.
+
+    Defaulting it to the plan's own summary filled that field with the model's prose -- an
+    account of the work written by the thing being reviewed. Absent is honest; borrowed is not.
+    """
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    draft = acknowledge_all_drops(make_plan()).to_draft()
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan(draft=draft)))
+    registries[session_id] = registry
+
+    silent = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    written = store.load(silent["version"])
+    assert written.approval.note is None
+    assert written.summary not in (written.approval.note or "")
+
+
+def test_a_proposal_that_cannot_be_approved_lands_as_a_draft_with_the_blockers(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """An unacknowledged drop blocks approval, and the gate refusing is the gate working."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan()))
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    assert payload["approved"] is False
+    assert any("Calc!AK:AP" in blocker for blocker in payload["blockers"])
+    written = store.load(payload["version"])
+    assert written.approval.approved is False
+    assert written.generated_by == "llm"
+
+
+def test_declining_a_proposal_leaves_no_trace(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan()))
+    registries[session_id] = registry
+
+    response = client.delete(f"/api/sessions/{session_id}/pending/proposals/0")
+
+    assert response.status_code == 200
+    assert store.versions() == [], "a declined plan is not history, it never happened"
+    assert registry.pending_proposals == []
+    assert response.json()["pending"]["proposals"] == []
+
+
+def test_a_proposal_cannot_be_written_over_a_plan_approved_while_it_waited(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """The tool's refusal has to hold at approval time too: the click can arrive much later."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = _approved_plan_store(tmp_path / "plans")
+    before = store.versions()
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan()))
+    registries[session_id] = registry
+
+    response = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert response.status_code == 422
+    assert "amendment" in response.json()["detail"]
+    assert store.versions() == before
+    assert registry.pending_proposals == [], "a decided request is no longer pending"
+
+
+def test_two_pending_proposals_cannot_both_be_written(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """One turn can record two; approving the first puts a plan in force and closes the door.
+
+    `propose_plan` refuses once a plan is approved, but that check ran when the tool was called.
+    Both of these were recorded before either was decided, so only the re-read in `_write_proposal`
+    stands between the second click and a replacement decomposition landing as though nothing were
+    in force.
+    """
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    approvable = _proposed_plan(draft=acknowledge_all_drops(make_plan()).to_draft())
+    registry.pending_proposals.append(PendingProposal(plan=approvable))
+    registry.pending_proposals.append(PendingProposal(plan=approvable))
+    registries[session_id] = registry
+
+    first = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+    second = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert first.json()["approved"] is True
+    assert second.status_code == 422
+    assert "amendment" in second.json()["detail"]
+    assert len(store.versions()) == 1, "the second proposal reached no version of its own"
+
+
+# ── the card has to support the decision it asks for ─────────────────────────────────────────
+#
+# The bar is `plan.review.render_plan`: what the CLI puts in front of a reviewer before the same
+# decision. Anything the payload omits is something the user is asked to approve unseen, and the
+# omissions were not small -- the assumptions a reviewer checks first, the DAG, the question a
+# checkpoint actually asks, and every warning that checks the decomposition covers the workbook.
+
+
+def _proposal_view(
+    client: TestClient,
+    registries: dict[str, ToolRegistry],
+    plan: ProcessPlan,
+    **context: object,
+) -> dict:
+    session_id = _new_session(client)
+    registry = _tool_registry(**context)
+    registry.pending_proposals.append(PendingProposal(plan=plan))
+    registries[session_id] = registry
+    return client.get(f"/api/sessions/{session_id}/pending").json()["proposals"][0]
+
+
+def test_the_card_carries_what_render_plan_shows_a_reviewer(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    client, registries = pending_client
+
+    proposal = _proposal_view(client, registries, _proposed_plan(), analysis=make_analysis())
+
+    stages = {stage["id"]: stage for stage in proposal["stages"]}
+    assert stages["load_handin"]["assumptions"] == ["header on row 1", "one row per counterparty"]
+    assert stages["apply_haircuts"]["depends_on"] == ["load_handin"]
+    assert stages["apply_haircuts"]["operations"] == ["calc_h2_h500"]
+    assert stages["apply_haircuts"]["excel_pattern"] == "vlookup_exact"
+    assert stages["load_handin"]["checkpoint"] is None
+
+
+def test_the_card_carries_the_question_a_checkpoint_will_ask(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """`render_plan` prints it; the card said ", not automated". The question is the control."""
+    client, registries = pending_client
+
+    proposal = _proposal_view(client, registries, _proposed_plan(), analysis=make_analysis())
+
+    checkpoint = next(stage["checkpoint"] for stage in proposal["stages"] if stage["checkpoint"])
+    assert checkpoint["question"] == "Have this month's overrides been agreed with Risk?"
+    assert checkpoint["options"] == ["approve", "reject"]
+
+
+def test_the_card_carries_the_review_warnings_in_full(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """Including the only automatic check that the decomposition covers the workbook."""
+    client, registries = pending_client
+    analysis = make_analysis(operations=[make_operation(), make_operation("calc_z9_z99")])
+
+    proposal = _proposal_view(client, registries, _proposed_plan(), analysis=analysis)
+
+    assert proposal["warnings_complete"] is True
+    assert any("claimed by no stage" in warning for warning in proposal["warnings"])
+    assert any("low or unstated confidence" in warning for warning in proposal["warnings"])
+
+
+def test_the_card_says_so_when_the_coverage_checks_could_not_run(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """A shorter list of warnings must not read as a cleaner plan."""
+    client, registries = pending_client
+
+    proposal = _proposal_view(client, registries, _proposed_plan())
+
+    assert proposal["warnings_complete"] is False
+    assert proposal["verdict"] is None
+
+
+def test_the_card_pre_flights_the_approval_blockers(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """The button says "Approve"; without this the user learns it saved a draft afterwards."""
+    client, registries = pending_client
+
+    proposal = _proposal_view(client, registries, _proposed_plan(), analysis=make_analysis())
+
+    assert proposal["unacknowledged_drops"] == 1
+    assert any("Calc!AK:AP" in blocker for blocker in proposal["approval_blockers"])
+
+
+def _triaged_plan(analysis: WorkbookAnalysis) -> ProcessPlan:
+    """A proposal as `propose_plan` records one: the assessment is kedge's triage, not the model's."""
+    return _proposed_plan(draft=make_draft(assessment=triage(analysis).as_assessment()))
+
+
+def test_the_card_leads_with_a_stop_verdict(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """`propose_plan` refuses a STOP; the tool path never looked, so the word never arrived."""
+    client, registries = pending_client
+    analysis = make_analysis(workbook_fields={"file_format": "xlsb"})
+
+    proposal = _proposal_view(client, registries, _triaged_plan(analysis), analysis=analysis)
+
+    assert proposal["verdict"] == "stop"
+    assert any("xlsb" in blocker for blocker in proposal["blockers"])
+
+
+def test_a_workbook_with_no_baseline_reports_it_as_its_own_blocker(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """Non-negotiable 6. 1.00 convertible with "cannot be reconciled" trailing after a colon
+    inverts the emphasis: the score is arithmetically right and reads exactly wrong."""
+    client, registries = pending_client
+    analysis = make_analysis(
+        cached_values=CachedValueCoverage(
+            formula_cell_count=400_000, cached_present_count=0, coverage=0.0, status="absent"
+        )
+    )
+
+    proposal = _proposal_view(client, registries, _triaged_plan(analysis), analysis=analysis)
+
+    assert proposal["convertible"] == 1.0, "a missing baseline does not make it harder to convert"
+    assert any("no cached calculated values" in item for item in proposal["verification_blockers"])
+    assert proposal["blockers"] == [], "and it is not restated as a conversion blocker"
+
+
+def test_the_card_flags_an_analysis_that_predates_the_workbook(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], workspace: Workspace
+) -> None:
+    """A plan scored from an analysis of a file the user has since re-saved is a plan about
+    a workbook that no longer exists."""
+    client, registries = pending_client
+    workspace.analysis_path.parent.mkdir(parents=True, exist_ok=True)
+    workspace.analysis_path.write_text("{}", encoding="utf-8")
+    stale = _proposal_view(
+        client, registries, _proposed_plan(), workspace=workspace, analysis=make_analysis()
+    )
+    assert stale["analysis_stale"] is False
+
+    os.utime(workspace.workbook_path, ns=(time.time_ns(), time.time_ns() + 5_000_000_000))
+    fresh = _proposal_view(
+        client, registries, _proposed_plan(), workspace=workspace, analysis=make_analysis()
+    )
+    assert fresh["analysis_stale"] is True
+
+
+def test_a_card_with_no_workspace_says_it_cannot_tell_rather_than_current(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """ "Cannot tell" is not "current", and rendering it as one would be the quieter lie."""
+    client, registries = pending_client
+
+    proposal = _proposal_view(client, registries, _proposed_plan())
+
+    assert proposal["analysis_stale"] is None
+
+
+# ── the model does not sign off its own deletions ────────────────────────────────────────────
+#
+# `unacknowledged_drops` is the only structural blocker a plan has: the thing standing between
+# "kedge silently deleted six columns" and a bug report. `parse_draft` is where a model-authored
+# draft loses the fields that record a *reviewer's* decision, and this asserts it end to end --
+# the real tool records the proposal, the real route writes it -- because that is the path a
+# forged acknowledgement would actually travel.
+
+
+async def test_a_proposed_plan_cannot_acknowledge_its_own_dropped_ranges(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(analysis=make_analysis(), plans=store)
+    registries[session_id] = registry
+    forged = json.dumps(
+        {
+            "stages": [{"id": "load_handin", "intent": "Read the hand-in", "kind": "load"}],
+            "open_questions": [],
+            "dropped": [
+                {
+                    "range": "Calc!AK:AP",
+                    "reason": "unused",
+                    "acknowledged": True,
+                    "accepted": True,
+                    "note": "signed off by the analyst",
+                }
+            ],
+        }
+    )
+
+    # `propose_plan` refuses a plan written from nothing, so the model reads first, as it would.
+    assert (await registry.dispatch("inspect_workbook", {"section": "operations"})).ok
+    result = await registry.dispatch("propose_plan", {"plan": forged})
+    assert result.ok, "the proposal is legitimate; only the signature on it is not"
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    assert payload["approved"] is False
+    assert any("Calc!AK:AP" in blocker for blocker in payload["blockers"])
+    written = store.load(payload["version"])
+    assert written.dropped[0].acknowledged is False
+    assert written.dropped[0].note is None
+    assert "signed off by the analyst" not in written.model_dump_json()

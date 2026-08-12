@@ -18,16 +18,47 @@ from typing import Any
 
 import pytest
 
-from kedge.agent.context import TokenCounter
-from kedge.agent.loop import ChatDelta, KedgeAgent, Usage
-from kedge.agent.tools import ToolContext
+from kedge.agent.context import (
+    _EVICTED_SHORT_TAIL,
+    _EVICTED_TAIL,
+    CARRY_BLOCK_TURNS,
+    MAX_EVICTED_SHAPE_CHARS,
+    ContextMessage,
+    TokenCounter,
+)
+from kedge.agent.loop import (
+    ChatDelta,
+    KedgeAgent,
+    Usage,
+    _history_before,
+    _result_shape,
+    _safe_arguments,
+)
+from kedge.agent.tools import ToolContext, ToolResult
+from kedge.analysis.model import WorkbookAnalysis
+from kedge.config import ContextConfig
 from kedge.errors import KedgeError
-from kedge.notebook.model import CellInfo, CellRef, GraphNode, GraphView, MutationResult
+from kedge.notebook.model import (
+    CellInfo,
+    CellRef,
+    GraphNode,
+    GraphView,
+    MutationResult,
+    ProbeResult,
+)
+from kedge.plan.store import PlanStore
 from kedge.server.agent_seam import AgentLoop, CancelToken, TurnMessage, TurnRequest
 from kedge.server.events import DoneEvent
 
 CLEAN_CELL = "apply_haircuts = load_handin.join(reference_haircuts, on='asset_class', how='left')\n"
 PANDAS_CELL = "import pandas as pd\nframe = pd.read_excel('handin.xlsx')\n"
+
+_EVICTION_TAILS = (_EVICTED_TAIL, _EVICTED_SHORT_TAIL)
+"""The wordings an eviction stub can end in.
+
+Which one it can afford depends on the length of the result it replaces — a stub costs no more
+than what it stands in for — so a test asking whether something was evicted asks for either rather
+than pinning the rung, and asks for the constants rather than for a phrase copied out of them."""
 
 
 # ── fakes ────────────────────────────────────────────────────────────────────────────────────
@@ -40,9 +71,10 @@ class ScriptedClient:
         self._rounds = list(rounds)
         self.seen: list[list[dict[str, Any]]] = []
         self.tools_offered: list[str] = []
+        self.models_asked: list[str] = []
 
     async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
-        del model
+        self.models_asked.append(model)
         self.seen.append([dict(message) for message in messages])
         self.tools_offered = [tool["function"]["name"] for tool in tools]
         for delta in self._rounds.pop(0) if self._rounds else []:
@@ -114,6 +146,13 @@ class FakeDriver:
             operation="create_cell", cell=CellRef(id="U1", name=name), ran=True, status="idle"
         )
 
+    async def probe(self, code: str) -> ProbeResult:
+        return ProbeResult(
+            ok=True,
+            value_repr="shape: (49999, 3)\n" + "| corp | 1000.0 | 0.02 |\n" * 6,
+            value_type="DataFrame",
+        )
+
 
 def call(name: str, arguments: dict[str, Any], *, index: int = 0) -> list[ChatDelta]:
     """The deltas a model emits for one tool call, split the way a real stream splits them."""
@@ -126,10 +165,12 @@ def call(name: str, arguments: dict[str, Any], *, index: int = 0) -> list[ChatDe
     ]
 
 
-def build(client: Any, *, driver: Any = None, **kwargs: Any) -> KedgeAgent:
+def build(
+    client: Any, *, driver: Any = None, context: ToolContext | None = None, **kwargs: Any
+) -> KedgeAgent:
     return KedgeAgent(
         client=client,
-        context=ToolContext(driver=driver),
+        context=context if context is not None else ToolContext(driver=driver),
         counter=TokenCounter(allow_download=False),
         system_prompt="SYSTEM PROMPT",
         **kwargs,
@@ -155,7 +196,9 @@ async def test_the_tools_offered_are_the_ones_plan_m4_lists() -> None:
     await drive(build(client))
     assert "propose_cell" in client.tools_offered
     assert "reconcile" in client.tools_offered
-    assert len(client.tools_offered) == 15
+    # PLAN M4's fifteen, plus `propose_plan`: the planning step has to be reachable from the chat
+    # too, or an account worked out in conversation stays prose and is compacted away with it.
+    assert len(client.tools_offered) == 16
 
 
 # ── exactly one DoneEvent ────────────────────────────────────────────────────────────────────
@@ -405,7 +448,14 @@ async def test_a_paused_turn_resumes_with_everything_it_had_learnt() -> None:
     assert not any(message.get("content") == "Looking." for message in resumed)
 
 
-async def test_the_carried_turn_is_let_go_once_the_model_answers() -> None:
+async def test_a_carried_turn_of_kernel_reads_is_let_go_once_the_model_answers() -> None:
+    """Answering is no longer what releases the carry — expiring is, and here everything has.
+
+    The turn read the kernel and nothing else. Once it answers, the conversation has moved past it
+    and a listing from before the user's next message describes a notebook they may have edited, so
+    every result in the span is evicted and what is left is a shell the server's own history
+    already replays.
+    """
     driver = FakeDriver()
     agent = build(
         client := ScriptedClient(
@@ -474,6 +524,320 @@ async def test_a_new_session_forgets_the_turn_that_was_held_for_it() -> None:
     agent.reset_session("s1")
     await drive(agent, "start again")
     assert not any(message["role"] == "tool" for message in client.seen[2])
+
+
+# ── carrying a turn that answered ────────────────────────────────────────────────────────────
+
+
+def _tools_in(prompt: list[dict[str, Any]]) -> dict[str, str]:
+    """The tool results in one prompt, by the id of the call each answers."""
+    return {
+        message["tool_call_id"]: message["content"]
+        for message in prompt
+        if message["role"] == "tool"
+    }
+
+
+async def test_an_answered_turn_hands_its_stable_results_to_the_next_one(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """The bug this exists for: summarise the workbook, then ask for the notebook.
+
+    The first turn read the workbook and answered well. The second re-read all of it, because a
+    turn that succeeded had its tool traffic thrown away and the server persists prose alone. The
+    expensive turn was being punished for succeeding.
+    """
+    client = ScriptedClient(
+        [
+            [*call("inspect_workbook", {"section": "operations"})],
+            [ChatDelta(text="Stage 2 is the haircut lookup in Calc!H.")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = build(client, context=ToolContext(analysis=analysis))
+    await drive(agent, "summarise the workbook stage by stage")
+    await drive(agent, "now build the notebook")
+
+    produced = _tools_in(client.seen[1])
+    assert _tools_in(client.seen[2]) == produced, "the workbook does not change under kedge"
+    assert produced
+
+
+async def test_an_answered_turns_volatile_results_arrive_as_stubs_rather_than_as_holes(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """What is carried is what is still true, and what is not still true is still *there*.
+
+    A kernel listing from before the follow-up describes a notebook the user may have edited in
+    the pane next to the chat. Dropping the message is not an option — an assistant message
+    carrying ``tool_calls`` without a result against each id is rejected outright — so it is
+    evicted instead, which leaves the model the call, its arguments and an invitation to repeat it.
+    """
+    driver = FakeDriver()
+    client = ScriptedClient(
+        [
+            [
+                *call("inspect_workbook", {"section": "operations"}, index=0),
+                *call("list_cells", {}, index=1),
+            ],
+            [ChatDelta(text="Two cells so far, and the lookup is in Calc!H.")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = build(client, context=ToolContext(analysis=analysis, driver=driver))
+    await drive(agent, "summarise the workbook stage by stage")
+    await drive(agent, "now build the notebook")
+
+    before, after = _tools_in(client.seen[1]), _tools_in(client.seen[2])
+    assert set(after) == set(before), "every call the carried turn made is still answered"
+    assert after["call_0"] == before["call_0"], "the workbook cannot have changed"
+    assert after["call_1"] != before["call_1"], "the kernel can, and has"
+    assert "list_cells" in after["call_1"]
+    assert any(tail in after["call_1"] for tail in _EVICTION_TAILS)
+
+
+async def test_the_carried_turn_still_answers_every_tool_call_it_makes(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """The API-rejection case, asserted over the request as the endpoint would receive it."""
+    driver = FakeDriver()
+    client = ScriptedClient(
+        [
+            [
+                *call("inspect_workbook", {"section": "operations"}, index=0),
+                *call("probe", {"code": "1 + 1"}, index=1),
+            ],
+            [ChatDelta(text="Both read.")],
+            [ChatDelta(text="Right.")],
+        ]
+    )
+    agent = build(client, context=ToolContext(analysis=analysis, driver=driver))
+    await drive(agent, "summarise the workbook stage by stage")
+    await drive(agent, "now build the notebook")
+
+    prompt = client.seen[2]
+    asked = {call["id"] for message in prompt for call in message.get("tool_calls") or ()}
+    answered = {message["tool_call_id"] for message in prompt if message["role"] == "tool"}
+    assert asked and asked == answered
+
+
+async def test_a_carried_result_ages_out_after_the_configured_number_of_turns(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """Re-dating is what keeps the carry in order; it must not also make the carry immortal.
+
+    ``resume`` re-dates a carried message into the turn it is resumed as, so a result carried
+    every turn would read as one turn old for ever and never reach the horizon
+    ``[context] evict_tool_results_after_turns`` sets.
+
+    A span holding nothing but an expired result is not carried at all. The stub that says a call
+    has gone earns its place next to results that have not; on its own it is the whole of what the
+    server's own history already replays, and a turn more expensive than the record it displaces.
+    """
+    rounds: list[list[ChatDelta]] = [
+        [*call("inspect_workbook", {"section": "operations"})],
+        [ChatDelta(text="Stage 2 is the haircut lookup in Calc!H.")],
+    ]
+    rounds += [[ChatDelta(text="Understood.")] for _ in range(4)]
+    agent = build(
+        client := ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis),
+        context_config=ContextConfig(evict_tool_results_after_turns=2),
+    )
+    await drive(agent, "summarise the workbook stage by stage")
+    for _ in range(3):
+        await drive(agent, "carry on")
+
+    fetched = _tools_in(client.seen[1])["call_0"]
+    assert _tools_in(client.seen[2])["call_0"] == fetched
+    assert not _tools_in(client.seen[3])
+    assert not _tools_in(client.seen[4])
+
+
+async def test_an_expired_result_spends_one_turn_as_a_stub_before_it_leaves(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """The extra turn a result spends as a stub, which is signal rather than an off-by-one.
+
+    Content lasts ``evict_tool_results_after_turns`` turns; the stub naming the call lasts one turn
+    beyond that, so the model reads "this is gone, ask again" rather than finding an earlier call
+    of its own with no answer against it. Each turn here makes a call of its own, which is what
+    keeps the span worth carrying — a span holding nothing but the stub is dropped whole.
+    """
+    rounds: list[list[ChatDelta]] = []
+    for index in range(4):
+        rounds.append([*call("inspect_workbook", {"section": "operations"}, index=index)])
+        rounds.append([ChatDelta(text=f"Read it, pass {index}.")])
+    agent = build(
+        client := ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis),
+        context_config=ContextConfig(evict_tool_results_after_turns=2),
+    )
+    for index in range(4):
+        await drive(agent, f"question {index}")
+
+    fetched = _tools_in(client.seen[1])["call_0"]
+    assert _tools_in(client.seen[2])["call_0"] == fetched, "content for the configured horizon"
+    stub = _tools_in(client.seen[4])["call_0"]
+    assert stub != fetched
+    assert "inspect_workbook" in stub
+    assert any(tail in stub for tail in _EVICTION_TAILS)
+    assert "call_0" not in _tools_in(client.seen[6]), "and then it goes"
+
+
+async def test_the_carry_stays_bounded_over_a_long_session(analysis: WorkbookAnalysis) -> None:
+    """Carrying on every turn is what makes this a leak rather than a corner case."""
+    turns = 10
+    rounds: list[list[ChatDelta]] = []
+    for index in range(turns):
+        rounds.append([*call("inspect_workbook", {"section": "operations"}, index=index)])
+        rounds.append([ChatDelta(text=f"Read it, pass {index}.")])
+    agent = build(
+        client := ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis),
+        context_config=ContextConfig(evict_tool_results_after_turns=3),
+    )
+    for index in range(turns):
+        await drive(agent, f"question {index}")
+
+    # The prompt that opens each turn: what the previous ones handed it, before it calls anything.
+    opening = [len(_tools_in(client.seen[index * 2])) for index in range(turns)]
+    assert opening[-1] == opening[-1 - CARRY_BLOCK_TURNS], "the carry reaches a steady cycle"
+    # Bounded by the horizon, and not by being empty: the whole point is that something arrives.
+    assert 0 < max(opening) <= 3 - 1 + CARRY_BLOCK_TURNS
+
+
+async def test_a_one_turn_horizon_carries_nothing_rather_than_a_span_of_stubs(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """``evict_tool_results_after_turns = 1`` is legal, and it is where the mechanism inverts.
+
+    Everything a turn reads is stubbed before the next turn sees it, so there is nothing to carry —
+    and holding the span anyway would trim a turn out of history to make room for a shell that
+    costs more than the record it displaced.
+    """
+    client = ScriptedClient(
+        [
+            [*call("inspect_workbook", {"section": "operations"})],
+            [ChatDelta(text="Stage 2 is the haircut lookup in Calc!H.")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis),
+        context_config=ContextConfig(evict_tool_results_after_turns=1),
+    )
+    await drive(agent, "summarise the workbook stage by stage")
+    await drive(agent, "now build the notebook")
+
+    assert not _tools_in(client.seen[2])
+
+
+async def test_consecutive_pauses_expire_what_the_kernel_may_have_changed(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """A paused turn is resumed as itself; the legs behind it are not.
+
+    The user types between the pause and the resume, and edits cells in the pane beside the chat
+    while the turn waits — which is why the notebook state is rebuilt every turn. So a ``probe``
+    read on the first leg is not still describing the kernel two pauses later, however the turns
+    ended, and only the leg that has just run keeps its volatile results.
+    """
+    client = ScriptedClient(
+        [[*call("probe", {"code": "load_handin.height"}, index=index)] for index in range(3)]
+    )
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis, driver=FakeDriver()),
+        context_config=ContextConfig(evict_tool_results_after_turns=6),
+        max_steps=1,
+    )
+    await drive(agent, "start reading")
+    await drive(agent, "continue")
+    await drive(agent, "continue")
+
+    # The leg that just ran keeps its probe; the one behind it has crossed a turn boundary.
+    third = _tools_in(client.seen[2])
+    assert "49999" in third["call_1"], "the leg the pause is resuming stands"
+    assert "49999" not in third["call_0"]
+    assert any(tail in third["call_0"] for tail in _EVICTION_TAILS)
+
+
+async def test_compaction_does_not_take_the_carry_with_it(analysis: WorkbookAnalysis) -> None:
+    """Compaction runs at the end of a turn and drops everything older than the one being built.
+
+    That is the whole resumed span. Taken before the carry it collapsed the hand-off to its newest
+    leg on every turn a session sat over the compaction threshold — the sessions that most need to
+    start warm. The digest is compaction's lasting product and does not care which order it is
+    written in.
+    """
+    client = ScriptedClient(
+        [
+            [*call("inspect_workbook", {"section": "operations"})],
+            [ChatDelta(text="Stage 2 is the haircut lookup in Calc!H.")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis),
+        # A budget the pinned blocks alone overrun, so compaction fires on the first turn.
+        context_config=ContextConfig(max_context_tokens=5_000, reserve_output_tokens=0),
+    )
+    await drive(agent, "summarise the workbook stage by stage")
+    await drive(agent, "now build the notebook")
+
+    assert _tools_in(client.seen[2]), "the carry survived the compaction that ran beside it"
+
+
+# ── what the server hands the loop, and what the loop hands back ──────────────────────────────
+
+
+def _span(*openers: str) -> list[ContextMessage]:
+    """A carried span holding one user message per leg, which is what history is counted against."""
+    return [
+        ContextMessage(role="user", content=opener, kind="user", turn=1, carried_age=age)
+        for age, opener in enumerate(reversed(openers))
+    ]
+
+
+def test_history_is_trimmed_by_counting_the_turns_the_span_reinstates() -> None:
+    history = [("user", "first"), ("assistant", "one"), ("user", "second"), ("assistant", "two")]
+    assert _history_before(history, _span("second")) == history[:2]
+
+
+def test_a_user_message_repeated_later_does_not_trim_history_at_the_earlier_copy() -> None:
+    """The defect this counts its way past, and the phrasing kedge itself suggests.
+
+    ``_pause_message`` asks the user to say "continue", so the colliding text is the likeliest text
+    there is, and a two-leg span needs nothing more exotic than two consecutive turns. Searching
+    backwards for a message equal to the span's opener stops at the *newer* copy, leaves the turn
+    between the two in history, and the model then reads that exchange twice — once flattened out
+    of order and once in its place.
+    """
+    history = [
+        ("user", "carry on"),
+        ("assistant", "ANSWER ONE"),
+        ("user", "carry on"),
+        ("assistant", "ANSWER TWO"),
+    ]
+    assert _history_before(history, _span("carry on", "carry on")) == []
+
+
+def test_history_is_left_alone_when_it_is_not_what_the_span_was_built_from() -> None:
+    """Two copies of a turn is a poor context; a turn silently truncated is a worse one."""
+    history = [("user", "something else"), ("assistant", "an answer")]
+    assert _history_before(history, _span("convert the haircut lookup")) == history
+
+
+def test_history_is_left_alone_when_it_holds_fewer_turns_than_the_span() -> None:
+    history = [("user", "only one"), ("assistant", "an answer")]
+    assert _history_before(history, _span("only one", "and another")) == history
+
+
+def test_a_span_with_no_user_message_leaves_history_alone() -> None:
+    assert _history_before([("user", "a question")], []) == [("user", "a question")]
 
 
 # ── context ──────────────────────────────────────────────────────────────────────────────────
@@ -671,6 +1035,189 @@ def test_a_paused_turn_resumes_through_the_server_with_what_it_had_learnt(
     assert [message.get("content") for message in resumed].count("describe Calc") == 1
 
 
+def test_an_answered_turn_carries_through_the_server_without_being_read_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The answered equivalent, and the case ``_history_before`` has the most to get wrong.
+
+    A paused turn leaves the server a user message and whatever prose had streamed. An answered
+    one leaves a user message and the whole answer — and the answer is in the carry too, because
+    the assistant message is recorded before the step loop returns. Trimming only the opener would
+    hand the model its own answer twice, once flattened out of order and once in its place.
+    """
+    from fastapi.testclient import TestClient
+    from openpyxl import Workbook as OpenpyxlWorkbook
+
+    from kedge.server.app import create_app
+    from kedge.server.sessions import SessionStore
+    from kedge.workspace import Workspace
+
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "process.xlsx"
+    book = OpenpyxlWorkbook()
+    sheet = book.active
+    sheet.title = "Calc"
+    sheet.append(["haircut"])
+    sheet.append([0.02])
+    book.save(workbook)
+
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+    answer = "Two rows, header on row 1."
+    client = ScriptedClient(
+        [
+            [
+                ChatDelta(text="Reading it.\n"),
+                *call("read_range", {"sheet": "Calc", "range": "A1:A2"}),
+            ],
+            [ChatDelta(text=answer)],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = KedgeAgent(
+        client=client,
+        context=ToolContext.for_workspace(workspace),
+        counter=TokenCounter(allow_download=False),
+    )
+    app = create_app(workspace, agent=agent, store=SessionStore(tmp_path / "sessions.sqlite"))
+
+    with TestClient(app) as http:
+        session = http.post("/api/sessions", json={"title": "smoke"}).json()["session"]["id"]
+        turns = f"/api/sessions/{session}/turns"
+        with http.stream("POST", turns, json={"message": "describe Calc"}) as response:
+            "".join(response.iter_text())
+        with http.stream("POST", turns, json={"message": "now build the notebook"}) as response:
+            "".join(response.iter_text())
+
+    second = client.seen[2]
+    contents = [message.get("content") for message in second]
+    # The workbook read came with it rather than being fetched again.
+    assert any("0.02" in (content or "") for content in contents)
+    # And the turn appears once: not flattened in history and reinstated in the carry as well.
+    assert contents.count("describe Calc") == 1
+    assert contents.count(answer) == 1
+    assert contents[-1] == "now build the notebook"
+
+
+def test_a_repeated_message_through_the_server_does_not_read_a_turn_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two turns saying the same thing, which the carry makes routine rather than exotic.
+
+    Every turn now hands its traffic on, so a span of two legs needs nothing more than two
+    consecutive turns — and ``_pause_message`` asks the user to type "continue", which makes the
+    colliding text the one kedge itself suggests. Trimming history by searching backwards for the
+    span's opening message stops at the *newer* of the two copies and leaves the first turn in the
+    prompt twice: once flattened, once in the span.
+    """
+    from fastapi.testclient import TestClient
+    from openpyxl import Workbook as OpenpyxlWorkbook
+
+    from kedge.server.app import create_app
+    from kedge.server.sessions import SessionStore
+    from kedge.workspace import Workspace
+
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "process.xlsx"
+    book = OpenpyxlWorkbook()
+    sheet = book.active
+    sheet.title = "Calc"
+    sheet.append(["haircut"])
+    sheet.append([0.02])
+    book.save(workbook)
+
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+    client = ScriptedClient(
+        [
+            [*call("read_range", {"sheet": "Calc", "range": "A1:A2"}, index=0)],
+            [ChatDelta(text="ANSWER ONE")],
+            [*call("read_range", {"sheet": "Calc", "range": "A1:A2"}, index=1)],
+            [ChatDelta(text="ANSWER TWO")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = KedgeAgent(
+        client=client,
+        context=ToolContext.for_workspace(workspace),
+        counter=TokenCounter(allow_download=False),
+    )
+    app = create_app(workspace, agent=agent, store=SessionStore(tmp_path / "sessions.sqlite"))
+
+    with TestClient(app) as http:
+        session = http.post("/api/sessions", json={"title": "smoke"}).json()["session"]["id"]
+        turns = f"/api/sessions/{session}/turns"
+        for message in ("carry on", "carry on", "and now the notebook"):
+            with http.stream("POST", turns, json={"message": message}) as response:
+                "".join(response.iter_text())
+
+    contents = [message.get("content") for message in client.seen[4]]
+    assert contents.count("ANSWER ONE") == 1
+    assert contents.count("ANSWER TWO") == 1
+    assert contents.count("carry on") == 2, "one per leg the span reinstates, and no more"
+    assert contents[-1] == "and now the notebook"
+
+
+def test_a_turn_that_read_the_workbook_and_the_kernel_carries_each_as_it_deserves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mixed case as the server produces it, rather than through the loop's own front door.
+
+    The workbook is a file kedge never writes, so what was read of it is still true next turn. The
+    kernel is a thing the user edits in the pane beside the chat, so what was read of it is not.
+    Both messages stay — the endpoint rejects a request whose assistant message carries a call with
+    no result against it — and only one of them still says anything.
+    """
+    from fastapi.testclient import TestClient
+    from openpyxl import Workbook as OpenpyxlWorkbook
+
+    from kedge.server.app import create_app
+    from kedge.server.sessions import SessionStore
+    from kedge.workspace import Workspace
+
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "process.xlsx"
+    book = OpenpyxlWorkbook()
+    sheet = book.active
+    sheet.title = "Calc"
+    sheet.append(["haircut"])
+    sheet.append([0.02])
+    book.save(workbook)
+
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+    client = ScriptedClient(
+        [
+            [
+                *call("read_range", {"sheet": "Calc", "range": "A1:A2"}, index=0),
+                *call("list_cells", {}, index=1),
+            ],
+            [ChatDelta(text="Two rows, and two cells so far.")],
+            [ChatDelta(text="Starting on it.")],
+        ]
+    )
+    agent = KedgeAgent(
+        client=client,
+        context=ToolContext.for_workspace(workspace, driver=FakeDriver()),
+        counter=TokenCounter(allow_download=False),
+    )
+    app = create_app(workspace, agent=agent, store=SessionStore(tmp_path / "sessions.sqlite"))
+
+    with TestClient(app) as http:
+        session = http.post("/api/sessions", json={"title": "smoke"}).json()["session"]["id"]
+        turns = f"/api/sessions/{session}/turns"
+        for message in ("describe Calc", "now build the notebook"):
+            with http.stream("POST", turns, json={"message": message}) as response:
+                "".join(response.iter_text())
+
+    carried = _tools_in(client.seen[2])
+    assert set(carried) == {"call_0", "call_1"}, "every call is still answered"
+    assert "0.02" in carried["call_0"], "the workbook cannot have changed under kedge"
+    assert "import polars as pl" not in carried["call_1"], "the kernel can, and may have"
+    assert "list_cells" in carried["call_1"]
+    assert any(tail in carried["call_1"] for tail in _EVICTION_TAILS)
+
+
 class EndpointRefusedError(KedgeError):
     """A kedge-shaped failure from the model endpoint, for the recoverable-error path."""
 
@@ -730,6 +1277,119 @@ async def test_a_step_the_endpoint_did_not_report_still_contributes_its_estimate
     assert total > reported.total
 
 
+# ── which model actually ran ─────────────────────────────────────────────────────────────────
+
+
+async def test_the_model_recorded_is_the_model_the_turn_ran() -> None:
+    """A per-session override runs, so a per-session override is what gets stamped on artifacts.
+
+    `[model] model` is a default: `routes.py` sends `body.model or session.model`, and the user
+    can change the session's model while the chat is open. Anything the turn produces and dates —
+    a plan, most of all — is read months later by someone asking which model wrote it and whether
+    that model is still trusted. A wrong id ends that question instead of answering it, which is
+    worse than no id at all.
+    """
+    client = ScriptedClient([[ChatDelta(text="done")]])
+    agent = build(client, driver=FakeDriver(), model="config-default")
+
+    await drive(agent, model="chosen-for-this-session")
+
+    assert client.models_asked == ["chosen-for-this-session"]
+    assert agent.registries["s1"].model == "chosen-for-this-session"
+
+
+async def test_config_is_the_fallback_when_the_turn_names_no_model() -> None:
+    client = ScriptedClient([[ChatDelta(text="done")]])
+    agent = build(client, driver=FakeDriver(), model="config-default")
+
+    await drive(agent)
+
+    assert client.models_asked == ["config-default"]
+    assert agent.registries["s1"].model == "config-default"
+
+
+# ── a draft the model cannot get right ───────────────────────────────────────────────────────
+
+
+async def test_a_draft_a_tool_keeps_rejecting_stops_the_turn(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """The cell path caps at three, and this is the same failure wearing different clothes.
+
+    Uncapped, a model that cannot produce a valid plan spends the whole step budget on it — up to
+    `max_steps` completions, each re-sending the whole tool surface — and the turn ends in a pause
+    that reads as though progress were being made. The cap ends it while the useful part is still
+    worth having, and says what that is.
+    """
+    rounds = [call("inspect_workbook", {"section": "operations"})]
+    rounds += [call("propose_plan", {"plan": "here you go: {stages: ["}) for _ in range(6)]
+    agent = build(
+        client := ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+
+    events = await drive(agent)
+    types = [event.type for event in events]
+
+    errors = [event for event in events if event.type == "error"]
+    assert len(errors) == 1
+    assert "rejected the draft 3 times" in errors[0].message
+    assert errors[0].recoverable is True
+    assert "Say in the chat what the process does" in errors[0].message
+    assert types.count("tool_call") == 4  # the read, then three attempts and no more
+    assert len(client.seen) == 4, "it stopped rather than spending the rest of the budget"
+    assert types.count("done") == 1
+
+
+async def test_a_refusal_the_model_cannot_fix_is_not_counted_as_an_attempt(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    # The read gate refuses, and no amount of redrafting changes that: the model has to go and
+    # read something. Counting it would stop the turn with advice about the wrong problem.
+    rounds = [call("propose_plan", {"plan": '{"stages": [], "open_questions": []}'})] * 4
+    rounds += [[ChatDelta(text="Let me read the workbook first.")]]
+    agent = build(
+        ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+
+    events = await drive(agent)
+
+    assert not any(event.type == "error" for event in events)
+    assert [event.type for event in events].count("tool_call") == 4
+
+
+# ── arguments kedge cannot decode ────────────────────────────────────────────────────────────
+
+
+def test_arguments_nested_past_the_recursion_limit_are_handed_back_rather_than_raised() -> None:
+    """`RecursionError` is not a `JSONDecodeError`, and everything reaching the loop's catch-all
+    is reported to the user as Fatal — a whole turn ended and the notebook's state put in doubt,
+    over one tool call kedge was only trying to summarise for the activity trail."""
+    raw = "[" * 3_000 + "1" + "]" * 3_000
+
+    assert _safe_arguments(raw) == {"arguments": raw}
+
+
+async def test_a_tool_call_kedge_cannot_decode_does_not_end_the_turn() -> None:
+    deep = "[" * 3_000 + "1" + "]" * 3_000
+    rounds = [
+        [
+            ChatDelta(index=0, call_id="call_0", name="list_cells"),
+            ChatDelta(index=0, arguments=deep),
+        ],
+        [ChatDelta(text="That argument was nonsense; here is what I found instead.")],
+    ]
+    events = await drive(build(ScriptedClient(rounds), driver=FakeDriver()))
+
+    assert not any(event.type == "error" and event.recoverable is False for event in events), (
+        "a malformed tool call is not a fatal turn"
+    )
+    assert [event.type for event in events].count("done") == 1
+
+
 async def test_the_pinned_blocks_are_ordered_least_volatile_first() -> None:
     # A prompt cache keys on the prefix: whatever sits ahead of a block that changes stays cached
     # and whatever sits behind it does not. The analysis and the plan hold still for a session;
@@ -746,3 +1406,26 @@ async def test_the_pinned_blocks_are_ordered_least_volatile_first() -> None:
     ]
     assert order == sorted(order)
     assert head.index("SYSTEM PROMPT") < order[0]
+
+
+def test_the_shape_recorded_for_an_eviction_stub_stays_inside_the_window_s_own_cap() -> None:
+    """The stub has to cost a fraction of what it replaced, so what describes it must be short.
+
+    It says the same handful of words whether the payload was one number or 32KB — a description
+    that grew with the result would defeat the mechanism it belongs to — and the window re-caps it
+    at render, so a field added here can crowd out what is already in the shape but can never grow
+    the stub.
+    """
+    shapes = [
+        _result_shape(ToolResult(text="x" * 40_000, row_count=49_999, truncated=True)),
+        _result_shape(ToolResult(text="6 cells\nAAaa imports", summary="6 cells")),
+        _result_shape(ToolResult.note("reconciliation failed on 14 of 400 rows " * 20)),
+        _result_shape(ToolResult(text="")),
+    ]
+    assert all(len(shape) <= MAX_EVICTED_SHAPE_CHARS for shape in shapes), shapes
+    assert "49999 rows" in shapes[0] and "truncated" in shapes[0]
+    assert "6 cells" in shapes[1]
+    # `ToolResult.note` defaults its summary to the payload's first line, so a fragment of the
+    # payload reaches the stub. That is deliberate and model-bound: the stub is worth having only
+    # if it says what is missing, and the model has already read the whole result.
+    assert shapes[2].startswith("reconciliation failed")

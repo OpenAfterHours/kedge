@@ -122,6 +122,33 @@ including the contract tests. `ty` is advisory there until its three known diagn
   cached and anything behind it does not; reordering that list is a silent cost regression. And
   `_Meter` accumulates **per step** — a single step's figure understates a turn by up to
   `max_steps`.
+- **A carried turn is re-dated, and its age must not be.** `ConversationWindow.resume` moves a
+  carried message into the turn it is resumed as — it has to, or it sorts behind history that is
+  older than it — and `KedgeAgent._carry` now hands a turn's tool traffic on whether or not the
+  turn answered. Read a message's age off `message.turn` after that and it is one turn old for
+  ever: `_age_out_tool_results` never fires, the span grows by a turn every turn, and the
+  mechanism meant to bound the window is the thing the carry disarms. Age is
+  `ContextMessage.age_at`, which adds the `carried_age` that `suspend()` stamps on the way out.
+  `turn` measures position; only `carried_age` measures time.
+- **The carried span sits on a moving boundary, and moving it every turn is a cost regression.**
+  The prompt is `head | flattened history | carried span | this message`. A leg that leaves the
+  span comes back in history *flattened* — one assistant message holding the answer, where the span
+  held interim prose, tool calls and results — so the moment that boundary moves, the new prompt
+  stops matching the old one at the first carried message and the whole span is re-sent uncached.
+  Measured at the default horizon against a 9k head: **1,408 uncached tokens a turn** to carry
+  payloads worth a few hundred. `ConversationWindow._recut` therefore stubs and drops legs together
+  on one turn in `CARRY_BLOCK_TURNS`, leaving the other turns append-only; the same measurement
+  becomes 1,292 / 254 alternating, a mean of 773. The re-cut turn's cost is irreducible — the leg
+  has to cross to history eventually and it is a different shape there. Anything that stubs or
+  drops one leg per turn puts the per-turn cost back, and stamping the stub on the *sending* side
+  is what keeps `_age_out_tool_results` from doing exactly that on arrival.
+- **A count of messages is not a bound on a cost.** One `sample_data` payload at the 32KB cap is
+  some fifteen thousand tokens, so `MAX_CARRIED_MESSAGES` of them is twenty times a 128k context.
+  `CARRY_BUDGET_SHARE` bounds the span in characters as well, and it is measured on the raw
+  payloads rather than on what they render as, because the same bound has to hold on what a session
+  *holds* — the alternative is six megabytes per session and a carry `fit()` throws away in full at
+  the far end. `[context] max_tool_result_tokens` is not this knob: it is a per-result truncation
+  ceiling, and it is read nowhere in `src/`.
 - Chat completions reports token usage only if asked (`stream_options={"include_usage": True}`,
   dropped from the ladder in `_recover` if the endpoint refuses it); responses reports it
   unprompted on `response.completed`. Prefer it over `TokenCounter`, which is an estimate over a

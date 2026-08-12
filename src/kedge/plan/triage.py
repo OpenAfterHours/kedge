@@ -42,6 +42,7 @@ from kedge.analysis.model import (
     SheetRole,
     WorkbookAnalysis,
 )
+from kedge.plan.model import Assessment
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,28 @@ class TriageResult:
         return [
             blocker.render() for blocker in (*self.conversion_blockers, *self.verification_blockers)
         ]
+
+    def as_assessment(self) -> Assessment:
+        """Render this triage as a plan's :class:`~kedge.plan.model.Assessment`.
+
+        The convertibility figure on a plan is a claim about the *workbook*, and this is where it
+        comes from whenever nobody has independently scored it. A model asked to score its own
+        decomposition has nothing to score it against, so the number it returns reads as evidence
+        while being an opinion — and a plan that says ``0.9`` because the model felt confident is
+        precisely the notebook that looks more complete than it is (PLAN 2.2).
+
+        Returns:
+            The assessment, carrying every blocker this triage found and a rationale naming the
+            verdict, so a reader can see the figure was not hand-waved.
+        """
+        return Assessment(
+            convertible=self.convertible,
+            blockers=self.blocker_lines(),
+            rationale=(
+                f"kedge triage: {self.verdict.value}, complexity {self.complexity:.2f}. Scored "
+                f"deterministically from the analysis, not estimated."
+            ),
+        )
 
     def explain(self) -> str:
         """A complete, plain-English explanation, including what the user can do about it.

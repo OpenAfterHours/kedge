@@ -820,7 +820,8 @@ async def _step_plan(workspace: Workspace, job: OpenJob) -> Any:
     job.step(
         "planning",
         "skipped",
-        "no process plan yet. The notebook opens empty; ask kedge in the chat to propose one.",
+        "no process plan yet. The notebook opens empty; ask kedge in the chat to propose one, "
+        "or run `kedge plan propose` on the command line.",
     )
     return None
 

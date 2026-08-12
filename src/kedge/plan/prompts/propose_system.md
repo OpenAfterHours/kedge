@@ -52,9 +52,10 @@ takes an afternoon. Write for that reader.
    checkpoint scaffolds to an approval cell where the user records a decision and a reason, and
    downstream cells stay blocked until they do. That is *better* than the Excel original, where
    the same step was someone typing a number with no record of why.
-6. **Be honest in `confidence` and in `assessment.convertible`.** An honest `0.4` with blockers
-   listed is far more useful than a plan that looks complete and is not. `low` on a stage you
-   are unsure of costs nothing; it makes the generated cell carry a review marker.
+6. **Be honest in `confidence`.** `low` on a stage you are unsure of costs nothing; it makes the
+   generated cell carry a review marker, and a plan that admits what it is unsure of is far more
+   useful than one that looks complete and is not. `assessment` is not yours: the schema requires
+   the field, so fill it in and move on — kedge replaces it with its own deterministic triage.
 7. **`depends_on` carries the real shape.** Stage order alone cannot express a DAG. List every
    stage a stage genuinely needs. Do not invent dependencies to force a straight line.
 8. **Where the vocabulary does not cover what the workbook does, raise an open question.** Do
@@ -75,9 +76,9 @@ Return **one JSON object** and nothing else. No prose before or after, no markdo
 
 | Field | Type | Notes |
 |---|---|---|
-| `assessment.convertible` | number 0-1 | Proportion of the logic you believe can be translated faithfully |
-| `assessment.blockers` | array of strings | Why it is not 1.0. Empty only if genuinely nothing |
-| `assessment.rationale` | string or null | One sentence on how you arrived at the figure |
+| `assessment.convertible` | number 0-1 | Required by the schema, then replaced by kedge's triage |
+| `assessment.blockers` | array of strings | Same. What a reviewer must act on belongs in `open_questions` |
+| `assessment.rationale` | string or null | Same |
 | `stages` | array, at least one | In the order they should run |
 | `stages[].id` | string | Short lower_snake_case slug, unique. Becomes the notebook cell name |
 | `stages[].intent` | string | What this step is for, in the business's own terms |

@@ -161,9 +161,10 @@ yet and the planner has to produce one. `kedge inspect` does not go through it �
 **What it needed, and got.** `from kedge.analysis.analyse import analyse`, with the now-pointless
 `ty: ignore` deleted alongside it. Re-exporting `analyse` from the package `__init__` would have
 worked too and would make the shadowing impossible to hit again, but it widens the analyser's
-public surface, which `analysis/__init__.py` documents deliberately. What is still missing is a
-test over the no-saved-analysis branch — nothing currently exercises it, which is how a
-`TypeError` on a live path survived to a release.
+public surface, which `analysis/__init__.py` documents deliberately. The missing test over the
+no-saved-analysis branch — whose absence is how a `TypeError` on a live path survived to a
+release — now exists: `kedge plan propose` on a workbook with no `analysis.json` runs it, in
+`tests/unit/test_cli.py::test_propose_analyses_the_workbook_when_none_has_been_saved`.
 
 ### 6. `src/kedge/server/hub.py:879` — `invalid-argument-type`
 

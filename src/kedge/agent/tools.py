@@ -1,4 +1,4 @@
-"""The tool surface: fifteen tools, one choke point, and a cap the model cannot walk around.
+"""The tool surface: sixteen tools, one choke point, and a cap the model cannot walk around.
 
 PLAN M4 lists the tools and PLAN 2.3 states the rule that shapes this module: *every*
 value-returning tool caps its result at 100 rows and 32KB, truncating with an explicit
@@ -18,7 +18,7 @@ tool remembers":
 3. The same choke point writes the audit line. There is no way to return a payload to the model
    without it being counted, and no way to count it without it having been capped first.
 
-Adding a sixteenth tool therefore inherits the cap by construction. Forgetting it would require
+Adding a seventeenth tool therefore inherits the cap by construction. Forgetting it would require
 deleting :meth:`dispatch`.
 
 **The model never touches the notebook directly.** Structural changes go through the validation
@@ -26,10 +26,34 @@ gate first (:mod:`kedge.agent.validate`), and ``delete_cell`` does not delete: i
 request and returns it, because a destructive change to the user's notebook is the user's decision
 and a model that can delete a cell on its own reasoning will eventually delete the wrong one.
 
+**Nor does it touch the plan.** ``propose_plan`` and ``amend_plan`` are the same shape: both
+record a proposal, say plainly that nothing has happened, and leave the writing to the user's
+half of the decision in :mod:`kedge.server.routes`. They divide the ground between them, and the
+division is the control PLAN 2.2 puts around a plan change — ``propose_plan`` authors a first
+plan and refuses once one has been approved, so a whole replacement decomposition cannot be
+walked past the review that ``amend_plan`` puts a single change through. It refuses three more
+things, for the same reason it refuses that one: it is the tool that turns a conversation into a
+large, structured, confident-looking artifact, so what must not happen is refused rather than
+discouraged. A workbook :func:`kedge.plan.triage.triage` returned ``STOP`` for is not planned at
+all, which is the refusal :func:`kedge.plan.propose.propose_plan` makes on the CLI path and which
+must mean the same thing reached through the chat. A session that has read nothing about the
+workbook cannot propose a plan about it (:data:`WORKBOOK_READING_TOOLS`). And no plan may be
+larger than a notebook someone will actually review (:data:`MAX_PROPOSED_STAGES`).
+
 Every collaborator is optional and every tool degrades to a sentence explaining what is missing.
 A workspace with no marimo attached, no analysis, no plan, an empty ``utils/`` and no knowledge
 pack is a normal early state, not a broken one — and "there is no plan yet" is a far more useful
 tool result than a traceback.
+
+**A result is remembered only when it cannot go stale.** :class:`ToolKind` says what a tool does;
+:class:`Volatility` says how long its answer stays true, and only the session-stable tools — the
+ones that are pure functions of the deterministic analysis and of an ``.xlsx`` kedge never writes
+— are held for the session. The cache is keyed on a fingerprint of those files, so a user who
+saves the workbook from Excel mid-session invalidates it without knowing it exists, and a hit
+still goes back through :meth:`ToolRegistry._finalise`, so the audit log gains no holes. The open
+workbook handle is keyed on that same fingerprint (:meth:`ToolRegistry._workbook`), because a
+cache that invalidates over a handle that does not would re-run the handler against the file as
+it was and charge the model for the same stale answer twice.
 """
 
 from __future__ import annotations
@@ -59,26 +83,34 @@ if TYPE_CHECKING:
     from kedge.agent.context import NameRegistry, NotebookState
     from kedge.analysis.model import WorkbookAnalysis
     from kedge.notebook.model import NotebookBridge
+    from kedge.plan.model import ProcessPlan
     from kedge.plan.store import PlanStore
     from kedge.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MAX_CACHED_BYTES",
+    "MAX_CACHED_RESULTS",
     "MAX_PAYLOAD_BYTES",
+    "MAX_PROPOSED_STAGES",
     "MAX_ROWS",
     "OMISSION_TEMPLATE",
     "TOOL_SPECS",
+    "WORKBOOK_READING_TOOLS",
     "Caps",
     "PendingAmendment",
     "PendingDeletion",
+    "PendingProposal",
     "ToolContext",
     "ToolKind",
     "ToolRegistry",
     "ToolResult",
     "ToolSpec",
+    "Volatility",
     "tool_names",
     "tool_schemas",
+    "volatility_of",
 ]
 
 MAX_ROWS = 100
@@ -86,6 +118,44 @@ MAX_ROWS = 100
 
 MAX_PAYLOAD_BYTES = 32_768
 """Default payload cap in bytes (PLAN 2.3). Overridden by ``[sampling]``."""
+
+MAX_CACHED_RESULTS = 32
+"""How many session-stable results one registry holds before the oldest is dropped."""
+
+MAX_CACHED_BYTES = 1_048_576
+"""How many bytes of cached payload one registry holds.
+
+Roughly ``MAX_CACHED_RESULTS`` results at the payload cap, so neither bound is decorative: a
+session that profiles fifty columns is held by the count, and one that reads fifty wide ranges by
+the bytes.
+"""
+
+MAX_PROPOSED_STAGES = 50
+"""Ceiling on the stages one proposed plan may carry.
+
+One stage becomes one cell, so this is the size of the notebook the plan describes. Fifty is the
+point past which two other things have already broken: a reviewer cannot hold that many stages in
+their head, which is the whole pitch (PLAN 2.6), and :data:`~kedge.agent.loop.DEFAULT_MAX_STEPS`
+is fifty completions, so a longer plan could not be scaffolded inside one turn even if it were
+right. A workbook that genuinely needs more stages than this is two processes, and the useful
+answer is to say so rather than to write one plan that nobody will read.
+"""
+
+WORKBOOK_READING_TOOLS: frozenset[str] = frozenset(
+    {"inspect_workbook", "sample_data", "profile_column", "read_range"}
+)
+"""The tools whose successful use means the model has actually looked at this workbook.
+
+The four that return facts about the workbook — the deterministic analysis beyond the pinned
+summary, and the ``.xlsx`` itself. ``probe`` is deliberately not among them: it runs against the
+live kernel and describes the hand-in loaded into the notebook rather than the process the
+workbook performs, which is what a plan decomposes. It could not be a route round this anyway,
+since probing needs cells and cells need an approved plan.
+
+Used by ``propose_plan`` to refuse a plan written from nothing. Membership is what the registry
+counts, and only an ``ok`` result counts: a ``sample_data`` call against a sheet that does not
+exist has read no more than not calling it would have.
+"""
 
 OMISSION_TEMPLATE = "[… {count} more rows omitted]"
 """The marker PLAN M4 requires on every truncated result. Its presence is the model's signal."""
@@ -210,6 +280,17 @@ class ToolResult:
     validated: bool | None = None
     """``True``/``False`` when the validation gate ran, ``None`` when the tool does not use it."""
 
+    draft_rejected: bool = False
+    """The model's own draft came back wrong and the loop should count the attempt.
+
+    Set only where calling again *with a corrected draft* is the right response — a plan whose
+    fields did not validate, a plan too large to be a plan. A refusal no retry can change (no plan
+    store attached, a plan already approved) leaves this ``False``, because capping those would be
+    counting the wrong thing and the message at the cap would be advice about the wrong problem.
+    :meth:`kedge.agent.loop.KedgeAgent._invoke` is what reads it, and it stops the turn at
+    :data:`~kedge.agent.loop.MAX_DRAFT_ATTEMPTS` exactly as the validation gate stops a cell.
+    """
+
     cell_id: str | None = None
     cell_name: str | None = None
     cell_preview: str = ""
@@ -306,6 +387,33 @@ class ToolKind(StrEnum):
     """Returns kedge's own artifacts: the plan, the catalogue, a knowledge pack."""
 
 
+class Volatility(StrEnum):
+    """How long a tool's result stays true, which is what decides whether it may be remembered.
+
+    Orthogonal to :class:`ToolKind`. That axis is about what a tool *does* — return data, change
+    the notebook, read kedge's own artifacts — and on it ``inspect_workbook``, which reads a file
+    the analyser wrote once, sits beside ``probe``, which runs arbitrary code against a live
+    kernel. This axis asks the other question: *called again with the same arguments an hour
+    later, could the answer have changed?*
+
+    Answer it for a new tool by naming what would have to change for its result to become wrong.
+    Nothing kedge or the user can do within a session — :attr:`SESSION_STABLE`. A file in the
+    project directory — :attr:`ARTIFACT_TIED`. The kernel, the notebook, or the call's own side
+    effects — :attr:`VOLATILE`, which is also the default, so a tool added without a thought
+    spent here is simply never remembered.
+    """
+
+    SESSION_STABLE = "session_stable"
+    """A pure function of the deterministic analysis and of the ``.xlsx``, neither of which kedge
+    writes. Cached for the session, keyed on a fingerprint of those files."""
+    ARTIFACT_TIED = "artifact_tied"
+    """True until one of kedge's own artifacts changes — the plan, ``utils/``, ``context/``. Not
+    cached today: these are cheap to read, and the plan is pinned into every turn regardless."""
+    VOLATILE = "volatile"
+    """True only at the moment it was read. A live kernel, a mutation, or a decision put to the
+    user. Never cached, and never carried forward as though it still described anything."""
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     """One tool as the model sees it, plus how kedge treats it."""
@@ -316,8 +424,22 @@ class ToolSpec:
     required: tuple[str, ...] = ()
     kind: ToolKind = ToolKind.VALUE
 
+    volatility: Volatility = Volatility.VOLATILE
+    """How long this tool's result stays true (:class:`Volatility`).
+
+    The default is deliberately the pessimistic one. A tool added later must opt in to being
+    remembered, because inheriting a cache by omission is how a payload that stopped being true
+    reaches the model with nobody having decided that it should.
+    """
+
     def schema(self) -> dict[str, Any]:
-        """The OpenAI chat-completions tool definition."""
+        """The OpenAI chat-completions tool definition.
+
+        Assembled key by key rather than dumped from the dataclass, and deliberately so: these
+        schemas are the head of the system prompt, which is the prompt cache's prefix, so a field
+        added here for kedge's own use would be a silent cost regression on every turn of every
+        session. ``kind`` and ``volatility`` are kedge's business and stay out of it.
+        """
         return {
             "type": "function",
             "function": {
@@ -443,6 +565,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "operation": _string("A logical operation id, required by the 'operation' section."),
         },
         required=("section",),
+        volatility=Volatility.SESSION_STABLE,
     ),
     ToolSpec(
         name="sample_data",
@@ -462,6 +585,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             },
         },
         required=("sheet",),
+        volatility=Volatility.SESSION_STABLE,
     ),
     ToolSpec(
         name="profile_column",
@@ -474,6 +598,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "column": _string("Column letter, e.g. 'H', or the header text."),
         },
         required=("sheet", "column"),
+        volatility=Volatility.SESSION_STABLE,
     ),
     ToolSpec(
         name="read_range",
@@ -490,6 +615,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             ),
         },
         required=("sheet", "range"),
+        volatility=Volatility.SESSION_STABLE,
     ),
     ToolSpec(
         name="probe",
@@ -515,6 +641,40 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "questions. These are your standing instructions."
         ),
         properties={},
+        kind=ToolKind.CONTEXT,
+        volatility=Volatility.ARTIFACT_TIED,
+    ),
+    ToolSpec(
+        name="propose_plan",
+        description=(
+            "Author the process plan: the stages in order, what each is for, where its inputs "
+            "come from, what it assumes, and what you still do not know. Read the workbook first "
+            "and call this once you can defend the decomposition — a plan is a reading of the "
+            "workbook, not a guess at one, and it is refused outright until you have used "
+            "inspect_workbook, sample_data, profile_column or read_range at least once. An "
+            "account left in the chat is compacted away as the conversation grows; a plan is on "
+            "disk, versioned, diffable and in front of you on every later turn. Requires the "
+            "user's approval exactly like the original planning step, so this records the "
+            "proposal and surfaces it; it writes nothing and changes no instructions. Refused "
+            "once a plan has been approved, and refused outright for a workbook kedge's own "
+            "triage has recommended against converting."
+        ),
+        properties={
+            "plan": _string(
+                'The plan as a JSON object: {"summary": one or two sentences on the shape of the '
+                'process, "stages": [{"id": short slug, becomes the cell name, "intent": what the '
+                'step is for in the business\'s own terms, "kind": load|transform|output|'
+                'checkpoint, "sources": sheet-qualified ranges, "handin", or upstream stage ids, '
+                '"depends_on": stage ids that must run first, "confidence": high|medium|low, '
+                '"assumptions": what the translation takes for granted, "operations": ids of the '
+                'analysis operations this implements, "excel_pattern": the pattern it translates'
+                '}], "open_questions": what you could not work out — required, and an empty list '
+                'on a complex workbook is itself suspicious, "dropped": [{"range": ..., "reason": '
+                "...}]}. Only id and intent are required of a stage. Send no assessment: "
+                "convertibility is scored by kedge's own triage, not by you."
+            )
+        },
+        required=("plan",),
         kind=ToolKind.CONTEXT,
     ),
     ToolSpec(
@@ -556,6 +716,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         ),
         properties={"query": _string("Filter by substring against name and description.")},
         kind=ToolKind.CONTEXT,
+        volatility=Volatility.ARTIFACT_TIED,
     ),
     ToolSpec(
         name="get_knowledge",
@@ -565,6 +726,7 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         ),
         properties={"key": _string("A document key or a table name. Omitted, the whole pack.")},
         kind=ToolKind.CONTEXT,
+        volatility=Volatility.ARTIFACT_TIED,
     ),
 )
 
@@ -580,6 +742,24 @@ def tool_names() -> tuple[str, ...]:
 
 
 _SPECS_BY_NAME = {spec.name: spec for spec in TOOL_SPECS}
+
+
+def volatility_of(name: str) -> Volatility:
+    """Return how long ``name``'s results stay true.
+
+    The lookup exists so a caller deciding what is still worth carrying forward — the agent loop,
+    holding a finished turn's tool traffic — can ask the question without reaching into the specs
+    table. An unknown name answers :attr:`Volatility.VOLATILE`, because the only safe assumption
+    about a result whose provenance kedge cannot identify is that it has already expired.
+
+    Args:
+        name: The tool name, as the model asked for it.
+
+    Returns:
+        The tool's volatility, or :attr:`Volatility.VOLATILE` for a name this build does not offer.
+    """
+    spec = _SPECS_BY_NAME.get(name)
+    return spec.volatility if spec is not None else Volatility.VOLATILE
 
 
 # ── pending user decisions ───────────────────────────────────────────────────────────────────
@@ -601,6 +781,20 @@ class PendingAmendment:
     rationale: str
     change: str
     stage: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingProposal:
+    """A whole process plan the model authored and the user has not approved.
+
+    The plan is assembled in full here — provenance and all — rather than at approval time,
+    because the analysis it is a reading of is at hand in the tool and may not be by the time the
+    user clicks. Assembling it is not writing it: nothing reaches
+    :class:`~kedge.plan.store.PlanStore` until :mod:`kedge.server.routes` is asked to, and until
+    then this is a proposal in memory that dies with the session if it is never approved.
+    """
+
+    plan: ProcessPlan
 
 
 # ── context ──────────────────────────────────────────────────────────────────────────────────
@@ -683,6 +877,13 @@ class ToolRegistry:
     notebook state rebuilt from the kernel, so the validation gate and the tools are checking
     against what is actually there rather than against what the conversation remembers.
 
+    The session cache hangs off the same instance and has the same lifetime, which is the whole
+    reason it is safe: it holds only :attr:`Volatility.SESSION_STABLE` results, keyed on a
+    fingerprint of the files those results were read from, so a repeat question is cheap rather
+    than forbidden and a workbook saved from Excel mid-session answers freshly. The open workbook
+    handle is held on the same terms and released the moment that fingerprint moves
+    (:meth:`_workbook`), or the miss would only buy a second read of the file as it was.
+
     Example:
         >>> import asyncio
         >>> registry = ToolRegistry(ToolContext())
@@ -696,9 +897,15 @@ class ToolRegistry:
         self._state: NotebookState | None = None
         self._registry: NameRegistry | None = None
         self._handle: Any = None
+        self._handle_fingerprint: str | None = None
         self._handle_failed = False
+        self._model: str | None = None
+        self._read: set[str] = set()
+        self._cache: dict[str, ToolResult] = {}
+        self._cache_bytes = 0
         self.pending_deletions: list[PendingDeletion] = []
         self.pending_amendments: list[PendingAmendment] = []
+        self.pending_proposals: list[PendingProposal] = []
 
     # ── per-turn state ───────────────────────────────────────────────────────────────────
 
@@ -712,10 +919,35 @@ class ToolRegistry:
         """The live name registry, or ``None`` before the first refresh."""
         return self._registry
 
-    def refresh(self, state: NotebookState) -> None:
-        """Adopt the notebook state read from the kernel at the start of a turn."""
+    @property
+    def model(self) -> str | None:
+        """The model id driving the turn, or ``None`` where nobody has said."""
+        return self._model
+
+    @property
+    def has_read_workbook(self) -> bool:
+        """Whether any :data:`WORKBOOK_READING_TOOLS` call has succeeded this session."""
+        return bool(self._read)
+
+    def refresh(self, state: NotebookState, *, model: str | None = None) -> None:
+        """Adopt the per-turn facts, read fresh at the top of every turn.
+
+        Both of these have exactly the lifetime of a turn, which is why they arrive together and
+        why this is where they arrive. The notebook state was rebuilt from the kernel because the
+        user edits cells between turns. The model id is the one the turn will actually run, which
+        is not necessarily the one in config: it can be overridden per session and per request,
+        and an artifact stamped with the configured id instead would be confidently wrong about
+        the one forensic question a plan's provenance exists to answer.
+
+        Args:
+            state: The notebook as the kernel has it now.
+            model: The model driving this turn. ``None`` leaves it unstamped, which is the honest
+                answer — a guess here is worse than an absence, because it reads as a fact.
+        """
         self._state = state
         self._registry = state.registry
+        if model is not None:
+            self._model = model
 
     def set_context(self, context: ToolContext) -> None:
         """Replace the collaborators, e.g. once marimo has come up mid-session."""
@@ -735,6 +967,10 @@ class ToolRegistry:
         This is the only path from a tool to the model. It parses the arguments the model sent,
         dispatches, re-applies the payload cap to whatever came back, and writes one audit line
         describing the payload's shape — never its values.
+
+        A session-stable tool asked the same question twice is answered from the session cache,
+        which changes what the call costs and nothing else: the text is byte-identical and the
+        audit line is written either way.
 
         Args:
             name: The tool name the model asked for.
@@ -773,6 +1009,17 @@ class ToolRegistry:
                 turn_id,
             )
 
+        cache_key = self._cache_key(spec, parsed)
+        if cache_key is not None:
+            remembered = self._cache.get(cache_key)
+            if remembered is not None:
+                logger.debug("tool %s answered from the session cache", name)
+                # Back through _finalise rather than returned straight from here. Every payload
+                # handed to the model is one line in the outbound log, and a log that grew holes
+                # wherever a result came from memory would be a worse defect than the second read
+                # it saved (SECURITY.md). The text is byte-identical, so the line is too.
+                return self._finalise(name, remembered, turn_id)
+
         handler = getattr(self, f"_tool_{name}")
         try:
             result = await handler(parsed)
@@ -782,13 +1029,23 @@ class ToolRegistry:
         except Exception as exc:
             logger.exception("tool %s raised", name)
             result = ToolResult.note(f"{name} could not run: {type(exc).__name__}: {exc}", ok=False)
-        return self._finalise(name, result, turn_id)
+        finalised = self._finalise(name, result, turn_id)
+        if cache_key is not None and finalised.ok:
+            # Only a success. A transient failure that pinned itself for the session would be a
+            # tool that stays broken until the user restarts kedge.
+            self._remember(cache_key, finalised)
+        return finalised
 
     def _finalise(self, name: str, result: ToolResult, turn_id: str | None) -> ToolResult:
         """Apply the payload cap unconditionally, then record the payload's shape.
 
         The re-cap is the belt to :meth:`ToolResult.from_rows`'s braces. A handler that builds a
         result by hand cannot emit an uncapped payload, because it does not control this step.
+
+        It is also where the session's reading is noted. The same argument that puts the audit
+        line here puts this here: a payload cannot reach the model without passing through, so
+        "has this session read the workbook?" is answered from the same evidence the outbound log
+        is written from, including on the path where a result came back from the cache.
         """
         text, clipped = _cap_text(result.text, self._context.caps)
         capped = (
@@ -798,6 +1055,8 @@ class ToolRegistry:
                 result, text=text, truncated=True, summary=result.summary or _first_line(text)
             )
         )
+        if capped.ok and name in WORKBOOK_READING_TOOLS:
+            self._read.add(name)
         if self._log is not None:
             self._log.record(
                 tool=name,
@@ -813,11 +1072,90 @@ class ToolRegistry:
             )
         return capped
 
+    # ── the session cache ────────────────────────────────────────────────────────────────
+
+    def _cache_key(self, spec: ToolSpec, args: Mapping[str, Any]) -> str | None:
+        """Build this call's cache key, or ``None`` when the call must not be cached at all.
+
+        Four things go into it: the tool; its arguments rendered with their keys in a fixed order,
+        because the model emits them in whatever order it likes and the same question asked twice
+        has to land on the same key; the fingerprint of the files the answer is a function of; and
+        the settings the payload was rendered under. That last part is short but not optional — a
+        result read before a redaction pattern was added was rendered without it, and reissuing it
+        afterwards would be kedge quietly unredacting a column.
+        """
+        if spec.volatility is not Volatility.SESSION_STABLE:
+            return None
+        fingerprint = self._fingerprint()
+        if fingerprint is None:
+            return None
+        try:
+            rendered = json.dumps(args, sort_keys=True, default=str, ensure_ascii=False)
+        except TypeError:  # pragma: no cover - a caller-supplied mapping, never model JSON
+            return None
+        context = self._context
+        settings = (
+            f"{context.caps.max_rows}:{context.caps.max_payload_bytes}:"
+            f"{context.hash_prefix_length}:{'|'.join(context.redaction_patterns)}"
+        )
+        return f"{spec.name}\x1f{fingerprint}\x1f{settings}\x1f{rendered}"
+
+    def _fingerprint(self) -> str | None:
+        """Identify the workbook and the analysis a session-stable result was read from.
+
+        ``st_mtime_ns`` and ``st_size`` of every file such a result is a function of. A user who
+        opens the workbook in Excel, changes a rate and saves it invalidates every cached row
+        without knowing the cache exists — which is the only reason it is safe to hold rows read
+        from a file kedge does not own.
+
+        Returns ``None`` when nothing could be stat'd, and the caller must then not cache. A
+        payload that cannot be shown to still be current is worth less than the read it saves.
+        """
+        analysis = self._context.analysis
+        workspace = self._context.workspace
+        sources: list[Path] = []
+        if workspace is not None:
+            sources += [workspace.workbook_path, workspace.analysis_path]
+        if analysis is not None:
+            sources.append(Path(analysis.workbook.path))
+
+        parts: list[str] = []
+        seen: set[str] = set()
+        for source in sources:
+            key = str(source)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                stat = source.stat()
+            except OSError:
+                continue
+            parts.append(f"{key}:{stat.st_mtime_ns}:{stat.st_size}")
+        if analysis is not None:
+            # The loaded analysis can be replaced in memory without analysis.json moving — a
+            # re-run is a new answer to the same question, and the results quoting it are stale.
+            parts.append(f"{analysis.workbook.sha256}:{analysis.generated_at.isoformat()}")
+        return "|".join(parts) or None
+
+    def _remember(self, key: str, result: ToolResult) -> None:
+        """Hold a result for the session, evicting oldest-first to stay inside both bounds."""
+        previous = self._cache.pop(key, None)
+        if previous is not None:
+            self._cache_bytes -= previous.byte_count
+        self._cache[key] = result
+        self._cache_bytes += result.byte_count
+        while self._cache and (
+            len(self._cache) > MAX_CACHED_RESULTS or self._cache_bytes > MAX_CACHED_BYTES
+        ):
+            oldest = next(iter(self._cache))
+            self._cache_bytes -= self._cache.pop(oldest).byte_count
+
     async def aclose(self) -> None:
         """Release the workbook handle, if one was opened."""
         if self._handle is not None:
             await asyncio.to_thread(self._handle.close)
             self._handle = None
+            self._handle_fingerprint = None
 
     # ── collaborators ────────────────────────────────────────────────────────────────────
 
@@ -843,17 +1181,42 @@ class ToolRegistry:
             raise KedgeError(msg)
         return analysis
 
-    async def _workbook(self) -> Any:
-        """Open the workbook lazily, once, and keep it for the session."""
-        if self._handle is not None:
-            return self._handle
-        if self._handle_failed:
-            msg = "the workbook could not be opened earlier in this session; see the server log."
-            raise KedgeError(msg)
+    def _require_workspace(self) -> Workspace:
         workspace = self._context.workspace
         if workspace is None:
             msg = "no workspace is attached, so the workbook cannot be read."
             raise KedgeError(msg)
+        return workspace
+
+    async def _workbook(self) -> Any:
+        """Open the workbook lazily, and keep it only while it is still the same file.
+
+        A :class:`~kedge.analysis.workbook.WorkbookHandle` is a zip archive and two openpyxl
+        views read at open time, so a handle held across a save answers from the workbook as it
+        was. That would make the session cache's invalidation theatre: the cache would miss on
+        the new fingerprint, the handler would re-read the same already-open handle, and the
+        model would pay to be told the identical stale thing twice.
+
+        Which is not hypothetical, because it is the workflow kedge itself asks for. "Open the
+        workbook in Excel, allow it to calculate, and save it" is the remedy
+        :mod:`kedge.analysis.findings` prints, and the one ``reconcile`` returns for a workbook
+        with no cached values — so the user who follows it and says "try again" is exactly the
+        user who would be told the same failure about the file they have just fixed.
+
+        The change is detected with :meth:`_fingerprint`, the same one the cache keys on, so
+        there is one notion of "has the workbook changed" rather than two that can drift. No
+        fingerprint means no reopen: an answer that cannot be compared is not evidence of a
+        change, and reopening on every call would be the expensive reading of a silence.
+        """
+        fingerprint = self._fingerprint()
+        if self._handle is not None:
+            if fingerprint is None or fingerprint == self._handle_fingerprint:
+                return self._handle
+            return await self._reopen(fingerprint)
+        if self._handle_failed:
+            msg = "the workbook could not be opened earlier in this session; see the server log."
+            raise KedgeError(msg)
+        workspace = self._require_workspace()
         from kedge.analysis.workbook import open_workbook
 
         try:
@@ -861,7 +1224,70 @@ class ToolRegistry:
         except Exception:
             self._handle_failed = True
             raise
+        self._handle_fingerprint = fingerprint
         return self._handle
+
+    async def _reopen(self, fingerprint: str) -> Any:
+        """Replace a handle whose file has moved underneath it.
+
+        The old handle is **closed**, not dropped.
+        :meth:`~kedge.analysis.workbook.WorkbookHandle.close` releases three OS handles, and
+        leaving them to the collector leaves them on a file the user is actively editing in
+        Excel — on Windows that is worse than a leak. Closed off the event loop, for the same
+        reason the open it mirrors is.
+
+        It is closed *before* the replacement is opened, and the attribute is cleared first, so
+        there is no path out of here that leaves a stale handle reachable. Serving the old file
+        quietly is the one outcome that must not be possible: it is what this whole method
+        exists to prevent.
+
+        A reopen that fails does not set ``_handle_failed``. The file has just been written, so
+        the likeliest cause is a write still in flight — Excel replaces the workbook rather than
+        editing it in place, and there is a moment in the middle where it cannot be opened.
+        Pinning the session on that would strand the user at the moment they had done what kedge
+        asked. The next call finds no handle and goes through the ordinary open path above,
+        which pins if it fails too; that is the existing mechanism doing its job one attempt
+        later, rather than a second one invented here.
+
+        Args:
+            fingerprint: The current fingerprint, stamped on the new handle so the next call
+                compares against what was actually opened.
+
+        Returns:
+            The fresh handle.
+
+        Raises:
+            KedgeError: The workbook changed and the new version could not be opened. Carries
+                what the model needs to know, which is mostly that its earlier reads describe
+                the previous version and must not be quoted as current.
+        """
+        stale = self._handle
+        self._handle = None
+        self._handle_fingerprint = None
+        logger.info("the workbook changed on disk; reopening it")
+        await asyncio.to_thread(stale.close)
+
+        workspace = self._require_workspace()
+        from kedge.analysis.workbook import open_workbook
+
+        try:
+            handle = await asyncio.to_thread(open_workbook, workspace.workbook_path)
+        except Exception as exc:
+            logger.warning("the workbook changed on disk and would not reopen: %s", exc)
+            msg = (
+                f"the workbook changed on disk during this session and the new version could "
+                f"not be opened ({exc}). The copy kedge had been reading was released rather "
+                f"than reused, so nothing is being answered from the old file — but everything "
+                f"you read from this workbook earlier describes the version before that change, "
+                f"and must not be quoted as current. If the user is part-way through saving "
+                f"{workspace.workbook_path.name} from Excel, wait for that to finish and read "
+                f"again; otherwise tell them kedge can no longer open it, and say what you were "
+                f"trying to read."
+            )
+            raise KedgeError(msg) from exc
+        self._handle = handle
+        self._handle_fingerprint = fingerprint
+        return handle
 
     # ── notebook tools ───────────────────────────────────────────────────────────────────
 
@@ -1182,9 +1608,12 @@ class ToolRegistry:
             state = "proposed but NOT approved"
         if plan is None:
             return ToolResult.note(
-                "no process plan exists for this workbook yet. Nothing should be written to the "
-                "notebook until one has been proposed and approved — run `kedge plan` first. "
-                "Improvising a decomposition here is exactly what the plan exists to prevent.",
+                "no process plan exists for this workbook yet, so you have no standing "
+                "instructions and nothing should be written to the notebook. The planning step is "
+                "yours: work out what this workbook does, stage by stage, then send that account "
+                "through `propose_plan` for the user to approve. That is the only way a plan gets "
+                "written, so do not tell the user to run a command instead. Improvising a "
+                "decomposition cell by cell is what the plan exists to prevent.",
                 ok=False,
                 summary="no plan",
             )
@@ -1193,6 +1622,169 @@ class ToolRegistry:
         return ToolResult.note(
             f"This plan is {state}.\n\n{build_plan_block(plan)}",
             summary=f"plan v{plan.version} ({state})",
+            caps=self._context.caps,
+        )
+
+    async def _tool_propose_plan(self, args: Mapping[str, Any]) -> ToolResult:
+        """Record a whole proposed plan for the user to approve. Volatile, and deliberately so.
+
+        Nothing about this may be remembered: it has a side effect, its refusal depends on what is
+        in the plan store at the moment it is called, and a second proposal answered from a cache
+        would be a proposal that never reached the user.
+
+        Four refusals guard it, and only the last is about the plan's contents. It is the one
+        tool on this surface that turns a conversation into a large, structured, confident-looking
+        artifact, and it is offered on every one of up to ``max_steps`` completions — so the
+        things that must not happen are refused rather than discouraged, which is how the row
+        caps, the validation gate and the scaffolder's approval check are all built. A plan may
+        not replace one already approved (that is ``amend_plan``'s review, walked round); it may
+        not be written for a workbook triage returned ``STOP`` for, which is what
+        :func:`kedge.plan.propose.propose_plan` refuses on the CLI path; it may not be written by
+        a session that has read nothing (:data:`WORKBOOK_READING_TOOLS`); and it may not be larger
+        than a notebook anyone will read (:data:`MAX_PROPOSED_STAGES`).
+        """
+        from pydantic import ValidationError
+
+        from kedge.plan.model import PlanError, ProcessPlan
+        from kedge.plan.propose import describe_errors, parse_draft
+        from kedge.plan.triage import triage
+
+        store = self._context.plans
+        if store is None:
+            return ToolResult.note(
+                "no plan store is attached to this workspace, so there is nowhere for a proposed "
+                "plan to go.",
+                ok=False,
+                summary="no plan store",
+            )
+
+        # The gate, and the reason this tool is not a way around amendment review. `amend_plan`
+        # exists so that a change to an approved plan is reviewed as a change; a whole replacement
+        # proposed here would be reviewed as a fresh plan, which is a quieter decision about a
+        # louder edit. The condition is "any version has been approved", because that is exactly
+        # when a plan is in force — `latest_approved` is what the scaffolder and `get_plan` read.
+        approved = await asyncio.to_thread(store.latest_approved)
+        if approved is not None:
+            return ToolResult.note(
+                f"refused: plan v{approved.version} is already approved for this workbook, and "
+                f"`propose_plan` only authors a first plan. Proposing a replacement would put a "
+                f"whole new decomposition past the review that every change to an approved plan "
+                f"goes through. Use `amend_plan` for what you want changed, one change at a time, "
+                f"with the rationale the user needs to judge it.",
+                ok=False,
+                summary=f"refused: plan v{approved.version} is already approved",
+            )
+
+        # Ahead of the read gate, because without an analysis there is nothing to read: telling
+        # the model to go and read the workbook when kedge has not looked at it either would be
+        # a dead end, and "run `kedge inspect`" is the answer to both.
+        analysis = self._require_analysis()
+
+        # The most fundamental of the refusals, and the only one about the workbook rather than
+        # about this session. `propose.propose_plan` raises `ProposalRefusedError` on a STOP
+        # rather than spend a model call on it, and the verdict has to mean the same thing when it
+        # is reached through the chat: without this, a workbook kedge would decline to convert is
+        # planned here, approved in the web UI, and the word "stop" never reaches the user.
+        # Ahead of the read gate, because reading cannot change the verdict — sending the model
+        # off through four tools and refusing it when it came back would spend the turn and imply
+        # the answer was ever going to be different. Behind the approved-plan refusal, which needs
+        # no analysis and points at `amend_plan`: a workbook already being converted is past the
+        # question this one asks.
+        triage_result = triage(analysis)
+        if triage_result.should_stop:
+            return ToolResult.note(
+                f"refused: kedge's triage recommends against converting this workbook, so no plan "
+                f"was authored. Triage is deterministic, so reading more of the workbook will not "
+                f"change it.\n\n"
+                f"{triage_result.explain()}\n\n"
+                f"Do not write the plan out in prose instead. Say plainly to the user why this "
+                f"workbook is not a candidate, quoting the blockers above, and leave the decision "
+                f"to override with them.",
+                ok=False,
+                summary=f"refused: triage says stop ({triage_result.convertible:.2f} convertible)",
+            )
+
+        if not self._read:
+            # Structural, not a reminder. Every other control in this project is — the row caps,
+            # the validation gate, the scaffolder's approval check — and exhortation is the
+            # weakest possible guard on the one tool that can manufacture a confident-looking
+            # decomposition out of nothing.
+            return ToolResult.note(
+                "refused: you have read nothing about this workbook yet, and a plan written from "
+                "the analysis summary alone is a guess with a confident tone. The summary carries "
+                "the order and purpose of the stages and nothing else — not a value, a dtype, a "
+                "count, or whether a key is unique, and each of those goes silently wrong in its "
+                "own way. Read the workbook first with `inspect_workbook`, `sample_data`, "
+                "`profile_column` or `read_range`, then propose the plan you can defend.",
+                ok=False,
+                summary="refused: nothing has been read about this workbook",
+            )
+
+        assessment = triage_result.as_assessment()
+        try:
+            draft = parse_draft(_as_json_text(args["plan"]), assessment=assessment)
+        except ValidationError as exc:
+            return ToolResult.note(
+                f"the plan did not validate, so nothing was recorded. Fix these and call "
+                f"`propose_plan` again:\n{describe_errors(exc)}",
+                ok=False,
+                summary="proposed plan did not validate",
+                draft_rejected=True,
+                caps=self._context.caps,
+            )
+        except PlanError as exc:
+            return ToolResult.note(
+                f"the plan could not be read, so nothing was recorded: {exc}. The `plan` argument "
+                f"is one JSON object with `stages` and `open_questions`, and nothing else around "
+                f"it.",
+                ok=False,
+                summary="proposed plan could not be read",
+                draft_rejected=True,
+                caps=self._context.caps,
+            )
+
+        if len(draft.stages) > MAX_PROPOSED_STAGES:
+            return ToolResult.note(
+                f"the plan has {len(draft.stages)} stages and the ceiling is "
+                f"{MAX_PROPOSED_STAGES}, so nothing was recorded. One stage becomes one cell, and "
+                f"a notebook nobody can hold in their head is no improvement on a spreadsheet "
+                f"nobody can hold in their head. Group the mechanical steps into the business "
+                f"stages a reviewer would name — a fill-down is one operation, not one per row. "
+                f"If this workbook genuinely runs more than {MAX_PROPOSED_STAGES} distinct "
+                f"stages, say so in prose: it is two processes and wants two notebooks.",
+                ok=False,
+                summary=f"refused: {len(draft.stages)} stages exceeds {MAX_PROPOSED_STAGES}",
+                draft_rejected=True,
+                caps=self._context.caps,
+            )
+
+        existing = await asyncio.to_thread(store.latest)
+        plan = ProcessPlan.from_analysis_draft(
+            draft,
+            analysis,
+            generated_by="llm",
+            # The model the turn is actually running, stamped by `refresh`, not the one in config
+            # — those differ the moment a session or a request overrides it, and a plan is read
+            # months later by someone asking which model wrote it and whether it is still trusted.
+            # An absent id sends them looking; a wrong one stops them looking.
+            llm_model=self._model,
+            version=await asyncio.to_thread(store.next_version),
+            based_on_version=existing.version if existing is not None else None,
+        )
+        self.pending_proposals.append(PendingProposal(plan=plan))
+        supersedes = (
+            f" It would supersede the unapproved v{existing.version} on disk." if existing else ""
+        )
+        return ToolResult.note(
+            f"The plan has been recorded and put to the user for approval: {len(plan.stages)} "
+            f"stage(s), {len(plan.open_questions)} open question(s), {len(plan.dropped)} dropped "
+            f"range(s).{supersedes} It is NOT in force — nothing has been written to the plan "
+            f"store and you have no standing instructions until they approve it, so write no "
+            f"cells against it yet. Set out in your reply what the process does stage by stage "
+            f"and what you are unsure of, so they are reviewing your reading of the workbook "
+            f"rather than a list of slugs. kedge's own triage scored this workbook "
+            f"{assessment.convertible:.2f} convertible; that figure is not yours to set.",
+            summary=f"plan proposed: {len(plan.stages)} stage(s), awaiting approval",
             caps=self._context.caps,
         )
 
@@ -1305,10 +1897,39 @@ def _parse_arguments(arguments: str | Mapping[str, Any]) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         msg = f"the tool arguments were not valid JSON ({exc}). Send a JSON object."
         raise ValueError(msg) from exc
+    except RecursionError as exc:
+        # Deep nesting, not bad syntax. `RecursionError` is not a `JSONDecodeError`, so left
+        # uncaught it goes straight past `dispatch`'s handler and out of the loop's catch-all,
+        # where the user is told the turn failed fatally over one malformed tool call.
+        msg = "the tool arguments were nested too deeply to decode. Send a flatter JSON object."
+        raise ValueError(msg) from exc
     if not isinstance(decoded, dict):
         msg = f"the tool arguments must be a JSON object, not {type(decoded).__name__}."
         raise ValueError(msg)
     return decoded
+
+
+def _as_json_text(value: Any) -> str:
+    """Render a tool argument documented as "a JSON object" back into JSON text.
+
+    Models emit an object where a description says "object" regardless of the schema declaring a
+    string, and both readings of the instruction are defensible. ``str()`` on the decoded object
+    would produce a Python repr — single quotes, ``None``, ``True`` — and the parser would then
+    tell the model its JSON was invalid at the first property name, which is both false and
+    unactionable: its JSON was fine and there is nothing in the message for it to fix.
+
+    Args:
+        value: Whatever arrived under the argument, decoded.
+
+    Returns:
+        ``value`` if it is already text, otherwise its JSON serialisation.
+    """
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):  # pragma: no cover - model arguments are always serialisable
+        return str(value)
 
 
 def _optional_str(value: Any) -> str | None:

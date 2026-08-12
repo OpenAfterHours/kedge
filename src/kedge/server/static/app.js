@@ -10,8 +10,9 @@
  *               gives no way to abort;
  *   turn      — the block model that interleaves prose and activity in arrival order, so the
  *               same code renders a live turn and a replayed one;
- *   pending   — the two decisions the model is not allowed to take on its own. `delete_cell` and
- *               `amend_plan` record a request and refuse; this is where the user says yes or no.
+ *   pending   — the three decisions the model is not allowed to take on its own. `delete_cell`,
+ *               `propose_plan` and `amend_plan` record a request and refuse; this is where the
+ *               user says yes or no.
  */
 
 (() => {
@@ -251,7 +252,7 @@
     sessionId: null,
     sessions: [],
     turn: null, // { controller, turnId, view }
-    pending: { deletions: [], amendments: [] },
+    pending: { deletions: [], amendments: [], proposals: [] },
     autoScroll: true,
   };
 
@@ -706,11 +707,16 @@
 
   // ── pending decisions ──────────────────────────────────────────────────────────────
 
-  /* `delete_cell` never deletes and `amend_plan` never amends: both record the request, tell the
-     model plainly that nothing has happened, and hand it to the user. This panel is that hand-off
-     made visible. A deletion shows what reads the doomed cell's names, because that is the part
-     of the decision the user cannot work out from the conversation; an amendment shows the
-     model's rationale next to the change it wants, because approving is a review, not a dismiss. */
+  /* `delete_cell` never deletes, `propose_plan` never writes a plan and `amend_plan` never
+     amends: all three record the request, tell the model plainly that nothing has happened, and
+     hand it to the user. This panel is that hand-off made visible. A deletion shows what reads
+     the doomed cell's names, because that is the part of the decision the user cannot work out
+     from the conversation; an amendment shows the model's rationale next to the change it wants;
+     a proposal shows the whole decomposition, because approving one unblocks the notebook and
+     PLAN 2.2 is emphatic that reviewing twelve lines now beats reviewing forty cells later.
+
+     Proposals lead. A plan is the largest decision on the panel and everything else is written
+     against it. */
   async function refreshPending() {
     const panel = $("pending");
     if (!state.sessionId) {
@@ -726,6 +732,7 @@
     }
     state.pending = data;
     const cards = [
+      ...(data.proposals || []).map((item, index) => proposalCard(item, index)),
       ...data.deletions.map((item, index) => deletionCard(item, index)),
       ...data.amendments.map((item, index) => amendmentCard(item, index)),
     ];
@@ -733,7 +740,21 @@
     panel.hidden = cards.length === 0;
   }
 
-  function decisionCard({ kind, title, tone, body, confirmLabel, onConfirm, onDismiss }) {
+  /* `confirmClass` is not decoration. A deletion's confirm button destroys something and is
+     styled to say so; a plan proposal's confirm button *accepts* something the user has just
+     read, and styling that destructive while "Discard it" sits quiet beside it points the eye at
+     the wrong choice. Danger styling means danger, or it means nothing. */
+  function decisionCard({
+    kind,
+    title,
+    tone,
+    body,
+    confirmLabel,
+    confirmClass,
+    dismissLabel,
+    onConfirm,
+    onDismiss,
+  }) {
     return el(
       "div",
       { class: "decision " + (tone || "") },
@@ -748,8 +769,18 @@
       el(
         "div",
         { class: "decision-actions" },
-        el("button", { class: "danger-button", type: "button", text: confirmLabel, onclick: onConfirm }),
-        el("button", { class: "ghost-button", type: "button", text: "Keep it", onclick: onDismiss }),
+        el("button", {
+          class: confirmClass || "danger-button",
+          type: "button",
+          text: confirmLabel,
+          onclick: onConfirm,
+        }),
+        el("button", {
+          class: "ghost-button",
+          type: "button",
+          text: dismissLabel || "Keep it",
+          onclick: onDismiss,
+        }),
       ),
     );
   }
@@ -780,6 +811,201 @@
     });
   }
 
+  /* A whole plan, rendered to be *read* rather than acknowledged, and the bar is what the CLI
+     shows before the same decision -- `plan.review.render_plan`. Anything left out here is
+     something the user is being asked to approve unseen, so a stage carries its assumptions
+     ("what a reviewer checks first"), its dependencies, the operations it claims and the pattern
+     it translates, and a checkpoint carries the question it will ask rather than a note that one
+     exists.
+
+     The order is the order a decision gets made in. The triage verdict leads: a workbook kedge
+     would decline to convert must not be planned and approved with the word never appearing.
+     Verification blockers get their own line rather than a clause after the score -- "1.00
+     convertible" with "cannot be reconciled" trailing behind a colon inverts the emphasis of the
+     rule that matters most. The review warnings carry the only automatic check that the
+     decomposition covers the workbook. And the approval blockers are pre-flighted so the button
+     says what clicking it will actually do: a plan with an unacknowledged drop lands as a draft,
+     and finding that out afterwards is finding it out too late. */
+  function proposalCard(item, index) {
+    const body = el("div", { class: "decision-body" });
+    const stop = item.verdict === "stop";
+
+    if (stop) {
+      body.append(
+        el("p", {
+          class: "decision-blocker",
+          text:
+            "kedge triage recommends NOT converting this workbook. Read the blockers below " +
+            "before approving anything: a plan written against a STOP verdict produces a " +
+            "notebook that looks more complete than it is.",
+        }),
+      );
+    } else if (item.verdict === "proceed_with_care") {
+      body.append(
+        el("p", { class: "decision-warn", text: "kedge triage: convertible, with reservations." }),
+      );
+    }
+
+    if (item.summary) body.append(el("p", { text: item.summary }));
+
+    body.append(
+      el("p", {
+        class: "decision-muted",
+        text:
+          `kedge triage scores this workbook ${item.convertible.toFixed(2)} convertible` +
+          (item.complexity === null || item.complexity === undefined
+            ? "."
+            : `, complexity ${item.complexity.toFixed(2)}.`) +
+          " That figure is kedge's own, scored from the analysis, not the model's opinion of itself.",
+      }),
+    );
+    for (const blocker of item.blockers) {
+      body.append(el("p", { class: "decision-warn", text: `Blocker: ${blocker}` }));
+    }
+    /* Non-negotiable 6: a workbook with no cached values still scores 1.00 convertible, which is
+       arithmetically right and reads exactly wrong. "Cannot be reconciled" is not a footnote to a
+       good score, it is the thing that makes the good score unprovable. */
+    for (const blocker of item.verification_blockers || []) {
+      body.append(el("p", { class: "decision-blocker", text: `Cannot be reconciled: ${blocker}` }));
+    }
+    if (item.analysis_stale) {
+      body.append(
+        el("p", {
+          class: "decision-warn",
+          text:
+            "The workbook has been saved since it was analysed, so this plan — and the score " +
+            "above — is a reading of a file that no longer exists. Re-analyse before approving.",
+        }),
+      );
+    }
+
+    body.append(
+      el("p", {
+        class: "decision-section",
+        text: `Stages (${item.stages.length}), in the order they will be scaffolded`,
+      }),
+    );
+    const stages = el("ul", { class: "decision-stages" });
+    for (const stage of item.stages) stages.append(stageItem(stage));
+    body.append(stages);
+
+    if (item.open_questions.length) {
+      body.append(
+        el("p", {
+          class: "decision-section",
+          text: `Open questions (${item.open_questions.length})`,
+        }),
+      );
+    }
+    for (const question of item.open_questions) {
+      const text = typeof question === "string" ? question : question.question;
+      const context = typeof question === "string" ? null : question.context;
+      body.append(el("p", { class: "decision-warn", text: `Open question: ${text}` }));
+      if (context) body.append(el("p", { class: "decision-muted", text: `context: ${context}` }));
+    }
+
+    for (const drop of item.dropped) {
+      body.append(
+        el("p", { class: "decision-warn", text: `Proposes dropping ${drop.range}: ${drop.reason}` }),
+      );
+    }
+
+    for (const warning of item.warnings || []) {
+      body.append(el("p", { class: "decision-warn", text: `Check: ${warning}` }));
+    }
+    if (item.warnings_complete === false) {
+      body.append(
+        el("p", {
+          class: "decision-muted",
+          text:
+            "No workbook analysis is loaded in this chat, so the coverage checks — operations " +
+            "claimed by no stage, and stage operation ids that are not in the analysis — did not " +
+            "run. The warnings above are the ones that need no analysis.",
+        }),
+      );
+    }
+
+    const blockers = item.approval_blockers || [];
+    for (const blocker of blockers) {
+      body.append(el("p", { class: "decision-blocker", text: `Blocks approval: ${blocker}` }));
+    }
+
+    return decisionCard({
+      kind: "Process plan",
+      title: `v${item.version}, ${item.stages.length} stage(s)`,
+      tone: stop ? "bad" : "",
+      body,
+      confirmLabel: approvalLabel(blockers.length, item.unacknowledged_drops || 0),
+      confirmClass: blockers.length ? "ghost-button" : "primary-button",
+      dismissLabel: "Discard it",
+      onConfirm: () => decide(`pending/proposals/${index}`, "POST", "The plan was written."),
+      onDismiss: () => decide(`pending/proposals/${index}`, "DELETE", "Plan discarded."),
+    });
+  }
+
+  /* "Approve this plan" is a promise the button cannot always keep: `approve` refuses a plan with
+     an unacknowledged drop and it lands as a draft instead. Saying so on the button is the
+     difference between a decision and a surprise. */
+  function approvalLabel(blockerCount, dropCount) {
+    if (!blockerCount) return "Approve this plan";
+    if (dropCount && dropCount === blockerCount) {
+      return `Save as draft — ${dropCount} drop${dropCount === 1 ? "" : "s"} need${
+        dropCount === 1 ? "s" : ""
+      } acknowledging`;
+    }
+    return `Save as draft — ${blockerCount} thing${blockerCount === 1 ? "" : "s"} block approval`;
+  }
+
+  function stageItem(stage) {
+    const li = el(
+      "li",
+      {},
+      el("span", { class: "decision-stage-id", text: stage.id }),
+      el("span", {
+        class: "decision-muted",
+        text: ` ${stage.kind} · confidence ${stage.confidence}`,
+      }),
+      el("div", { text: stage.intent }),
+    );
+    const detail = (label, value) =>
+      li.append(el("div", { class: "decision-muted", text: `${label}: ${value}` }));
+
+    if ((stage.depends_on || []).length) detail("after", stage.depends_on.join(", "));
+    if ((stage.sources || []).length) detail("sources", stage.sources.join(", "));
+    if (stage.excel_pattern) detail("pattern", stage.excel_pattern);
+    const operations = stage.operations || [];
+    if (operations.length) {
+      const shown = operations.slice(0, 6).join(", ");
+      detail("operations", operations.length > 6 ? `${shown} (+${operations.length - 6} more)` : shown);
+    }
+    /* The stage field whose own docstring says "these are what a reviewer checks first". A wrong
+       assumption -- "one row per counterparty" on a file that has two -- is the cheapest error to
+       catch here and the most expensive to catch in forty scaffolded cells. */
+    for (const assumption of stage.assumptions || []) {
+      li.append(el("div", { class: "decision-assumes", text: `assumes: ${assumption}` }));
+    }
+    if (stage.checkpoint) {
+      li.append(
+        el("div", {
+          class: "decision-asks",
+          text: `not automated — asks: ${stage.checkpoint.question}`,
+        }),
+      );
+      detail("options", (stage.checkpoint.options || []).join(", "));
+      if (stage.checkpoint.guidance) detail("guidance", stage.checkpoint.guidance);
+      /* `require_note` defaults to true and the note is the whole improvement over someone typing
+         a number into Excel with no record of why. A plan that turns it off is weakening the
+         control it is proposing, which the user should see before approving it. */
+      if (stage.checkpoint.require_note === false) {
+        li.append(
+          el("div", { class: "decision-warn", text: "no note is required to clear this checkpoint" }),
+        );
+      }
+    }
+    if (stage.notes) detail("note", stage.notes);
+    return li;
+  }
+
   function amendmentCard(item, index) {
     const body = el("div", { class: "decision-body" });
     body.append(el("p", { text: item.change }));
@@ -789,6 +1015,7 @@
       title: item.stage ? `stage ${item.stage}` : "plan-level",
       body,
       confirmLabel: "Approve and write a new plan version",
+      confirmClass: "primary-button",
       onConfirm: () =>
         decide(`pending/amendments/${index}`, "POST", "A new plan version was written."),
       onDismiss: () => decide(`pending/amendments/${index}`, "DELETE", "Amendment declined."),
@@ -910,8 +1137,8 @@
       state.turn = null;
       setRunning(false);
       refreshSessions().catch(() => {});
-      // A turn is the only thing that can record a pending deletion or amendment, so this is the
-      // one moment the panel can change without the user having clicked something.
+      // A turn is the only thing that can record a pending deletion, plan proposal or amendment,
+      // so this is the one moment the panel can change without the user having clicked something.
       refreshPending().catch(() => {});
       promptBox.focus();
     }

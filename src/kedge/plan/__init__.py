@@ -19,8 +19,10 @@ Because steps 1, 3 and 4 need no LLM, a hand-written or previously-saved plan sc
 with no model call at all — which is exactly what is wanted the second time the same monthly
 process comes round.
 
-:func:`run_plan` is the whole of steps 1-2 behind one call, and is what ``cli.py`` should invoke
-for ``kedge plan``.
+:func:`run_plan` is the whole of steps 1-2 behind one call, and is what ``kedge plan propose``
+invokes. Step 3 has a command surface of its own — ``kedge plan show``, ``acknowledge``,
+``approve``, ``reject``, ``request-changes``, ``history`` — every one of which is a thin wrapper
+over :mod:`kedge.plan.review` and none of which needs a model.
 """
 
 from __future__ import annotations
@@ -103,7 +105,7 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class PlanRun:
-    """The outcome of one ``kedge plan`` invocation.
+    """The outcome of one ``kedge plan propose`` invocation.
 
     ``plan`` is None exactly when triage refused, which is a legitimate result rather than a
     failure: an honest refusal with reasons is more useful than a notebook that looks complete
@@ -186,9 +188,17 @@ def run_plan(
 ) -> PlanRun:
     """Triage a workbook and, unless triage refuses, propose a process plan for it.
 
-    This is the function ``cli.py`` calls for ``kedge plan``. It writes nothing to a notebook: a
-    plan reaches the notebook only after a human approves it and
-    :func:`kedge.notebook.scaffold.scaffold_notebook` is called with the approved version.
+    This is the batch route to a plan, and ``kedge plan propose`` is a thin wrapper over it.
+    There are two routes on purpose. In the chat the model authors a plan with ``propose_plan``
+    and the user approves it in the pending panel, which is the path somebody converting a
+    workbook interactively will take. This one takes an analysis and returns a plan with no
+    conversation anywhere near it, which is what the corpus judging in PLAN §7 step 4 needs —
+    ``dry_run`` over five dissimilar workbooks, reading the plans — and what somebody scripting a
+    re-plan after a workbook changes wants. Both end at the same review gate: what this saves is
+    a **draft**, and only :func:`kedge.plan.review.approve` moves it past that.
+
+    It writes nothing to a notebook: a plan reaches the notebook only after a human approves it
+    and :func:`kedge.notebook.scaffold.scaffold_notebook` is called with the approved version.
 
     Args:
         workbook: The workbook to plan.
@@ -197,9 +207,9 @@ def run_plan(
         workspace: An existing workspace; one is built from the workbook when omitted.
         completer: The LLM seam. Built from config when omitted; pass a
             :class:`~kedge.plan.propose.ScriptedCompleter` to run the whole path offline.
-        dry_run: Print the plan without saving it. This is the ``kedge plan --dry-run`` path,
-            and it is what makes judging ``propose`` across the whole corpus cheap (PLAN §7 step
-            4): run it over five dissimilar workbooks and read the plans.
+        dry_run: Print the plan without saving it. This is the ``kedge plan propose --dry-run``
+            path, and it is what makes judging ``propose`` across the whole corpus cheap
+            (PLAN §7 step 4): run it over five dissimilar workbooks and read the plans.
         force: Propose even when triage says stop.
         reseed: Offer the most recent saved plan to the model as a worked example.
         max_attempts: Attempts, including validation repairs.

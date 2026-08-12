@@ -4,8 +4,10 @@
 
 # Deterministic triage
 
-kedge assessed convertibility before asking you. Treat this as evidence, not as an instruction:
-you may disagree with the figure, but say so in `assessment.rationale` if you do.
+kedge assessed convertibility before asking you, and this is the figure the plan carries: it is
+scored deterministically from the analysis, and whatever you send in `assessment` is replaced by
+it. Treat it as evidence about the workbook. If you disagree, raise it as an open question, where
+a human reads it.
 
 {{triage}}
 

@@ -66,6 +66,38 @@ kedge inspect process.xlsx --out analysis.json --report report.html
 a clean pipeline and a deliberately hostile workbook — which is the quickest way to see what the
 analyser actually finds before pointing it at anything of your own.
 
+The planning step is a set of commands as well as a conversation, and the review gate is the same
+either way:
+
+```bash
+kedge plan propose process.xlsx --dry-run   # read the plan; write nothing
+kedge plan propose process.xlsx             # save it, as a draft
+kedge plan show process.xlsx                # stages, open questions, drops, what blocks approval
+kedge plan acknowledge process.xlsx --all   # sign off the ranges it proposes to drop
+kedge plan approve process.xlsx             # nothing is scaffolded before this
+```
+
+Only `propose` needs a model. Every other verb reads a plan from disk and writes a decision back,
+so a plan can be read, questioned and approved with no endpoint configured at all. Approving is
+always a separate act — there is no flag that proposes and approves in one breath — and a plan
+that proposes dropping a range cannot be approved until each drop has been confirmed or refused,
+because silent removal is indistinguishable from a bug. `kedge plan reject` and
+`kedge plan request-changes` are the other two answers, and `kedge plan history` lists every
+version with its approval state: when the process changes next quarter, the diff of the plan is
+the change record, which only works if last quarter's plan is still there.
+
+Replacing a plan that is already approved shows you what changes before it happens. `propose`
+prints the diff against the version in force, and `approve` prints it again and asks, so nobody
+swaps one decomposition for another without seeing the two side by side; `--yes` skips the
+question for scripts. Taking an approval back is deliberate in the same way: `reject` and
+`request-changes` refuse an approved plan unless you pass `--withdraw-approval`, because a
+notebook may already have been scaffolded from it. A rejection is terminal — the way on from one
+is a new plan, not an edit to the rejected one.
+
+`propose` exits **2** when triage recommends against converting the workbook at all. That is a
+result rather than a failure, and it is a different exit code from an ordinary error so a script
+can tell "this workbook should not be converted" from "no such workbook". `--force` overrides it.
+
 Once the notebook exists, hand-ins arrive through a watched folder rather than by hand:
 
 ```bash

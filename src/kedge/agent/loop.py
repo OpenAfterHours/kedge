@@ -32,13 +32,24 @@ Retries are capped. A cell rejected by the validation gate three times stops bei
 the model can win on its own, so kedge surfaces it to the user rather than burning the rest of the
 budget rephrasing the same mistake.
 
-**A turn that stops without answering keeps what it learnt.** The step budget is a check-in, not a
-wall: at :data:`DEFAULT_MAX_STEPS` model round trips the loop pauses and asks whether to carry on,
-and the turn's tool traffic is held against the session and seeded into the next turn's window.
-The same applies to a Stop, and to a turn the validation cap ends. Only prose survives in the
-server's history, so without that hand-off a model that had just spent forty calls reading a
-workbook would come back to the next message knowing nothing about it — and would spend the
-forty again.
+**Every turn keeps what it learnt, whether or not it answered.** Only prose survives in the
+server's history, so without a hand-off a model that had just spent forty calls reading a workbook
+comes back to the next message knowing nothing about it — and spends the forty again. That is as
+true of the turn that succeeded as of the one that ran out of steps, and it was the more expensive
+failure of the two: a user who asks for a summary and then asks for the notebook was paying twice
+for one investigation. So :meth:`KedgeAgent._carry` holds the turn's tool traffic against the
+session on every path out of the step loop, and :meth:`KedgeAgent._window_for` seeds it into the
+next turn.
+
+What is carried is not always carried *whole*. A turn that stopped early — the step budget, a
+Stop, the validation cap — is resumed as itself, so the leg it just ran is still true and survives
+entire. A turn that answered is a turn the conversation has moved past, and every leg older than
+the current one has lived through a turn boundary whichever way the turn ended; for those, only
+results that cannot have gone stale keep their content. :func:`kedge.agent.tools.volatility_of`
+decides, and everything below :attr:`~kedge.agent.tools.Volatility.SESSION_STABLE` is reduced to
+the stub that names the call and invites the model to make it again. The messages themselves stay
+either way, because an assistant message whose tool results went missing is rejected by the
+endpoint outright.
 """
 
 from __future__ import annotations
@@ -47,7 +58,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
@@ -62,7 +73,7 @@ from kedge.agent.context import (
     build_plan_block,
 )
 from kedge.agent.prompts import build_system_prompt
-from kedge.agent.tools import ToolContext, ToolRegistry, tool_schemas
+from kedge.agent.tools import ToolContext, ToolRegistry, Volatility, tool_schemas, volatility_of
 from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
 from kedge.errors import KedgeError
 from kedge.server.events import (
@@ -86,6 +97,7 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
 
+    from kedge.agent.tools import ToolResult
     from kedge.analysis.model import WorkbookAnalysis
     from kedge.config import ContextConfig
     from kedge.notebook.model import NotebookBridge
@@ -97,6 +109,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_MAX_STEPS",
+    "MAX_DRAFT_ATTEMPTS",
     "AgentError",
     "ChatDelta",
     "KedgeAgent",
@@ -119,6 +132,17 @@ it keeps its tool traffic (:meth:`KedgeAgent._carry`) and the next message resum
 budget costs a question rather than the work. Real conversions run long: eight steps was enough to
 read a sheet and propose one cell, and not enough to finish anything. Configurable as
 ``[agent] max_steps``.
+"""
+
+MAX_DRAFT_ATTEMPTS = MAX_VALIDATION_ATTEMPTS
+"""How many times one tool may reject the model's own draft before the turn stops.
+
+Three, matching the cell path, and for the same reason: the fourth attempt at a shape the model
+has got wrong three times is not the one that works. Without a cap the turn spends the whole step
+budget on it — up to :data:`DEFAULT_MAX_STEPS` completions, each re-sending the entire prompt —
+and ends in a pause that reads as though progress were being made. The cap ends it while the
+useful part is still worth having: the model's account of the workbook, in prose, which the user
+can act on whether or not it ever fitted the schema.
 """
 
 _EDITING_TOOLS = frozenset({"propose_cell", "edit_cell", "delete_cell"})
@@ -976,7 +1000,10 @@ class KedgeAgent:
         self.registries: dict[str, ToolRegistry] = {}
         self._digests: dict[str, str] = {}
         self._suspended: dict[str, tuple[ContextMessage, ...]] = {}
-        """Per session: the messages of a turn that stopped before the model answered."""
+        """Per session: the messages of the turn just finished, held for the next one.
+
+        Held whether or not the turn answered (:meth:`_carry`). What differs is how much of it is
+        still true by the time it is read."""
 
     # ── construction ─────────────────────────────────────────────────────────────────────
 
@@ -1060,18 +1087,34 @@ class KedgeAgent:
     ) -> AsyncIterator[AnyEvent]:
         """Work the turn to an answer, or to the point where it needs the user.
 
-        Every path out of the step loop other than the model answering leaves the window held for
-        the session, so the next message continues this turn rather than starting a colder one.
-        That is done in ``finally`` because the paths are not all returns: a Stop and a failing
-        endpoint both leave through an exception, and both have usually spent real work getting
-        wherever they got to.
+        Every path out of the step loop offers the window to the session, the answering one
+        included, so the next message starts warm rather than re-reading a workbook this turn has
+        already read. The *call* is unconditional; whether anything is held is not — a turn whose
+        every result has expired hands on nothing (:meth:`_carry`). It is done in ``finally``
+        because the paths are not all returns: a Stop and a failing endpoint both leave through an
+        exception, and both have usually spent real work getting wherever they got to.
+
+        The carry is taken before :meth:`_remember` compacts, and the order matters.
+        :meth:`~kedge.agent.context.ConversationWindow.compact` drops every message older than the
+        turn being built, which is precisely the resumed span, so compacting first collapses the
+        carry to its newest leg on every turn a session is over the compaction threshold — the
+        sessions that most need the warm start. Compaction's lasting product is the digest, which
+        is unaffected by being written second, and :meth:`_carry` does not mutate the window.
+
+        ``answered`` is the one thing the ``finally`` cannot work out for itself, since a return
+        and a raise arrive there identically, so the step loop records it on the way past.
         """
         yield StatusEvent(phase="analysing")
         cancel.raise_if_cancelled()
 
         tools = self._registry_for(request.session_id)
         state = await self._notebook_state()
-        tools.refresh(state)
+        # Resolved once and used twice, which is the whole fix: the id stamped onto anything this
+        # turn produces is the same expression that chooses the endpoint it runs against, so the
+        # two cannot drift. `request.model` is per session and mutable (`server/routes.py`), so
+        # config is the fallback rather than the answer.
+        model = request.model or self._model
+        tools.refresh(state, model=model)
         window = self._window_for(request, state)
         attempts: dict[str, int] = {}
         answered = False
@@ -1086,7 +1129,7 @@ class KedgeAgent:
                 # token_total is the same count over the same messages, already memoised by the
                 # window -- recounting the rendered list here was a third full tokenisation.
                 meter.stage_prompt(window.token_total())
-                async for event in self._complete(messages, request.model, cancel, reply):
+                async for event in self._complete(messages, model, cancel, reply):
                     yield event
                 meter.record(reply.usage)
 
@@ -1116,13 +1159,13 @@ class KedgeAgent:
             logger.info("turn %s paused after its %d step budget", request.turn_id, self._max_steps)
             yield PausedEvent(message=paused, steps=self._max_steps)
         finally:
-            self._remember(request.session_id, window)
             self._carry(request.session_id, window, answered=answered)
+            self._remember(request.session_id, window)
 
     async def _complete(
         self,
         messages: Sequence[Mapping[str, Any]],
-        model: str | None,
+        model: str,
         cancel: CancelToken,
         reply: _Reply,
     ) -> AsyncIterator[AnyEvent]:
@@ -1131,11 +1174,13 @@ class KedgeAgent:
         Pulled one fragment at a time through :func:`_abandon_if_cancelled` rather than with a
         plain ``async for``, so that Stop lands while the model is still thinking rather than only
         once it has something to say. See that function for why the difference is not academic.
+
+        ``model`` is already resolved by :meth:`_turn`, and falling back to the configured default
+        a second time here is the bug this signature now forbids: two places deciding which model
+        runs is one place too many, and the loser stamps its answer onto the turn's artifacts.
         """
         parts: dict[int, dict[str, str]] = {}
-        stream = self._client.stream(
-            model=model or self._model, messages=messages, tools=self._tools
-        ).__aiter__()
+        stream = self._client.stream(model=model, messages=messages, tools=self._tools).__aiter__()
         try:
             while True:
                 try:
@@ -1184,7 +1229,15 @@ class KedgeAgent:
         request: TurnRequest,
         attempts: dict[str, int],
     ) -> AsyncIterator[AnyEvent]:
-        """Run one tool call and emit everything the UI needs to narrate it."""
+        """Run one tool call and emit everything the UI needs to narrate it.
+
+        Two retry caps share the ``attempts`` ledger, and they count different things. The
+        validation gate rejecting a cell is counted per cell name, because a model fixing one cell
+        while another stays broken is making progress. A tool rejecting the model's own *draft* is
+        counted per tool, because there is only one draft in play. Both stop the turn at three
+        with an :class:`~kedge.server.events.ErrorEvent`, which the step loop treats as a reason
+        to return rather than to keep spending the budget.
+        """
         arguments = _safe_arguments(call.arguments)
         if call.name in _EDITING_TOOLS:
             yield StatusEvent(phase="editing")
@@ -1213,7 +1266,13 @@ class KedgeAgent:
                     error=result.cell_error,
                 )
 
-        window.add_tool_result(tool_call_id=call.id, name=call.name, content=result.text)
+        window.add_tool_result(
+            tool_call_id=call.id,
+            name=call.name,
+            content=result.text,
+            arguments=arguments,
+            shape=_result_shape(result),
+        )
 
         if result.validated is False:
             key = str(arguments.get("name") or arguments.get("cell") or call.name)
@@ -1230,6 +1289,28 @@ class KedgeAgent:
                         f"'{key}' did not pass validation {attempts[key]} times running, so I have "
                         f"stopped rather than keep guessing. The violations are above — they are "
                         f"the actual reason, not a summary of it."
+                    ),
+                    recoverable=True,
+                )
+
+        if result.draft_rejected:
+            # Namespaced so a cell that happens to share a tool's name cannot share its counter.
+            key = f"draft:{call.name}"
+            attempts[key] = attempts.get(key, 0) + 1
+            if attempts[key] >= MAX_DRAFT_ATTEMPTS:
+                logger.info(
+                    "stopping turn %s: %s rejected the model's draft %d times",
+                    request.turn_id,
+                    call.name,
+                    attempts[key],
+                )
+                yield ErrorEvent(
+                    message=(
+                        f"`{call.name}` rejected the draft {attempts[key]} times running, so I "
+                        f"have stopped rather than keep reformatting it. Say in the chat what the "
+                        f"process does stage by stage, what each stage is for and what you are "
+                        f"unsure of — that account is the useful part, and the user can put it "
+                        f"through the planning step themselves. The rejections are above."
                     ),
                     recoverable=True,
                 )
@@ -1289,10 +1370,16 @@ class KedgeAgent:
         if resumed is not None:
             window.resume(resumed)
             logger.info(
-                "session %s resumes a paused turn: %d messages carried, %d of them tool results",
+                "session %s picks up the turn it carried: %d messages, %d of them tool results, "
+                "%d of those still holding their content",
                 request.session_id,
                 len(resumed),
                 sum(1 for message in resumed if message.kind == "tool_result"),
+                sum(
+                    1
+                    for message in resumed
+                    if message.kind == "tool_result" and not message.evicted
+                ),
             )
         window.begin_turn()
         window.add_user(request.message)
@@ -1325,25 +1412,73 @@ class KedgeAgent:
             logger.info("compacted session %s to a digest", session_id)
 
     def _carry(self, session_id: str, window: ConversationWindow, *, answered: bool) -> None:
-        """Hold an unfinished turn's tool traffic for the next message, or let it go.
+        """Hold the turn's tool traffic for the next message, keeping what is still true.
 
-        Held only when there is something in it worth holding. A turn that stopped before the
-        model called anything has nothing the server's own history will not replay, and carrying
-        an empty shell would mean trimming a turn out of history to make room for less than it
-        said (:func:`_history_before`).
+        A turn that answered is carried too, and that is the point of this method rather than a
+        detail of it. The user who asks for a summary of the workbook and then asks for the
+        notebook was, until this, paying for the same investigation twice: the server persists
+        prose only, so a successful turn's forty tool calls were thrown away precisely because it
+        had gone well. The expensive turn was being punished for succeeding.
+
+        What differs is how much of the carry keeps its content, and the axis is a turn boundary
+        rather than success. A turn boundary is when the user acts: they type the next message, and
+        they edit cells in the pane beside the chat while a paused turn waits — which is why
+        :class:`~kedge.agent.context.NotebookState` is rebuilt from the kernel every turn and never
+        read out of history. So:
+
+        * the leg this turn just ran is resumed as itself when the turn stopped early. Nothing has
+          crossed a boundary since it ran, so every result stands. When the turn answered, the
+          conversation has moved past it and only
+          :attr:`~kedge.agent.tools.Volatility.SESSION_STABLE` results — the workbook and the
+          analysis, neither of which kedge writes — are still true;
+        * every older leg in the span has crossed at least one boundary whichever way this turn
+          ended, so its volatile results expire regardless. Two pauses in a row used to skip this
+          entirely, and turn one's ``probe`` output was still being carried with full content at
+          turn three, after turn two had created cells.
+
+        Stale results are evicted rather than removed. A chat completion is rejected outright when
+        an assistant message carrying ``tool_calls`` is not followed by a result for each of them
+        (:meth:`~kedge.agent.context.ConversationWindow.suspend`), so dropping the message would
+        break the request; evicting it leaves the stub that names the call, says what shape came
+        back, and tells the model to make it again if it still wants the answer.
+
+        Held only when something in it will still hold its content next turn.
+        :meth:`~kedge.agent.context.ConversationWindow._recut` stamps the stub on anything that
+        would arrive expired, so a result still unevicted here is one the next turn can actually
+        read — which is what makes this gate honest at
+        ``evict_tool_results_after_turns = 1``, where the whole span expires on arrival and a gate
+        measuring on the other side of that boundary reported it as current. A turn that called
+        nothing, or one whose every result has expired, is an all-volatile shell: the same user
+        message and the same final answer the server's history already holds, plus interim prose
+        and a stub naming a call that no longer answers anything. It costs about 2.8 times the
+        flattened record and adds nothing load-bearing, so it is dropped and history is left
+        untrimmed (:func:`_history_before`).
+
+        **The audit log is not written again for a carried payload.** One line per value-returning
+        call is what :mod:`kedge.agent.audit` records, and a result held here is re-sent to the
+        endpoint for several turns after that line was written. The set of data that has left this
+        machine is still recorded in full — nothing reaches the model that was not audited on its
+        first call — so ``SECURITY.md``'s claim holds, but the count of lines is a count of calls
+        and never a count of transmissions. The session cache in :mod:`kedge.agent.tools` takes the
+        opposite decision for the same class of re-use, routing a cache hit back through
+        ``_finalise`` so it writes its line; that asymmetry is deliberate. A cache hit is a fresh
+        call the user made and would expect to see; a carry is one call the model keeps reading.
         """
-        if answered:
-            self._suspended.pop(session_id, None)
-            return
         carried = window.suspend()
-        if not any(message.kind == "tool_result" for message in carried):
+        carried = _expire_volatile(carried, from_age=0 if answered else 1)
+        live = sum(
+            1 for message in carried if message.kind == "tool_result" and not message.evicted
+        )
+        if not live:
             self._suspended.pop(session_id, None)
             return
         self._suspended[session_id] = carried
         logger.info(
-            "session %s is holding %d messages from an unfinished turn for the next one",
+            "session %s is holding %d messages from the turn it just %s, %d of them still current",
             session_id,
             len(carried),
+            "answered" if answered else "paused",
+            live,
         )
 
     def reset_session(self, session_id: str) -> None:
@@ -1382,24 +1517,135 @@ def _history_before(
 ) -> list[tuple[str, str]]:
     """Drop the persisted record of the turn ``resumed`` carries, which is about to replace it.
 
-    The server stores a turn as one user message and the prose that answered it, so a paused turn
+    The server stores a turn as one user message and the prose that answered it, so a carried turn
     is already in history — flattened, with the tool calls that motivated the prose gone and the
     interleaving with them gone too. The carried messages are that same turn intact, so the record
     is replaced rather than kept alongside and read twice.
 
-    Left alone if the opening message cannot be found, which means history is not what the paused
-    turn was built from. Two copies of a turn is a poor context; a turn silently truncated to
-    resolve a disagreement about which one is real is a worse one.
+    Both endings need the same trim, and the answered one needs it more. A turn that paused leaves
+    a user message and whatever prose had streamed before the pause; a turn that answered leaves a
+    user message and the whole answer — and the answer is in the carry too, because the assistant
+    message is recorded before the step loop returns. Everything from the opener onward is dropped
+    rather than the opener alone, which is what keeps the answer from being read twice, once
+    flattened and once in place.
+
+    How much to trim is *counted*, not searched for. A window that has been carried repeatedly
+    hands back several turns at once, one user message each, and the span always reinstates the
+    last of history and nothing else — so trimming the last ``n`` exchanges, where ``n`` is the
+    number of user messages the span holds, removes exactly what is about to be put back.
+
+    Searching backwards for a message whose content equals the span's opener is what this used to
+    do, and it is wrong for a reason the feature makes routine rather than exotic: the same user
+    text recurs. ``_pause_message`` asks the user to type "continue", two consecutive "carry on"s
+    are one span, and matching the *later* copy trims history at the wrong place — leaving every
+    turn between the two copies in the prompt twice, once flattened and once in the span.
+
+    Left alone if history is not what the span was built from, which is what a mismatched opener at
+    the counted position means. Two copies of a turn is a poor context; a turn silently truncated
+    to resolve a disagreement about which record is real is a worse one.
     """
-    opener = next((message.content for message in resumed if message.kind == "user"), None)
-    if opener is None:
+    openers = [message.content for message in resumed if message.kind == "user"]
+    if not openers:
         return list(history)
-    for index in range(len(history) - 1, -1, -1):
-        role, content = history[index]
-        if role == "user" and content == opener:
-            return list(history[:index])
-    logger.debug("the resumed turn does not appear in history; keeping every message of it")
-    return list(history)
+    starts = [index for index, (role, _) in enumerate(history) if role == "user"]
+    if len(starts) < len(openers):
+        logger.debug("history holds fewer turns than the carry reinstates; keeping all of it")
+        return list(history)
+    cut = starts[-len(openers)]
+    if history[cut][1] != openers[0]:
+        logger.debug("the resumed turn does not appear in history; keeping every message of it")
+        return list(history)
+    return list(history[:cut])
+
+
+_MAX_SHAPE_SUMMARY_CHARS = 32
+"""Characters of a result's own summary kept for the eviction stub's description of it."""
+
+
+def _result_shape(result: ToolResult) -> str:
+    """Describe what a tool result held, in the few words an eviction stub can afford.
+
+    Read off the fields the result already carries rather than off its text. The stub exists to
+    cost a fraction of what it replaced, so this has to come to the same handful of words whether
+    the payload was a single number or 32KB of rows — a description that grew with the result
+    would defeat the mechanism it belongs to. The row count is preferred to the prose summary
+    where there is one: what the model needs in order to decide whether to call again is the size
+    of what it is missing, not a restatement of the call.
+
+    Where the prose summary is used, it may be a fragment of the payload:
+    :meth:`~kedge.agent.tools.ToolResult.note` defaults ``summary`` to the result's first line. That
+    is kept rather than trimmed away, and deliberately. The stub is model-bound and nothing else —
+    the SSE trail carries a summary, the audit log carries no values, and the model has already read
+    the whole result — so no boundary is crossed by thirty-two characters of it, and those thirty-two
+    characters are the difference between a stub the model can act on ("6 cells", "reconciliation
+    failed") and one that only says something has gone. The eviction it survives is an eviction for
+    *cost*, and its cost is about eight tokens.
+
+    Args:
+        result: The result about to be recorded in the window.
+
+    Returns:
+        A short description. Held inside the window's own
+        :data:`~kedge.agent.context.MAX_EVICTED_SHAPE_CHARS` by the caps below rather than by
+        assumption — the window re-caps it at render, so a field added here can never grow a stub,
+        only crowd out what is already in it.
+    """
+    parts: list[str] = []
+    if result.row_count:
+        parts.append(f"{result.row_count} rows")
+    elif result.summary:
+        summary = " ".join(result.summary.split())
+        if len(summary) > _MAX_SHAPE_SUMMARY_CHARS:
+            summary = summary[: _MAX_SHAPE_SUMMARY_CHARS - 1].rstrip() + "…"
+        parts.append(summary)
+    size = result.byte_count
+    parts.append(f"{size}B" if size < 1024 else f"{size / 1024:.1f}KB")
+    if result.truncated:
+        parts.append("truncated")
+    return ", ".join(parts)
+
+
+def _expire_volatile(
+    carried: Sequence[ContextMessage], *, from_age: int
+) -> tuple[ContextMessage, ...]:
+    """Evict the content of every carried result that has stopped describing anything.
+
+    The axis is :class:`~kedge.agent.tools.Volatility`, and the question it asks is the only one
+    that matters here: called again with the same arguments an hour later, could the answer have
+    changed? For the workbook and the analysis it could not — kedge never writes to either — so
+    ``inspect_workbook``, ``sample_data``, ``profile_column`` and ``read_range`` keep what they
+    said. For a live kernel it plainly could, so ``probe``, ``list_cells``, ``reconcile`` and the
+    mutating tools do not. A name this build does not offer answers volatile, which is the safe
+    way round.
+
+    Evicted, never removed: the endpoint rejects a request whose assistant message carries
+    ``tool_calls`` with no result against each id, so the message has to stay. What it renders as
+    is the stub — the call, its arguments, the shape of what came back, and an invitation to make
+    the call again — which is exactly what wants saying about a result that has expired.
+
+    Args:
+        carried: The span :meth:`~kedge.agent.context.ConversationWindow.suspend` handed back.
+        from_age: The oldest leg to leave alone, in
+            :attr:`~kedge.agent.context.ContextMessage.carried_age`. ``0`` expires the whole span,
+            which is what a turn that answered wants; ``1`` spares the leg that has just run, which
+            is what resuming a paused turn wants, and still expires everything behind it — a leg
+            with an age of one or more has lived through a turn boundary, and a turn boundary is
+            where the user edits the notebook.
+
+    Returns:
+        The same span with its expired results marked. Marked on copies, so a window that is still
+        assembling — the ``finally`` this runs from can be reached before the turn has ended — is
+        never edited underneath itself.
+    """
+    return tuple(
+        replace(message, evicted=True)
+        if message.kind == "tool_result"
+        and not message.evicted
+        and message.carried_age >= from_age
+        and volatility_of(message.tool_name or "") is not Volatility.SESSION_STABLE
+        else message
+        for message in carried
+    )
 
 
 def _describe(exc: Exception) -> str:
@@ -1478,10 +1724,18 @@ def _status_detail(exc: Exception, limit: int = 300) -> str:
 
 
 def _safe_arguments(raw: str) -> dict[str, Any]:
-    """Decode a tool call's arguments for the activity trail, tolerating a truncated stream."""
+    """Decode a tool call's arguments for the activity trail, tolerating a truncated stream.
+
+    ``RecursionError`` is caught alongside the decode error because it is the same event wearing
+    a different exception: arguments this function cannot turn into a dictionary. It is not a
+    ``JSONDecodeError``, so uncaught it passes :meth:`KedgeAgent._invoke` untouched and lands in
+    the loop's catch-all, which the UI renders as **Fatal** — a whole turn ended, and the user
+    told the notebook may be broken, over one deeply nested tool call that kedge was only trying
+    to summarise. Handed back as a raw argument instead, the tool refuses it and the turn goes on.
+    """
     try:
         decoded = json.loads(raw or "{}")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         return {"arguments": raw}
     return decoded if isinstance(decoded, dict) else {"arguments": decoded}
 
