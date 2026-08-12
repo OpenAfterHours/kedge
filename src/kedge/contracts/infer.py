@@ -372,7 +372,10 @@ def to_yaml(contract: Contract, *, notes: dict[str, list[str]] | None = None) ->
         f"checksum: {_scalar(contract.checksum)}",
         f"checksum_mode: {_quote(contract.checksum_mode.value)}",
         "",
-        "columns:",
+        # An empty list is written out explicitly. A bare `columns:` key parses back as null
+        # rather than as [], and the file would not survive a round trip through
+        # load_contract -- which is the one thing a generated draft has to do.
+        "columns:" if contract.columns else "columns: []",
     ]
 
     for column in contract.columns:

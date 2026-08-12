@@ -24,15 +24,18 @@ total is simply smaller than it should be with nothing anywhere saying so.
 
 from __future__ import annotations
 
+import csv
 import difflib
 import logging
 import math
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
+import fastexcel
 import polars as pl
 
 from kedge.analysis.model import ColumnProfile, NumericStats, Severity
@@ -86,6 +89,21 @@ _CSV_SUFFIXES = frozenset({".csv", ".txt"})
 _TSV_SUFFIXES = frozenset({".tsv", ".tab"})
 _PARQUET_SUFFIXES = frozenset({".parquet", ".pq"})
 
+_READ_ERRORS: tuple[type[Exception], ...] = (
+    OSError,
+    ValueError,
+    pl.exceptions.PolarsError,
+    fastexcel.FastExcelError,
+)
+"""Everything a reader raises when a file will not parse.
+
+``fastexcel.FastExcelError`` is in the list because calamine's errors are fastexcel's own
+type rather than a ``PolarsError``: a workbook that is not a zip archive raises
+``CalamineError`` straight out through ``pl.read_excel``, and without this a hand-in that is
+not really a spreadsheet would reach the user as a bare traceback instead of a
+:class:`HandInReadError` (CONVENTIONS non-negotiable 4).
+"""
+
 _LAYOUT_SCAN_ROWS = 25
 _NUMERIC_STRIP = re.compile(r"[,\s_$£€%()]")
 _ALPHANUMERIC = re.compile(r"[^a-z0-9]+")
@@ -131,6 +149,35 @@ class HandInReadError(IngestError):
 # =============================================================================
 
 
+def _without_time_zones(frame: pl.DataFrame) -> pl.DataFrame:
+    """Return the frame with every timezone-aware Datetime column converted to naive UTC.
+
+    Nothing downstream wants the zone -- :func:`dtype_name` collapses
+    ``Datetime(time_zone='UTC')`` to "Datetime" and a profile records instants, not offsets --
+    but a great deal downstream turns cells into Python objects, and polars builds a
+    :class:`zoneinfo.ZoneInfo` to do it. On an interpreter with no IANA database (a Windows
+    CPython without ``tzdata``, which is the ordinary case) that fails inside Rust and arrives
+    as ``pyo3_runtime.PanicException`` -- a ``BaseException``, so it walks straight past
+    :data:`_READ_ERRORS` and every other degrade-gracefully path here and takes the process
+    with it. It is not hypothetical: a parquet hand-in with an ``as_of`` column killed
+    :func:`detect_totals_row` on ``frame.row(-1)`` before profiling was even reached.
+
+    Converting to UTC rather than simply dropping the zone keeps the instant exactly, and
+    keeps two months' hand-ins comparable when the sending team switches zone.
+    """
+    aware = [
+        name
+        for name, dtype in frame.schema.items()
+        if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None
+    ]
+    if not aware:
+        return frame
+    logger.debug("converting %d timezone-aware column(s) to naive UTC", len(aware))
+    return frame.with_columns(
+        pl.col(name).dt.convert_time_zone("UTC").dt.replace_time_zone(None) for name in aware
+    )
+
+
 def read_frame(
     path: Path,
     *,
@@ -159,14 +206,15 @@ def read_frame(
     try:
         if suffix in _EXCEL_SUFFIXES:
             options = {"header_row": skip} if skip else None
-            frame = pl.read_excel(path, sheet_name=sheet, read_options=options)
-            return frame if isinstance(frame, pl.DataFrame) else next(iter(frame.values()))
+            read = pl.read_excel(path, sheet_name=sheet, read_options=options)
+            frame = read if isinstance(read, pl.DataFrame) else next(iter(read.values()))
+            return _without_time_zones(frame)
         if suffix in _CSV_SUFFIXES or suffix in _TSV_SUFFIXES:
             separator = "\t" if suffix in _TSV_SUFFIXES else ","
-            return pl.read_csv(path, separator=separator, skip_rows=skip)
+            return _without_time_zones(pl.read_csv(path, separator=separator, skip_rows=skip))
         if suffix in _PARQUET_SUFFIXES:
-            return pl.read_parquet(path)
-    except (OSError, pl.exceptions.PolarsError, ValueError) as exc:
+            return _without_time_zones(pl.read_parquet(path))
+    except _READ_ERRORS as exc:
         msg = f"could not read the hand-in {path.name}: {exc}"
         raise HandInReadError(msg) from exc
 
@@ -181,32 +229,47 @@ def read_frame(
 def _read_raw(path: Path, *, sheet: str | None, rows: int) -> list[tuple[Any, ...]]:
     """Read the top of a file with no header applied, every value as text."""
     suffix = path.suffix.lower()
+    if suffix in _CSV_SUFFIXES or suffix in _TSV_SUFFIXES:
+        return _read_raw_delimited(
+            path, separator="\t" if suffix in _TSV_SUFFIXES else ",", rows=rows
+        )
+    if suffix not in _EXCEL_SUFFIXES:
+        return []
     try:
-        if suffix in _EXCEL_SUFFIXES:
-            frame = pl.read_excel(
-                path,
-                sheet_name=sheet,
-                has_header=False,
-                drop_empty_rows=False,
-                drop_empty_cols=False,
-            )
-            raw = frame if isinstance(frame, pl.DataFrame) else next(iter(frame.values()))
-        elif suffix in _CSV_SUFFIXES or suffix in _TSV_SUFFIXES:
-            separator = "\t" if suffix in _TSV_SUFFIXES else ","
-            raw = pl.read_csv(
-                path,
-                separator=separator,
-                has_header=False,
-                infer_schema_length=0,
-                truncate_ragged_lines=True,
-            )
-        else:
-            return []
-    except (OSError, pl.exceptions.PolarsError, ValueError) as exc:
+        frame = pl.read_excel(
+            path,
+            sheet_name=sheet,
+            has_header=False,
+            drop_empty_rows=False,
+            drop_empty_cols=False,
+        )
+        raw = frame if isinstance(frame, pl.DataFrame) else next(iter(frame.values()))
+    except _READ_ERRORS as exc:
         logger.warning("could not scan %s for preamble rows: %s", path.name, exc)
         return []
     text = raw.head(rows).select(pl.all().cast(pl.String, strict=False))
     return list(text.iter_rows())
+
+
+def _read_raw_delimited(path: Path, *, separator: str, rows: int) -> list[tuple[Any, ...]]:
+    """Read the top rows of a delimited file with the stdlib reader, one width per row.
+
+    Deliberately not ``pl.read_csv``: with ``has_header=False`` polars fixes the frame's
+    width from the first line, so a one-cell title sitting above the header truncates every
+    data row to one column and the preamble becomes invisible to :func:`detect_layout` --
+    which then reads the title as the header and the file will not parse at all. An extra
+    preamble row is one of the named drift cases in PLAN 2.8, so the scan has to see it.
+    """
+    try:
+        # utf-8-sig because an Excel-exported CSV carries a byte-order mark, and polars
+        # strips it: leaving it on here would make the scan's view of the first cell differ
+        # from the one read_frame goes on to produce.
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.reader(handle, delimiter=separator)
+            return [tuple(row) for _, row in zip(range(rows), reader, strict=False)]
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        logger.warning("could not scan %s for preamble rows: %s", path.name, exc)
+        return []
 
 
 def _looks_numeric(value: str) -> bool:
@@ -223,6 +286,24 @@ def _looks_numeric(value: str) -> bool:
     return True
 
 
+def _filled_width(row: tuple[Any, ...]) -> int:
+    """How many cells of a scanned row carry anything at all."""
+    return sum(1 for cell in row if cell is not None and str(cell).strip())
+
+
+def _usual_field_count(rows: list[tuple[Any, ...]]) -> int:
+    """How many fields the scanned rows mostly agree on.
+
+    The modal count, not the maximum: a delimited file with one malformed row has exactly one
+    row wider than the rest, and the majority is what the file is really shaped like. Ties
+    break towards the narrower count, so a two-line file whose second line is ragged still
+    reads as "line one is the header" -- and so fails loudly on the read rather than promoting
+    the ragged line.
+    """
+    counts = Counter(len(row) for row in rows)
+    return min(counts, key=lambda width: (-counts[width], width))
+
+
 def detect_layout(path: Path, *, sheet: str | None = None) -> tuple[int, int]:
     """Work out which row carries the headers, and how many preamble rows sit above it.
 
@@ -232,7 +313,12 @@ def detect_layout(path: Path, *, sheet: str | None = None) -> tuple[int, int]:
 
     The header is taken to be the first row that is as wide as the widest row scanned, whose
     cells are all distinct, and none of which parses as a number. That last condition is what
-    stops an all-text data row being mistaken for a header.
+    stops an all-text data row being mistaken for a header. Rows carrying more fields than the
+    file otherwise agrees on are ruled out before any of that: an unquoted delimiter inside a
+    text value ("Acme, Inc") makes one data row wider than every other, and the widest row is
+    then the *malformed* one. Promoting it would discard the real header as preamble and lose
+    a row from the frame -- where the honest outcome is the loud read failure a ragged file
+    deserves.
 
     Args:
         path: The file to inspect.
@@ -245,11 +331,16 @@ def detect_layout(path: Path, *, sheet: str | None = None) -> tuple[int, int]:
     rows = _read_raw(path, sheet=sheet, rows=_LAYOUT_SCAN_ROWS)
     if not rows:
         return 0, 0
-    widths = [sum(1 for cell in row if cell is not None and str(cell).strip()) for row in rows]
-    widest = max(widths, default=0)
+    # Every row a spreadsheet scan returns is the same length, so this rules out nothing
+    # there; it is the delimited reader, which reports each line at its own width, that
+    # needs it.
+    usual = _usual_field_count(rows)
+    scanned = [(index, row) for index, row in enumerate(rows) if len(row) <= usual]
+    widths = {index: _filled_width(row) for index, row in scanned}
+    widest = max(widths.values(), default=0)
     if widest == 0:
         return 0, 0
-    for index, row in enumerate(rows):
+    for index, row in scanned:
         if widths[index] < widest:
             continue
         values = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
@@ -509,8 +600,14 @@ def _profile_column(
             redacted=True,
         )
 
+    # Renamed before counting: value_counts names its tally column "count", and a hand-in
+    # column already called "count" -- an ordinary thing for an extract to contain -- makes
+    # polars raise DuplicateError rather than produce a profile. Fixing both names here means
+    # neither can collide with whatever the sending team called theirs.
     counts = (
-        series.drop_nulls().value_counts(sort=True).head(top_k) if frame.height else pl.DataFrame()
+        series.drop_nulls().rename("value").value_counts(sort=True, name="count").head(top_k)
+        if frame.height
+        else pl.DataFrame()
     )
     frequent = (
         [(_jsonable(row[0]), int(row[1])) for row in counts.iter_rows()] if counts.height else []
@@ -545,7 +642,13 @@ def profile_frame(
     redaction: RedactionConfig | None = None,
     seed: int = 0,
 ) -> list[ColumnProfile]:
-    """Profile every column of a frame, reusing the analyser's ``ColumnProfile`` contract."""
+    """Profile every column of a frame, reusing the analyser's ``ColumnProfile`` contract.
+
+    Frames read by this module arrive with no timezone-aware column, but this one is public
+    and takes any frame, so it repeats the conversion rather than trusting its caller -- see
+    :func:`_without_time_zones` for what happens if a tz-aware column reaches ``to_list``.
+    """
+    frame = _without_time_zones(frame)
     return [
         _profile_column(
             frame, name, index, sheet=sheet, sampling=sampling, redaction=redaction, seed=seed
@@ -988,6 +1091,7 @@ def check_drift(
     *,
     store_dir: Path,
     sheet: str | None = None,
+    header_row: int | None = None,
     sampling: SamplingConfig | None = None,
     redaction: RedactionConfig | None = None,
     row_count_tolerance: float = DEFAULT_ROW_COUNT_TOLERANCE,
@@ -1003,6 +1107,10 @@ def check_drift(
         handin: The received hand-in.
         store_dir: The managed store root, which is also where accepted shapes live.
         sheet: Worksheet name for spreadsheet formats.
+        header_row: Override the detected header row. Pass the contract's ``header_row`` where
+            there is one, so the shape being diffed is the shape about to be checked -- otherwise
+            the profile detects a header the contract has already pinned somewhere else, and the
+            two disagree about the row count for reasons nobody can see.
         sampling: Row and top-k caps for the profile.
         redaction: Optional column masking.
         row_count_tolerance: Relative row-count change that counts as drift.
@@ -1015,7 +1123,9 @@ def check_drift(
     Raises:
         HandInReadError: If the hand-in cannot be read.
     """
-    profile = profile_handin(handin, sheet=sheet, sampling=sampling, redaction=redaction)
+    profile = profile_handin(
+        handin, sheet=sheet, header_row=header_row, sampling=sampling, redaction=redaction
+    )
     store.store_profile(store_dir, profile)
     report = compare(
         store.last_accepted_profile(store_dir),

@@ -21,10 +21,15 @@ The intended notebook sequence::
     handin  = kedge.ingest.receive(selector.value, store_dir=ws.handins_dir)
     profile, drift = kedge.ingest.check_drift(handin, store_dir=ws.handins_dir)
     report  = kedge.contracts.validate(handin, contract)
-    frame   = pl.read_excel(handin.path)
+    frame, layout = kedge.ingest.read_data(handin.path, sheet=contract.sheet)
 
 Drift is reported before the contract check on purpose: "column ``EAD`` became ``EAD_GBP``"
 is a far more useful message than a schema-validation traceback.
+
+The last line is :func:`~kedge.ingest.drift.read_data` rather than a bare ``pl.read_excel``
+because it is the one reader profiling, validation and inference all go through, and reading
+the file any other way means the frame downstream is not the frame that was validated. Pass
+the contract's ``sheet`` and ``header_row`` to all three calls, or none of them.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from kedge.ingest.drift import (
     dtype_name,
     profile_frame,
     profile_handin,
+    read_data,
     read_frame,
 )
 from kedge.ingest.model import (
@@ -102,6 +108,7 @@ __all__ = [
     "load_profile",
     "profile_frame",
     "profile_handin",
+    "read_data",
     "read_frame",
     "receipt_for_hash",
     "receive",
