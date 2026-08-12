@@ -20,22 +20,45 @@ somebody:
   cell and everything downstream of it in the dataflow graph, so a downstream cell referencing
   an unapproved checkpoint's output cannot silently proceed.
 
+**The head and the tail call the real machinery.** The hand-in cells go through
+:mod:`kedge.ingest` — ``receive`` for the managed record, ``check_drift`` for the shape diff,
+``read_data`` for the frame — the check cell through :mod:`kedge.contracts`, and the tail
+through :mod:`kedge.reconcile`. Nothing here re-implements any of it, and the frame cell in
+particular makes the *identical* ``read_data`` call ``kedge.contracts.validate`` makes rather
+than an equivalent-looking one, because "equivalent-looking" is a refactor away from a green
+contract panel describing rows nobody computed on.
+
+The head is emitted receive, contract, drift, check, frame. The contract is *loaded* ahead of
+the other three because which sheet and which header row to read is part of the agreement and
+all three of them need it; loading a contract is not checking a hand-in against it, so
+PLAN 2.8's ordering still holds — drift is *reported* before the contract check, because
+"column ``EAD`` became ``EAD_GBP``" is a far better message than a schema-validation traceback.
+The check then comes before the frame so that ``mo.stop`` in the frame cell can keep a hand-in
+that failed its contract out of every calculation below it.
+
+The tail cell is the one place in this module where a mistake would be dangerous rather than
+merely wrong. Where there is no baseline — no workbook, no cached values, no region matching a
+notebook column — it reports "not reconciled" and says why. It has no path that reports
+"passed" (PLAN 6.2).
+
 Nothing here writes to a notebook without an approved plan. :func:`scaffold_notebook` checks
 ``plan.approval`` and refuses, and there is no parameter to talk it out of that.
 
 **Driver dependency.** ``kedge.notebook.driver`` is the only module permitted to touch
 ``marimo._code_mode``, and it is owned elsewhere. This module depends on the narrow
 :class:`CellCreator` protocol below — one method, matching the ``create_cell`` signature
-verified in ``docs/marimo-api.md`` §2. At the time of writing ``driver.py`` does not exist yet;
-if its surface differs, this protocol is the single place to adapt.
+verified in ``docs/marimo-api.md`` §2. If that surface moves, this protocol is the single place
+to adapt.
 
 References:
 - PLAN.md 2.2 (checkpoints), 2.5 (polars house rules), 2.6 (Excel semantics), 2.8 (hand-in
-  head), 4.5 (reconciliation), M2 step 4; docs/marimo-api.md §2.
+  head), 4.5 (reconciliation), 6.2 (never a false pass), M2 step 4, M5 (contracts);
+  docs/marimo-api.md §2.
 """
 
 from __future__ import annotations
 
+import ast
 import keyword
 import logging
 import re
@@ -68,12 +91,24 @@ __all__ = [
 
 CellRole = Literal["setup", "handin", "stage", "checkpoint", "reconcile"]
 
-HEAD_CELL_NAMES = ("kedge_setup", "handin_source", "handin", "handin_frame", "handin_check")
+HEAD_CELL_NAMES = (
+    "kedge_setup",
+    "handin_source",
+    "handin",
+    "handin_contract",
+    "handin_drift",
+    "handin_check",
+    "handin_frame",
+)
 """The fixed head, in emission order (PLAN 2.8).
 
-The frame is loaded before the contract check because the check reports on the schema that
-arrived. marimo would resolve the order from the dataflow graph either way; emitting them in
-dependency order simply means the notebook reads top to bottom.
+The contract is loaded before the drift panel because it names the sheet and the header row,
+and the profile, the check and the frame all have to read the same rows or the check is a
+statement about data nobody used. Loading is not checking, so drift is still *reported* before
+the contract check: a renamed column explains a failure in one line where a schema report
+explains it in fifteen. The check then comes before the frame so that the frame cell can
+``mo.stop`` on a failed contract, which is what makes the check a gate rather than a comment:
+nothing downstream of the frame runs on a hand-in that was rejected.
 """
 
 TAIL_CELL_NAMES = ("reconciliation",)
@@ -84,13 +119,16 @@ _RESERVED = {
     *TAIL_CELL_NAMES,
     "handin_drop",
     "handin_pick",
-    "reconciliation_frame",
+    "handin_profile",
+    "reconciliation_values",
+    "kedge",
     "mo",
     "pl",
     "datetime",
-    "hashlib",
     "pathlib",
     "HANDIN_DIR",
+    "WORKBOOK",
+    "CONTRACT_PATH",
 }
 
 _IDENTIFIER_UNSAFE = re.compile(r"[^0-9a-zA-Z_]+")
@@ -142,8 +180,16 @@ class CellCreator(Protocol):
     scaffolder should not be able to delete or run anything.
     """
 
-    async def create_cell(self, code: str, *, name: str, hide_code: bool = False) -> str:
-        """Create one cell and return its id."""
+    async def create_cell(self, code: str, *, name: str, hide_code: bool = False) -> object:
+        """Create one cell.
+
+        The return type is deliberately unconstrained. Both real implementations --
+        :class:`kedge.notebook.driver.NotebookDriver` and
+        :class:`kedge.notebook.filedriver.FileDriver` -- return a
+        :class:`~kedge.notebook.model.MutationResult`, but pinning that here would make this
+        module depend on the driver's vocabulary for a value it does not read. The scaffolder
+        knows the names it asked for and reports those; what came back is the caller's business.
+        """
         ...
 
 
@@ -198,11 +244,31 @@ def cell_name_for(stage_id: str, taken: Iterable[str] = ()) -> str:
     raise ScaffoldError(msg)
 
 
+def _satellite_names(name: str) -> tuple[str, ...]:
+    """The names a checkpoint claims beyond the stage name itself.
+
+    A checkpoint scaffolds to two cells, not one: a cell called ``<name>_ui`` that defines
+    ``<name>_decision`` and ``<name>_note``, and a gate cell called ``<name>``. So it is those
+    three derived names that have to be unique across the notebook as well, not only the stage
+    names. A plan with a checkpoint ``review`` beside a stage ``review_decision`` would
+    otherwise scaffold two cells defining one name, which marimo rejects as multiply defined
+    and which reaches the user as a notebook that will not open.
+    """
+    return (f"{name}_ui", f"{name}_decision", f"{name}_note")
+
+
 def _name_map(plan: ProcessPlan) -> dict[str, str]:
     """Map every stage id to its cell name, assigned in emission order."""
     names: dict[str, str] = {}
+    used: set[str] = set()
     for stage in plan.ordered_stages():
-        names[stage.id] = cell_name_for(stage.id, names.values())
+        name = cell_name_for(stage.id, used)
+        if stage.is_checkpoint:
+            while any(satellite in used for satellite in _satellite_names(name)):
+                name = cell_name_for(name, used | {name})
+            used.update(_satellite_names(name))
+        names[stage.id] = name
+        used.add(name)
     return names
 
 
@@ -215,6 +281,8 @@ def build_cells(
     plan: ProcessPlan,
     *,
     handins_dir: Path | None = None,
+    workbook_path: Path | None = None,
+    contract_path: Path | None = None,
     allow_unapproved: bool = False,
 ) -> list[ScaffoldCell]:
     """Turn an approved plan into the cells that implement it.
@@ -224,8 +292,14 @@ def build_cells(
 
     Args:
         plan: The approved plan.
-        handins_dir: Where dropped hand-ins are persisted. Defaults to ``handins`` relative to
-            the notebook.
+        handins_dir: Where hand-ins are persisted. Defaults to ``handins`` relative to the
+            notebook.
+        workbook_path: The workbook the notebook was converted from, whose cached values are
+            the reconciliation baseline. Defaults to the standard workspace layout — the plan's
+            workbook filename beside the project directory. Wrong is survivable: the
+            reconciliation cell reports "not reconciled" rather than guessing.
+        contract_path: Where the hand-in contract lives. Defaults to ``contract.yaml`` in the
+            project directory. It need not exist.
         allow_unapproved: Render a preview of an unapproved plan. This writes nothing;
             :func:`scaffold_notebook` has no equivalent escape hatch, so an unapproved plan can
             be looked at but never scaffolded.
@@ -235,14 +309,14 @@ def build_cells(
 
     Raises:
         PlanNotApprovedError: when the plan is not approved and ``allow_unapproved`` is not set.
-        ScaffoldError: when a generated cell would breach the house rules.
+        ScaffoldError: when a generated cell would breach the house rules or would not parse.
     """
     if not plan.approval.approved and not allow_unapproved:
         raise _not_approved(plan)
 
     names = _name_map(plan)
     checkpoints = {stage.id for stage in plan.stages if stage.is_checkpoint}
-    cells: list[ScaffoldCell] = list(_head_cells(plan, handins_dir))
+    cells: list[ScaffoldCell] = list(_head_cells(plan, handins_dir, workbook_path, contract_path))
 
     ordered = plan.ordered_stages()
     for index, stage in enumerate(ordered, start=1):
@@ -254,14 +328,32 @@ def build_cells(
     cells.extend(_tail_cells(plan, names))
 
     for cell in cells:
-        if _BANNED_IMPORT.search(cell.code):
-            msg = (
-                f"cell {cell.name!r} would import pandas, which kedge does not permit anywhere. "
-                f"Generated code is polars (PLAN 2.5)"
-            )
-            raise ScaffoldError(msg)
+        _check_house_rules(cell)
     logger.info("built %d cell(s) from plan v%d for %s", len(cells), plan.version, plan.workbook)
     return cells
+
+
+def _check_house_rules(cell: ScaffoldCell) -> None:
+    """Refuse a cell that would not compile, or that breaks the one rule about pandas.
+
+    Both are the scaffolder marking its own homework rather than trusting itself. A cell body is
+    assembled from free-form plan text, and a cell that will not parse reaches the user as a
+    notebook that does not open — far worse than a refusal here naming the cell.
+    """
+    if _BANNED_IMPORT.search(cell.code):
+        msg = (
+            f"cell {cell.name!r} would import pandas, which kedge does not permit anywhere. "
+            f"Generated code is polars (PLAN 2.5)"
+        )
+        raise ScaffoldError(msg)
+    try:
+        ast.parse(cell.code)
+    except SyntaxError as exc:
+        msg = (
+            f"cell {cell.name!r} would not parse: {exc.msg} at line {exc.lineno}. "
+            f"This is a scaffolder bug, not a plan error; nothing was written."
+        )
+        raise ScaffoldError(msg) from exc
 
 
 async def scaffold_notebook(
@@ -269,6 +361,8 @@ async def scaffold_notebook(
     driver: CellCreator,
     *,
     handins_dir: Path | None = None,
+    workbook_path: Path | None = None,
+    contract_path: Path | None = None,
 ) -> list[str]:
     """Write an approved plan into the notebook, one named cell per stage.
 
@@ -278,10 +372,16 @@ async def scaffold_notebook(
     Args:
         plan: The approved plan.
         driver: The notebook driver, or anything satisfying :class:`CellCreator`.
-        handins_dir: Where dropped hand-ins are persisted.
+        handins_dir: Where hand-ins are persisted.
+        workbook_path: The workbook holding the reconciliation baseline.
+        contract_path: Where the hand-in contract lives.
 
     Returns:
-        The created cell ids, in creation order.
+        The names of the cells written, in creation order. Names rather than driver-assigned
+        ids: a name is what the user and the agent both address a cell by, it is stable across
+        a reopen, and it is the one thing this function knows for certain whatever the driver
+        hands back. ``NotebookDriver`` returns a ``MutationResult``, ``FileDriver`` returns a
+        ``MutationResult``, and neither is a cell id.
 
     Raises:
         PlanNotApprovedError: when ``plan.approval.state`` is not ``approved``.
@@ -289,13 +389,18 @@ async def scaffold_notebook(
     if not plan.approval.approved:
         raise _not_approved(plan)
 
-    cells = build_cells(plan, handins_dir=handins_dir)
-    created: list[str] = []
+    cells = build_cells(
+        plan,
+        handins_dir=handins_dir,
+        workbook_path=workbook_path,
+        contract_path=contract_path,
+    )
+    written: list[str] = []
     for cell in cells:
-        cell_id = await driver.create_cell(cell.code, name=cell.name, hide_code=False)
-        created.append(cell_id)
-    logger.info("scaffolded %d cell(s) from plan v%d", len(created), plan.version)
-    return created
+        await driver.create_cell(cell.code, name=cell.name, hide_code=False)
+        written.append(cell.name)
+    logger.info("scaffolded %d cell(s) from plan v%d", len(written), plan.version)
+    return written
 
 
 def _not_approved(plan: ProcessPlan) -> PlanNotApprovedError:
@@ -315,20 +420,39 @@ def _not_approved(plan: ProcessPlan) -> PlanNotApprovedError:
 _SETUP_TEMPLATE = """# Generated by kedge from process plan v{version} for {workbook}.
 # These cells are yours to edit. kedge writes them; it does not own them.
 import datetime
-import hashlib
 import pathlib
 
 import marimo as mo
 import polars as pl
 
-# Registers the Excel-semantics expression namespace: col("x").xl.round(2), .xl.add, .xl.div.
-# Excel and polars disagree about rounding at .5, empty cells in arithmetic, and division by
-# zero. Every one of those disagreements produces silently wrong numbers rather than an error
-# (PLAN 2.6), so translations state their intent through this namespace rather than
-# open-coding the workaround where nobody can grep for it.
-from kedge import xl as _kedge_xl
+# kedge's own packages. `import kedge.x` binds exactly one name -- `kedge` -- so this cell owns
+# the whole surface under marimo's single-definition rule, and every cell below reads the way
+# the package docstrings do: kedge.ingest.receive(...), kedge.contracts.validate(...),
+# kedge.reconcile.reconcile_panel(...).
+import kedge
+import kedge.contracts
+import kedge.ingest
+import kedge.reconcile
 
-HANDIN_DIR = pathlib.Path({store!r})"""
+# Importing kedge.xl registers the Excel-semantics expression namespace: col("x").xl.round(2),
+# .xl.add, .xl.div. Excel and polars disagree about rounding at .5, empty cells in arithmetic,
+# and division by zero. Every one of those disagreements produces silently wrong numbers rather
+# than an error (PLAN 2.6), so translations state their intent through this namespace rather
+# than open-coding the workaround where nobody can grep for it.
+import kedge.xl
+
+# The managed hand-in store: every file this notebook has consumed, hashed, dated and
+# receipted, so "this run consumed this file" is a defensible claim (PLAN 2.8).
+HANDIN_DIR = pathlib.Path({store!r})
+
+# The workbook this notebook was converted from. Its cached values are the only baseline the
+# reconciliation cell has, so if the workbook moves, correct the path here -- the panel reports
+# "not reconciled" rather than guessing (PLAN 4.5).
+WORKBOOK = pathlib.Path({workbook_path!r})
+
+# Where the hand-in contract lives. It does not have to exist: with no contract the notebook
+# still runs and the check cell says, in as many words, that nothing is enforced (PLAN M5).
+CONTRACT_PATH = pathlib.Path({contract_path!r})"""
 
 _SOURCE_CELL = """# The hand-in selector. Swapping the file here re-runs everything below it in dataflow
 # order, the contract re-validates, and the reconciliation panel goes green or red. That is
@@ -343,86 +467,226 @@ handin_pick = mo.ui.file_browser(multiple=False, label="...or select one on this
 handin_source = mo.ui.tabs({"Drop": handin_drop, "Select": handin_pick})
 handin_source"""
 
-_HANDIN_CELL = """# Normalise either entry point into one record with a stable path and a hash. The hash is
-# what makes the audit line defensible: this run consumed this file.
-#
-# TODO(kedge): replace this body with `kedge.ingest.receive(...)` when M5 lands (PLAN 2.8).
-# The record shape below is deliberately the shape that returns, so nothing downstream moves.
-_dropped = handin_drop.value
-_picked = handin_pick.value
+_HANDIN_CELL = """# Both entry points converge here, and kedge.ingest.receive does the whole job: a dropped
+# file's bytes are written into the managed store, a selected path is copied into it, both are
+# hashed and deduplicated against what is already there, and a receipt is recorded. `handin` is
+# a HandIn record whose `path` is always the managed copy and never the transient upload --
+# which is what makes this notebook re-runnable tomorrow, when the uploaded bytes are gone.
 mo.stop(
-    not _dropped and not _picked,
+    not handin_drop.value and not handin_pick.value,
     mo.md("**Waiting for a hand-in.** Drop a file above, or select one."),
 )
 
-if _picked:
-    _path = pathlib.Path(_picked[0].path)
-    _origin = "selected"
-else:
-    _upload = _dropped[0]
-    _directory = HANDIN_DIR / datetime.date.today().isoformat()
-    _directory.mkdir(parents=True, exist_ok=True)
-    _path = _directory / f"{hashlib.sha256(_upload.contents).hexdigest()[:12]}-{_upload.name}"
-    _path.write_bytes(_upload.contents)
-    _origin = "dropped"
+# A selected path wins over dropped bytes where both are present: it is the reproducible one.
+handin = kedge.ingest.receive(handin_pick.value or handin_drop.value, store_dir=HANDIN_DIR)
+mo.md(f"**Hand-in** `{handin.audit_line()}`")"""
 
-handin = {
-    "path": _path,
-    "original_name": _path.name,
-    "sha256": hashlib.sha256(_path.read_bytes()).hexdigest(),
-    "size_bytes": _path.stat().st_size,
-    "received_at": datetime.datetime.now(datetime.UTC),
-    "source": _origin,
-}
-handin"""
-
-_FRAME_CELL = """# LazyFrame from the start. Nothing is materialised until a boundary asks for it, which is
-# what keeps the notebook's cell graph and polars' query plan aligned, and what makes this
-# scale past the point where Excel gave up (PLAN 2.5).
-# pl.read_excel defaults to the calamine engine: fast, and no Excel install needed.
-if handin["path"].suffix.lower() in (".csv", ".txt", ".tsv"):
-    handin_frame = pl.scan_csv(handin["path"])
-else:
-    handin_frame = pl.read_excel(handin["path"]).lazy()
-
-handin_frame"""
-
-_CHECK_CELL = """# The contract check. This is what turns "a notebook" into "a controlled process": the first
-# thing that runs after ingestion, failing loudly on a hand-in that is not what was agreed
-# (PLAN 2.8, M5).
+_CONTRACT_CELL = """# The contract, loaded once and read by all three cells below it: the shape profile, the check,
+# and the frame every stage computes on. *Which sheet and which header row* is part of the
+# agreement, so all three have to read the same rows -- a contract that goes green against 500
+# rows of 'Data' while the notebook computes on the cover sheet is worse than no contract at
+# all, because it looks controlled and is not.
 #
-# TODO(kedge): replace with `kedge.contracts.validate(handin, contract)` when M5 lands. Until
-# then this reports the shape that arrived, so drift is visible from the very first run.
-# collect_schema() reads the plan, not the data: no rows are materialised here.
-_schema = handin_frame.collect_schema()
-handin_check = mo.md(
-    "\\n".join(
-        [
-            "### Hand-in",
-            f"`{handin['original_name']}`  sha256 `{handin['sha256'][:16]}...`  ",
-            f"**{len(_schema)} columns:** "
-            + ", ".join(f"`{_name}` {_dtype}" for _name, _dtype in _schema.items()),
-            "",
-            "_No contract is configured yet, so nothing above is enforced._",
-        ]
+# Loading a contract is not checking a hand-in against it, so this does not put the contract
+# ahead of the drift panel. PLAN 2.8 is about what gets reported first, and drift still does.
+#
+# No contract is not an error. It is the state every new notebook starts in, and everything
+# below degrades to saying so rather than pretending anything was enforced. Draft one from a
+# real hand-in with `kedge contract infer`, save it at CONTRACT_PATH, and nothing else changes.
+handin_contract = None
+_problem = None
+if CONTRACT_PATH.is_file():
+    try:
+        handin_contract = kedge.contracts.load(CONTRACT_PATH)
+    except kedge.ContractError as _error:
+        _problem = str(_error)
+
+_lines = ["### Contract"]
+if handin_contract is not None:
+    _sheet = f"sheet `{handin_contract.sheet}`" if handin_contract.sheet else "the first sheet"
+    _header = (
+        "the detected header row"
+        if handin_contract.header_row is None
+        else f"header row {handin_contract.header_row}"
     )
+    _lines.append(
+        f"`{handin_contract.name}`, from `{CONTRACT_PATH}`. Everything below reads {_sheet}, "
+        f"{_header}, with any preamble above it skipped and any totals row excluded."
+    )
+elif _problem is not None:
+    # A contract that exists but will not load is worse than no contract at all, for the same
+    # reason. It does not block -- a typo in the YAML should not put the data out of reach --
+    # but it says so at the top of the panel.
+    _lines.append(f"**The contract at `{CONTRACT_PATH}` could not be loaded.** {_problem}")
+    _lines.append("")
+    _lines.append("_Nothing below is enforced until this is fixed._")
+else:
+    _lines.append(f"_No contract at_ `{CONTRACT_PATH}`_, so nothing below is enforced._")
+    _lines.append("")
+    _lines.append(f"Draft one: `kedge contract infer {handin.path} --out {CONTRACT_PATH}`")
+mo.md("\\n".join(_lines))"""
+
+_DRIFT_CELL = """# What arrived, and how it differs from last time -- reported BEFORE the contract check.
+# "column EAD became EAD_GBP" is a far more useful message than a schema-validation traceback
+# three checks deep, and it is the difference between a two-minute fix and an afternoon. Seeing
+# the shape before any processing happens is the other half of PLAN 2.8.
+#
+# Profiled off the sheet and header row the contract names, so the shape being diffed is exactly
+# the shape being checked. With no contract that is the first sheet with a detected header, which
+# is what the check would read too.
+#
+# check_drift stores the new profile but deliberately does not accept it: accepting is a
+# decision, made by calling kedge.ingest.accept_profile(HANDIN_DIR, handin_profile) once
+# somebody has read what changed.
+handin_profile = None
+handin_drift = None
+_problem = None
+try:
+    handin_profile, handin_drift = kedge.ingest.check_drift(
+        handin,
+        store_dir=HANDIN_DIR,
+        sheet=handin_contract.sheet if handin_contract is not None else None,
+        header_row=handin_contract.header_row if handin_contract is not None else None,
+    )
+except kedge.IngestError as _error:
+    _problem = str(_error)
+
+_lines = ["### Hand-in shape"]
+if handin_drift is None:
+    _lines.append(f"**Could not profile the hand-in.** {_problem}")
+else:
+    # Capped, because a 200-column extract renders as a wall rather than as information.
+    # The whole profile is bound as `handin_profile` either way.
+    _shown = handin_profile.columns[:24]
+    _more = handin_profile.column_count - len(_shown)
+    _lines.append(
+        f"{handin_profile.row_count:,} rows, {handin_profile.column_count} columns: "
+        + ", ".join(f"`{_column.header or _column.column}` {_column.dtype}" for _column in _shown)
+        + (f", and {_more} more -- see `handin_profile`" if _more else "")
+    )
+    _lines.append("")
+    _lines.append(handin_drift.summary_line())
+    _lines.append("")
+    _lines.extend(
+        f"- **{_item.severity.value}** `{_item.column or '-'}` -- {_item.message}"
+        for _item in handin_drift.items
+    )
+mo.md("\\n".join(_lines))"""
+
+_CHECK_CELL = """# The contract check: the first thing that runs after ingestion, and what turns "a notebook"
+# into "a controlled process". A hand-in that is not what was agreed is rejected before a single
+# number is computed (PLAN 2.8, M5). When this fails, read the shape panel above first -- it
+# usually explains the failure in one line.
+handin_check = None
+_problem = None
+if handin_contract is not None:
+    try:
+        handin_check = kedge.contracts.validate(handin, handin_contract)
+    except (kedge.ContractError, kedge.IngestError) as _error:
+        _problem = str(_error)
+
+_lines = ["### Contract check"]
+if handin_check is not None:
+    _lines.append(handin_check.summary_line())
+    _lines.append("")
+    _lines.extend(
+        f"- **{_check.status.value}** `{_check.column or '-'}` {_check.check}: {_check.message}"
+        for _check in (*handin_check.failures, *handin_check.warnings)
+    )
+elif _problem is not None:
+    _lines.append(f"**The contract could not be applied to this hand-in.** {_problem}")
+    _lines.append("")
+    _lines.append("_Nothing below is enforced until this is fixed._")
+else:
+    _lines.append("_No contract loaded, so nothing was checked. See the panel above._")
+mo.md("\\n".join(_lines))"""
+
+_FRAME_CELL = """# The contract gates the data. mo.stop halts this cell and every cell downstream of it in the
+# dataflow graph, so a hand-in that failed its contract cannot reach a single calculation. A
+# notebook with no contract configured passes straight through: handin_check is None, and None
+# is not a failure (PLAN 2.8).
+mo.stop(
+    handin_check is not None and not handin_check.ok,
+    mo.md(
+        "**Blocked: the hand-in does not satisfy its contract.** Fix the hand-in, correct the "
+        "contract, or remove it if it no longer describes what this process receives."
+    ),
 )
-handin_check"""
+
+# read_data is the one reader that profiling, contract validation and contract inference all go
+# through, and this is the identical call kedge.contracts.validate makes: the contract's own
+# sheet and header row, preamble above it skipped, a trailing totals row excluded. That the two
+# calls are the same call is the whole point -- read the file any other way and the frame the
+# notebook computes on is not the frame that was validated, so the green panel above becomes a
+# statement about rows nobody used. Mirroring these arguments here instead would put the two one
+# refactor apart, which is exactly how that bug gets in.
+_data, _layout = kedge.ingest.read_data(
+    handin.path,
+    sheet=handin_contract.sheet if handin_contract is not None else None,
+    header_row=handin_contract.header_row if handin_contract is not None else None,
+)
+
+# LazyFrame from here on. Nothing is materialised again until a boundary asks for it, which is
+# what keeps the notebook's cell graph and polars' query plan aligned (PLAN 2.5).
+handin_frame = _data.lazy()
+
+# Say what had to be skipped to reach the data, because a row count that does not match the
+# file is otherwise a mystery the user has to solve twice.
+_notes = _layout.notes()
+mo.vstack(
+    [mo.md("_Layout: " + "; ".join(_notes) + "._"), handin_frame] if _notes else [handin_frame]
+)"""
 
 
-def _head_cells(plan: ProcessPlan, handins_dir: Path | None) -> list[ScaffoldCell]:
-    """The selector, the ingest, the load, and the contract check. Same in every notebook."""
-    store = str(handins_dir if handins_dir is not None else Path("handins"))
+def _fixed_paths(
+    plan: ProcessPlan,
+    handins_dir: Path | None,
+    workbook_path: Path | None,
+    contract_path: Path | None,
+) -> dict[str, str]:
+    """The three filesystem constants the head cells close over.
+
+    Each default assumes the standard workspace layout -- a ``<workbook>.kedge`` directory
+    beside the workbook, with ``handins`` inside it -- and each is emitted as a plain constant
+    rather than something computed at run time, so a user whose files have moved corrects one
+    line instead of reading the scaffolder.
+    """
+    store = handins_dir if handins_dir is not None else Path("handins")
+    project = store.parent
+    return {
+        "store": str(store),
+        "workbook_path": str(
+            workbook_path if workbook_path is not None else project.parent / plan.workbook
+        ),
+        "contract_path": str(
+            contract_path if contract_path is not None else project / "contract.yaml"
+        ),
+    }
+
+
+def _head_cells(
+    plan: ProcessPlan,
+    handins_dir: Path | None,
+    workbook_path: Path | None,
+    contract_path: Path | None,
+) -> list[ScaffoldCell]:
+    """Setup, selector, receipt, contract, drift, check, frame. The same seven every time.
+
+    The order is :data:`HEAD_CELL_NAMES` and the reasoning for it is there (PLAN 2.8).
+    """
+    paths = _fixed_paths(plan, handins_dir, workbook_path, contract_path)
     return [
         ScaffoldCell(
             name="kedge_setup",
             role="setup",
-            code=_SETUP_TEMPLATE.format(version=plan.version, workbook=plan.workbook, store=store),
+            code=_SETUP_TEMPLATE.format(version=plan.version, workbook=plan.workbook, **paths),
         ),
         ScaffoldCell(name="handin_source", role="handin", code=_SOURCE_CELL),
         ScaffoldCell(name="handin", role="handin", code=_HANDIN_CELL),
-        ScaffoldCell(name="handin_frame", role="handin", code=_FRAME_CELL),
+        ScaffoldCell(name="handin_contract", role="handin", code=_CONTRACT_CELL),
+        ScaffoldCell(name="handin_drift", role="handin", code=_DRIFT_CELL),
         ScaffoldCell(name="handin_check", role="handin", code=_CHECK_CELL),
+        ScaffoldCell(name="handin_frame", role="handin", code=_FRAME_CELL),
     ]
 
 
@@ -609,45 +873,89 @@ def _comment(label: str, text: str, *, width: int = 92) -> list[str]:
 # =============================================================================
 
 
+_RECONCILE_BODY = """
+# There is exactly one way this cell can say "passed", and it runs through kedge.reconcile,
+# which refuses to construct a pass without compared rows. Every other path -- no workbook on
+# this machine, no cached values in it, no region matching a notebook column, an error part
+# way through -- lands on NOT RECONCILED with a reason attached. A signed-off claim that
+# nothing was checked is the most dangerous artifact this project could produce (PLAN 6.2),
+# so the fallback is built from the same report type as the real thing rather than from a
+# hopeful string.
+_reason = None
+reconciliation = None
+if not WORKBOOK.is_file():
+    _reason = (
+        f"The workbook {WORKBOOK} is not on this machine, so nothing was compared. That is "
+        f"not a pass: correct WORKBOOK in the setup cell and re-run."
+    )
+else:
+    try:
+        reconciliation = kedge.reconcile.reconcile_panel(WORKBOOK, reconciliation_values)
+    except kedge.KedgeError as _error:
+        _reason = f"Reconciliation could not run, so nothing was compared: {_error}"
+
+if reconciliation is None:
+    reconciliation = kedge.reconcile.ReconciliationPanel(
+        kedge.reconcile.ReconciliationReport(
+            workbook=str(WORKBOOK),
+            tolerance=kedge.reconcile.Tolerance(),
+            notes=[_reason],
+        )
+    )
+reconciliation"""
+
+
+def _reconciliation_values(plan: ProcessPlan, names: dict[str, str]) -> list[str]:
+    """The ``operation id -> notebook value`` literal the panel is driven from.
+
+    ``Stage.operations`` holds the ids of the analysis operations a stage implements, and
+    :func:`kedge.reconcile.infer_regions` keys the regions it proposes by that same id. Mapping
+    one to the other is therefore the whole wiring, and it is why the plan carries the link back
+    to the facts at all.
+
+    A stage that names no operation contributes nothing: there is no honest guess to make about
+    which workbook range it reproduces, and a region matched to the wrong column would pass or
+    fail for the wrong reason.
+    """
+    seen: set[str] = set()
+    entries: list[str] = []
+    for stage in plan.ordered_stages():
+        if stage.is_checkpoint:
+            continue
+        for operation in stage.operations:
+            if operation in seen:
+                continue
+            seen.add(operation)
+            entries.append(f"    {operation!r}: {names[stage.id]},  # stage {stage.id!r}")
+    return entries
+
+
 def _tail_cells(plan: ProcessPlan, names: dict[str, str]) -> list[ScaffoldCell]:
     """The reconciliation panel: the artifact that makes the notebook a controlled process."""
-    ordered = [stage for stage in plan.ordered_stages() if not stage.is_checkpoint]
-    final = ordered[-1] if ordered else None
-    translated = len(ordered)
-
     lines = [
         "# Reconciliation against the workbook's cached values (PLAN 4.5). Re-runs reactively",
         "# whenever anything upstream changes, and reports per region rather than per sheet so a",
-        "# failure localises. Where the workbook carries no cached values this must report",
-        '# "not reconciled" -- never "passed".',
+        "# failure localises to the column that moved.",
         "#",
-        "# TODO(kedge): call kedge.reconcile once M4.5 lands. Until then it states, accurately,",
-        "# that nothing has been verified.",
+        "# The keys are analysis operation ids, taken from each stage's `operations` in the plan.",
+        "# kedge.reconcile reads the workbook, proposes one region per formula region carrying",
+        "# cached values -- keyed by that same id -- and compares the two. Add an entry here as",
+        "# each stage is translated; a stage with no entry is reported as unchecked, never as",
+        "# passed.",
     ]
-    if final is None:
-        lines.append("reconciliation_frame = pl.DataFrame()")
-    elif final.kind is StageKind.OUTPUT:
-        lines.append(f"reconciliation_frame = {names[final.id]}  # already materialised")
+    entries = _reconciliation_values(plan, names)
+    if entries:
+        lines.append("reconciliation_values = {")
+        lines.extend(entries)
+        lines.append("}")
     else:
-        lines.append(
-            f"reconciliation_frame = {names[final.id]}.collect()  # boundary: the only collect"
+        lines.extend(
+            [
+                "#",
+                "# No stage in this plan names an analysis operation, so there is nothing to map",
+                "# yet. Entries look like: '<operation id>': <the cell that reproduces it>.",
+                "reconciliation_values = {}",
+            ]
         )
-
-    lines.extend(
-        [
-            "reconciliation = mo.md(",
-            '    "\\n".join(',
-            "        [",
-            '            "### Reconciliation",',
-            f'            "**NOT RECONCILED.** {translated} translated stage(s) have not been "',
-            '            "checked against the workbook\'s cached values.",',
-            '            "",',
-            '            f"Final frame: {reconciliation_frame.height} rows x "',
-            '            f"{reconciliation_frame.width} columns.",',
-            "        ]",
-            "    )",
-            ")",
-            "reconciliation",
-        ]
-    )
+    lines.append(_RECONCILE_BODY)
     return [ScaffoldCell(name="reconciliation", code="\n".join(lines), role="reconcile")]
