@@ -27,7 +27,7 @@ from kedge.errors import (
 )
 from kedge.workspace import MarimoMarker, MarimoSession, Workspace
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 __all__ = [
     "AnalysisError",
