@@ -328,6 +328,21 @@ class Workspace:
         return self.project_dir / "handins"
 
     @property
+    def contract_path(self) -> Path:
+        """The hand-in contract this workbook's notebook enforces (PLAN 2.8).
+
+        One contract per workbook rather than one per hand-in: the contract describes the shape
+        every hand-in must arrive in, so it belongs beside the plan and the notebook that depend
+        on it, not beside whichever file happened to arrive first. ``kedge contract infer`` still
+        defaults to writing its draft next to the hand-in -- that is a draft to read, and moving
+        it here is the act of adopting it. Overridable by ``ingest.contract``.
+        """
+        configured = self.config.ingest.contract
+        if configured is not None:
+            return configured if configured.is_absolute() else self.project_dir / configured
+        return self.project_dir / "contract.yaml"
+
+    @property
     def analysis_path(self) -> Path:
         """Where ``kedge inspect`` writes this workbook's analysis by default."""
         return self.project_dir / "analysis.json"

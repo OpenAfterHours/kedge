@@ -462,6 +462,7 @@
   // ── opening ────────────────────────────────────────────────────────────────────────
 
   const STEP_LABELS = {
+    bridge: "Check the marimo bridge",
     cleanup: "Clean up after any previous run",
     analysing: "Analyse the workbook",
     planning: "Find an approved process plan",

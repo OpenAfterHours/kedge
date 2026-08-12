@@ -221,8 +221,11 @@ class IngestConfig(_Section):
     watch_dir: Path | None = None
     watch_glob: str = "*.xlsx"
     dedupe_by_hash: bool = True
+    contract: Path | None = None
+    """The hand-in contract the notebook enforces. ``None`` means ``<project_dir>/contract.yaml``.
+    A relative path is relative to the project directory, as ``store_dir`` is."""
 
-    @field_validator("store_dir", "watch_dir")
+    @field_validator("store_dir", "watch_dir", "contract")
     @classmethod
     def _expand_user(cls, value: Path | None) -> Path | None:
         return None if value is None else Path(value).expanduser()
