@@ -12,6 +12,10 @@ Read this first, then the document you actually need:
 | `CONVENTIONS.md` | Binding style rules. Reviewers reject on these. |
 | `docs/marimo-api.md` | **Empirically verified** marimo behaviour. Supersedes `PLAN.md` §1.1–§1.3 wherever they disagree. |
 | `RELEASING.md` | How a version tag becomes a PyPI release, and how to recover when one fails. |
+| `CONTRIBUTING.md` | The short version for a human arriving from GitHub. Points back at this file and `CONVENTIONS.md`. |
+| `docs/analyser-worked-example.md` | Real `kedge inspect` output over two fixture workbooks, annotated. The fastest way to see what the analyser actually produces. |
+| `docs/ty-diagnostics.md` | Every outstanding `ty` diagnostic, why it is there, and what would clear it. |
+| `SECURITY.md` | The actual trust boundary: loopback, no auth, machine-level. Read before changing anything that binds a socket or logs a payload. |
 
 ## Non-negotiables
 
@@ -34,6 +38,11 @@ Read this first, then the document you actually need:
    for `--no-token` servers, so our own process never appears in it.
 6. **Reconciliation never reports "passed" when it has no baseline.** A workbook with no cached
    values degrades to "not reconciled". This is the most dangerous failure mode in the project.
+7. **marimo's HTTP API is spoken by `src/kedge/marimo_http.py` alone.** `notebook/kernel.py` is
+   the one deliberate exception — async SSE streaming of `POST /api/kernel/execute` is a
+   different shape — and even it imports the path and headers from `marimo_http`. Also enforced
+   by `scripts/guardrails.py`. (CONVENTIONS.md numbers this one 6; it has no reconciliation
+   entry.)
 
 ## Architecture in one paragraph
 
@@ -56,7 +65,7 @@ uv run pytest -m contract          # live-kernel tests; spawns a real marimo
 uv run pytest -m llm               # needs a configured model endpoint; skipped by default
 uv run ruff check --fix . && uv run ruff format .
 uv run ty check src/
-uv run python scripts/guardrails.py        # non-negotiables 1 and 2, by AST not by grep
+uv run python scripts/guardrails.py        # non-negotiables 1, 2 and 7, by AST not by grep
 uv run python scripts/version.py v0.2.0    # does that tag match __version__?
 uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole release
 
@@ -65,7 +74,9 @@ uv run kedge --help
 ```
 
 CI runs all of the above on Ubuntu and Windows across 3.12 and 3.13 (`.github/workflows/ci.yml`),
-including the contract tests. `ty` is advisory there until its six known diagnostics are cleared.
+including the contract tests. `ty` is advisory there until its three known diagnostics are cleared
+(`docs/ty-diagnostics.md`). One matrix leg — Ubuntu, 3.12 — also measures coverage against the
+`fail_under` in `pyproject.toml`.
 
 ## Testing
 

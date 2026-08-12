@@ -1,0 +1,32 @@
+name: Feature request
+description: Something kedge should do and does not.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        `PLAN.md` is the author's brief and says what is deliberately *not* being built —
+        accounts, multi-user, deployment and scaling are all out of scope by decision rather than
+        by omission (PLAN 2.9). Worth a look before writing this up.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What you were trying to do with a workbook, and where kedge got in the way. The concrete
+        situation is more useful than the proposed solution.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+      description: Including what you would accept as evidence that it works.
+
+  - type: input
+    id: plan-section
+    attributes:
+      label: Related PLAN section, if you know of one
+      placeholder: "PLAN 2.7 — formula to polars translation reference"

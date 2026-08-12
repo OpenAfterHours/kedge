@@ -1,0 +1,93 @@
+# Dependency-bump notifications. The point is the notification, not the merge.
+#
+# `marimo==0.23.15` and `polars==1.43.2` are exact pins on purpose. marimo because `_code_mode`
+# is a private API with no versioning guarantees (PLAN 6.1 mitigation 2); polars because it has
+# changed rounding behaviour between versions and the `kedge.xl` Excel table is the tripwire
+# (PLAN 6.2). A pin only protects a project that notices a new release exists, and until this
+# file landed nothing in this repository looked.
+#
+# PLAN 6.1 mitigation 3 asks for the other half: "Contract tests in CI ... These must run on
+# every marimo bump, and the bump does not merge until they pass." `ci.yml` runs on
+# `pull_request`, so a Dependabot marimo PR picks up the contract job on Ubuntu and Windows with
+# no extra wiring, and `.github/pull_request_template.md` carries the rest of the checklist.
+#
+# There is deliberately **no auto-merge** here, and none should be added -- least of all for
+# marimo or polars. An unattended bump past a pin is precisely the failure the pin exists to
+# prevent, and a green CI run is evidence for a human, not a substitute for one.
+#
+# What this file cannot do, stated plainly:
+#   - Dependabot reads its configuration from the default branch only. Nothing happens until
+#     this is on `main`.
+#   - It bumps `pyproject.toml`, not `MARIMO_PIN` in `src/kedge/lifecycle.py`. The two must agree,
+#     so a marimo PR arrives red: `test_the_installed_marimo_matches_the_pin` fails until someone
+#     updates the constant by hand. That is the intended shape -- the test is the enforcement and
+#     the PR template is the walk-through.
+#   - It cannot re-verify `docs/marimo-api.md`. That is a person reading a document against a
+#     live server.
+#   - It proves nothing by itself. CI proves things; this only makes sure someone is asked.
+
+version: 2
+
+updates:
+  # ── Python dependencies ──────────────────────────────────────────────────────────────────
+  # `uv`, not `pip`: the pip ecosystem understands a PEP 621 `pyproject.toml` but not `uv.lock`,
+  # and CI installs with `uv sync --locked`, which fails when the lock has drifted from the
+  # manifest. A bump that moved one and not the other would arrive permanently red.
+  #
+  # No `versioning-strategy` is set. Under the default, a dependency declared `>=` is expected to
+  # produce a quiet `uv.lock`-only bump because the existing constraint already admits the new
+  # version, while the two exact pins have to be rewritten in `pyproject.toml` for the bump to
+  # mean anything -- which is the visible, unmissable PR this file exists to raise.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 5
+    # Only labels that already exist on the repository are applied. "dependencies" is one
+    # Dependabot creates itself; anything else has to be created first or it is dropped.
+    labels:
+      - "dependencies"
+    # Conventional Commits, which this repository requires of everyone else too. `include: scope`
+    # produces `chore(deps): bump ...` and `chore(deps-dev): bump ...`.
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      # One pull request a week for the long tail. marimo and polars are excluded from the group
+      # so that each arrives on its own, with its own CI run and its own review: the two bumps a
+      # human genuinely has to look at must never be buried in a list of twelve.
+      python-minor-and-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "marimo"
+          - "polars"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # ── GitHub Actions ───────────────────────────────────────────────────────────────────────
+  # The workflows pin actions by tag (`actions/checkout@v7`, `astral-sh/setup-uv@v9.0.0`), which
+  # is a pin that ages silently. Grouped into one PR: a stale action is a maintenance matter, not
+  # a correctness risk, and one review a week is the right amount of attention for it.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Europe/London"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

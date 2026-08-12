@@ -119,6 +119,22 @@ Each stage gates the next, so nothing is uploaded until everything before it is 
 Publishing runs before the GitHub release deliberately: a release that exists is a release whose
 artifacts reached PyPI.
 
+## There is no CHANGELOG.md, on purpose
+
+`pyproject.toml` points its `Changelog` URL at <https://github.com/OpenAfterHours/kedge/releases>,
+and that is the changelog. This is a decision, not an omission — please do not "fix" it.
+
+The reasoning is that a release here is a pushed tag, and `github-release` builds its notes from
+the commits in the range. Conventional Commits is what makes those notes readable, and it is
+already required of every pull request, so the commit messages *are* the changelog and there is
+exactly one copy of them. A `CHANGELOG.md` would be a second copy, hand-maintained, in a workflow
+where nothing at any point prompts you to edit a file — `scripts/release.py` bumps a version, runs
+the gates and pushes. It would be complete for two releases and wrong from the third.
+
+Revisit when there is something generated notes genuinely cannot say: a curated "what breaks and
+what to do about it" for people pinning kedge in their own projects. At that point the upkeep buys
+something. Before then it only buys a file that disagrees with the tags.
+
 ## When something goes wrong
 
 **The tag disagrees with the version.** The `verify` job fails and nothing else runs. Fix

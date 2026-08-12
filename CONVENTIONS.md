@@ -18,6 +18,11 @@ Read `PLAN.md` for *what* to build. This file is *how*. It is binding: reviewers
 5. **Never auto-discover a marimo server.** kedge owns its own process, targeted by explicit
    url + session id. Reading the registry is permitted *only* to identify a stale
    kedge-owned process via our own marker file (PLAN §2.9).
+6. **marimo's HTTP API is spoken by `src/kedge/marimo_http.py` alone.**
+   `src/kedge/notebook/kernel.py` is the one deliberate exception — streaming
+   `POST /api/kernel/execute` asynchronously is a different shape from the rest — and even it
+   imports the path and the auth headers from `marimo_http`. One marimo release moving an
+   endpoint should cost one file, not a hunt. Enforced by `scripts/guardrails.py`.
 
 ## Python style
 

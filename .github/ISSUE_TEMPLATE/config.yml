@@ -1,0 +1,7 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security issue
+    url: https://github.com/OpenAfterHours/kedge/security/advisories/new
+    about: >-
+      Report privately rather than in a public issue. SECURITY.md sets out what kedge's security
+      surface actually is, which is narrower than most projects'.
