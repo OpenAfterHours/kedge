@@ -436,6 +436,494 @@ def test_the_analysis_step_writes_the_analysis_and_the_report_beside_the_workboo
     assert client.get(f"/api/hub/report/{key}").status_code == 200
 
 
+# ── the plan the notebook is scaffolded from ─────────────────────────────────────────────────
+#
+# `kedge open --plan <file>` names the plan to scaffold from. Everything here is about the step
+# that reads it: it must prefer the named file over the store, it must not scaffold from a file
+# nobody approved, and neither a missing file nor a mangled one may reach the user as a traceback.
+
+
+STORE_SUMMARY = "the decomposition already saved in the store"
+"""What the seeded store's approved plan says, so a test can tell it from the one it names."""
+
+
+class _StubDriver:
+    """Just enough notebook bridge for the plan gate to be the only thing under test."""
+
+    def __init__(self) -> None:
+        self.created: list[tuple[str, str]] = []
+
+    async def create_cell(self, code: str, *, name: str, **_kw: object):
+        from kedge.notebook.model import CellRef, MutationResult
+
+        self.created.append((name, code))
+        return MutationResult(
+            operation="create_cell", cell=CellRef(id="U1", name=name), ran=True, status="idle"
+        )
+
+
+def _bare_workspace(tmp_path: Path, home: Path) -> Workspace:
+    """A workspace for a real workbook, with no plan of any kind saved for it."""
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    return workspace
+
+
+def _planned_workspace(tmp_path: Path, home: Path) -> Workspace:
+    """A workspace whose plan store already holds an approved plan of its own.
+
+    The store's plan is deliberately not the one the tests name with the flag. A test where both
+    plans are the same proves nothing about which one was read.
+    """
+    from conftest import approved_plan_store, make_draft
+
+    workspace = _bare_workspace(tmp_path, home)
+    approved_plan_store(
+        workspace.plans_dir,
+        draft=make_draft(summary=STORE_SUMMARY),
+        workbook="the-store-s-own.xlsx",
+    )
+    return workspace
+
+
+def _plan_for(workspace: Workspace, *, summary: str = "named with the flag") -> object:
+    """An approved plan written for this exact workbook, digest and all.
+
+    The identity warning fires on a plan whose workbook does not match, which is right and is
+    tested for -- but it would otherwise ride along on the detail line of every other assertion
+    here and make them read as though a mismatch were normal. The summary is what tells two
+    otherwise identical plans apart.
+    """
+    from conftest import make_approved_plan, make_draft
+    from kedge.analysis.workbook import read_identity
+
+    identity = read_identity(workspace.workbook_path)
+    return make_approved_plan(
+        draft=make_draft(summary=summary),
+        workbook=workspace.workbook_path.name,
+        workbook_sha256=identity.sha256,
+    )
+
+
+def _write_plan(path: Path, plan: object) -> Path:
+    from kedge.plan.store import plan_to_yaml
+
+    path.write_text(plan_to_yaml(plan), encoding="utf-8")
+    return path
+
+
+def _store(workspace: Workspace) -> object:
+    from kedge.plan.store import PlanStore
+
+    return PlanStore.for_workspace(workspace)
+
+
+async def test_an_explicitly_named_plan_is_read_instead_of_the_stores_latest_approved(
+    tmp_path: Path, home: Path
+) -> None:
+    """--plan means *this* plan. Both are approved here, so only provenance can decide."""
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    in_store = _store(workspace).latest_approved()
+    named = _write_plan(
+        tmp_path / "agreed.yaml", _plan_for(workspace, summary="the one named with the flag")
+    )
+    job = OpenJob(job_id="explicit", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert in_store.summary == STORE_SUMMARY, "the two plans have to genuinely differ"
+    assert plan is not None
+    assert plan.summary == "the one named with the flag", "the store's plan must not win instead"
+    detail = job.frames[-1].detail
+    assert job.frames[-1].state == "ok"
+    assert "--plan" in detail, "the terminal and the dialog both have to say where the plan is from"
+    assert str(named) in detail
+
+
+async def test_the_named_plan_is_recorded_so_the_rest_of_kedge_agrees_with_the_notebook(
+    tmp_path: Path, home: Path
+) -> None:
+    """The scaffolded plan must not be invisible to everything that reads the store.
+
+    `latest_approved()` is what "a plan is in force" means to the agent's write gate, `get_plan`,
+    `propose_plan`'s already-approved refusal and the pinned plan block. A notebook scaffolded from
+    a file the store has never heard of is a workspace at war with itself: cells implementing a
+    decomposition the chat says does not exist, and a `propose_plan` offering to write a first one
+    over the top of it.
+    """
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    named = _write_plan(tmp_path / "agreed.yaml", _plan_for(workspace, summary="adopted by flag"))
+    job = OpenJob(job_id="record", workbook=str(workspace.workbook_path))
+
+    adopted = await _step_plan(workspace, job, plan_path=named)
+
+    in_force = _store(workspace).latest_approved()
+    assert in_force is not None, "nothing else in kedge can see a plan that was never recorded"
+    assert in_force.summary == "adopted by flag"
+    assert adopted.version == in_force.version, "the notebook is scaffolded from what was recorded"
+    assert "recorded as plan v1" in job.frames[-1].detail
+
+
+async def test_adopting_the_same_plan_again_records_nothing_new(tmp_path: Path, home: Path) -> None:
+    """Re-opening a workbook is routine. `kedge plan approve` already refuses to record a
+    decision that changes nothing, and a history of identical versions says nothing to the person
+    reading it next quarter."""
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    named = _write_plan(tmp_path / "agreed.yaml", _plan_for(workspace))
+    first = OpenJob(job_id="once", workbook=str(workspace.workbook_path))
+    second = OpenJob(job_id="twice", workbook=str(workspace.workbook_path))
+
+    await _step_plan(workspace, first, plan_path=named)
+    await _step_plan(workspace, second, plan_path=named)
+
+    assert _store(workspace).versions() == [1]
+    assert "already the approved plan in force" in second.frames[-1].detail
+
+
+async def test_the_agents_write_gate_agrees_once_a_named_plan_is_adopted(
+    tmp_path: Path, home: Path
+) -> None:
+    """The assertion that would have caught the flag scaffolding a plan nothing else could see.
+
+    Same store, same predicate the tools use. Before the adoption `propose_cell` is refused, which
+    is what makes the second half worth asserting: it is the adoption that moves the gate, not the
+    fixture.
+    """
+    from kedge.agent.context import NotebookState
+    from kedge.agent.tools import ToolContext, ToolRegistry
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    named = _write_plan(tmp_path / "agreed.yaml", _plan_for(workspace))
+    driver = _StubDriver()
+    tools = ToolRegistry(ToolContext(driver=driver, plans=_store(workspace)))
+    tools.refresh(NotebookState(cells=()))
+    cell = {"name": "apply_haircuts", "code": "apply_haircuts = 1\n"}
+
+    before = await tools.dispatch("propose_cell", cell)
+    await _step_plan(workspace, OpenJob(job_id="gate", workbook=str(workspace.workbook_path)))
+    refused_by_the_store = await tools.dispatch("propose_cell", cell)
+    await _step_plan(
+        workspace, OpenJob(job_id="gate", workbook=str(workspace.workbook_path)), plan_path=named
+    )
+    after = await tools.dispatch("propose_cell", cell)
+
+    assert not before.ok and "no approved plan" in before.summary
+    assert not refused_by_the_store.ok, "the store alone still has nothing approved in it"
+    assert after.ok, "the tools must not refuse to write the notebook kedge just scaffolded"
+    assert [name for name, _code in driver.created] == ["apply_haircuts"]
+
+
+async def test_a_named_plan_superseding_an_approved_one_says_which_one(
+    tmp_path: Path, home: Path
+) -> None:
+    """A decomposition never displaces another one quietly (see `_confirm_replacing_the_plan_in_force`).
+
+    On this path there is nobody to ask -- the sequence is already running -- so the frame carries
+    the fact instead, and it is the one the user needs: the plan they reviewed last month is no
+    longer the one this notebook implements.
+    """
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    in_force = _store(workspace).latest_approved()
+    named = _write_plan(tmp_path / "agreed.yaml", _plan_for(workspace, summary="this month's"))
+    job = OpenJob(job_id="supersede", workbook=str(workspace.workbook_path))
+
+    await _step_plan(workspace, job, plan_path=named)
+
+    detail = job.frames[-1].detail
+    assert f"superseding v{in_force.version}" in detail
+    assert f"recorded as plan v{in_force.version + 1}" in detail
+    assert _store(workspace).latest_approved().summary == "this month's"
+
+
+async def test_a_file_claiming_an_approval_the_review_gate_would_refuse_is_not_adopted(
+    tmp_path: Path, home: Path
+) -> None:
+    """`approval.state: approved` typed by hand is not the same thing as an approved plan.
+
+    Every plan that went through `kedge.plan.review.approve` is approvable by construction, so
+    this refuses only a file that could not have come from the real path -- here one whose dropped
+    range nobody ever acknowledged, which is the blocker the whole acknowledge verb exists for.
+    Ten scaffolded cells behind a drop nobody agreed to is exactly the silent removal PLAN 2.2
+    treats as indistinguishable from a bug.
+    """
+    from kedge.plan.model import Approval, ApprovalState
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    from conftest import make_plan
+
+    claimed = make_plan(workbook=workspace.workbook_path.name).model_copy(
+        update={"approval": Approval(state=ApprovalState.APPROVED, by="typed it in myself")}
+    )
+    named = _write_plan(tmp_path / "hand-approved.yaml", claimed)
+    job = OpenJob(job_id="unapprovable", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert plan is None
+    assert job.frames[-1].state == "failed"
+    detail = job.frames[-1].detail
+    assert "has not been acknowledged" in detail, "the blockers are named, not just counted"
+    assert _store(workspace).versions() == [], "nothing may be recorded from a file like this"
+
+
+async def test_a_plan_approved_by_nobody_named_is_adopted_and_says_so(
+    tmp_path: Path, home: Path
+) -> None:
+    """Who approved it is a record, not a gate.
+
+    A hand-written file can leave `approval.by` out, and there is no honest way to fill it in
+    afterwards. Refusing would block a legitimate plan over a missing name; recording the gap where
+    the user can see it is what the rest of kedge does (`kedge plan approve` prints "nobody named").
+    """
+    from kedge.plan.model import Approval, ApprovalState
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    anonymous = _plan_for(workspace).model_copy(
+        update={"approval": Approval(state=ApprovalState.APPROVED)}
+    )
+    named = _write_plan(tmp_path / "anonymous.yaml", anonymous)
+    job = OpenJob(job_id="anonymous", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert plan is not None, "a missing reviewer name is not a reason to refuse a plan"
+    assert "approved by nobody named" in job.frames[-1].detail
+
+
+async def test_the_step_refuses_a_foreign_plan_itself_and_not_only_the_cli_before_it(
+    tmp_path: Path, home: Path
+) -> None:
+    """The guard on a durable artifact belongs beside the write, not only in front of one caller.
+
+    `cli._require_usable_plan` refuses this before a marimo is spawned, and today that is the only
+    way in -- `OpenWorkbookBody` has no plan field. The day it gains one, a refusal that lived only
+    in the CLI would be gone with no test failing, which inverts the pattern the project states for
+    its own gate: `scaffold_notebook` refuses an unapproved plan structurally, with no parameter
+    that talks it out of it. So this drives the step directly, with no pre-flight in front of it.
+    """
+    from conftest import make_approved_plan
+    from kedge.server.hub import _plan_from_file
+
+    workspace = _bare_workspace(tmp_path, home)
+    foreign = _write_plan(
+        tmp_path / "foreign.yaml", make_approved_plan(workbook="quite_other.xlsx")
+    )
+    job = OpenJob(job_id="foreign", workbook=str(workspace.workbook_path))
+
+    plan = await _plan_from_file(workspace, job, foreign)
+
+    assert plan is None, "nothing may be scaffolded from another workbook's decomposition"
+    assert job.frames[-1].state == "failed"
+    assert _store(workspace).versions() == [], "and nothing may be written to this plan history"
+    detail = job.frames[-1].detail
+    assert "written for quite_other.xlsx, not rwa_monthly.xlsx" in detail
+    assert "`workbook:` line" in detail, "the way through is the edit, and it has to be named"
+
+
+async def test_a_workbook_that_has_merely_changed_is_adopted_with_a_warning(
+    tmp_path: Path, home: Path
+) -> None:
+    """Same filename, different digest: what a monthly process looks like, so it is not refused.
+
+    This is the carve-out that makes the refusal above safe to be a refusal -- and it is the state
+    a user lands in after taking the advice in that refusal and editing the `workbook:` line.
+    """
+    from conftest import make_approved_plan
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    moved_on = _write_plan(
+        tmp_path / "moved.yaml",
+        make_approved_plan(workbook=workspace.workbook_path.name, workbook_sha256="b" * 64),
+    )
+    job = OpenJob(job_id="moved", workbook=str(workspace.workbook_path))
+
+    assert await _step_plan(workspace, job, plan_path=moved_on) is not None
+    assert "has changed since this plan was written" in job.frames[-1].detail
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("workbook", "", "does not record which workbook it was written for"),
+        ("workbook_sha256", "", "records no sha256"),
+    ],
+)
+async def test_a_plan_that_says_nothing_about_its_workbook_is_not_told_it_has_changed(
+    tmp_path: Path, home: Path, field: str, value: str, expected: str
+) -> None:
+    """Saying the wrong thing about identity is worse than saying nothing.
+
+    Both of these used to fall through to the digest branch and report that the workbook "has
+    changed since this plan was written for it" -- a claim about a comparison that never happened.
+    An empty `workbook` skipped the foreign-workbook check on the way past, too, so the file was
+    adopted and then described inaccurately.
+    """
+    from kedge.server.hub import _step_plan
+
+    workspace = _bare_workspace(tmp_path, home)
+    named = _write_plan(
+        tmp_path / "vague.yaml", _plan_for(workspace).model_copy(update={field: value})
+    )
+    job = OpenJob(job_id="vague", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert plan is not None, "an unidentified plan claims nothing about another workbook"
+    detail = job.frames[-1].detail
+    assert expected in detail
+    assert "has changed since" not in detail
+
+
+async def test_an_unapproved_plan_file_is_stepped_over_rather_than_scaffolded(
+    tmp_path: Path, home: Path
+) -> None:
+    """The review gate does not move because the user typed a path.
+
+    `scaffold_notebook` refuses an unapproved plan structurally and has no override, so the only
+    question is how that refusal reaches the user: as a legible step, with the workbook open and
+    the notebook empty, rather than as an exception out of the open sequence. Falling back to the
+    store's approved plan would be worse still -- it would scaffold a decomposition nobody asked
+    for -- so this asserts nothing at all comes back.
+    """
+    from conftest import make_plan
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    named = _write_plan(tmp_path / "draft.yaml", make_plan(workbook="named-with-the-flag.xlsx"))
+    job = OpenJob(job_id="unapproved", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert plan is None, "an unapproved file must not silently fall back to the store's plan"
+    assert job.frames[-1].state == "skipped", "a held gate is not a crash"
+    detail = job.frames[-1].detail
+    assert "'draft', not approved" in detail
+    assert str(named) in detail
+    assert "nothing is scaffolded unreviewed" in detail
+
+
+async def test_a_plan_file_that_will_not_parse_is_one_message_naming_the_file(
+    tmp_path: Path, home: Path
+) -> None:
+    """A hand-edited plan is invited (PLAN 2.2), so a mangled one is a normal thing to hit."""
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    named = tmp_path / "mangled.yaml"
+    named.write_text("stages: [oh dear\n", encoding="utf-8")
+    job = OpenJob(job_id="mangled", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=named)
+
+    assert plan is None
+    assert job.frames[-1].state == "failed"
+    detail = job.frames[-1].detail
+    assert str(named) in detail, "the message has to name the file the user typed"
+    assert "not valid YAML" in detail
+
+
+async def test_a_plan_file_that_is_not_there_is_reported_not_raised(
+    tmp_path: Path, home: Path
+) -> None:
+    """The CLI checks first, but the step is what the hub would call and it must not raise."""
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    missing = tmp_path / "never-written.yaml"
+    job = OpenJob(job_id="missing", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job, plan_path=missing)
+
+    assert plan is None
+    assert job.frames[-1].state == "failed"
+    assert str(missing) in job.frames[-1].detail
+
+
+async def test_the_scaffold_step_does_not_claim_no_plan_was_named_when_one_was(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "No approved plan" is the wrong account of a run where the user named one and it was refused.
+
+    Two steps report the same silence and only one of them knows why. A reader told the wrong
+    reason here goes looking in the plan store for something that was never the problem.
+    """
+    from kedge.server.hub import _step_scaffold
+
+    monkeypatch.setattr(
+        "kedge.notebook.driver.NotebookDriver.for_workspace", lambda _workspace: _StubDriver()
+    )
+    workspace = _bare_workspace(tmp_path, home)
+    named = tmp_path / "refused.yaml"
+    with_flag = OpenJob(job_id="named", workbook=str(workspace.workbook_path))
+    without = OpenJob(job_id="unnamed", workbook=str(workspace.workbook_path))
+
+    await _step_scaffold(workspace, None, with_flag, plan_path=named)
+    await _step_scaffold(workspace, None, without)
+
+    assert with_flag.frames[-1].state == "skipped"
+    assert "was not adopted" in with_flag.frames[-1].detail
+    assert str(named) in with_flag.frames[-1].detail
+    assert without.frames[-1].detail == "no approved plan, so there is nothing to scaffold"
+
+
+async def test_the_named_plan_survives_the_whole_open_sequence(
+    client: TestClient,
+    workbook: Path,
+    no_marimo: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The defect was the wiring, not the step: the flag was validated and then dropped.
+
+    Asserted through `open_workbook` because that is the seam `kedge open` and the hub's Open
+    button share -- a parameter that stops anywhere along `_run_open` is the same lie in `--help`
+    as no parameter at all.
+    """
+    from kedge.server.hub import open_workbook
+
+    seen: list[Path | None] = []
+
+    async def _capture(_workspace, _job, *, plan_path=None):
+        seen.append(plan_path)
+        return None
+
+    monkeypatch.setattr("kedge.server.hub._step_plan", _capture)
+    named = tmp_path / "agreed.yaml"
+
+    await open_workbook(_state(client), workbook, reattach=False, plan_path=named)
+
+    assert seen == [named]
+
+
+async def test_the_hubs_own_open_still_takes_the_stores_latest_approved(
+    tmp_path: Path, home: Path
+) -> None:
+    """Nothing about the hub's route changed: no file named, no behaviour moved."""
+    from kedge.server.hub import _step_plan
+
+    workspace = _planned_workspace(tmp_path, home)
+    job = OpenJob(job_id="store", workbook=str(workspace.workbook_path))
+
+    plan = await _step_plan(workspace, job)
+
+    assert plan is not None
+    assert plan.workbook == "the-store-s-own.xlsx"
+    assert "--plan" not in job.frames[-1].detail
+
+
 # ── the contract the analysis step sketches ──────────────────────────────────────────────────
 
 

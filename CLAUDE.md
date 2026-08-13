@@ -115,13 +115,16 @@ including the contract tests. `ty` is advisory there until its three known diagn
   429, a 5xx and a refusal the dialect negotiation declined all land. Quote the endpoint's prose
   from `body["error"]["message"]`, never the SDK's `message`: that one is
   `"Error code: 429 - {repr of the whole body}"`.
-- A turn is up to `[agent] max_steps` completions and **every one re-sends the whole prompt** —
-  around 8,000 tokens of system prompt, tool schemas and pinned blocks before the conversation.
-  Two consequences. `_window_for` pins **least volatile first** (analysis, plan, registry, state)
-  because a prompt cache keys on the prefix, so anything ahead of a block that changes stays
-  cached and anything behind it does not; reordering that list is a silent cost regression. And
-  `_Meter` accumulates **per step** — a single step's figure understates a turn by up to
-  `max_steps`.
+- A turn is up to `[agent] max_steps` completions, **plus one**: a turn stopped by a retry cap gets
+  a last word with the tools withheld (`KedgeAgent._final_word`), or it ends having said nothing at
+  all. **Every one re-sends the whole prompt** — around 8,000 tokens of system prompt, tool schemas
+  and pinned blocks before the conversation — except the last word, which re-sends everything but
+  the schemas and is therefore the one step billed entirely uncached, since dropping them changes
+  the prompt at byte zero. Two consequences. `_window_for` pins **least volatile first** (analysis,
+  plan, registry, state) because a prompt cache keys on the prefix, so anything ahead of a block
+  that changes stays cached and anything behind it does not; reordering that list is a silent cost
+  regression. And `_Meter` accumulates **per step** — a single step's figure understates a turn by
+  up to `max_steps + 1`.
 - **A carried turn is re-dated, and its age must not be.** `ConversationWindow.resume` moves a
   carried message into the turn it is resumed as — it has to, or it sorts behind history that is
   older than it — and `KedgeAgent._carry` now hands a turn's tool traffic on whether or not the
@@ -158,6 +161,17 @@ including the contract tests. `ty` is advisory there until its three known diagn
 - marimo's two file inputs return different things: `mo.ui.file` gives bytes with no path,
   `mo.ui.file_browser` gives a path with no bytes. An uploaded hand-in is **not reproducible**,
   which is why everything converges on a managed `HandIn` record.
+- **A test that posts `json={}` is not testing the request the browser sends.** Every decision
+  route declared its `DecisionBody` required and all twenty tests posted `json={}`, so the suite
+  was green while every Approve button in the pane was a 422: `app.js` announced
+  `Content-Type: application/json` on requests that carried no body. Request validation fails
+  *before* the handler, so nothing was popped, nothing was written, the card sat there, and
+  FastAPI's `detail` — a **list** of errors, where kedge's own `HTTPException` raises a string —
+  reached `notice` as `[object Object]`. Hence three rules. A decision body is optional
+  (`routes.NO_NOTE`), so a missing one costs a note rather than the click. `api()` sends the
+  content type only when there is a body, as `hub.js` always did. And anything rendering a
+  `detail` must handle both shapes, because the anonymous error is the one on the path where the
+  user has done nothing wrong.
 
 ## Style, briefly
 

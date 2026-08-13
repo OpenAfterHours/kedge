@@ -417,6 +417,20 @@ def _question_index(plan: ProcessPlan, question: str | int) -> int:
     raise PlanError(msg)
 
 
+def _drop_refusal_question(range_: str) -> str:
+    """The question a refused drop raises, composed in one place so it can be taken back.
+
+    Withdrawing it when the refusal is overturned means finding it again, and the only handle an
+    :class:`~kedge.plan.model.OpenQuestion` offers is its text. Composed here, the sentence a
+    withdrawal looks for is the sentence the refusal wrote — equality is identity by construction,
+    with nothing to drift and no prefix rule to be over-eager.
+    """
+    return (
+        f"{range_} was proposed for dropping and the drop was rejected, so it must "
+        f"be kept. Which stage consumes it, and what does it feed?"
+    )
+
+
 def acknowledge_drop(
     plan: ProcessPlan,
     range_: str,
@@ -430,6 +444,22 @@ def acknowledge_drop(
     consumes it — so an open question is raised automatically and approval stays blocked until
     somebody says which stage should. Silently accepting a rejection would be exactly the kind
     of quiet hole this gate exists to prevent.
+
+    **Overturning a refusal takes that question back.** Confirming a drop that was refused answers
+    it by withdrawing its premise: nothing has to consume a range that is going. Left behind, the
+    plan asserted both things at once — the drop confirmed, and a question insisting the range be
+    kept — and the contradiction outlived the review, because no verb here removes a question.
+
+    Three things narrow that withdrawal, and it is the only place in this module that deletes
+    anything, so each is load-bearing. The sentence must be the exact one
+    :func:`_drop_refusal_question` composed for *this* range — a question a model wrote that merely
+    opens by naming the range is somebody's real question. It must be unanswered — an answer is a
+    decision. And **the drop must actually have been refused**, which is the one that reads as
+    redundant and is not: :meth:`~kedge.plan.store.PlanStore.seed` offers the previous plan to the
+    model when a new one is proposed, ``propose`` strips the human decisions but carries question
+    text across verbatim, and a re-proposing model commonly repeats the questions it was shown. So
+    a fresh proposal can arrive holding last quarter's refusal sentence against a drop nobody has
+    refused this time, and confirming that drop would delete an inherited question unread.
 
     Args:
         plan: The plan to revise.
@@ -456,17 +486,14 @@ def acknowledge_drop(
         else drop
         for drop in plan.dropped
     ]
+    raised = _drop_refusal_question(range_)
     questions = list(plan.open_questions)
     if not accepted:
-        questions.append(
-            OpenQuestion(
-                question=(
-                    f"{range_} was proposed for dropping and the drop was rejected, so it must "
-                    f"be kept. Which stage consumes it, and what does it feed?"
-                ),
-                context=note,
-            )
-        )
+        questions.append(OpenQuestion(question=raised, context=note))
+    elif any(drop.rejected for drop in matches):
+        questions = [
+            question for question in questions if question.answered or question.question != raised
+        ]
     return _revise(
         plan,
         dropped=[drop.model_dump(mode="python") for drop in updated],
@@ -826,7 +853,12 @@ def render_plan(
     blockers = plan.approval_blockers()
     lines.extend(["", "APPROVAL"])
     if plan.approval.approved:
-        lines.append(f"  approved by {plan.approval.by} at {plan.approval.at:%Y-%m-%d %H:%M}")
+        # Through :func:`_attribution` rather than formatted here, so one place decides how an
+        # attribution reads. Unguarded, an approval carrying no timestamp took `kedge plan show`
+        # and `kedge plan propose` down with a `TypeError` out of `__format__`, and one naming
+        # nobody printed "approved by None". Neither is exotic: `kedge open --plan` adopts a plan
+        # file the user wrote, and a hand-written approval block records whatever it records.
+        lines.append(f"  approved {_attribution(plan.approval)}")
     elif blockers:
         lines.append("  cannot be approved yet:")
         lines.extend(_wrap(f"- {blocker}", indent="    ") for blocker in blockers)

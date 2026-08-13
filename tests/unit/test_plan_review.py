@@ -17,6 +17,7 @@ import pytest
 from conftest import make_analysis, make_draft, make_operation, make_plan
 from kedge.analysis.model import ExcelPattern
 from kedge.plan.model import (
+    Approval,
     ApprovalState,
     Assessment,
     Checkpoint,
@@ -32,6 +33,7 @@ from kedge.plan.model import (
 )
 from kedge.plan.review import (
     PlanNotApprovableError,
+    _drop_refusal_question,
     acknowledge_all_drops,
     acknowledge_drop,
     add_question,
@@ -611,6 +613,80 @@ def test_rejecting_a_drop_raises_a_question_and_keeps_approval_blocked() -> None
     assert any("no stage lists it as a source" in b for b in rejected.approval_blockers())
 
 
+def test_overturning_a_refusal_takes_back_the_question_the_refusal_raised() -> None:
+    """A confirmed drop beside "which stage consumes the range we must keep?" says both at once.
+
+    `kedge plan acknowledge --reject` followed by a confirm left that sentence behind for ever:
+    nothing here removes a question, so the contradiction outlived the review and reached the
+    reviewer of the *next* version as a real open question about a range that had gone.
+    """
+    rejected = acknowledge_drop(make_plan(), "Calc!AK:AP", accepted=False, note="Finance reads it")
+    asked = len(make_plan().open_questions)
+
+    confirmed = acknowledge_drop(rejected, "Calc!AK:AP", note="checked with Finance, it is dead")
+
+    assert confirmed.dropped[0].accepted
+    assert not any("must be kept" in question.question for question in confirmed.open_questions)
+    assert len(confirmed.open_questions) == asked, "the model's own questions are untouched"
+    assert confirmed.is_approvable
+
+
+def test_overturning_a_refusal_leaves_a_question_the_model_wrote_about_the_range() -> None:
+    """Matched by identity, not by prose. A prefix rule read this as ours and deleted it.
+
+    A model that opens a legitimate question by naming the range it proposed dropping is doing
+    exactly what it should. Withdrawing it silently, in the module whose whole purpose is that
+    nothing is decided quietly, is data loss with no notice anywhere.
+    """
+    theirs = (
+        "Calc!AK:AP was proposed for dropping, but the 2023 archive still references it. Should "
+        "the archive be re-pointed before it goes?"
+    )
+    plan = make_plan(draft=make_draft(open_questions=[theirs]))
+
+    rejected = acknowledge_drop(plan, "Calc!AK:AP", accepted=False)
+    confirmed = acknowledge_drop(rejected, "Calc!AK:AP")
+
+    assert [question.question for question in confirmed.open_questions] == [theirs]
+
+
+def test_overturning_a_refusal_leaves_the_question_if_somebody_answered_it() -> None:
+    """An answer is a decision, and a decision is not ours to delete on a later click."""
+    rejected = acknowledge_drop(make_plan(), "Calc!AK:AP", accepted=False)
+    answered = answer_question(
+        rejected, len(rejected.open_questions) - 1, "apply_haircuts will read it"
+    )
+
+    confirmed = acknowledge_drop(answered, "Calc!AK:AP")
+
+    kept = [
+        question for question in confirmed.open_questions if "must be kept" in question.question
+    ]
+    assert len(kept) == 1
+    assert kept[0].answer == "apply_haircuts will read it"
+
+
+def test_confirming_a_drop_nobody_refused_keeps_the_question_it_would_have_raised() -> None:
+    """The withdrawal is a reversal, not a sweep -- and the sweep is reachable, not theoretical.
+
+    `PlanStore.seed` offers the previous plan to the model when a new one is proposed, the
+    stripping of human decisions carries question text across verbatim, and a re-proposing model
+    commonly repeats the open questions it was shown. So a fresh proposal can arrive holding last
+    quarter's refusal sentence against a drop nobody has refused this time. Without the "was it
+    refused" gate, confirming that drop deletes an inherited question nobody has read.
+
+    Built from `_drop_refusal_question` rather than from a transcribed sentence: a test that
+    guards an exact match has to use the exact string, or it guards the transcription.
+    """
+    inherited = _drop_refusal_question("Calc!AK:AP")
+    plan = make_plan(draft=make_draft(open_questions=[inherited]))
+    assert not plan.dropped[0].rejected, "nobody has refused this drop; the question is inherited"
+
+    confirmed = acknowledge_drop(plan, "Calc!AK:AP", note="dead this quarter as well")
+
+    assert [question.question for question in confirmed.open_questions] == [inherited]
+
+
 def test_a_rejected_drop_stops_blocking_once_a_stage_claims_the_range() -> None:
     rejected = acknowledge_drop(make_plan(), "Calc!AK:AP", accepted=False)
     claimed = edit_stage(
@@ -1155,6 +1231,31 @@ def test_an_approvable_plan_says_nothing_reaches_the_notebook_until_approval() -
 def test_an_approved_plan_renders_who_approved_it() -> None:
     rendered = render_plan(_approved(make_plan()), show_warnings=False)
     assert "approved by phil at" in rendered
+
+
+@pytest.mark.parametrize(
+    ("by", "expected"),
+    [("phil", "  approved by phil"), (None, "  approved by an unnamed reviewer")],
+)
+def test_an_approval_with_no_timestamp_renders_rather_than_crashing(
+    by: str | None, expected: str
+) -> None:
+    """`kedge plan show` died with a `TypeError` out of `__format__` on an approval with no `at`.
+
+    Not exotic input: `kedge open --plan` adopts a plan file the user wrote, and a hand-written
+    approval block records whatever it records. The renderer took `plan propose` down with it,
+    since `PlanRun.render` goes through the same function, and printed "approved by None" where
+    nobody was named. `_attribution` already degraded correctly for the three refusal messages;
+    this line was formatting its own.
+    """
+    plan = acknowledge_all_drops(make_plan(), note="read").model_copy(
+        update={"approval": Approval(state=ApprovalState.APPROVED, by=by, at=None)}
+    )
+
+    rendered = render_plan(plan, show_warnings=False).splitlines()
+
+    line = rendered[rendered.index("APPROVAL") + 1]
+    assert line == expected, "and no dangling 'at' where there is no time to give"
 
 
 def test_an_empty_plan_body_still_renders_its_empty_sections_honestly() -> None:

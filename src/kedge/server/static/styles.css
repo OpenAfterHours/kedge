@@ -516,6 +516,20 @@ kbd {
   padding-left: 7px;
 }
 
+/* A drop carries its own decision, so its controls sit with it rather than in `.decision-actions`
+   at the foot of the card: a plan can propose several, and "confirm" has to mean *this* range. */
+.decision-drop { margin: 7px 0; }
+.decision-drop-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 3px;
+}
+.decision-drop-actions .ghost-button { font-size: 11.5px; padding: 2px 8px; }
+/* A decision in flight takes the whole card with it: a second click on a live button is a second
+   decision, and the card is about to be replaced by one drawn from the answer either way. */
+.decision button:disabled { opacity: 0.55; cursor: default; }
+
 .decision-section {
   margin-top: 9px !important;
   font-size: 10.5px !important;

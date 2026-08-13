@@ -38,6 +38,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from kedge import __version__, tls
 from kedge.config import (
@@ -218,7 +219,9 @@ def open(  # the verb is the interface; shadowing the builtin is local and harml
     ] = 8000,
     plan: Annotated[
         Path | None,
-        typer.Option("--plan", help="Scaffold from a saved plan instead of proposing a new one."),
+        typer.Option(
+            "--plan", help="Scaffold from this plan file instead of the latest approved one."
+        ),
     ] = None,
     no_browser: Annotated[
         bool, typer.Option("--no-browser", help="Do not open a browser.")
@@ -236,12 +239,27 @@ def open(  # the verb is the interface; shadowing the builtin is local and harml
     workbook offline, scaffold the notebook from an approved plan, spawn a marimo server that
     kedge owns, assert a kernel session onto it, start the kedge server on loopback, and open a
     browser at it.
+
+    ``--plan`` *adopts* a plan for this workbook — one kept under version control, say, rather than
+    the one the plan store last approved. It is recorded in the store as a new version, because
+    every other part of kedge decides what is in force by reading the store: scaffolding from a
+    file it has never heard of would leave the notebook holding cells while the chat insisted no
+    plan existed. If another version was approved, the step says which one this supersedes.
+
+    Naming a file is not approving it, and because adopting one *persists* it, a file that cannot
+    be adopted at all is refused before anything is spawned: one that will not load, one written
+    for a different workbook, and one claiming an approval the review gate would have refused. The
+    single case that still opens is a plan that is simply unapproved — that is a decision waiting
+    on the user rather than a mistake in what they typed, so the workbook opens with an empty
+    notebook, nothing is recorded, and the step says what is blocking.
     """
     console = _console()
     if not workbook.is_file():
         raise _fail(f"no such workbook: {workbook}")
     if plan is not None and not plan.is_file():
         raise _fail(f"no such plan: {plan}")
+    if plan is not None:
+        _require_usable_plan(plan, workbook)
     _require_bridge()
     if port is not None:
         console.print(f"[dim]pinning marimo to port {port} instead of picking a free one[/dim]")
@@ -267,6 +285,7 @@ def open(  # the verb is the interface; shadowing the builtin is local and harml
             workbook,
             reattach=True,
             workspace=workspace,
+            plan_path=plan,
             on_event=_print_open_event(console),
         )
     )
@@ -284,6 +303,85 @@ def open(  # the verb is the interface; shadowing the builtin is local and harml
     run_server(server_app, port=server_port)
 
 
+def _require_usable_plan(path: Path, workbook: Path) -> None:
+    """Refuse a ``--plan`` file that cannot be adopted, before anything at all is spawned.
+
+    The line this draws: a mistake in what the user typed is refused here, where they are standing
+    and can fix it; a decision they have yet to take is not. The hub degrades and continues on all
+    of it, because it has a page to keep answering and no file to name — that behaviour is
+    untouched, and nothing here is reachable from it.
+
+    Three refusals, all of them pure checks over the file:
+
+    * **It will not load.** A path typed wrong already failed at the ``is_file`` check above; a
+      YAML typo used to run on for five steps, spawn a marimo, open a workbook around an empty
+      notebook, point a browser at it and exit 0, with the one FAIL line scrolled off above the
+      banner.
+    * **It was written for a different workbook.** ``--plan`` now *records* what it adopts, so
+      this would file another workbook's decomposition in this one's plan history, approved and in
+      force, with every consumer reading it. :func:`_explicit_analysis` refuses the same case for
+      the same reason — nothing downstream catches it, and ``workbook_sha256`` is read nowhere in
+      ``src/``. The message names the way through, and it has to be the *edit*: the commonest
+      legitimate case is last month's plan against ``..._v15.xlsx``, where there is no plan for the
+      new name — that being why ``--plan`` was reached for — and opening the old file opens last
+      month's workbook. There is deliberately no override flag; a flag would be typed by reflex,
+      and what this refuses is durable. A matching filename with a different digest is *not* this
+      case: that is the same workbook, changed, which is the normal state of a monthly process and
+      is warned about in the open sequence rather than refused. :func:`_require_usable_plan` is not
+      the only place this is enforced — see :func:`kedge.server.hub._foreign_workbook`, which
+      guards the write itself.
+    * **It claims an approval the review gate would have refused.** Anything that went through
+      :func:`kedge.plan.review.approve` is approvable by construction, so this catches only a
+      hand-written file — typically one proposing a drop nobody acknowledged, which is precisely
+      the silent removal the acknowledge verb exists to prevent.
+
+    An *unapproved* file is deliberately not refused: that is the review decision the user has yet
+    to take, and the open sequence's account of it — the workbook opens, the notebook stays empty,
+    the step says what is blocking — is the right one.
+
+    Raises:
+        typer.Exit: naming what is wrong with the file, in the store's own words where it is the
+            store that knows.
+    """
+    from kedge.plan.store import PlanStoreError, plan_from_yaml, read_plan_text
+
+    try:
+        plan = plan_from_yaml(read_plan_text(path))
+    except PlanStoreError as exc:
+        raise _fail(f"the plan at {path} cannot be used: {exc}") from exc
+
+    # The same reading of a plan's `workbook:` the open sequence uses, so the pre-flight and the
+    # step cannot come to different conclusions about what the file claims.
+    from kedge.server.hub import plan_workbook_name
+
+    named = plan_workbook_name(plan)
+    if named and named.casefold() != workbook.name.casefold():
+        raise _fail(
+            f"the plan at {path} was written for {plan.workbook}, not {workbook.name}. Adopting it "
+            f"would file that decomposition in {workbook.name}'s own plan history as the approved "
+            f"plan in force, and every stage in it names the other workbook's ranges. If this is "
+            f"the same process under a new filename, change the plan's `workbook:` line to "
+            f"{workbook.name} and run this again — the file is a review artifact and is meant to "
+            f"be edited — and kedge will adopt it, noting as it does that the workbook has changed "
+            f"since the plan was written for it."
+        )
+
+    blockers = plan.approval_blockers()
+    if plan.approval.approved and blockers:
+        _console(stderr=True).print(
+            f"[bold red]error[/bold red] the plan at {_plain(path)} says it is approved, but the "
+            f"review gate would have refused it, so kedge will not adopt it"
+        )
+        for blocker in blockers:
+            typer.echo(f"  - {blocker}", err=True)
+        typer.echo(
+            "  clear these in the plan file itself, or approve it through `kedge plan approve`, "
+            "which cannot record an approval while they stand.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
 def _print_open_event(console: Console) -> Callable[[Any], None]:
     """Draw the hub's open-progress frames onto the terminal.
 
@@ -294,15 +392,24 @@ def _print_open_event(console: Console) -> Callable[[Any], None]:
     marks = {"running": "[dim]···[/dim]", "ok": "[green]ok [/green]", "skipped": "[dim]-- [/dim]"}
 
     def draw(event: Any) -> None:
+        # Nothing an event carries is interpolated into markup: these frames name paths, and a
+        # step whose whole job is to say which file it could not read must not mangle the name.
+        # `_plain` is not enough on its own here. rich only escapes brackets that look like a tag,
+        # so `Docs [old]\agreed.yaml` survives it -- but a folder named `[2026]` does not, because
+        # the renderer eats the backslash in front of the bracket either way and prints
+        # `p[2026]\a.yaml`, a different path, silently. Appending to a `Text` parses no markup at
+        # all, which is the only form that is right for both.
         if getattr(event, "type", "") != "open_progress":
             if getattr(event, "type", "") == "error":
-                console.print(f"[bold red]error[/bold red] {event.message}")
+                console.print(Text.from_markup("[bold red]error[/bold red] ").append(event.message))
             return
         if event.state == "running":
             return  # The terminal has no spinner to update; report outcomes only.
         mark = marks.get(event.state, "[bold red]FAIL[/bold red]")
-        detail = f" [dim]{event.detail}[/dim]" if event.detail else ""
-        console.print(f"  {mark} {event.step}{detail}")
+        line = Text.from_markup(f"  {mark} ").append(event.step)
+        if event.detail:
+            line.append(" ").append(event.detail, style="dim")
+        console.print(line)
 
     return draw
 

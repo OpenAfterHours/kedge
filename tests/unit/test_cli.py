@@ -628,6 +628,214 @@ def test_open_runs_the_same_sequence_the_hub_runs(
     assert called["reattach"] is True, "a crashed previous run is the common case on the CLI"
 
 
+def test_the_plan_option_reaches_the_open_sequence(
+    workbook: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--plan` was declared, validated, and then never passed anywhere.
+
+    An option that is accepted and silently ignored is a lie in `--help`: the user is told the
+    notebook was scaffolded from the plan they named while it was scaffolded from whatever the
+    store last approved, which may be a different decomposition entirely.
+    """
+    seen: dict[str, object] = {}
+    named = write_plan_file(tmp_path / "cwd" / "agreed-plan.yaml", workbook=workbook.name)
+
+    async def _capture(_state, _path, **kwargs):
+        seen["plan_path"] = kwargs.get("plan_path")
+        raise SystemExit(0)
+
+    monkeypatch.setattr("kedge.server.hub.open_workbook", _capture)
+
+    runner.invoke(app, ["open", str(workbook), "--plan", str(named), "--no-browser"])
+
+    assert seen["plan_path"] == named
+
+
+def write_plan_file(path: Path, **overrides: object) -> Path:
+    """An approved plan on disk, for `--plan` to name."""
+    from conftest import make_approved_plan
+    from kedge.plan.store import plan_to_yaml
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(plan_to_yaml(make_approved_plan(**overrides)), encoding="utf-8")
+    return path
+
+
+def refuse_to_open(
+    workbook: Path, named: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[int, str, list[str]]:
+    """Run `open --plan` with the open sequence stubbed, and report what happened.
+
+    The list is what the sequence did: empty is the assertion these tests are about, because a
+    refusal that arrives after a marimo has been spawned is not a refusal.
+    """
+    reached: list[str] = []
+
+    async def _capture(*_args, **_kwargs):
+        reached.append("open sequence started")
+        raise SystemExit(0)
+
+    monkeypatch.setattr("kedge.server.hub.open_workbook", _capture)
+    result = runner.invoke(app, ["open", str(workbook), "--plan", str(named), "--no-browser"])
+    return result.exit_code, flattened(result.output), reached
+
+
+def test_a_plan_written_for_another_workbook_is_refused_before_anything_is_spawned(
+    workbook: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adopting a plan writes it into this workbook's history, so a foreign one is refused.
+
+    `_explicit_analysis` refuses the same case on the same reasoning: nothing downstream catches
+    it, and `workbook_sha256` is read nowhere in `src/`. Warning would be no use here either --
+    by the time the open sequence could say anything, the other workbook's decomposition is
+    already filed as this one's approved plan of record, and the user was never asked.
+    """
+    named = write_plan_file(tmp_path / "quarterly.yaml", workbook="quite_other_quarterly.xlsx")
+
+    code, output, reached = refuse_to_open(workbook, named, monkeypatch)
+
+    assert code == 1
+    assert reached == [], "nothing may be spawned, and nothing may be written to the plan store"
+    assert "was written for quite_other_quarterly.xlsx, not process.xlsx" in output
+    # The way through has to be one that exists. The commonest legitimate case is last month's
+    # plan against `..._v15.xlsx`, where there is no plan for the new name -- that being why
+    # --plan was reached for -- and opening the old file opens last month's workbook.
+    assert "change the plan's `workbook:` line to process.xlsx" in output
+    assert "kedge open" not in output, "pointing the user at the other workbook is a dead end"
+
+
+def test_a_plan_naming_its_workbook_as_a_path_is_read_the_same_way_on_every_platform(
+    workbook: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plans travel in version control, so a Windows path in `workbook:` reaches Linux.
+
+    `Path(...).name` uses the running platform's flavour, so `C:\\processes\\process.xlsx` is the
+    whole string on Linux and the plan is refused there while being accepted on the machine that
+    wrote it. CI runs Linux; nothing here had a path-shaped `workbook:` to catch it.
+    """
+    accepted = write_plan_file(tmp_path / "windows.yaml", workbook=r"C:\processes\process.xlsx")
+    refused = write_plan_file(tmp_path / "posix.yaml", workbook="/mnt/share/quarterly.xlsx")
+
+    opened, _output, reached = refuse_to_open(workbook, accepted, monkeypatch)
+    code, output, _reached = refuse_to_open(workbook, refused, monkeypatch)
+
+    assert opened == 0 and reached == ["open sequence started"], "same file, drive letter and all"
+    assert code == 1
+    assert "not process.xlsx" in output, "and a foreign one stays refused whichever way it is spelt"
+
+
+def test_a_plan_claiming_an_approval_the_gate_would_refuse_stops_open(
+    workbook: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-typed `state: approved` is a defect in what was typed, not a pending decision.
+
+    So it belongs with the other refusals, before a marimo is spawned, rather than eight seconds
+    later as one FAIL line above the banner of a workbook that opened anyway. Both checks are pure
+    reads of the file, so there is no reason for them to be on different sides of the line.
+    """
+    from conftest import make_plan
+    from kedge.plan.model import Approval, ApprovalState
+    from kedge.plan.store import plan_to_yaml
+
+    claimed = make_plan(workbook=workbook.name).model_copy(
+        update={"approval": Approval(state=ApprovalState.APPROVED, by="typed it in myself")}
+    )
+    named = tmp_path / "hand-approved.yaml"
+    named.write_text(plan_to_yaml(claimed), encoding="utf-8")
+
+    code, output, reached = refuse_to_open(workbook, named, monkeypatch)
+
+    assert code == 1
+    assert reached == []
+    assert "the review gate would have refused it" in output
+    assert "has not been acknowledged" in output, "the blockers are named, not just counted"
+
+
+def test_a_plan_whose_workbook_has_merely_changed_still_opens(
+    workbook: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same filename, different digest: the workbook moved on, which is what monthly ones do.
+
+    Refusing this would refuse the ordinary case, and it is warned about in the open sequence
+    instead. The distinction is the whole reason the refusal above is keyed on the filename.
+    """
+    named = write_plan_file(
+        tmp_path / "last-month.yaml", workbook=workbook.name, workbook_sha256="b" * 64
+    )
+
+    code, _output, reached = refuse_to_open(workbook, named, monkeypatch)
+
+    assert code == 0, "a workbook that has changed since its plan was written is not an error"
+    assert reached == ["open sequence started"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "body", "expected"),
+    [
+        (None, None, "no such plan"),
+        ("mangled.yaml", "stages: [oh dear\n", "not valid YAML"),
+        ("wrong-shape.yaml", "- a list, not a plan\n", "should contain a mapping"),
+    ],
+)
+def test_a_plan_file_that_will_not_load_stops_open_before_anything_is_spawned(
+    workbook: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str | None,
+    body: str | None,
+    expected: str,
+) -> None:
+    """A path typed wrong and a YAML typo are the same user error and get the same answer.
+
+    Only the missing file was caught. A file with a typo in it reached the planning step -- five
+    steps and one spawned marimo later -- and the run went on to open the workbook, start the
+    server, launch a browser and exit 0, with the one FAIL line scrolled off above the banner.
+    The hub still degrades and continues, because it has a page to keep answering; a command line
+    has an exit code and should use it.
+    """
+    reached: list[str] = []
+    named = tmp_path / (filename or "never-written.yaml")
+    if body is not None:
+        named.write_text(body, encoding="utf-8")
+
+    async def _capture(*_args, **_kwargs):
+        reached.append("open sequence started")
+        raise SystemExit(0)
+
+    monkeypatch.setattr("kedge.server.hub.open_workbook", _capture)
+
+    result = runner.invoke(app, ["open", str(workbook), "--plan", str(named), "--no-browser"])
+
+    assert result.exit_code == 1
+    assert reached == [], "nothing may be spawned for a plan file that cannot be used"
+    assert expected in flattened(result.output)
+
+
+def test_the_open_progress_lines_do_not_eat_brackets_in_a_path() -> None:
+    """rich reads square brackets as markup, and bracketed folder names are ordinary on Windows.
+
+    Unescaped, `Docs [old]\\agreed.yaml` prints as `Docs \\agreed.yaml` and `p\\[2026]\\a.yaml` as
+    `p[2026]\\a.yaml` -- a different path, wrong, and silently. A step whose entire job is to name
+    the file it could not read must not mangle the name. `tmp_path` never contains a bracket,
+    which is why this survived every other test of the open progress lines.
+    """
+    import io
+
+    from rich.console import Console
+
+    from kedge.server.events import ErrorEvent, OpenProgressEvent
+
+    buffer = io.StringIO()
+    draw = cli._print_open_event(Console(file=buffer, highlight=False, width=200))
+
+    draw(OpenProgressEvent(step="planning", state="failed", detail=r"C:\Docs [old]\agreed.yaml"))
+    draw(ErrorEvent(message=r"could not open C:\p\[2026]\a.xlsx", recoverable=False))
+
+    printed = buffer.getvalue()
+    assert r"C:\Docs [old]\agreed.yaml" in printed
+    assert r"C:\p\[2026]\a.xlsx" in printed
+
+
 def test_the_port_option_actually_pins_the_marimo_port(
     workbook: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

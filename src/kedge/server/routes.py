@@ -31,6 +31,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -559,6 +560,14 @@ async def monitor(request: Request) -> StreamingResponse:
 # The registries hang off the agent loop, keyed by chat session (`KedgeAgent.registries`). The
 # server reads that attribute and requires nothing else of the loop, so the scripted stand-in —
 # which has no registries at all — degrades to an empty list rather than a 500.
+#
+# The drop routes are the third kind and the odd one out: they decide something *within* a pending
+# proposal rather than deciding the proposal. An unacknowledged drop is the only structural thing
+# that blocks approval (`ProcessPlan.approval_blockers`), so the card correctly degraded its button
+# to "Save as draft" — and then offered no way to clear what it had just raised. The pane raised a
+# gate and handed the user no key to it; the only remedy was `kedge plan acknowledge` at a
+# terminal. These routes are that remedy, taken before the plan is written rather than against a
+# draft on disk afterwards, so the review the card asks for can actually be completed there.
 
 
 class DecisionBody(BaseModel):
@@ -683,7 +692,20 @@ def _proposal_payload(
             {"question": question.question, "context": question.context}
             for question in plan.open_questions
         ],
-        "dropped": [{"range": drop.range, "reason": drop.reason} for drop in plan.dropped],
+        # The decision travels with the drop, not just the proposal. The card draws a confirm/keep
+        # control per outstanding drop and the recorded outcome for a decided one, and without
+        # `acknowledged` it cannot tell those apart — so a drop the user had already signed off
+        # would keep asking, and a refusal would be indistinguishable from a confirmation.
+        "dropped": [
+            {
+                "range": drop.range,
+                "reason": drop.reason,
+                "acknowledged": drop.acknowledged,
+                "accepted": drop.accepted,
+                "note": drop.note,
+            }
+            for drop in plan.dropped
+        ],
         "warnings": _review_warnings(plan, analysis, triage_result),
         "warnings_complete": analysis is not None,
         "approval_blockers": plan.approval_blockers(),
@@ -915,9 +937,12 @@ def approve_proposal(
 
     The counterpart of :func:`approve_amendment`, and the same gate: ``propose_plan`` authored a
     plan and said plainly that it was not in force; this is the user reading it and deciding. What
-    is written is the plan exactly as the model authored it — ``generated_by: llm`` with the model
-    id — saved through :class:`~kedge.plan.store.PlanStore` at the next free version so an earlier
-    draft is superseded rather than overwritten.
+    is written is the decomposition exactly as the model authored it — ``generated_by: llm`` with
+    the model id — carrying whatever drop decisions the reviewer took on the card, which are
+    recorded on the drops themselves with the reviewer's note. Those decisions leave the plan's
+    identity alone (:func:`_restore_proposal_identity`), so the one version this writes still says
+    who wrote the decomposition. Saved through :class:`~kedge.plan.store.PlanStore` at the next
+    free version so an earlier draft is superseded rather than overwritten.
 
     Approval is recorded on it only when the plan is approvable on its own terms. A plan whose
     dropped ranges nobody has acknowledged lands as a **draft** with the blockers reported, for the
@@ -957,6 +982,220 @@ def dismiss_proposal(session_id: str, index: int, request: Request) -> dict[str,
     }
 
 
+@router.post("/api/sessions/{session_id}/pending/proposals/{index}/drops/{drop}/acknowledge")
+async def acknowledge_proposal_drop(
+    session_id: str,
+    index: int,
+    drop: int,
+    request: Request,
+    body: DecisionBody = NO_NOTE,
+) -> dict[str, Any]:
+    """Confirm one range the proposal wants to drop, so it stops blocking approval.
+
+    Also the way back from a refusal: confirming a range that was kept clears the blocker, and
+    :func:`~kedge.plan.review.acknowledge_drop` takes the question the refusal raised with it. A
+    mis-click has to have an exit, or this control is the gate-with-no-key it was written to
+    remove.
+
+    The drop is named by its position in the plan's own ``dropped`` list — the order the card
+    renders — rather than by the range itself: a sheet name is free text and can carry any
+    character a path segment would have to be taught to survive.
+
+    ``async`` on all three of these is load-bearing. A synchronous path operation is handed to a
+    threadpool, so two rapid clicks read, revise and write back the same slot of
+    ``registry.pending_proposals`` in parallel and the second overwrites the first. The work is
+    pure in-memory revision of a small object with nothing to await, so run it on the loop and it
+    cannot interleave.
+    """
+    return _decide_drops(request, session_id, index, drop=drop, accepted=True, note=body.note)
+
+
+@router.post("/api/sessions/{session_id}/pending/proposals/{index}/drops/{drop}/refuse")
+async def refuse_proposal_drop(
+    session_id: str,
+    index: int,
+    drop: int,
+    request: Request,
+    body: DecisionBody = NO_NOTE,
+) -> dict[str, Any]:
+    """Refuse one drop: the range must be kept.
+
+    Not the mirror image of acknowledging, and the card must not draw it as one. Refusing records
+    the decision and clears the "not acknowledged" blocker, then
+    :func:`~kedge.plan.review.acknowledge_drop` raises the open question of which stage consumes
+    the range, and :meth:`~kedge.plan.model.ProcessPlan.approval_blockers` replaces the old blocker
+    with a new one until some stage lists it as a source. Adding that stage is a plan edit, which
+    this pane does not do — so approval stays blocked and the plan will land as a draft to be
+    finished with the plan surface. That is the gate working, and saying so on the button is the
+    difference between a decision and a surprise. It is reversible: see
+    :func:`acknowledge_proposal_drop`.
+    """
+    return _decide_drops(request, session_id, index, drop=drop, accepted=False, note=body.note)
+
+
+@router.post("/api/sessions/{session_id}/pending/proposals/{index}/drops/acknowledge-all")
+async def acknowledge_all_proposal_drops(
+    session_id: str,
+    index: int,
+    request: Request,
+    body: DecisionBody = NO_NOTE,
+) -> dict[str, Any]:
+    """Confirm every outstanding drop on this proposal at once.
+
+    The same convenience the CLI's ``--all`` is, and the same audit trail: each drop is stamped
+    individually, so a reviewer reading the plan a quarter later cannot tell this from a run of
+    single clicks — which is right, because it is one. "Outstanding" is the operative word: a drop
+    the user has already refused is left refused, because a convenience must not quietly overturn
+    a decision somebody took deliberately.
+    """
+    return _decide_drops(request, session_id, index, drop=None, accepted=True, note=body.note)
+
+
+def _decide_drops(
+    request: Request,
+    session_id: str,
+    index: int,
+    *,
+    drop: int | None,
+    accepted: bool,
+    note: str | None,
+) -> dict[str, Any]:
+    """Record a drop decision on the pending proposal and hand back the refreshed card.
+
+    **Nothing is written.** The revised plan replaces the one on the in-memory
+    :class:`~kedge.agent.tools.PendingProposal` and goes no further;
+    :func:`approve_proposal` remains the only route that reaches
+    :class:`~kedge.plan.store.PlanStore`. A user who acknowledges a drop and then discards the
+    proposal has left nothing behind, which is what "pending" has meant here all along.
+
+    The *semantics* come from :func:`~kedge.plan.review.acknowledge_drop` and
+    :func:`~kedge.plan.review.acknowledge_all_drops` — the same functions ``kedge plan
+    acknowledge`` calls — so what a decision means, and the open question a refusal raises, are
+    the CLI's and not a second implementation of them. What is **not** shared is the re-stamping
+    those functions do on the way out, and :func:`_restore_proposal_identity` says why.
+
+    A decision the plan already carries is a no-op. The card leaves its buttons live for the
+    length of a round trip, so a double click is a real event, and
+    :func:`~kedge.plan.review.acknowledge_drop` appends an open question on **every** refusal with
+    nothing to stop it stacking a second identical one.
+
+    Args:
+        request: The live request, for the server state.
+        session_id: The chat session holding the proposal.
+        index: Position of the pending proposal.
+        drop: Position of the drop in the plan's ``dropped`` list, or ``None`` for all outstanding.
+        accepted: True to confirm the drop, False to keep the range.
+        note: The reviewer's reason, recorded either way.
+    """
+    from kedge.plan.review import acknowledge_all_drops, acknowledge_drop
+
+    state = get_state(request)
+    _require_session(state, session_id)
+    registry = _registry_for(state, session_id)
+    proposal = _peek_pending(registry, "pending_proposals", index)
+    plan = proposal.plan
+
+    if drop is not None and not 0 <= drop < len(plan.dropped):
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"This plan proposes {len(plan.dropped)} dropped range(s), so there is none at "
+                f"position {drop}."
+            ),
+        )
+    target = None if drop is None else plan.dropped[drop]
+    decided = (
+        [item.range for item in plan.unacknowledged_drops] if target is None else [target.range]
+    )
+    if _decision_stands(plan, target, accepted=accepted, note=note):
+        logger.debug("drop decision in session %s changes nothing; leaving it alone", session_id)
+        return _drop_response(registry, plan, decided=decided, accepted=accepted)
+
+    try:
+        revised = (
+            acknowledge_all_drops(plan, note=note)
+            if target is None
+            else acknowledge_drop(plan, target.range, accepted=accepted, note=note)
+        )
+    except KedgeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    revised = _restore_proposal_identity(plan, revised)
+
+    # `PendingProposal` is frozen, so the decision is recorded by replacing the entry rather than
+    # by mutating it -- which is the point of it being frozen: the plan on a proposal changes only
+    # where somebody meant it to.
+    registry.pending_proposals[index] = replace(proposal, plan=revised)
+    logger.info(
+        "user %s %d dropped range(s) on a pending proposal in session %s",
+        "confirmed" if accepted else "refused",
+        len(decided),
+        session_id,
+    )
+    return _drop_response(registry, revised, decided=decided, accepted=accepted)
+
+
+def _decision_stands(plan: Any, drop: Any, *, accepted: bool, note: str | None) -> bool:
+    """Whether the plan already says exactly this, so deciding again could only add noise.
+
+    The note is part of the decision rather than a label on it. Keyed on the verdict alone, a
+    re-post correcting the reason answered 200, reported the decision back, and kept the old
+    words — an API that lies, even if the pane has no way to send it.
+
+    "Every outstanding drop" is a different claim: with none outstanding it covers nothing, and
+    the answer names the empty list it acknowledged, so there is no note there to correct.
+    """
+    if drop is None:
+        return not plan.unacknowledged_drops
+    return drop.acknowledged and drop.accepted == accepted and drop.note == note
+
+
+def _drop_response(
+    registry: Any, plan: Any, *, decided: list[str], accepted: bool
+) -> dict[str, Any]:
+    """The answer to a drop decision: what it covered, and the card redrawn from the result."""
+    return {
+        "acknowledged": decided,
+        "accepted": accepted,
+        "approval_blockers": plan.approval_blockers(),
+        "pending": _pending_payload(registry),
+    }
+
+
+def _restore_proposal_identity(before: Any, after: Any) -> Any:
+    """Put back the identity and provenance :func:`~kedge.plan.review._revise` re-stamps.
+
+    Those functions are shaped for a plan that is *on disk*: ``_revise`` bumps the version, resets
+    ``created_at`` and sets ``generated_by`` to ``human``, which is exactly right when the model's
+    row already exists and this is the next one after it. ``kedge plan acknowledge`` writes into
+    that shape — the ``llm`` version was recorded before the drop was signed off.
+
+    A pending proposal has no row anywhere, because the card promises nothing is written until
+    approval and that promise has to hold. Left to re-stamp, the store ended up holding a *single*
+    version, authored ``human``, with nothing anywhere recording that a model wrote the
+    decomposition — ``cli._plan_author`` shows the model id only for ``generated_by == "llm"``, so
+    ``kedge plan history`` rendered a bare "human" for the only version there is. The version bump
+    was doubly meaningless: :meth:`~kedge.plan.store.PlanStore.save_next` renumbers a plan down to
+    the next free version and records the number it *arrived* with as ``based_on_version``, so a
+    v2-in-memory proposal saved into an empty store came out as v1 deriving from v2.
+
+    So the review verb is applied for its semantics and its numbering is undone: the only
+    difference between ``before`` and what comes back is the drop decision itself, and the open
+    question a refusal raises or an overturned refusal takes back. ``approval`` is deliberately
+    not restored — a proposal in memory is
+    never approved, and resetting to ``DRAFT`` is the safe direction if one ever were.
+    """
+    return after.model_copy(
+        update={
+            "version": before.version,
+            "based_on_version": before.based_on_version,
+            "generated_by": before.generated_by,
+            "llm_model": before.llm_model,
+            "created_at": before.created_at,
+        }
+    )
+
+
 @router.delete("/api/sessions/{session_id}/pending/amendments/{index}")
 def dismiss_amendment(session_id: str, index: int, request: Request) -> dict[str, Any]:
     """Decline an amendment. The approved plan is unchanged and the proposal is dropped."""
@@ -968,8 +1207,13 @@ def dismiss_amendment(session_id: str, index: int, request: Request) -> dict[str
     return {"dismissed": pending.change, "pending": _pending_payload(registry)}
 
 
-def _pop_pending(registry: Any, attribute: str, index: int) -> Any:
-    """Remove and return one pending decision, or explain why it is not there."""
+def _peek_pending(registry: Any, attribute: str, index: int) -> Any:
+    """Return one pending decision, leaving it pending, or explain why it is not there.
+
+    Split out of :func:`_pop_pending` for the drop routes, which decide something *inside* a
+    pending proposal: acknowledging a dropped range is not deciding the proposal, and popping it
+    would take the card off the panel with the plan it revised held nowhere.
+    """
     if registry is None:
         raise HTTPException(
             status_code=404,
@@ -984,7 +1228,13 @@ def _pop_pending(registry: Any, attribute: str, index: int) -> Any:
             status_code=404,
             detail=f"There is no pending decision at position {index}; it may already be decided.",
         )
-    return items.pop(index)
+    return items[index]
+
+
+def _pop_pending(registry: Any, attribute: str, index: int) -> Any:
+    """Remove and return one pending decision, or explain why it is not there."""
+    _peek_pending(registry, attribute, index)
+    return getattr(registry, attribute).pop(index)
 
 
 def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> dict[str, Any]:

@@ -40,7 +40,7 @@ import sys
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
@@ -68,7 +68,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["OpenJob", "open_workbook", "router"]
+__all__ = ["OpenJob", "open_workbook", "plan_workbook_name", "router"]
 
 router = APIRouter()
 
@@ -533,12 +533,16 @@ async def _run_open(
     *,
     reattach: bool,
     workspace: Workspace | None = None,
+    plan_path: Path | None = None,
 ) -> None:
     """Run the open sequence, publishing one progress frame per step.
 
     Never raises. Anything that fails becomes a failed step plus an unrecoverable
     :class:`~kedge.server.events.ErrorEvent`, because a browser waiting on this stream is the only
     thing the user is looking at.
+
+    ``plan_path`` reaches :func:`_step_plan` and nothing else. It defaults to None so the hub's own
+    route, which has no way to name a file, keeps taking the plan store's latest approved version.
     """
     from kedge import __version__
 
@@ -550,7 +554,7 @@ async def _run_open(
         await _step_bridge(job)
         adopted = await _step_cleanup(workspace, job, reattach=reattach)
         analysis = await _step_analyse(workspace, job)
-        plan = await _step_plan(workspace, job)
+        plan = await _step_plan(workspace, job, plan_path=plan_path)
         await _step_notebook(workspace, job)
 
         if adopted is None:
@@ -559,7 +563,7 @@ async def _run_open(
             job.step("launching", "skipped", f"reattached to our own marimo on {adopted}")
         await _step_session(workspace, job)
 
-        driver = await _step_scaffold(workspace, plan, job)
+        driver = await _step_scaffold(workspace, plan, job, plan_path=plan_path)
         demo = await _step_agent(state, workspace, analysis, driver, job)
 
         if key:
@@ -589,6 +593,7 @@ async def open_workbook(
     *,
     reattach: bool = True,
     workspace: Workspace | None = None,
+    plan_path: Path | None = None,
     on_event: Callable[[HubEvent], None] | None = None,
 ) -> OpenJob:
     """Run the open sequence to completion, off the HTTP path.
@@ -606,6 +611,10 @@ async def open_workbook(
             second one. True for the CLI, where a crashed previous run is the common case.
         workspace: A pre-built workspace, for a caller that needs config overrides applied --
             ``kedge open --port`` pins marimo's port this way. Built from the workbook otherwise.
+        plan_path: Adopt the plan in this file rather than the plan store's latest approved
+            version -- ``kedge open --plan``. It is recorded in the store, so the notebook and
+            everything that reads ``latest_approved()`` agree; the file has to be approved, and
+            approvable, on its own account, because naming one is not approving it.
         on_event: Called with each progress frame as it happens, so a caller with no browser can
             still show the user what is going on.
 
@@ -627,7 +636,15 @@ async def open_workbook(
     if on_event is not None:
         with job.subscribe() as queue:
             task = asyncio.create_task(
-                _run_open(state, job, key, workbook, reattach=reattach, workspace=workspace)
+                _run_open(
+                    state,
+                    job,
+                    key,
+                    workbook,
+                    reattach=reattach,
+                    workspace=workspace,
+                    plan_path=plan_path,
+                )
             )
             while True:
                 event = await queue.get()
@@ -637,7 +654,9 @@ async def open_workbook(
             await task
         return job
 
-    await _run_open(state, job, key, workbook, reattach=reattach, workspace=workspace)
+    await _run_open(
+        state, job, key, workbook, reattach=reattach, workspace=workspace, plan_path=plan_path
+    )
     return job
 
 
@@ -827,13 +846,23 @@ def _sketch_contract(workspace: Workspace, analysis: Any) -> str:
     )
 
 
-async def _step_plan(workspace: Workspace, job: OpenJob) -> Any:
+async def _step_plan(workspace: Workspace, job: OpenJob, *, plan_path: Path | None = None) -> Any:
     """Find an approved plan, or say plainly that there is not one.
 
     No plan is *proposed* here. Proposing one is a model call whose output the user must review
     and approve before anything is written (PLAN 2.2), and doing that silently inside a page load
     would be exactly the gate this project exists to keep shut.
+
+    ``plan_path`` -- what ``kedge open --plan`` names -- takes the plan from that one file and
+    *adopts* it: :func:`_plan_from_file` records it in this workbook's store, so the notebook and
+    everything that reads :meth:`~kedge.plan.store.PlanStore.latest_approved` agree on which
+    decomposition is in force. The store's own latest approved version is never quietly substituted
+    for a named file that will not load; the user asked for a particular decomposition, and
+    silently scaffolding a different one is the failure mode this project exists to prevent.
     """
+    if plan_path is not None:
+        return await _plan_from_file(workspace, job, plan_path)
+
     from kedge.plan.store import PlanStore, PlanStoreError
 
     job.step("planning", "running", "looking for an approved process plan")
@@ -868,6 +897,265 @@ async def _step_plan(workspace: Workspace, job: OpenJob) -> Any:
         "or run `kedge plan propose` on the command line.",
     )
     return None
+
+
+async def _plan_from_file(workspace: Workspace, job: OpenJob, path: Path) -> Any:
+    """Adopt the plan in the file ``--plan`` named: check it, record it, and scaffold from it.
+
+    **Adopting it means writing it into the workspace's plan store**, and that is not a
+    convenience. Everything else that asks "is a plan in force" reads
+    :meth:`~kedge.plan.store.PlanStore.latest_approved` -- the agent's write gate
+    (``agent/tools.py``), ``get_plan``, ``propose_plan``'s already-approved refusal, and the
+    pinned plan block in the loop. Scaffolding from a file the store has never heard of leaves the
+    notebook holding cells while the chat says no plan exists and offers to author a first one over
+    the top; approving *that* files a decomposition beside a notebook implementing a different one.
+    A plan the notebook implements but nothing else can see is worse than the flag being ignored.
+
+    Naming a file is still not approving what is in it. Two conditions must hold before anything is
+    written: the file says ``approved``, and :attr:`~kedge.plan.model.ProcessPlan.is_approvable`
+    agrees -- anything that went through :func:`kedge.plan.review.approve` satisfies the second by
+    construction, so it rejects only a hand-written file claiming an approval the review gate would
+    have refused, such as one with a drop nobody acknowledged. Either way nothing is recorded and
+    nothing is scaffolded; the workbook opens with an empty notebook and the frame says why.
+
+    A file that cannot be read or will not parse is the same shape of answer for the same reason:
+    this runs inside a page load as well as on a terminal, and a traceback in the opening dialog
+    tells the user nothing they can act on.
+
+    Every check here except the unapproved one is also made by :func:`kedge.cli._require_usable_plan`
+    before a marimo is spawned, which is where a mistake in what the user typed belongs. They are
+    not redundant: this function is what any caller that did not pre-flight reaches, and the file
+    can change between the two. This is the half that must never scaffold; that one is the half
+    that saves the user a workbook opened around their typo.
+    """
+    # Read and parsed exactly as the store reads its own versions, so a hand-edited file that will
+    # not load says which field is wrong. Both raise PlanStoreError, so one except covers the pair.
+    from kedge.plan.store import PlanStoreError, plan_from_yaml, read_plan_text
+
+    job.step("planning", "running", f"reading the process plan given with --plan: {path}")
+    try:
+        text = await run_in_threadpool(read_plan_text, path)
+        plan = plan_from_yaml(text)
+    except PlanStoreError as exc:
+        job.step(
+            "planning", "failed", f"the plan given with --plan could not be read. {path}: {exc}"
+        )
+        return None
+
+    if not plan.approval.approved:
+        job.step(
+            "planning",
+            "skipped",
+            f"plan v{plan.version} given with --plan ({path}) is "
+            f"'{plan.approval.state.value}', not approved. No plan from the store was used in its "
+            f"place; nothing was recorded and the notebook stays empty until this one is "
+            f"approved — nothing is scaffolded unreviewed.",
+        )
+        return None
+
+    blockers = plan.approval_blockers()
+    if blockers:
+        job.step(
+            "planning",
+            "failed",
+            f"plan v{plan.version} given with --plan ({path}) says it is approved, but the review "
+            f"gate would have refused it, so it was not adopted and nothing was scaffolded. "
+            f"{len(blockers)} blocker(s): " + "; ".join(blockers),
+        )
+        return None
+
+    foreign = _foreign_workbook(workspace, plan, path)
+    if foreign is not None:
+        job.step("planning", "failed", foreign)
+        return None
+
+    try:
+        adopted, record = await run_in_threadpool(_record_named_plan, workspace, plan)
+    except PlanStoreError as exc:
+        job.step(
+            "planning",
+            "failed",
+            f"the plan at {path} could not be recorded in this workbook's plan store, so nothing "
+            f"was scaffolded from it — a plan the notebook implements and the store has never "
+            f"heard of is worse than no plan at all: {exc}",
+        )
+        return None
+
+    provenance = await run_in_threadpool(_plan_identity_note, workspace, adopted)
+    job.step(
+        "planning",
+        "ok",
+        # Deliberately not led by the version in the file: it is about to be renumbered, and
+        # "plan v2 ... recorded as plan v1" reads as a mistake. The version that matters from here
+        # on is the one the store now holds, which is what `record` names.
+        f"the plan given with --plan ({path}) is approved by "
+        f"{plan.approval.by or 'nobody named'}: {len(plan.stages)} stage(s), "
+        f"{plan.assessment.convertible:.0%} judged convertible. {record}{provenance}",
+    )
+    return adopted
+
+
+_ADOPTION_STAMPS = frozenset({"version", "based_on_version", "plan_schema_version"})
+"""What :meth:`~kedge.plan.store.PlanStore.save_next` rewrites as it files a plan.
+
+Everything else is the decomposition itself, which is what decides whether a named plan is the one
+already in force or a different one arriving.
+"""
+
+
+def _record_named_plan(workspace: Workspace, plan: Any) -> tuple[Any, str]:
+    """File a ``--plan`` file in the workspace's store, and say plainly what that did.
+
+    Through :meth:`~kedge.plan.store.PlanStore.save_next`, so the artifact is byte-identical to one
+    the review verbs write and the history is retained rather than overwritten (PLAN 2.2).
+
+    Re-opening with the same file records nothing the second time. That is the rule
+    ``kedge plan approve`` already follows for approving the plan in force: nothing has changed, and
+    a version whose only difference from the one before it is a timestamp fills the history with
+    entries that say nothing.
+
+    Returns:
+        The plan now in force -- the one to scaffold from -- and one sentence for the step's detail
+        line. A decomposition displacing another one is never allowed to happen quietly, so that
+        sentence names the version superseded.
+
+    Raises:
+        PlanStoreError: if the store cannot be written to. The caller must not scaffold then.
+    """
+    from kedge.plan.store import PlanStore, PlanStoreError
+
+    store = PlanStore.for_workspace(workspace)
+    unreadable = ""
+    try:
+        in_force = store.latest_approved()
+    except PlanStoreError as exc:
+        # A single unparseable version somewhere in the history must not stop the user adopting a
+        # plan. It does stop us claiming to know what this supersedes, so that is what is said.
+        logger.warning("could not read the plan history for %s: %s", workspace.key, exc)
+        in_force, unreadable = (
+            None,
+            f" This workbook's saved plan history could not be read ({exc})",
+        )
+
+    if in_force is not None and _same_decomposition(in_force, plan):
+        return in_force, (
+            f"It is already the approved plan in force for this workbook, recorded as "
+            f"v{in_force.version}; nothing new was written."
+        )
+
+    stored, written = store.save_next(plan)
+    if in_force is None:
+        return stored, (
+            f"Adopted for this workbook and recorded as plan v{stored.version} ({written.name}), "
+            f"so the chat, the agent's tools and `kedge plan show` all read the plan this notebook "
+            f"was built from.{unreadable}"
+        )
+    return stored, (
+        f"Adopted for this workbook and recorded as plan v{stored.version} ({written.name}), "
+        f"superseding v{in_force.version}, which was the approved plan in force until now. That "
+        f"decomposition is no longer the one this notebook implements."
+    )
+
+
+def _same_decomposition(one: Any, other: Any) -> bool:
+    """Whether two plans differ only in where they sit in the store's numbering."""
+    return one.model_dump(mode="json", exclude=_ADOPTION_STAMPS) == other.model_dump(
+        mode="json", exclude=_ADOPTION_STAMPS
+    )
+
+
+def plan_workbook_name(plan: Any) -> str:
+    """The bare filename a plan says it was written for, whatever shape it is written in.
+
+    ``PureWindowsPath`` rather than :class:`~pathlib.Path`, and not because this is Windows: it is
+    the flavour that treats both separators as separators, and a plan is a file in version control
+    that is read on whichever machine has it. ``Path("C:/x/rwa.xlsx").name`` is the whole string on
+    Linux, so the same plan would be accepted on the author's laptop and refused in CI.
+
+    Returns:
+        The filename, or empty when the plan does not say. An empty ``workbook`` is a hand-edited
+        file that dropped the field -- everything kedge writes fills it -- and it is a distinct
+        answer from a name that disagrees, not a match.
+    """
+    return PureWindowsPath(plan.workbook).name if plan.workbook else ""
+
+
+def _foreign_workbook(workspace: Workspace, plan: Any, path: Path) -> str | None:
+    """Refuse a plan written for a *different* workbook, or return None.
+
+    Here as well as in :func:`kedge.cli._require_usable_plan`, and deliberately so. This is the
+    function that writes to the store, and the guard on a durable artifact belongs beside the write
+    rather than only in front of the one caller that exists today: ``OpenWorkbookBody`` has no plan
+    field now, and the day it gains one the refusal would be gone with no test failing. It is the
+    pattern the project already states for its own gate -- ``scaffold_notebook`` refuses an
+    unapproved plan structurally, with no parameter that talks it out of it.
+
+    The CLI copy is not redundant. It runs before a marimo is spawned, where the user can still act;
+    this one is what stops the write when nothing pre-flighted, and what catches a file edited
+    between the two.
+
+    Returns:
+        The detail line for a failed step, or None when the plan is for this workbook or says
+        nothing about which workbook it is for.
+    """
+    named = plan_workbook_name(plan)
+    name = workspace.workbook_path.name
+    if not named or named.casefold() == name.casefold():
+        return None
+    return (
+        f"the plan given with --plan ({path}) was written for {plan.workbook}, not {name}, so it "
+        f"was not adopted and nothing was scaffolded: filing another workbook's decomposition in "
+        f"this one's plan history would leave every stage naming ranges that are not in this file. "
+        f"If it is the same process under a new filename, change the plan's `workbook:` line to "
+        f"{name} and open again."
+    )
+
+
+def _plan_identity_note(workspace: Workspace, plan: Any) -> str:
+    """How well an adopted plan matches the workbook it is now in force for, in one sentence.
+
+    Everything here is a warning rather than a refusal, matching
+    :func:`kedge.cli._warn_if_the_workbook_moved_on` and the digest half of
+    :func:`kedge.cli._explicit_analysis`: a monthly file that has moved on since its plan was
+    written is the normal case, not the alarming one, and it cannot produce a false "passed"
+    because reconciliation degrades to "not reconciled" when the baseline does not line up. The
+    case that *is* refused -- a plan for a different workbook -- never reaches here; see
+    :func:`_foreign_workbook`.
+
+    The three answers are kept apart because they are three different things, and saying the wrong
+    one is worse than saying nothing. A plan with no ``workbook`` and a plan with no
+    ``workbook_sha256`` used to fall through to the digest branch and report that the workbook "has
+    changed since this plan was written for it", which was a claim about a comparison that had not
+    happened.
+
+    Returns:
+        A sentence to append to the step's detail, or empty when there is nothing to say.
+    """
+    from kedge.analysis.workbook import read_identity
+
+    name = workspace.workbook_path.name
+    if not plan_workbook_name(plan):
+        return (
+            f" Warning: this plan does not record which workbook it was written for, so nothing in "
+            f"it ties it to {name}. Fill in its `workbook:` line."
+        )
+    if not plan.workbook_sha256:
+        return (
+            f" Warning: this plan records no sha256, so kedge cannot tell whether {name} is the "
+            f"file it was written for or a later version of it."
+        )
+    try:
+        digest = read_identity(workspace.workbook_path).sha256
+    except (OSError, ValueError) as exc:  # pragma: no cover - the analysis step reports this too
+        logger.debug("could not read the identity of %s: %s", workspace.workbook_path, exc)
+        return ""
+    if digest == plan.workbook_sha256:
+        return ""
+    return (
+        f" Warning: {name} has changed since this plan was written for it — the recorded sha256 no "
+        f"longer matches the file on disk — so the decomposition describes an earlier version of "
+        f"the workbook."
+    )
 
 
 async def _step_notebook(workspace: Workspace, job: OpenJob) -> None:
@@ -931,12 +1219,18 @@ async def _step_session(workspace: Workspace, job: OpenJob) -> None:
     job.step("session", "ok", f"kernel session {session_id} is live")
 
 
-async def _step_scaffold(workspace: Workspace, plan: Any, job: OpenJob) -> Any:
+async def _step_scaffold(
+    workspace: Workspace, plan: Any, job: OpenJob, *, plan_path: Path | None = None
+) -> Any:
     """Build the notebook driver, and scaffold from an approved plan where there is one.
 
     A scaffold failure is reported and stepped over rather than fatal: the notebook, the kernel
     and the chat all still work, and telling the user "the notebook is open but scaffolding
     failed, here is why" beats refusing to open the workbook at all.
+
+    ``plan_path`` is carried this far for one sentence. "No approved plan" is the wrong account of
+    a run where the user named one and it was refused, and a step that misreports why it did
+    nothing sends the reader looking in the wrong place -- the planning step above has the reason.
     """
     from kedge.notebook.driver import NotebookDriver
 
@@ -948,7 +1242,14 @@ async def _step_scaffold(workspace: Workspace, plan: Any, job: OpenJob) -> Any:
         return None
 
     if plan is None:
-        job.step("scaffolding", "skipped", "no approved plan, so there is nothing to scaffold")
+        job.step(
+            "scaffolding",
+            "skipped",
+            f"the plan given with --plan ({plan_path}) was not adopted — see the planning step "
+            f"above — so there is nothing to scaffold"
+            if plan_path is not None
+            else "no approved plan, so there is nothing to scaffold",
+        )
         return driver
 
     from kedge.notebook.scaffold import scaffold_notebook

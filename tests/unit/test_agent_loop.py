@@ -16,8 +16,10 @@ import json
 from functools import cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from conftest import approved_plan_store
@@ -30,8 +32,12 @@ from kedge.agent.context import (
     TokenCounter,
 )
 from kedge.agent.loop import (
+    _FINAL_WORD_PROMPT,
+    _NO_ACCOUNT,
+    AgentError,
     ChatDelta,
     KedgeAgent,
+    OpenAIClient,
     Usage,
     _history_before,
     _result_shape,
@@ -77,13 +83,17 @@ class ScriptedClient:
     def __init__(self, rounds: list[list[ChatDelta]]) -> None:
         self._rounds = list(rounds)
         self.seen: list[list[dict[str, Any]]] = []
-        self.tools_offered: list[str] = []
+        self.tools_offered: list[list[str]] = []
+        """What each round was offered, in order. Per round rather than latest-wins because the
+        last word a stopped turn gets is offered nothing, and a field that only remembers the most
+        recent request cannot tell that apart from a turn that was never asked anything at all."""
+
         self.models_asked: list[str] = []
 
     async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
         self.models_asked.append(model)
         self.seen.append([dict(message) for message in messages])
-        self.tools_offered = [tool["function"]["name"] for tool in tools]
+        self.tools_offered.append([tool["function"]["name"] for tool in tools])
         for delta in self._rounds.pop(0) if self._rounds else []:
             yield delta
 
@@ -215,11 +225,11 @@ def test_the_loop_satisfies_the_server_s_protocol() -> None:
 async def test_the_tools_offered_are_the_ones_plan_m4_lists() -> None:
     client = ScriptedClient([[ChatDelta(text="Nothing to do.")]])
     await drive(build(client))
-    assert "propose_cell" in client.tools_offered
-    assert "reconcile" in client.tools_offered
+    assert "propose_cell" in client.tools_offered[0]
+    assert "reconcile" in client.tools_offered[0]
     # PLAN M4's fifteen, plus `propose_plan`: the planning step has to be reachable from the chat
     # too, or an account worked out in conversation stays prose and is compacted away with it.
-    assert len(client.tools_offered) == 16
+    assert len(client.tools_offered[0]) == 16
 
 
 # ── exactly one DoneEvent ────────────────────────────────────────────────────────────────────
@@ -296,8 +306,18 @@ async def test_stop_lands_while_the_model_is_still_thinking() -> None:
         token.cancel()
 
     stopper = asyncio.create_task(press_stop())
+    # Timed, for the reason `test_stop_during_the_last_word_is_honoured` sets out at length: `run`
+    # turns a cancellation into a tidy finish, so `wait_for` prising the turn off a 30 second call
+    # at the deadline looks from here exactly like the turn abandoning it at once. Without the
+    # clock this test passes with `_abandon_if_cancelled` taken out -- a false positive sitting
+    # directly above the docstring explaining why that must not happen.
+    clock = asyncio.get_running_loop().time
+    started = clock()
     events = await asyncio.wait_for(collect(), timeout=5)
+    elapsed = clock() - started
     await stopper
+
+    assert elapsed < 1, f"the turn waited {elapsed:.1f}s on a model call it should have abandoned"
 
     types = [event.type for event in events]
     assert types.count("done") == 1
@@ -425,7 +445,10 @@ async def test_validation_retries_are_capped_at_three() -> None:
     assert len(errors) == 1
     assert "3 times running" in errors[0].message
     assert types.count("done") == 1
-    assert len(client.seen) == 3  # it stopped rather than spending the rest of the budget
+    # Three attempts and the last word, rather than the rest of the budget: the fourth request is
+    # the one that asks for prose, and it is offered nothing to call.
+    assert len(client.seen) == 4
+    assert client.tools_offered[-1] == []
 
 
 # ── the step budget, and carrying a turn across it ───────────────────────────────────────────
@@ -1357,9 +1380,15 @@ async def test_a_draft_a_tool_keeps_rejecting_stops_the_turn(
     assert len(errors) == 1
     assert "rejected the draft 3 times" in errors[0].message
     assert errors[0].recoverable is True
-    assert "Say in the chat what the process does" in errors[0].message
+    # Written for the user, who reads it as a warning chip, and written in the past tense about
+    # what happened. The instruction that used to sit here was addressed to the model, which never
+    # saw it; the account it asks for is best-effort, so the chip must not promise one.
+    assert "The rejections are above" in errors[0].message
+    assert "follows" not in errors[0].message
     assert types.count("tool_call") == 4  # the read, then three attempts and no more
-    assert len(client.seen) == 4, "it stopped rather than spending the rest of the budget"
+    # The fifth request is the last word and calls nothing, so the tool call it comes back with is
+    # dropped rather than dispatched -- and the sixth request is never made.
+    assert len(client.seen) == 5, "it stopped rather than spending the rest of the budget"
     assert types.count("done") == 1
 
 
@@ -1380,6 +1409,525 @@ async def test_a_refusal_the_model_cannot_fix_is_not_counted_as_an_attempt(
 
     assert not any(event.type == "error" for event in events)
     assert [event.type for event in events].count("tool_call") == 4
+
+
+# ── the last word a stopped turn still gets ──────────────────────────────────────────────────
+
+
+def _rejected_drafts(count: int) -> list[list[ChatDelta]]:
+    """A read, then ``count`` rounds of a plan `propose_plan` cannot parse.
+
+    The read is not decoration. `propose_plan` refuses outright until something has been read this
+    session, and that refusal is not counted as an attempt (no redraft fixes it), so a script that
+    opens with the draft never reaches the cap at all.
+    """
+    return [call("inspect_workbook", {"section": "operations"})] + [
+        call("propose_plan", {"plan": "here you go: {stages: ["}) for _ in range(count)
+    ]
+
+
+def _stopped_by_a_draft_it_cannot_fix(
+    rounds: list[list[ChatDelta]], analysis: WorkbookAnalysis, plans: Path
+) -> tuple[KedgeAgent, ScriptedClient]:
+    """A loop that reads, hits the draft cap on its next three rounds, then does what ``rounds`` says.
+
+    The last word is therefore the fifth request, and `client.seen[4]` is the one that asks for it.
+    """
+    client = ScriptedClient(_rejected_drafts(3) + rounds)
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis, plans=PlanStore(plans)),
+        max_steps=10,
+    )
+    return agent, client
+
+
+async def test_a_stopped_turn_still_ends_in_prose_the_user_can_read(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """The defect: a turn could end having produced no answer at all, and say nothing about it.
+
+    A user spent two full 50-step turns having a workbook read and got back a trail of tool calls,
+    a warning chip and not one sentence. The cap that stopped the turn was right to stop it — the
+    fourth attempt at a shape the model has got wrong three times is not the one that works — but
+    it ended the turn before the model was ever given a completion in which to write down what it
+    had worked out, which is the only part of the turn the user can act on.
+
+    The error still comes first. The user has to know why it stopped before they read the account,
+    or the account arrives as prose that trails off for no stated reason.
+    """
+    agent, _ = _stopped_by_a_draft_it_cannot_fix(
+        [[ChatDelta(text="Stage 1 loads the hand-in. "), ChatDelta(text="Stage 2 is the lookup.")]],
+        analysis,
+        tmp_path / "plans",
+    )
+
+    events = await drive(agent)
+    types = [event.type for event in events]
+
+    assert types.index("error") < types.index("token"), "why it stopped, then what was worked out"
+    account = "".join(event.text for event in events if event.type == "token")
+    assert account == "Stage 1 loads the hand-in. Stage 2 is the lookup."
+    assert types.count("done") == 1
+
+
+async def test_the_last_word_is_asked_for_with_no_tools_at_all(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """Withheld rather than discouraged, because the cap fires where asking nicely has failed.
+
+    Left the tool surface, a model that has just been told to stop drafting has an obvious fourth
+    attempt in front of it, and the turn ends silently again. Offered nothing, the only move left
+    is to speak — and an empty sequence is sent as no ``tools`` key at all, since an
+    OpenAI-compatible endpoint is entitled to refuse ``"tools": []``.
+    """
+    agent, client = _stopped_by_a_draft_it_cannot_fix(
+        [[ChatDelta(text="Here is what the process does.")]], analysis, tmp_path / "plans"
+    )
+
+    await drive(agent)
+
+    assert client.tools_offered[0], "the turn itself is worked with the whole surface"
+    assert client.tools_offered[-1] == []
+    assert len(client.tools_offered) == 5
+
+
+async def test_the_last_word_is_spoken_to_one_request_rather_than_stored(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """The instruction is true of that one request and false of every later one.
+
+    Kept in the window it would be carried into the next turn, where the budget is whole and "there
+    is no further step" is a lie. Kept as a *user* message it would be counted by `_history_before`
+    as an exchange the span reinstates, and the trim would cut the wrong turn out of history.
+    """
+    agent, client = _stopped_by_a_draft_it_cannot_fix(
+        [[ChatDelta(text="Here is what the process does.")], [ChatDelta(text="Right.")]],
+        analysis,
+        tmp_path / "plans",
+    )
+
+    await drive(agent)
+    await drive(agent, "try that again")
+
+    asked_for = {"role": "user", "content": _FINAL_WORD_PROMPT}
+    assert client.seen[4][-1] == asked_for, "the request that asks for prose closes with it"
+    assert asked_for not in client.seen[5], "and no request after it carries it at all"
+
+
+async def test_the_last_word_happens_once_and_does_not_re_enter_the_step_loop(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """One extra completion, whatever the model does with it.
+
+    A model handed no tools may call one anyway. Dispatching it would put the turn back in the loop
+    the cap exists to leave, so the calls are ignored — and dropped from the window as well as from
+    the loop, because an assistant message carrying ``tool_calls`` that nothing answers is rejected
+    outright by the endpoint, which would break every later turn of the session rather than this one.
+    """
+    agent, client = _stopped_by_a_draft_it_cannot_fix(
+        [
+            call("propose_plan", {"plan": "still not json"}, index=7),
+            [ChatDelta(text="Right.")],
+        ],
+        analysis,
+        tmp_path / "plans",
+    )
+
+    events = await drive(agent)
+    types = [event.type for event in events]
+    # Tool calls and no prose is one of the ways the account can go missing, so the line that says
+    # so stands in for it rather than the turn ending silently after all.
+    assert _NO_ACCOUNT in "".join(event.text for event in events if event.type == "token")
+    assert types.count("tool_call") == 4, (
+        "the read and three attempts; the ignored call ran nothing"
+    )
+    assert len(client.seen) == 5, "the read, three attempts and one last word"
+
+    await drive(agent, "try that again")
+    carried = client.seen[5]
+    asked = {
+        tool_call["id"] for message in carried for tool_call in message.get("tool_calls") or ()
+    }
+    answered = {message["tool_call_id"] for message in carried if message["role"] == "tool"}
+    assert asked and asked == answered, "the ignored call was never recorded"
+    assert "call_7" not in asked
+
+
+async def test_the_account_is_recorded_so_the_next_turn_still_reads_it(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """The one piece of state the last word writes, and nothing else would notice its loss.
+
+    `_history_before` trims the persisted exchange out of history on the understanding that the
+    carried span reinstates it. An account the window never recorded is therefore not replaced by
+    anything: it appears in the next turn's prompt zero times, and the model loses its own last
+    answer — the only message of the turn the user actually read.
+
+    Exactly once, too. Carried *and* left in history, it would be read twice, once flattened and
+    once in place.
+    """
+    account = "Stage 1 loads the hand-in; stage 2 is the haircut lookup in Calc!H."
+    agent, client = _stopped_by_a_draft_it_cannot_fix(
+        [[ChatDelta(text=account)], [ChatDelta(text="Right.")]], analysis, tmp_path / "plans"
+    )
+
+    await drive(agent)
+    # What the server persists of a stopped turn: the question, and the prose that reached the user.
+    history = (
+        TurnMessage(role="user", content="convert the haircut lookup"),
+        TurnMessage(role="assistant", content=account),
+    )
+    await drive(agent, "try that again", history=history)
+
+    carried = [message.get("content") or "" for message in client.seen[5]]
+    assert sum(1 for content in carried if account in content) == 1
+
+
+async def test_a_last_word_that_fails_does_not_brand_the_turn_fatal(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """A best-effort extra call must not escalate a stop the turn has already explained.
+
+    Anything raised inside the last word would reach the loop's catch-all, which reports every
+    exception as unrecoverable and which `app.js` renders as **Fatal** — a banner saying the turn
+    broke, under a chip saying it stopped for a reason it understood, on a turn whose conclusion
+    was settled before the call was made. The account failing to arrive is not fatal to anything.
+    """
+
+    class FailsWhenTheToolsGoAway:
+        """Reads, redrafts until the cap fires, then fails the request that asks for prose."""
+
+        def __init__(self) -> None:
+            self.rounds = 0
+
+        async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
+            del model, messages
+            self.rounds += 1
+            if not tools:
+                raise ValueError("the SDK changed shape")
+                yield  # pragma: no cover - unreachable, and what makes this a generator
+            script = (
+                call("inspect_workbook", {"section": "operations"})
+                if self.rounds == 1
+                else call("propose_plan", {"plan": "here you go: {stages: ["})
+            )
+            for delta in script:
+                yield delta
+
+    agent = build(
+        FailsWhenTheToolsGoAway(),
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+
+    events = await drive(agent)
+    errors = [event for event in events if event.type == "error"]
+
+    assert [event.recoverable for event in errors] == [True], "the cap chip, and no Fatal banner"
+    assert "rejected the draft" in errors[0].message
+    assert _NO_ACCOUNT in "".join(event.text for event in events if event.type == "token")
+    assert [event.type for event in events].count("done") == 1
+
+
+async def test_an_account_cut_short_says_so_on_the_screen_and_in_the_record(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """Prose, then a failure — the shape the mid-answer translation exists for, arriving here.
+
+    `reply.content` is truthy, so the empty-account fallback does not fire and the containment
+    would otherwise swallow the failure into a WARNING: the account stops mid-word with no marker,
+    and the user is left to guess. The record is the worse half. What arrived is recorded, carried
+    into the next turn and persisted by the server as the turn's assistant message, so an unmarked
+    fragment reads as a finished thought for as long as the transcript survives.
+    """
+    fragment = "Stage 1 loads the hand-in, stage 2 is the hair"
+    died = AgentError(
+        "the model endpoint at http://127.0.0.1:1/v1 accepted the request and then failed "
+        "part-way through the answer: upstream closed the connection."
+    )
+
+    class FailsPartWayThroughTheAccount:
+        """Reads, redrafts until the cap fires, then dies half-way through the account."""
+
+        def __init__(self) -> None:
+            self.rounds = 0
+            self.seen: list[list[dict[str, Any]]] = []
+
+        async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
+            del model
+            self.seen.append([dict(message) for message in messages])
+            self.rounds += 1
+            if not tools:
+                yield ChatDelta(text=fragment)
+                raise died
+            script = (
+                call("inspect_workbook", {"section": "operations"})
+                if self.rounds == 1
+                else call("propose_plan", {"plan": "here you go: {stages: ["})
+            )
+            for delta in script:
+                yield delta
+
+    client = FailsPartWayThroughTheAccount()
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+
+    events = await drive(agent)
+    on_screen = "".join(event.text for event in events if event.type == "token")
+
+    assert on_screen.startswith(fragment), "what arrived is kept; it is not thrown away"
+    assert "This account stops here" in on_screen
+    assert "upstream closed the connection" in on_screen, "and why, in the endpoint's own words"
+    assert [event.recoverable for event in events if event.type == "error"] == [True]
+
+    # And the same text is what the next turn reads, rather than a fragment ending mid-word.
+    await drive(agent, "try that again")
+    recorded = [
+        message.get("content") or ""
+        for message in client.seen[5]
+        if message["role"] == "assistant" and fragment in (message.get("content") or "")
+    ]
+    assert recorded == [on_screen]
+
+
+async def test_a_last_word_with_nothing_in_it_says_so_rather_than_going_quiet(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """Silence is the defect, so the one path left that could produce it says a line instead.
+
+    An endpoint that answers the last word with no content at all — or with tool calls and no prose,
+    which is the same thing once they are dropped — would otherwise leave the user exactly where
+    they started: a chip, a trail of tool calls, and nothing written. The line is worth having for
+    what it says next, which is that the reading is still on the shelf.
+    """
+    agent, _ = _stopped_by_a_draft_it_cannot_fix([[]], analysis, tmp_path / "plans")
+
+    events = await drive(agent)
+
+    assert "".join(event.text for event in events if event.type == "token") == _NO_ACCOUNT
+    assert [event.type for event in events].count("done") == 1
+
+
+async def test_the_validation_cap_gets_the_same_last_word() -> None:
+    """Both caps leave the user in the same place, so both owe them the same account.
+
+    A cell the gate keeps rejecting is a different failure from a plan a tool keeps refusing, but
+    what reaches the chat is identical: a stopped turn. The account of what the cell was for is
+    what the user needs in order to write it themselves.
+    """
+    rounds = [[*call("propose_cell", {"name": "loader", "code": PANDAS_CELL})] for _ in range(3)]
+    rounds += [[ChatDelta(text="The loader reads the hand-in; polars wants scan_csv here.")]]
+    client = ScriptedClient(rounds)
+
+    events = await drive(build(client, driver=FakeDriver()))
+    types = [event.type for event in events]
+
+    assert types.count("validation") == 3
+    assert types.index("error") < types.index("token")
+    assert "".join(event.text for event in events if event.type == "token").startswith("The loader")
+    assert client.tools_offered[-1] == []
+
+
+async def test_the_last_word_is_counted_like_any_other_step(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """It re-sends the whole prompt, so a turn's figure is only truthful if it is metered.
+
+    Every step of a turn re-sends the head, the tool schemas and the conversation, and this one is
+    a step like the others. Left out of `meter.record`, the ``DoneEvent`` would understate the turn
+    by an entire prompt — and the turns that reach a cap are the long ones.
+    """
+    step = Usage(prompt=100, completion=10)
+    account = Usage(prompt=9_000, completion=40)
+    # The read and the three refused drafts each report the same modest figure; the last word
+    # reports a whole prompt of its own, which is what it costs.
+    rounds = [[*round_, ChatDelta(usage=step)] for round_ in _rejected_drafts(3)]
+    rounds += [[ChatDelta(text="Here is the account."), ChatDelta(usage=account)]]
+    agent = build(
+        ScriptedClient(rounds),
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+
+    events = await drive(agent)
+
+    assert _done(events).tokens_used == 4 * step.total + account.total
+
+
+async def test_stop_during_the_last_word_is_honoured(
+    analysis: WorkbookAnalysis, tmp_path: Path
+) -> None:
+    """The last word is one more model call, and Stop means stop during it too.
+
+    It goes through `_complete` rather than opening a stream of its own precisely so that this
+    holds: the call is abandoned mid-thought, and the turn leaves through the cancel path with its
+    single `DoneEvent` and the tool traffic it paid for still on the shelf.
+    """
+
+    class StopWhenTheToolsGoAway:
+        """Reads, redrafts until the cap fires, then thinks about the account while Stop is pressed.
+
+        The round with nothing to call is the last word, so the token is set there — and then the
+        fake *hangs*, which is the part that makes this a test rather than a formality. A fake that
+        cancels and yields in the same breath is stopped by the ordinary check after the await,
+        and would pass just as happily with `_abandon_if_cancelled` taken out; the 30 seconds of
+        thinking against a 5 second deadline can only be survived by abandoning the call.
+        """
+
+        def __init__(self) -> None:
+            self.token = CancelToken()
+            self.tools_offered: list[list[str]] = []
+            self.rounds = 0
+            self.finished = False
+
+        async def stream(self, *, model: str, messages: Any, tools: Any) -> Any:
+            del model, messages
+            self.tools_offered.append([tool["function"]["name"] for tool in tools])
+            self.rounds += 1
+            if not tools:
+                self.token.cancel()
+                await asyncio.sleep(30)  # still thinking about the account when Stop lands
+                self.finished = True  # pragma: no cover - the turn is abandoned long before
+                yield ChatDelta(text="never read")  # pragma: no cover
+                return
+            script = (
+                call("inspect_workbook", {"section": "operations"})
+                if self.rounds == 1
+                else call("propose_plan", {"plan": "here you go: {stages: ["})
+            )
+            for delta in script:
+                yield delta
+
+    client = StopWhenTheToolsGoAway()
+    agent = build(
+        client,
+        context=ToolContext(analysis=analysis, plans=PlanStore(tmp_path / "plans")),
+        max_steps=10,
+    )
+    request = TurnRequest(turn_id="t1", session_id="s1", message="convert the haircut lookup")
+
+    async def collect() -> list[Any]:
+        return [event async for event in agent.run(request, cancel=client.token)]
+
+    # Timed, and the deadline is not the assertion. `run` converts a cancellation into a tidy
+    # finish by design, so a turn that sat out the whole 30 seconds -- or that had to be prised off
+    # it by `wait_for` -- comes back looking exactly like one that abandoned the call immediately.
+    # Only the clock tells them apart, and that difference is the whole subject of this test.
+    clock = asyncio.get_running_loop().time
+    started = clock()
+    events = await asyncio.wait_for(collect(), timeout=5)
+    elapsed = clock() - started
+    types = [event.type for event in events]
+
+    assert elapsed < 1, f"the turn waited {elapsed:.1f}s on a model call it should have abandoned"
+    assert client.tools_offered[-1] == [], "the cap fired and the last word was asked for"
+    assert client.finished is False, "the last word was abandoned, not waited out"
+    assert not any(event.type == "token" for event in events), "the stop landed before the prose"
+    errors = [event for event in events if event.type == "error"]
+    assert errors[-1].message == "Turn cancelled at your request."
+    assert types.count("done") == 1
+    assert types[-1] == "done"
+
+
+# ── a failure the endpoint reports once it has already started answering ─────────────────────
+
+
+_CONTEXT_REFUSAL = "This model's maximum context length is 128000 tokens, however you requested 0"
+
+
+def _bare_api_error() -> BaseException:
+    """The exception `openai/_streaming.py` raises for an `error` event delivered after the 200.
+
+    Its MRO is `(APIError, OpenAIError, Exception)`: not an `APIStatusError`, because there is no
+    response left to carry a status, and not an `APIConnectionError`, because the connection is
+    working — the endpoint is using it to say something. That is precisely why it used to slip past
+    every clause in `OpenAIClient.stream` and land in the loop's catch-all.
+    """
+    from openai import APIError
+
+    return APIError(
+        _CONTEXT_REFUSAL,
+        httpx.Request("POST", "http://127.0.0.1:1/v1/chat/completions"),
+        body={"error": {"message": _CONTEXT_REFUSAL}},
+    )
+
+
+class FailingSDK:
+    """Stands in for `AsyncOpenAI`: the stream opens cleanly, then fails while the body is drained.
+
+    The position is the point. A gateway that refuses on context length, or loses its upstream,
+    has usually already answered 200 and begun relaying, so the failure arrives among the chunks
+    rather than around the request — where the SDK's own translation no longer reaches it.
+    """
+
+    def __init__(self, error: BaseException) -> None:
+        self._error = error
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **_payload: Any) -> Any:
+        return self._chunks()
+
+    async def _chunks(self) -> Any:
+        delta = SimpleNamespace(content="Reading the reference sheet ", tool_calls=None)
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+        raise self._error
+
+    async def close(self) -> None:
+        return None
+
+
+def _failing_endpoint() -> OpenAIClient:
+    return OpenAIClient(
+        base_url="http://127.0.0.1:1/v1",
+        api_key="k",
+        api="chat_completions",
+        client=FailingSDK(_bare_api_error()),
+    )
+
+
+async def test_a_bare_api_error_mid_answer_leaves_the_client_as_an_agent_error() -> None:
+    """The invariant CLAUDE.md states: nothing the SDK raises may leave `stream` untranslated.
+
+    `stream` had a clause for a timeout, one for a broken connection and one for a status error,
+    and a mid-stream `APIError` is none of the three. The endpoint's own prose is what is quoted,
+    not the SDK's wrapper around it.
+    """
+    with pytest.raises(AgentError) as caught:
+        async for _ in _failing_endpoint().stream(
+            model="m", messages=[{"role": "user", "content": "convert this"}], tools=[]
+        ):
+            pass
+
+    assert "maximum context length" in str(caught.value)
+    assert "part-way through the answer" in str(caught.value)
+    # The endpoint's own prose, not the SDK's wrapper around it (CLAUDE.md). Asserted as the
+    # absence of the wrapper rather than the presence of the phrase, because the phrase is inside
+    # the wrapper too: interpolating `{exc!r}` passes a test that only looks for it.
+    assert "Error code:" not in str(caught.value)
+    assert "APIError(" not in str(caught.value)
+
+
+async def test_a_failure_mid_answer_is_reported_as_recoverable_rather_than_fatal() -> None:
+    """Which is the whole reason the translation matters, and it is not a capped-turn problem.
+
+    Everything reaching the loop's catch-all is reported unrecoverable and rendered as **Fatal**,
+    so before this an ordinary context-length refusal — mid-answer, on any turn — told the user
+    their notebook might be half-written. It is recoverable and it says so, in the endpoint's words.
+    """
+    events = await drive(build(_failing_endpoint()))
+    errors = [event for event in events if event.type == "error"]
+
+    assert [event.recoverable for event in errors] == [True]
+    assert "maximum context length" in errors[0].message
+    assert [event.type for event in events].count("done") == 1
+    # What had streamed before the failure still reached the user; it is all there is of it.
+    assert "".join(event.text for event in events if event.type == "token") == (
+        "Reading the reference sheet "
+    )
 
 
 # ── arguments kedge cannot decode ────────────────────────────────────────────────────────────

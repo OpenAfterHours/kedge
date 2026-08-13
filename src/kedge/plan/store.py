@@ -39,6 +39,7 @@ __all__ = [
     "PlanStoreError",
     "plan_from_yaml",
     "plan_to_yaml",
+    "read_plan_text",
 ]
 
 PLAN_FILENAME_PATTERN = re.compile(r"^plan-v(\d+)\.ya?ml$")
@@ -123,8 +124,13 @@ def _summarise(exc: ValidationError) -> str:
     return "\n".join([f"{len(problems)} {plural}:", *lines])
 
 
-def _read(path: Path) -> str:
+def read_plan_text(path: Path) -> str:
     """Read a plan file as UTF-8, or say why it could not be read.
+
+    Public because two callers outside this module load a plan the store does not own -- the file
+    ``kedge open --plan`` names -- and they need this message rather than a bare ``OSError``. It was
+    private and imported anyway, which is the worst of both: public in effect, with nothing
+    declaring the signature callers depend on.
 
     Both failure modes have to be named here, because they are not related by type.
     ``UnicodeDecodeError`` is a ``ValueError``, not an ``OSError``, so an ``except OSError`` around
@@ -213,7 +219,7 @@ class PlanStore:
             available = ", ".join(str(item) for item in self.versions()) or "none"
             msg = f"no plan version {version} in {self.directory} (available: {available})"
             raise PlanStoreError(msg)
-        text = _read(path)
+        text = read_plan_text(path)
         try:
             return plan_from_yaml(text)
         except PlanStoreError as exc:
@@ -272,7 +278,7 @@ class PlanStore:
         path = self.path_for(plan.version)
         text = plan_to_yaml(plan)
         if path.is_file():
-            existing = _read(path)
+            existing = read_plan_text(path)
             if existing == text:
                 return path
             msg = (

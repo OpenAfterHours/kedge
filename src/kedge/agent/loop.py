@@ -28,9 +28,13 @@ notebook is stale the moment they do. The name registry and the live cell listin
 server persists the trail against the assistant message when it sees one, so a turn that ends
 without it leaves a half-written conversation on disk, and a turn that emits two writes it twice.
 
-Retries are capped. A cell rejected by the validation gate three times stops being a conversation
-the model can win on its own, so kedge surfaces it to the user rather than burning the rest of the
-budget rephrasing the same mistake.
+Retries are capped, and a capped turn still says something. A cell rejected by the validation gate
+three times stops being a conversation the model can win on its own, so kedge surfaces it to the
+user rather than burning the rest of the budget rephrasing the same mistake — and then spends one
+last completion with the tools withheld (:meth:`KedgeAgent._final_word`). Stopping on its own left
+a user two full turns of workbook reading, a warning chip and no prose whatsoever: the account the
+model had worked out on the way to the failure is the part they can act on, and it was being thrown
+away at exactly the moment it became the only thing left to hand them.
 
 **Every turn keeps what it learnt, whether or not it answered.** Only prose survives in the
 server's history, so without a hand-off a model that had just spent forty calls reading a workbook
@@ -143,6 +147,59 @@ budget on it — up to :data:`DEFAULT_MAX_STEPS` completions, each re-sending th
 and ends in a pause that reads as though progress were being made. The cap ends it while the
 useful part is still worth having: the model's account of the workbook, in prose, which the user
 can act on whether or not it ever fitted the schema.
+
+That account is not a hope, it is a step. :meth:`KedgeAgent._final_word` is what actually collects
+it, because a cap that only stops the turn ends the conversation before the model has been given a
+completion in which to write anything down.
+"""
+
+_FINAL_WORD_PROMPT = (
+    "kedge has stopped this turn: the same thing has been rejected three times running, so the "
+    "tools have been withdrawn and this reply is your last word on it. Answer the user directly, "
+    "in prose. Say what you worked out about the process stage by stage, what each stage is for, "
+    "how far you had got, and what you are unsure of or would need from them. That account is the "
+    "useful part — it is what they can act on, whether or not what you drafted ever fitted the "
+    "schema — so write it out rather than apologising for the failure or promising to retry. "
+    "There is no further step this turn in which a retry could happen."
+)
+"""What the model is told when the loop has stopped it and wants prose out of it anyway.
+
+Appended to the assembled messages for one request rather than added to the window, and the
+distinction is not tidiness. A window that holds it carries it into the next turn — where it is
+false, since that turn has its whole budget — and a *user* message that holds it is counted by
+:func:`_history_before` as a turn to trim, which would silently cut the wrong exchange out of
+history. So it is spoken once, to one request, and never stored.
+
+It lives here rather than in :mod:`kedge.agent.prompts` because it is a property of this
+control-flow decision rather than of the standing system prompt: nothing else in kedge sends it,
+and it is sent at most once per turn.
+"""
+
+_NO_ACCOUNT = (
+    "[I have not been able to write that up. Nothing I read on this turn has been thrown away, so "
+    "ask me to summarise what I found and I will pick it up from where it stopped.]"
+)
+"""What the user is told when the last word comes back empty, or does not come back at all.
+
+Silence is the whole of the defect this path exists to remove, and the account can still go missing
+three ways: the completion fails, the endpoint answers with tool calls and no prose, or it answers
+with nothing whatever. None of those is worth a second error chip — the turn has already explained
+itself — but all three are worth a line, and the line says the one thing the user needs, which is
+that the reading is still on the shelf (:meth:`KedgeAgent._carry`) and asking again is cheap.
+
+Not emitted when the user pressed Stop. They asked for silence, and they are entitled to it.
+
+Bracketed, because in this channel that is what says kedge is speaking rather than the model. It is
+the rule :func:`_cut_short` follows for the same reason, and a rule that holds for one of the two
+lines is not a rule at all: a reader has to be able to tell whose words they are without being told.
+
+Prose alone, with no chip of its own — and :func:`_pause_message` is precedent for only half of
+that. It emits a :class:`~kedge.server.events.PausedEvent` *and* records its prose in the window,
+so a chip plainly need not cost the window record. What it is precedent for is the record, which is
+the half that matters here: the next turn has to read this as the last thing the assistant said, or
+"summarise what you found" answers nothing. The chip is left out because it would want a new event
+type, which is a change to the server's event model and to ``app.js`` rather than to this file. The
+brackets carry the authorship until somebody makes that change.
 """
 
 _EDITING_TOOLS = frozenset({"propose_cell", "edit_cell", "delete_cell"})
@@ -585,13 +642,21 @@ class OpenAIClient:
         unrecoverable — and the chat pane renders that as **Fatal**. A rate limit is the most
         recoverable thing an endpoint can say.
 
+        **Nothing the SDK raises may leave here untranslated**, which is why the chain ends on
+        :class:`openai.APIError` rather than on the four shapes worth their own sentence. The
+        specific clauses are kept for the quality of what they say; the last one exists because the
+        invariant is "every model-endpoint failure arrives as an :class:`AgentError`", and one
+        exception escaping it is the whole of the difference between a recoverable turn and a
+        **Fatal** one.
+
         Raises:
-            AgentError: The endpoint timed out, the connection to it failed, or it refused the
-                request outright. All are recoverable: the loop reports them and leaves the
-                conversation intact.
+            AgentError: The endpoint timed out, the connection to it failed, it refused the request
+                outright, or it failed part-way through an answer it had already begun. All are
+                recoverable: the loop reports them and leaves the conversation intact.
         """
         from openai import (
             APIConnectionError,
+            APIError,
             APIStatusError,
             APITimeoutError,
             BadRequestError,
@@ -635,6 +700,16 @@ class OpenAIClient:
             status = getattr(exc, "status_code", 0)
             logger.warning("%s refused the request with HTTP %s: %s", self._base_url, status, exc)
             raise self._refused(model, int(status), _status_detail(exc)) from exc
+        # Later still, because every clause above is an APIError as well. This is the one that
+        # catches a failure the endpoint reported *after* the 200: `openai/_streaming.py` raises a
+        # bare APIError for an `error` event in the body, which is neither an APIStatusError (there
+        # is no response left to carry a status) nor an APIConnectionError (the connection is fine
+        # -- the endpoint is telling us something). A gateway announcing a context-length refusal
+        # or an upstream it has just lost does exactly that, mid-answer, and it was reaching the
+        # loop's catch-all: the most ordinary mid-stream failure there is, reported as **Fatal**.
+        except APIError as exc:
+            logger.warning("%s failed part-way through the answer: %s", self._base_url, exc)
+            raise self._mid_answer(exc) from exc
 
     def _timed_out(self) -> AgentError:
         """Explain a timeout in terms of the setting that governs it.
@@ -666,6 +741,25 @@ class OpenAIClient:
             f"answer in flight was abandoned, but nothing was left half-written. Run `kedge "
             f"doctor` to check the endpoint is reachable and its certificate verifies, then ask "
             f"again."
+        )
+
+    def _mid_answer(self, exc: Exception) -> AgentError:
+        """Explain a failure the endpoint reported once it had already started answering.
+
+        Said in terms of where it leaves the user, because that is what distinguishes this from
+        every other endpoint failure: part of an answer has already been streamed and persisted,
+        and the rest is not coming. The two usual causes are named rather than guessed at -- a
+        context that outgrew the model's window, and an upstream a gateway lost mid-answer -- since
+        one of them is fixed by asking something shorter and the other by asking again, and the
+        user cannot tell which from prose the endpoint wrote for a machine.
+        """
+        return AgentError(
+            f"the model endpoint at {self._base_url} accepted the request and then failed part-way "
+            f"through the answer: {_status_detail(exc)}. Whatever had streamed before that is all "
+            f"there is of it, and nothing was left half-written -- every notebook edit is a single "
+            f"atomic flush. This is usually a conversation that outgrew the model's context "
+            f"window, or an upstream a gateway lost while relaying: ask something narrower, or "
+            f"ask again."
         )
 
     def _refused(self, model: str, status: int, detail: str) -> AgentError:
@@ -835,8 +929,11 @@ class _Meter:
     Two tallies, kept apart. The estimate is kedge's own count over a fixed encoding and is always
     available; the report is the endpoint's, is authoritative, and is the only one that can see
     what the cache served. Whichever is used, it accumulates **per step** -- a turn is up to
-    ``max_steps`` completions and each one re-sends the whole prompt, so a single step's figure
-    understates the turn by as much as that multiple.
+    ``max_steps`` completions, plus the last word a capped turn is given
+    (:meth:`KedgeAgent._final_word`), and each one re-sends the whole prompt, so a single step's
+    figure understates the turn by as much as that multiple. The last word re-sends everything but
+    the tool schemas, which it withholds -- which makes it the one step that is also billed
+    entirely uncached.
     """
 
     prompt: int = 0
@@ -1129,7 +1226,9 @@ class KedgeAgent:
                 # token_total is the same count over the same messages, already memoised by the
                 # window -- recounting the rendered list here was a third full tokenisation.
                 meter.stage_prompt(window.token_total())
-                async for event in self._complete(messages, model, cancel, reply):
+                async for event in self._complete(
+                    messages, model, cancel, reply, tools=self._tools
+                ):
                     yield event
                 meter.record(reply.usage)
 
@@ -1149,6 +1248,19 @@ class KedgeAgent:
                             stop = True
                         yield event
                 if stop:
+                    # One completion, tools withheld, and then the turn is over. Returning straight
+                    # after it is what makes "exactly once" structural rather than a flag somebody
+                    # has to keep true: however many caps fired in this step, control leaves the
+                    # step loop here and cannot come back round.
+                    #
+                    # `answered` deliberately stays False. Prose reaches the user, but the *work*
+                    # did not finish — the next message is "try that again" against everything this
+                    # turn read — so `_carry` must resume the leg it just ran as itself. Setting it
+                    # True would expire the whole span from age zero and throw away the forty reads
+                    # the account was written from, which is the expensive failure the carry exists
+                    # to prevent, and it would be thrown away on the one path that most needs it.
+                    async for event in self._final_word(window, model, cancel, meter, request):
+                        yield event
                     return
 
             # The budget is spent but the work is not lost: the window goes on the shelf, the
@@ -1168,6 +1280,8 @@ class KedgeAgent:
         model: str,
         cancel: CancelToken,
         reply: _Reply,
+        *,
+        tools: Sequence[Mapping[str, Any]],
     ) -> AsyncIterator[AnyEvent]:
         """Stream one completion, emitting prose as it arrives and collecting tool calls.
 
@@ -1178,9 +1292,15 @@ class KedgeAgent:
         ``model`` is already resolved by :meth:`_turn`, and falling back to the configured default
         a second time here is the bug this signature now forbids: two places deciding which model
         runs is one place too many, and the loser stamps its answer onto the turn's artifacts.
+
+        ``tools`` is passed rather than taken from ``self`` for the same reason, and it has one
+        caller that hands it nothing: :meth:`_final_word` withholds the surface so that the only
+        move left is to speak. Both dialects send no ``tools`` key at all for an empty sequence
+        (:meth:`OpenAIClient._open_chat`), which is what an endpoint that rejects ``"tools": []``
+        needs and what "there is nothing to call" honestly looks like on the wire.
         """
         parts: dict[int, dict[str, str]] = {}
-        stream = self._client.stream(model=model, messages=messages, tools=self._tools).__aiter__()
+        stream = self._client.stream(model=model, messages=messages, tools=tools).__aiter__()
         try:
             while True:
                 try:
@@ -1221,6 +1341,110 @@ class KedgeAgent:
             if slot["name"]
         ]
 
+    async def _final_word(
+        self,
+        window: ConversationWindow,
+        model: str,
+        cancel: CancelToken,
+        meter: _Meter,
+        request: TurnRequest,
+    ) -> AsyncIterator[AnyEvent]:
+        """Spend one completion, with nothing to call, so a stopped turn still says something.
+
+        Reached only from the retry caps in :meth:`_invoke`, and only once — the step loop returns
+        the moment this finishes. That is the whole design: the caps exist because the model cannot
+        talk its way out of the failure, so handing it the tools again would be inviting a fourth
+        attempt at the shape it has got wrong three times. Withheld, the only move left is prose,
+        which is the move that was wanted.
+
+        The :class:`~kedge.server.events.ErrorEvent` has already been emitted by the time this
+        runs, and the order is load-bearing rather than incidental: the user reads why the turn
+        stopped and then reads the account, so the account arrives as an explanation of a stop they
+        have already been told about rather than as prose that trails off for no stated reason.
+
+        **Withholding the tools costs the prompt cache the whole request, knowingly.** The tool
+        definitions sit at the front of the payload, so sending none of them changes the prompt at
+        byte zero and nothing behind it can match the prefix the turn's earlier steps cached: the
+        entire last-word prompt is billed fresh, some 9,000 tokens where an ordinary step's
+        uncached remainder is nearer 100. That is the right trade exactly here — the path runs only
+        when a turn has already failed, and it runs once — and it would be an expensive habit
+        anywhere else in this file.
+
+        **Best-effort, and contained.** The call can fail, and a turn that has already told the
+        user why it stopped must not then be branded unrecoverable — which is what the loop's
+        catch-all would do with anything raised here, and what ``app.js`` renders as **Fatal**. An
+        account that does not arrive is not fatal to anything: the turn's own conclusion stands and
+        the reading is still on the shelf. Where nothing arrives at all, :data:`_NO_ACCOUNT` says so
+        rather than leaving the stop to be read as a hang.
+
+        Tool calls that come back anyway are dropped rather than dispatched, and dropped from the
+        window as well as from the loop. An assistant message carrying ``tool_calls`` with no result
+        against each id is rejected outright by the endpoint, so recording them would poison every
+        later turn of the session with a request that cannot be sent
+        (:meth:`~kedge.agent.context.ConversationWindow.suspend`).
+
+        Cancellation runs through :meth:`_complete` exactly as it does for any other step, which is
+        the point of going through it rather than opening a stream here: Stop pressed during the
+        last word abandons the call mid-thought (:func:`_abandon_if_cancelled`) and leaves the turn
+        through :meth:`run`'s cancel path, ``finally`` and carry included.
+        """
+        yield StatusEvent(phase="thinking")
+        reply = _Reply()
+        messages = [*window.assemble(), {"role": "user", "content": _FINAL_WORD_PROMPT}]
+        # The prompt the endpoint is billed for is the window plus the nudge, so both are staged:
+        # a step left out of the meter understates the turn just as surely as one counted twice
+        # overstates it, and this one is a whole prompt.
+        meter.stage_prompt(window.token_total() + self._counter.count(_FINAL_WORD_PROMPT))
+        failure: Exception | None = None
+        try:
+            async for event in self._complete(messages, model, cancel, reply, tools=()):
+                yield event
+        except Exception as exc:
+            # Broad, and it has to be: what makes this containment rather than swallowing is that
+            # `asyncio.CancelledError` is a `BaseException` and so passes straight through, leaving
+            # the user's Stop to end the turn as a cancellation exactly as it would anywhere else.
+            # Everything else is one extra call that did not come off, on a turn whose outcome was
+            # settled before it was made.
+            #
+            # With the traceback, because the one class of exception this genuinely hides is our
+            # own: a `TypeError` in delta translation is Fatal-with-a-stack on any ordinary step
+            # and would be a single line here. The containment is for the user's sake, not for the
+            # log's.
+            failure = exc
+            logger.warning(
+                "turn %s could not fetch its last word: %s",
+                request.turn_id,
+                _describe(exc),
+                exc_info=True,
+            )
+
+        account = reply.content
+        if not account:
+            account = _NO_ACCOUNT
+            yield TokenEvent(text=account)
+        elif failure is not None:
+            # Prose arrived and then the call died -- which is exactly the shape the mid-answer
+            # translation exists for, and the one failure here that leaves something behind. The
+            # empty-account fallback cannot cover it, and without a marker the turn ends mid-word.
+            marker = _cut_short(failure)
+            account += marker
+            yield TokenEvent(text=marker)
+        # After the fallback rather than before it, so the step closes over a line kedge wrote
+        # itself instead of leaving it pending on the turn's total. Where the endpoint reported its
+        # own numbers -- the case the figure's accuracy actually rests on -- the estimate carrying
+        # it is discarded with the step, and nobody is billed for prose the model never sent.
+        meter.record(reply.usage)
+        # Recorded so the window carries the answer the user just read, which is what makes a
+        # resumed conversation replay it: `_history_before` trims the persisted exchange on the
+        # understanding that the carried span reinstates it, so an account the window never held is
+        # an account the next turn cannot see at all.
+        window.add_assistant(account)
+        logger.info(
+            "turn %s spent its last word with the tools withheld: %d characters of prose",
+            request.turn_id,
+            len(account),
+        )
+
     async def _invoke(
         self,
         call: PendingToolCall,
@@ -1236,7 +1460,20 @@ class KedgeAgent:
         while another stays broken is making progress. A tool rejecting the model's own *draft* is
         counted per tool, because there is only one draft in play. Both stop the turn at three
         with an :class:`~kedge.server.events.ErrorEvent`, which the step loop treats as a reason
-        to return rather than to keep spending the budget.
+        to stop spending the budget — and then to spend one last completion on prose
+        (:meth:`_final_word`).
+
+        Both messages are written for the user, and only the user. They are rendered in the trail
+        as a warning chip and the model never sees them; the instruction that used to be buried in
+        the second one — "say in the chat what the process does stage by stage" — was addressed to
+        a reader who was never given a turn in which to do it, which is what made this defect quiet.
+        The instruction now lives in :data:`_FINAL_WORD_PROMPT`, where the model actually reads it.
+
+        **What is left promises nothing.** The account :meth:`_final_word` goes on to fetch is
+        best-effort by construction — the call can fail, come back empty, or be cut short by a Stop
+        that is honoured — and a chip saying prose follows is worse than a terse one on every path
+        where it does not. The chip is the turn's own account of itself, read after the fact in a
+        persisted trail, so it is written in the past tense about what actually happened.
         """
         arguments = _safe_arguments(call.arguments)
         if call.name in _EDITING_TOOLS:
@@ -1307,10 +1544,8 @@ class KedgeAgent:
                 yield ErrorEvent(
                     message=(
                         f"`{call.name}` rejected the draft {attempts[key]} times running, so I "
-                        f"have stopped rather than keep reformatting it. Say in the chat what the "
-                        f"process does stage by stage, what each stage is for and what you are "
-                        f"unsure of — that account is the useful part, and the user can put it "
-                        f"through the planning step themselves. The rejections are above."
+                        f"have stopped rather than keep reformatting it. The rejections are above "
+                        f"— they are the actual reason, not a summary of it."
                     ),
                     recoverable=True,
                 )
@@ -1477,7 +1712,9 @@ class KedgeAgent:
             "session %s is holding %d messages from the turn it just %s, %d of them still current",
             session_id,
             len(carried),
-            "answered" if answered else "paused",
+            # Not "paused": a turn can now also stop at a retry cap and answer in prose anyway, and
+            # a flag with two values cannot name three endings. It says what it actually knows.
+            "answered" if answered else "did not finish",
             live,
         )
 
@@ -1509,6 +1746,41 @@ def _pause_message(steps: int) -> str:
         f"with you rather than keep going on my own. Nothing is lost — everything I have read and "
         f"run so far is still here. Say 'continue' and I will pick up exactly where I stopped, or "
         f"tell me what to do differently and I will take it from there."
+    )
+
+
+def _cut_short(exc: Exception) -> str:
+    """Mark an account the endpoint stopped part-way through — in the text, not only on the screen.
+
+    The failure this covers is the one :meth:`OpenAIClient._mid_answer` exists for, and it is the
+    only one here that leaves something behind: prose has already streamed, so :data:`_NO_ACCOUNT`
+    does not fire and the last word would otherwise end mid-word with nothing to say why. On the
+    screen that is a puzzle. In the record it is worse — :meth:`KedgeAgent._final_word` records what
+    arrived, :meth:`KedgeAgent._carry` hands it to the next turn, and the server persists it as the
+    turn's assistant message — so a fragment with no marker reads as a complete thought for as long
+    as the transcript lasts. Appending it to ``account`` rather than only emitting it is therefore
+    the point of this, not a detail of it.
+
+    Bracketed because it is inserted into somebody else's paragraph: everything before it is the
+    model's and this is kedge's, and a reader has to be able to tell without being told. The same
+    rule as :data:`_NO_ACCOUNT`, which is the other thing kedge says in this channel.
+
+    Args:
+        exc: What ended the account. A :class:`~kedge.errors.KedgeError` is quoted whole, since it
+            is already prose written for this user; anything else is named by type as well as
+            message (:func:`_describe`), because a message written for a developer is better
+            labelled than quoted bare. That is the same split :meth:`KedgeAgent.run` makes.
+
+    Returns:
+        The marker, with the leading blank line that separates it from the prose it follows.
+    """
+    reason = (str(exc) if isinstance(exc, KedgeError) else _describe(exc)).strip()
+    if not reason.endswith("."):
+        reason += "."
+    return (
+        f"\n\n[This account stops here: {reason} What is above it is all of it that arrived. "
+        f"Nothing I read on this turn has been thrown away, so ask me to summarise what I found "
+        f"and I will pick it up from where it stopped.]"
     )
 
 

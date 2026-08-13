@@ -1083,7 +1083,15 @@ def test_a_recorded_proposal_is_surfaced_as_a_plan_the_user_can_read(
     assert any(stage["checkpoint"] for stage in proposal["stages"])
     assert proposal["open_questions"], "an open question the user never sees is not a question"
     assert proposal["dropped"] == [
-        {"range": "Calc!AK:AP", "reason": "no downstream refs, all zero since 2023"}
+        {
+            "range": "Calc!AK:AP",
+            "reason": "no downstream refs, all zero since 2023",
+            # The decision travels with the drop: the card draws a control for an outstanding one
+            # and the recorded outcome for a decided one, and cannot tell them apart without this.
+            "acknowledged": False,
+            "accepted": True,
+            "note": None,
+        }
     ]
 
 
@@ -1146,7 +1154,7 @@ def test_a_proposal_is_approved_by_a_click_that_carries_no_body(
 def test_no_decision_route_requires_a_body(
     pending_client: tuple[TestClient, dict[str, ToolRegistry]],
 ) -> None:
-    """All three, checked at the schema rather than one at a time through a fixture.
+    """Every one of them, checked at the schema rather than one at a time through a fixture.
 
     A body carrying one optional note is not worth failing a click over on any of them, and the
     route that regresses next is the one nobody wrote the fixture for.
@@ -1154,14 +1162,25 @@ def test_no_decision_route_requires_a_body(
     client, _registries = pending_client
     paths = client.get("/openapi.json").json()["paths"]
 
+    drops = "/api/sessions/{session_id}/pending/proposals/{index}/drops"
     required = {
         f"{name}s": paths[f"/api/sessions/{{session_id}}/pending/{name}s/{{index}}"]["post"]
         .get("requestBody", {})
         .get("required", False)
         for name in ("deletion", "amendment", "proposal")
+    } | {
+        tail: paths[f"{drops}/{tail}"]["post"].get("requestBody", {}).get("required", False)
+        for tail in ("{drop}/acknowledge", "{drop}/refuse", "acknowledge-all")
     }
 
-    assert required == {"deletions": False, "amendments": False, "proposals": False}
+    assert required == {
+        "deletions": False,
+        "amendments": False,
+        "proposals": False,
+        "{drop}/acknowledge": False,
+        "{drop}/refuse": False,
+        "acknowledge-all": False,
+    }
 
 
 def test_an_approval_note_is_the_reviewers_or_nobodys(
@@ -1478,3 +1497,371 @@ async def test_a_proposed_plan_cannot_acknowledge_its_own_dropped_ranges(
     assert written.dropped[0].acknowledged is False
     assert written.dropped[0].note is None
     assert "signed off by the analyst" not in written.model_dump_json()
+
+
+# ── the pane raised a gate; these are the key to it ──────────────────────────────────────────
+#
+# An unacknowledged drop is the only structural blocker a plan has, and the card pre-flighted it
+# honestly -- "Save as draft, 1 drop needs acknowledging" -- while offering nothing that could
+# acknowledge one. The only remedy was `kedge plan acknowledge` at a terminal, so a user reviewing
+# a plan in the pane was stuck in it. These routes decide a drop *within* the pending proposal:
+# the revised plan replaces the one held in memory and nothing reaches the store until approve.
+
+
+def _drop_route(session_id: str, tail: str, index: int = 0) -> str:
+    return f"/api/sessions/{session_id}/pending/proposals/{index}/drops/{tail}"
+
+
+def _pending_proposal(
+    client: TestClient,
+    registries: dict[str, ToolRegistry],
+    *,
+    plan: ProcessPlan | None = None,
+    **context: object,
+) -> tuple[str, ToolRegistry]:
+    """A session holding one unapproved proposal, with one outstanding drop unless told otherwise."""
+    session_id = _new_session(client)
+    registry = _tool_registry(**context)
+    registry.pending_proposals.append(PendingProposal(plan=plan if plan else _proposed_plan()))
+    registries[session_id] = registry
+    return session_id, registry
+
+
+def _multi_drop_plan() -> ProcessPlan:
+    """A proposal with three outstanding drops, for the decisions that only bite in a run."""
+    return _proposed_plan(
+        draft=make_draft(
+            dropped=[
+                DroppedRange(range="Calc!AK:AP", reason="no downstream refs"),
+                DroppedRange(range="Calc!BB:BD", reason="scratch working, never read"),
+                DroppedRange(range="Data!Z1:Z9", reason="a stale import, blank since 2024"),
+            ]
+        )
+    )
+
+
+def test_acknowledging_the_drop_lets_the_next_click_approve_the_plan(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """The whole point. Without this the pane could raise the blocker and never clear it."""
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    session_id, _registry = _pending_proposal(client, registries, plans=store)
+
+    acknowledged = client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "checked"})
+    approved = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["approval_blockers"] == []
+    payload = approved.json()
+    assert payload["approved"] is True
+    written = store.load(payload["version"])
+    assert written.approval.approved is True
+    assert written.dropped[0].acknowledged is True
+    assert written.dropped[0].note == "checked"
+    assert written.generated_by == "llm", "and the drop decision did not rewrite the authorship"
+
+
+def test_a_drop_decision_is_recorded_on_the_proposal_and_written_nowhere(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """Approving is still the only route that writes; a drop decided and then discarded is gone."""
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    session_id, registry = _pending_proposal(client, registries, plans=store)
+
+    response = client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "agreed"})
+
+    assert store.versions() == [], "nothing is written until the plan is approved"
+    assert len(registry.pending_proposals) == 1, "deciding a drop does not decide the proposal"
+    held = registry.pending_proposals[0].plan
+    assert held.dropped[0].acknowledged is True
+    assert held.dropped[0].accepted is True
+    assert held.unacknowledged_drops == []
+    # The refreshed card comes back with the decision on it, so the pane re-renders showing the
+    # outcome rather than asking again.
+    drop = response.json()["pending"]["proposals"][0]["dropped"][0]
+    assert drop["acknowledged"] is True
+    assert drop["note"] == "agreed"
+
+
+def test_refusing_a_drop_keeps_the_range_and_says_approval_is_still_blocked(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """Refusing is not the mirror image of confirming, and the pane must not draw it as one.
+
+    `acknowledge_drop` raises the open question of which stage consumes the kept range, and
+    `approval_blockers` replaces "not acknowledged" with "no stage lists it as a source". Adding
+    that stage is a plan edit the pane does not do, so the plan lands as a draft -- which is the
+    gate working, and is what the button says it will do.
+    """
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    session_id, registry = _pending_proposal(client, registries, plans=store)
+
+    refused = client.post(_drop_route(session_id, "0/refuse"), json={"note": "still read by Risk"})
+    approved = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert refused.status_code == 200
+    assert refused.json()["accepted"] is False
+    blockers = refused.json()["approval_blockers"]
+    assert any("Calc!AK:AP" in blocker and "no stage lists it" in blocker for blocker in blockers)
+    payload = approved.json()
+    assert payload["approved"] is False
+    assert any("Calc!AK:AP" in blocker for blocker in payload["blockers"])
+    written = store.load(payload["version"])
+    assert written.dropped[0].accepted is False
+    assert written.dropped[0].note == "still read by Risk"
+    assert any("Calc!AK:AP" in question.question for question in written.open_questions)
+    assert registry.pending_proposals == []
+
+
+def test_a_drop_is_acknowledged_by_a_click_that_carries_no_body(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """The request the pane actually sends: a header announcing JSON and nothing behind it."""
+    client, registries = pending_client
+    session_id, registry = _pending_proposal(client, registries)
+
+    response = client.post(
+        _drop_route(session_id, "0/acknowledge"), headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 200
+    held = registry.pending_proposals[0].plan
+    assert held.dropped[0].acknowledged is True
+    assert held.dropped[0].note is None, "no body means no note, not a failed click"
+
+
+def test_acknowledging_every_outstanding_drop_clears_them_in_one_request(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """The pane's equivalent of `kedge plan acknowledge --all`, with the same per-drop trail."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    registry = _tool_registry()
+    draft = make_draft(
+        dropped=[
+            DroppedRange(range="Calc!AK:AP", reason="no downstream refs"),
+            DroppedRange(range="Calc!BB:BD", reason="scratch working, never read"),
+        ]
+    )
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan(draft=draft)))
+    registries[session_id] = registry
+
+    response = client.post(_drop_route(session_id, "acknowledge-all"), json={"note": "read them"})
+
+    assert response.status_code == 200
+    assert response.json()["acknowledged"] == ["Calc!AK:AP", "Calc!BB:BD"]
+    assert response.json()["approval_blockers"] == []
+    held = registry.pending_proposals[0].plan
+    assert [drop.note for drop in held.dropped] == ["read them", "read them"]
+    assert all(drop.acknowledged for drop in held.dropped)
+
+
+def test_a_drop_route_404s_on_an_index_that_is_not_there(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """Both indices, and a session the agent never made a registry for."""
+    client, registries = pending_client
+    stranger = _new_session(client)
+    session_id, _registry = _pending_proposal(client, registries)
+
+    assert client.post(_drop_route(stranger, "0/acknowledge")).status_code == 404
+    assert client.post(_drop_route(session_id, "0/acknowledge", index=3)).status_code == 404
+    missing = client.post(_drop_route(session_id, "5/refuse"))
+    assert missing.status_code == 404
+    assert "position 5" in missing.json()["detail"]
+
+
+# ── a proposal is not a stored version, and deciding a drop must not pretend it is ───────────
+#
+# `kedge.plan.review` is shaped for a plan that is on disk: `_revise` bumps the version, restamps
+# `created_at` and sets `generated_by="human"`, which is right for `kedge plan acknowledge`
+# because the model's row was written before the drop was signed off. A pending proposal has no
+# row anywhere -- the card promises nothing is written until approval -- so re-stamping here left
+# the store holding one version, authored "human", with nothing recording that a model wrote the
+# decomposition, and `save_next` turned the bumped version into a v1 deriving from v2.
+
+
+def test_a_drop_decided_in_the_pane_leaves_the_plans_provenance_alone(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """Who wrote the decomposition has to survive the reviewer signing off a drop.
+
+    `cli._plan_author` shows the model id only for ``generated_by == "llm"``, so a plan that
+    reached disk stamped "human" renders as a bare "human" in `kedge plan history` -- for the only
+    version there is, with no earlier row naming the model. The drop decision is the reviewer's;
+    the decomposition is not, and the file has to say both.
+    """
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    session_id, registry = _pending_proposal(client, registries, plans=store)
+    proposed = registry.pending_proposals[0].plan
+
+    client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "read it"})
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    written = store.load(payload["version"])
+    assert written.generated_by == "llm"
+    assert written.llm_model == "gpt-5.6-terra"
+    assert written.created_at == proposed.created_at
+    assert written.version == proposed.version
+    assert written.based_on_version == proposed.based_on_version
+    assert written.summary == proposed.summary
+    # The decision, and nothing else, is what moved.
+    assert written.dropped[0].acknowledged is True
+    assert written.dropped[0].note == "read it"
+
+
+@pytest.mark.parametrize("decisions", [1, 2, 3])
+def test_a_run_of_drop_decisions_never_writes_a_version_derived_from_a_later_one(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path, decisions: int
+) -> None:
+    """`save_next` renumbers a plan down to the next free version and records the number it
+    *arrived* with as `based_on_version`. A revision that bumped the in-memory version therefore
+    came back inverted -- v1 claiming it derives from v2 -- and each further decision widened it.
+    """
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    session_id, _registry = _pending_proposal(
+        client, registries, plan=_multi_drop_plan(), plans=store
+    )
+
+    for position in range(decisions):
+        assert client.post(_drop_route(session_id, f"{position}/acknowledge")).status_code == 200
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    written = store.load(payload["version"])
+    assert written.version == 1
+    assert written.based_on_version is None, "nothing on disk for it to derive from"
+    assert payload["approved"] is (decisions == 3)
+
+
+def test_a_decided_proposal_still_lands_at_the_next_free_version(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """Restoring the identity must not disarm the renumbering: v2 derives from v1, not the reverse."""
+    client, registries = pending_client
+    store = PlanStore(tmp_path / "plans")
+    store.save(make_plan())
+    session_id, _registry = _pending_proposal(client, registries, plans=store)
+
+    client.post(_drop_route(session_id, "0/acknowledge"))
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    written = store.load(payload["version"])
+    assert written.version == 2
+    assert written.based_on_version == 1
+    assert written.generated_by == "llm"
+
+
+def test_clicking_the_same_drop_decision_twice_changes_nothing(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """A double click is a real event: the buttons are live for the length of the round trip.
+
+    `acknowledge_drop` appends an open question on every refusal with nothing to stop it stacking
+    a second identical one, and every pass through `_revise` moved the plan on again.
+    """
+    client, registries = pending_client
+    session_id, registry = _pending_proposal(client, registries)
+    same = {"note": "Risk still read it"}
+
+    first = client.post(_drop_route(session_id, "0/refuse"), json=same)
+    held = registry.pending_proposals[0].plan
+    second = client.post(_drop_route(session_id, "0/refuse"), json=same)
+
+    assert second.status_code == 200
+    assert second.json()["approval_blockers"] == first.json()["approval_blockers"]
+    again = registry.pending_proposals[0].plan
+    assert again is held, "a decision the plan already carries revises nothing"
+    assert again.version == held.version, "so there is no version to drift"
+    assert sum("must be kept" in item.question for item in again.open_questions) == 1
+    assert again.dropped[0].note == "Risk still read it"
+
+
+def test_re_deciding_a_drop_with_a_corrected_note_records_the_correction(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """The note is part of the decision, not a label on it.
+
+    Keyed on the verdict alone, the no-op guard answered 200 to a re-post carrying a corrected
+    reason, reported the decision back, and kept the old words. The pane cannot send this, but an
+    API that reports a change it did not make is an API that lies.
+    """
+    client, registries = pending_client
+    session_id, registry = _pending_proposal(client, registries)
+
+    client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "dead since 2023"})
+    client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "dead since 2022, in fact"})
+
+    assert registry.pending_proposals[0].plan.dropped[0].note == "dead since 2022, in fact"
+
+
+def test_acknowledging_every_drop_leaves_a_range_the_user_refused_kept(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """ "Outstanding" is the operative word: a convenience must not overturn a deliberate refusal."""
+    client, registries = pending_client
+    session_id, registry = _pending_proposal(client, registries, plan=_multi_drop_plan())
+
+    client.post(_drop_route(session_id, "0/refuse"), json={"note": "Risk still read it"})
+    response = client.post(_drop_route(session_id, "acknowledge-all"), json={"note": "read them"})
+
+    assert response.json()["acknowledged"] == ["Calc!BB:BD", "Data!Z1:Z9"]
+    held = registry.pending_proposals[0].plan
+    assert [drop.accepted for drop in held.dropped] == [False, True, True]
+    assert held.dropped[0].note == "Risk still read it", "the refusal keeps its own reason"
+    assert any("must be kept" in item.question for item in held.open_questions)
+    assert any("Calc!AK:AP" in blocker for blocker in response.json()["approval_blockers"])
+
+
+def test_overturning_a_refusal_takes_its_open_question_with_it(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """A confirmed drop next to "which stage consumes the range we must keep?" says both at once.
+
+    Which also matters because the card offers the way back at all: without it a mis-click on
+    "Keep the range" has no exit but approving a draft or discarding the whole proposal, and a
+    gate with no key is the complaint this feature exists to answer.
+    """
+    client, registries = pending_client
+    session_id, registry = _pending_proposal(client, registries)
+    asked = len(registry.pending_proposals[0].plan.open_questions)
+
+    client.post(_drop_route(session_id, "0/refuse"), json={"note": "mis-click"})
+    response = client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "meant it"})
+
+    assert response.json()["approval_blockers"] == []
+    held = registry.pending_proposals[0].plan
+    assert held.dropped[0].accepted is True
+    assert not any("must be kept" in item.question for item in held.open_questions)
+    assert len(held.open_questions) == asked, "and the model's own questions are left alone"
+
+
+def test_the_way_back_from_a_refusal_leaves_a_question_the_model_wrote(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """The withdrawal matches by identity, and this is the case a prefix rule destroyed.
+
+    A model that opens a legitimate question by naming the range it proposed dropping is doing
+    exactly what it should. Refuse then confirm from the card and it went, silently, out of the
+    plan that reached disk -- unannounced data loss on the surface whose whole point is that
+    nothing is decided quietly. `kedge.plan.review.acknowledge_drop` now removes only the exact
+    sentence it composed itself.
+    """
+    client, registries = pending_client
+    theirs = (
+        "Calc!AK:AP was proposed for dropping, but the 2023 archive still references it. Should "
+        "the archive be re-pointed before it goes?"
+    )
+    plan = _proposed_plan(draft=make_draft(open_questions=[theirs]))
+    session_id, registry = _pending_proposal(client, registries, plan=plan)
+
+    client.post(_drop_route(session_id, "0/refuse"), json={"note": "mis-click"})
+    client.post(_drop_route(session_id, "0/acknowledge"), json={"note": "meant it"})
+
+    held = registry.pending_proposals[0].plan
+    assert [question.question for question in held.open_questions] == [theirs]
+    assert held.approval_blockers() == []

@@ -914,9 +914,29 @@
       if (context) body.append(el("p", { class: "decision-muted", text: `context: ${context}` }));
     }
 
-    for (const drop of item.dropped) {
+    const dropped = item.dropped || [];
+    const outstanding = dropped.filter((drop) => !drop.acknowledged);
+    for (const [position, drop] of dropped.entries()) {
+      body.append(dropDecision(index, position, drop));
+    }
+    if (outstanding.length > 1) {
       body.append(
-        el("p", { class: "decision-warn", text: `Proposes dropping ${drop.range}: ${drop.reason}` }),
+        el(
+          "div",
+          { class: "decision-drop-actions" },
+          el("button", {
+            class: "ghost-button",
+            type: "button",
+            text: `Confirm all ${outstanding.length} outstanding drops`,
+            onclick: (event) =>
+              guardedDecide(
+                event,
+                `pending/proposals/${index}/drops/acknowledge-all`,
+                "Every outstanding drop confirmed. Any range you chose to keep is left kept. " +
+                  "Nothing is written until you approve the plan.",
+              ),
+          }),
+        ),
       );
     }
 
@@ -951,6 +971,87 @@
       onConfirm: () => decide(`pending/proposals/${index}`, "POST", "The plan was written."),
       onDismiss: () => decide(`pending/proposals/${index}`, "DELETE", "Plan discarded."),
     });
+  }
+
+  /* An unacknowledged drop is the only structural thing that blocks approval, and until these
+     controls existed the pane raised that gate and handed the user no key to it: the button said
+     "Save as draft — 1 drop needs acknowledging" and the only way to acknowledge one was
+     `kedge plan acknowledge` at a terminal. The decision belongs here, on the proposal, before
+     anything is written.
+
+     The two controls are not mirror images and the labels must not pretend they are. Confirming a
+     drop clears its blocker. *Keeping* a range replaces that blocker with another —
+     `approval_blockers` then wants a stage that lists the range as a source, and adding a stage is
+     a plan edit this pane does not do — so approval stays blocked and the plan will land as a
+     draft. A control that quietly leaves the user stuck again is the bug being fixed, not a new
+     one to add. */
+  function dropDecision(index, position, drop) {
+    const row = el("div", { class: "decision-drop" });
+    const refused = drop.acknowledged && !drop.accepted;
+    row.append(
+      el("p", {
+        class: refused ? "decision-blocker" : "decision-warn",
+        text: `Proposes dropping ${drop.range}: ${drop.reason}`,
+      }),
+    );
+    if (drop.acknowledged) {
+      row.append(
+        el("p", {
+          class: "decision-muted",
+          text: drop.accepted
+            ? "You confirmed this drop, so it no longer blocks approval."
+            : `You kept ${drop.range}. Approval stays blocked until a stage consumes it, which ` +
+              "is a plan edit: approving now saves a draft.",
+        }),
+      );
+      if (drop.note) {
+        row.append(el("p", { class: "decision-muted", text: `Your note: ${drop.note}` }));
+      }
+    }
+
+    const base = `pending/proposals/${index}/drops/${position}`;
+    const control = (text, tail, success) =>
+      el("button", {
+        class: "ghost-button",
+        type: "button",
+        text,
+        onclick: (event) => guardedDecide(event, `${base}/${tail}`, success),
+      });
+    const confirm = control(
+      drop.acknowledged ? "Confirm the drop after all — clears the blocker" : "Confirm the drop",
+      "acknowledge",
+      `Dropping ${drop.range} confirmed` +
+        (refused ? ", and the open question your refusal raised has gone with it" : "") +
+        ". Nothing is written until you approve the plan.",
+    );
+    const keep = control(
+      drop.acknowledged
+        ? "Keep the range instead — approval stays blocked"
+        : "Keep the range — approval stays blocked",
+      "refuse",
+      `${drop.range} will be kept, and approval stays blocked: the plan now needs a stage that ` +
+        "consumes it, which is a plan edit. Approving saves a draft — finish it with " +
+        "kedge plan show.",
+    );
+    /* A decided drop is offered only the other decision. Clicking the one it already carries is a
+       no-op at the server, and a button that does nothing is worse than no button -- but a
+       *mis*-click on "Keep the range" with no way back is the same complaint this whole feature
+       answers, so there is always exactly one way out. */
+    const controls = drop.acknowledged ? [drop.accepted ? keep : confirm] : [confirm, keep];
+    row.append(el("div", { class: "decision-drop-actions" }, controls));
+    return row;
+  }
+
+  /* Every button on the card goes dead for the length of the request. `decide` is a round trip and
+     these stayed live across it, so a double click sent two decisions: the second stacked a
+     duplicate open question on a refusal and revised the plan a second time. The server now treats
+     a decision the plan already carries as a no-op, and this is the other half -- the click that
+     never happens cannot race the one that did. Nothing re-enables them, because `decide` ends in
+     `refreshPending` and the card is replaced by one drawn from the answer. */
+  function guardedDecide(event, path, success) {
+    const card = event.currentTarget.closest(".decision");
+    if (card) for (const button of card.querySelectorAll("button")) button.disabled = true;
+    return decide(path, "POST", success);
   }
 
   /* "Approve this plan" is a promise the button cannot always keep: `approve` refuses a plan with
