@@ -38,7 +38,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from kedge.config import get_api_key
 from kedge.errors import KedgeError
@@ -562,9 +562,27 @@ async def monitor(request: Request) -> StreamingResponse:
 
 
 class DecisionBody(BaseModel):
-    """Body for confirming or approving a pending decision."""
+    """Body for confirming or approving a pending decision.
+
+    Every field is optional and so is the body itself: see :data:`NO_NOTE`. Frozen, because that
+    default is one shared instance.
+    """
+
+    model_config = ConfigDict(frozen=True)
 
     note: str | None = None
+
+
+NO_NOTE = DecisionBody()
+"""The default body, for a client that sends none.
+
+Declaring the body required cost nothing in the tests -- every one of them posts ``json={}`` --
+and made every decision button in the pane a 422: the browser announced ``Content-Type:
+application/json`` with nothing behind it, so FastAPI rejected the click before the handler ran,
+and its *list* of validation errors reached the pane as ``[object Object]``. ``app.js`` no longer
+sends that header without a body; this default is the other half, so that a client which gets it
+wrong again loses an optional note rather than the decision.
+"""
 
 
 def _registry_for(state: ServerState, session_id: str) -> Any:
@@ -796,8 +814,8 @@ def pending_decisions(session_id: str, request: Request) -> dict[str, Any]:
 async def confirm_deletion(
     session_id: str,
     index: int,
-    body: DecisionBody,
     request: Request,
+    body: DecisionBody = NO_NOTE,
 ) -> dict[str, Any]:
     """Carry out a deletion the model asked for and the user has now confirmed.
 
@@ -850,8 +868,8 @@ def dismiss_deletion(session_id: str, index: int, request: Request) -> dict[str,
 def approve_amendment(
     session_id: str,
     index: int,
-    body: DecisionBody,
     request: Request,
+    body: DecisionBody = NO_NOTE,
 ) -> dict[str, Any]:
     """Write an approved plan amendment as a new plan version.
 
@@ -890,8 +908,8 @@ def approve_amendment(
 def approve_proposal(
     session_id: str,
     index: int,
-    body: DecisionBody,
     request: Request,
+    body: DecisionBody = NO_NOTE,
 ) -> dict[str, Any]:
     """Write a proposed process plan as a new plan version.
 

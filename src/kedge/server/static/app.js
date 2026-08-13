@@ -60,8 +60,11 @@
   }
 
   async function api(path, options) {
+    /* The header follows the body, as it does in `hub.js`. Announced unconditionally it was a
+       claim about requests that carried nothing, and a POST declaring JSON with an empty body is
+       rejected as malformed before the route is reached. */
     const response = await fetch(path, {
-      headers: { "Content-Type": "application/json" },
+      headers: options && options.body ? { "Content-Type": "application/json" } : {},
       ...options,
     });
     if (!response.ok) {
@@ -70,6 +73,13 @@
         detail = (await response.json()).detail || detail;
       } catch (_) {
         /* the body was not JSON; the status text will do */
+      }
+      /* A `detail` is a string when kedge raised the HTTPException and a list of {loc, msg, type}
+         when FastAPI rejected the request before the handler ran. Left as it was, `new Error` on
+         that list stringified to "[object Object]" -- the one error shape that tells the user
+         nothing at all, on the one path where they have done nothing wrong. */
+      if (Array.isArray(detail)) {
+        detail = detail.map((item) => (item && item.msg) || JSON.stringify(item)).join("; ");
       }
       throw new Error(detail);
     }
@@ -1022,9 +1032,14 @@
     });
   }
 
+  /* POST carries an empty JSON body rather than nothing at all. A matching server does not need
+     it -- an absent body is an absent note there -- but a pane served from a browser cache can
+     outlive the server it was written for, and against one that still declares the body required
+     this is the difference between a decision and a 422. DELETE reads no body anywhere. */
   async function decide(path, method, success) {
     try {
-      const data = await api(`/api/sessions/${state.sessionId}/${path}`, { method });
+      const options = method === "POST" ? { method, body: "{}" } : { method };
+      const data = await api(`/api/sessions/${state.sessionId}/${path}`, options);
       let message = success;
       if (data.version) {
         message =

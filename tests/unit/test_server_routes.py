@@ -1111,6 +1111,59 @@ def test_approving_a_proposal_writes_the_plan_the_model_authored(
     assert registry.pending_proposals == []
 
 
+def test_a_proposal_is_approved_by_a_click_that_carries_no_body(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """The request the pane actually sends, which no other test here sends.
+
+    Every test around this one posts ``json={}``; the browser posts nothing at all. Declaring the
+    body required therefore passed the suite and failed every decision button in the pane -- a 422
+    raised before the handler ran, so the card stayed and the plan was never written, and FastAPI's
+    list of validation errors reached `notice` as "[object Object]".
+    """
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)
+    registry.pending_proposals.append(
+        PendingProposal(plan=_proposed_plan(draft=acknowledge_all_drops(make_plan()).to_draft()))
+    )
+    registries[session_id] = registry
+
+    response = client.post(
+        f"/api/sessions/{session_id}/pending/proposals/0",
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approved"] is True
+    assert store.load(payload["version"]).approval.approved is True
+    assert store.load(payload["version"]).approval.note is None, "no body means no note"
+    assert registry.pending_proposals == []
+
+
+def test_no_decision_route_requires_a_body(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+) -> None:
+    """All three, checked at the schema rather than one at a time through a fixture.
+
+    A body carrying one optional note is not worth failing a click over on any of them, and the
+    route that regresses next is the one nobody wrote the fixture for.
+    """
+    client, _registries = pending_client
+    paths = client.get("/openapi.json").json()["paths"]
+
+    required = {
+        f"{name}s": paths[f"/api/sessions/{{session_id}}/pending/{name}s/{{index}}"]["post"]
+        .get("requestBody", {})
+        .get("required", False)
+        for name in ("deletion", "amendment", "proposal")
+    }
+
+    assert required == {"deletions": False, "amendments": False, "proposals": False}
+
+
 def test_an_approval_note_is_the_reviewers_or_nobodys(
     pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
 ) -> None:
