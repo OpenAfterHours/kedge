@@ -1332,7 +1332,7 @@ class ToolRegistry:
     async def _refuse_without_an_approved_plan(self) -> ToolResult | None:
         """Refuse a write to the notebook that no approved plan authorises, or return None.
 
-        The tools' half of the review gate. :func:`kedge.notebook.scaffold.scaffold_notebook`
+        The tools' half of the review gate. :func:`kedge.notebook.scaffold.sync_notebook`
         refuses an unapproved plan structurally and with no override, but it is not the only way a
         cell is written: ``propose_cell`` and ``edit_cell`` reach the same kernel, and until this
         existed the only thing between a plan the user had declined and forty cells implementing it

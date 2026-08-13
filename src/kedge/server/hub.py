@@ -1087,7 +1087,7 @@ def _foreign_workbook(workspace: Workspace, plan: Any, path: Path) -> str | None
     function that writes to the store, and the guard on a durable artifact belongs beside the write
     rather than only in front of the one caller that exists today: ``OpenWorkbookBody`` has no plan
     field now, and the day it gains one the refusal would be gone with no test failing. It is the
-    pattern the project already states for its own gate -- ``scaffold_notebook`` refuses an
+    pattern the project already states for its own gate -- ``sync_notebook`` refuses an
     unapproved plan structurally, with no parameter that talks it out of it.
 
     The CLI copy is not redundant. It runs before a marimo is spawned, where the user can still act;
@@ -1222,7 +1222,14 @@ async def _step_session(workspace: Workspace, job: OpenJob) -> None:
 async def _step_scaffold(
     workspace: Workspace, plan: Any, job: OpenJob, *, plan_path: Path | None = None
 ) -> Any:
-    """Build the notebook driver, and scaffold from an approved plan where there is one.
+    """Build the notebook driver, and bring the notebook into line with an approved plan.
+
+    Through :func:`~kedge.notebook.scaffold.sync_notebook`, because this step runs on every
+    open and only the first one finds an empty notebook. The scaffolder that created every cell
+    unconditionally meant the second open of a scaffolded workbook died on ``CellNameError`` at
+    the first name and reported the whole plan as unscaffolded; now the cells already there are
+    recognised, the ones the user has worked on are left alone, and a plan approved since the
+    last open lands as the cells it was missing.
 
     A scaffold failure is reported and stepped over rather than fatal: the notebook, the kernel
     and the chat all still work, and telling the user "the notebook is open but scaffolding
@@ -1252,10 +1259,10 @@ async def _step_scaffold(
         )
         return driver
 
-    from kedge.notebook.scaffold import scaffold_notebook
+    from kedge.notebook.scaffold import sync_notebook
 
     try:
-        cells = await scaffold_notebook(
+        result = await sync_notebook(
             plan,
             driver,
             handins_dir=workspace.handins_dir,
@@ -1269,7 +1276,7 @@ async def _step_scaffold(
     except (KedgeError, OSError) as exc:
         job.step("scaffolding", "failed", f"scaffolding plan v{plan.version} failed: {exc}")
         return driver
-    job.step("scaffolding", "ok", f"wrote {len(cells)} cell(s) from plan v{plan.version}")
+    job.step("scaffolding", "ok", result.summary(plan.version))
     return driver
 
 

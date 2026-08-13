@@ -448,7 +448,7 @@ async def test_edit_cell_surfaces_staleness_as_a_retryable_result(
 
 # ── the review gate on the writing tools ─────────────────────────────────────────────────────
 #
-# `scaffold_notebook` refuses an unapproved plan structurally and with no override, and its
+# `sync_notebook` refuses an unapproved plan structurally and with no override, and its
 # docstring calls itself "the one place that consumes" approval. It was not: `propose_cell` and
 # `edit_cell` reach the same kernel and never looked at the plan at all, so the only thing between
 # a plan the user had declined and the cells implementing it was a sentence in the system prompt.

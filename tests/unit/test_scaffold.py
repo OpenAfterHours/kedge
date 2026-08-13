@@ -19,7 +19,9 @@ resulting panel is asserted to be falsy and to say so in words.
 from __future__ import annotations
 
 import ast
+import inspect
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -33,6 +35,7 @@ import kedge.ingest.drift
 import kedge.reconcile
 from conftest import make_draft, make_plan
 from kedge.notebook import scaffold
+from kedge.notebook.driver import CellNameError, StaleCellError
 from kedge.notebook.scaffold import (
     HEAD_CELL_NAMES,
     TAIL_CELL_NAMES,
@@ -41,7 +44,7 @@ from kedge.notebook.scaffold import (
     ScaffoldError,
     build_cells,
     cell_name_for,
-    scaffold_notebook,
+    sync_notebook,
 )
 from kedge.plan.model import (
     Approval,
@@ -98,17 +101,6 @@ def public_names(code: str) -> set[str]:
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             found.add(node.name)
     return {name for name in found if not name.startswith("_")}
-
-
-class RecordingDriver:
-    """A `CellCreator` that records rather than writing. No kernel, no marimo."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, bool]] = []
-
-    async def create_cell(self, code: str, *, name: str, hide_code: bool = False) -> str:
-        self.calls.append((name, code, hide_code))
-        return f"id-{len(self.calls)}"
 
 
 def plain_workbook(path: Path) -> Path:
@@ -240,46 +232,95 @@ def test_an_unapproved_plan_can_be_previewed_but_not_written() -> None:
     assert [cell.name for cell in preview[: len(HEAD_CELL_NAMES)]] == list(HEAD_CELL_NAMES)
 
 
-def test_scaffold_notebook_has_no_way_to_write_an_unapproved_plan() -> None:
-    import inspect
+# ── writing an approved plan into the notebook ───────────────────────────────
+#
+# `sync_notebook` is the only way in. The scaffolder it replaced created every cell
+# unconditionally, which collided on the second call and is why scaffolding used to happen once,
+# inside the open sequence. The things worth asserting hardest are what this one does *not* do:
+# it never overwrites a cell it cannot prove kedge wrote, and it never deletes.
 
-    parameters = inspect.signature(scaffold_notebook).parameters
-    assert "allow_unapproved" not in parameters
+
+class SyncingDriver:
+    """A `CellSyncer` over a dict. No kernel, no marimo, and no file either."""
+
+    def __init__(self, cells: dict[str, str] | None = None, *, refuse: str = "") -> None:
+        self.cells: dict[str, str] = dict(cells or {})
+        self.created: list[tuple[str, str | None]] = []
+        self.hidden: list[bool] = []
+        self.edited: list[str] = []
+        self.deleted: list[str] = []
+        self._refuse = refuse
+
+    async def list_cells(self, *, with_code: bool = True) -> tuple[SimpleNamespace, ...]:
+        return tuple(
+            SimpleNamespace(name=name, code=code if with_code else None)
+            for name, code in self.cells.items()
+        )
+
+    async def create_cell(
+        self, code: str, *, name: str, after: str | None = None, hide_code: bool = False
+    ) -> str:
+        # The collision the old scaffolder hit on every reopen. Raised rather than tolerated so a
+        # sync that ever calls this for a name already in the notebook fails loudly here.
+        if name in self.cells:
+            raise CellNameError(f"the name {name!r} is already taken")
+        self.created.append((name, after))
+        self.hidden.append(hide_code)
+        self.cells[name] = code
+        return f"id-{name}"
+
+    async def edit_cell(self, target: str, code: str, *, run: bool = True) -> str:
+        if target == self._refuse:
+            raise StaleCellError(f"{target} changed since kedge last read it")
+        self.edited.append(target)
+        self.cells[target] = code
+        return f"id-{target}"
+
+
+def synced_names(plan: ProcessPlan | None = None) -> list[str]:
+    return [cell.name for cell in cells_for(plan)]
 
 
 @pytest.mark.parametrize(
     "state",
     [ApprovalState.DRAFT, ApprovalState.CHANGES_REQUESTED, ApprovalState.REJECTED],
 )
-async def test_scaffold_notebook_writes_nothing_without_approval(state: ApprovalState) -> None:
+async def test_sync_notebook_writes_nothing_without_approval(state: ApprovalState) -> None:
+    """Approval is state on the plan, and this is the one place that consumes it."""
     plan = make_plan().model_copy(update={"approval": Approval(state=state)})
-    driver = RecordingDriver()
+    driver = SyncingDriver()
 
     with pytest.raises(PlanNotApprovedError):
-        await scaffold_notebook(plan, driver)
+        await sync_notebook(plan, driver)
 
-    assert driver.calls == []
+    assert driver.created == []
+    assert "allow_unapproved" not in inspect.signature(sync_notebook).parameters
 
 
-async def test_scaffold_notebook_creates_every_cell_visible() -> None:
+async def test_sync_notebook_scaffolds_an_empty_notebook_whole() -> None:
+    """The approve-a-proposal case: nothing there, so everything the plan calls for is written."""
+    driver = SyncingDriver()
+
+    result = await sync_notebook(approved(), driver)
+
+    assert [name for name, _ in driver.created] == synced_names()
+    assert list(result.named("created")) == synced_names()
+    assert result.wrote_anything
+
+
+async def test_sync_notebook_creates_every_cell_visible() -> None:
     """`create_cell` hides code by default, and kedge always overrides that (PLAN 1.1)."""
-    driver = RecordingDriver()
+    driver = SyncingDriver()
 
-    created = await scaffold_notebook(approved(), driver)
+    await sync_notebook(approved(), driver)
 
-    # Names, not driver-assigned ids: both real drivers return a MutationResult, so an id is not
-    # available here and pretending otherwise is what made `ty` flag the hub's call site.
-    assert created == [cell.name for cell in cells_for()]
-    assert [name for name, _, _ in driver.calls] == [cell.name for cell in cells_for()]
-    assert all(hide_code is False for _, _, hide_code in driver.calls)
+    assert driver.hidden == [False] * len(synced_names())
 
 
-async def test_scaffold_notebook_passes_the_paths_through_to_the_setup_cell(
-    tmp_path: Path,
-) -> None:
-    driver = RecordingDriver()
+async def test_sync_notebook_passes_the_paths_through_to_the_setup_cell(tmp_path: Path) -> None:
+    driver = SyncingDriver()
 
-    await scaffold_notebook(
+    await sync_notebook(
         approved(),
         driver,
         handins_dir=tmp_path / "handins",
@@ -287,9 +328,143 @@ async def test_scaffold_notebook_passes_the_paths_through_to_the_setup_cell(
         contract_path=tmp_path / "agreed.yaml",
     )
 
-    setup = driver.calls[0][1]
+    setup = driver.cells["kedge_setup"]
     assert repr(str(tmp_path / "source.xlsx")) in setup
     assert repr(str(tmp_path / "agreed.yaml")) in setup
+
+
+async def test_sync_notebook_places_a_new_cell_behind_the_one_the_plan_emits_before_it() -> None:
+    """Order is presentation, but a stage under the reconciliation tail reads as a mistake."""
+    driver = SyncingDriver()
+
+    await sync_notebook(approved(), driver)
+
+    names = synced_names()
+    assert driver.created[0] == (names[0], None)  # nothing to sit behind yet
+    assert [after for _, after in driver.created[1:]] == names[:-1]
+
+
+async def test_sync_notebook_is_idempotent_and_writes_nothing_the_second_time() -> None:
+    """The reopen case. This used to die on CellNameError at the first cell."""
+    driver = SyncingDriver()
+    await sync_notebook(approved(), driver)
+    driver.created.clear()
+
+    result = await sync_notebook(approved(), driver)
+
+    assert driver.created == []
+    assert driver.edited == []
+    assert list(result.named("unchanged")) == synced_names()
+    assert not result.wrote_anything
+
+
+async def test_sync_notebook_leaves_a_cell_somebody_has_worked_on_alone() -> None:
+    """The rule the whole function exists for.
+
+    By the time a plan is amended the stage cells have usually been translated: the scaffolded
+    body is a documented passthrough with a TODO in it, and the body beside it a week later is
+    the user's and the agent's work. Overwriting that is the one unrecoverable thing here.
+    """
+    plan = approved()
+    stage = synced_names(plan)[len(HEAD_CELL_NAMES)]
+    translated = f"{stage} = handin_frame.filter(pl.col('amount') > 0)  # mine, not kedge's"
+    driver = SyncingDriver({stage: translated})
+
+    result = await sync_notebook(plan, driver)
+
+    assert driver.cells[stage] == translated
+    assert driver.edited == []
+    assert list(result.named("diverged")) == [stage]
+    assert stage in result.summary(plan.version)
+
+
+async def test_sync_notebook_updates_a_cell_it_can_prove_it_wrote_itself() -> None:
+    """The amendment case: a note attached to a stage reaches the untouched cell for that stage."""
+    before = approved()
+    stage_id = before.stages[0].id
+    after = before.model_copy(
+        update={
+            "version": before.version + 1,
+            "stages": [
+                before.stages[0].model_copy(update={"notes": "FX rates come from Treasury."}),
+                *before.stages[1:],
+            ],
+        }
+    )
+    driver = SyncingDriver({cell.name: cell.code for cell in cells_for(before)})
+    name = next(cell.name for cell in cells_for(after) if cell.stage_id == stage_id)
+
+    result = await sync_notebook(after, driver, previous=before)
+
+    assert name in driver.edited
+    assert "FX rates come from Treasury." in driver.cells[name]
+    assert name in result.named("updated")
+    # The setup cell names the version it was generated from, so a bump rewrites its header too.
+    # Both are cells kedge wrote and nobody has touched, which is the whole test.
+    assert set(driver.edited) == {name, "kedge_setup"}
+    assert not result.named("diverged")
+
+
+async def test_sync_notebook_without_a_previous_plan_reports_rather_than_overwrites() -> None:
+    """No evidence that kedge wrote the cell is the same answer as evidence that it did not.
+
+    Safe in the only direction that matters: the sync declines and says so, rather than
+    overwriting on the assumption that a differing cell must be stale scaffolding.
+    """
+    before = approved()
+    after = before.model_copy(
+        update={
+            "stages": [
+                before.stages[0].model_copy(update={"notes": "an amendment"}),
+                *before.stages[1:],
+            ]
+        }
+    )
+    driver = SyncingDriver({cell.name: cell.code for cell in cells_for(before)})
+
+    result = await sync_notebook(after, driver)  # no `previous`
+
+    assert driver.edited == []
+    assert result.named("diverged")
+
+
+async def test_sync_notebook_never_deletes_a_cell_the_plan_has_stopped_mentioning() -> None:
+    """A plan edit is not consent to lose the code that implemented the old decomposition."""
+    before = approved()
+    after = before.model_copy(update={"stages": before.stages[:1]})
+    driver = SyncingDriver({cell.name: cell.code for cell in cells_for(before)})
+    dropped = set(synced_names(before)) - set(synced_names(after))
+
+    result = await sync_notebook(after, driver, previous=before)
+
+    assert dropped
+    assert dropped <= set(driver.cells)
+    assert set(result.obsolete) == dropped
+    assert not hasattr(driver, "delete_cell") or driver.deleted == []
+    assert "nothing was deleted" in result.summary(after.version)
+
+
+async def test_a_cell_the_kernel_refuses_does_not_stop_the_rest_being_written() -> None:
+    """Nine tenths of a notebook in line with the plan beats giving up at the first refusal."""
+    before = approved()
+    after = before.model_copy(
+        update={
+            "stages": [
+                before.stages[0].model_copy(update={"notes": "an amendment"}),
+                *before.stages[1:],
+            ]
+        }
+    )
+    stale = next(cell.name for cell in cells_for(after) if cell.stage_id == before.stages[0].id)
+    existing = {cell.name: cell.code for cell in cells_for(before)}
+    del existing[synced_names(after)[-1]]  # one still to create, after the refusal
+    driver = SyncingDriver(existing, refuse=stale)
+
+    result = await sync_notebook(after, driver, previous=before)
+
+    assert list(result.named("refused")) == [stale]
+    assert list(result.named("created")) == [synced_names(after)[-1]]
+    assert "The kernel refused 1" in result.summary(after.version)
 
 
 # ── every cell is real Python ────────────────────────────────────────────────

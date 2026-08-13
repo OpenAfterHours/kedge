@@ -41,14 +41,23 @@ merely wrong. Where there is no baseline — no workbook, no cached values, no r
 notebook column — it reports "not reconciled" and says why. It has no path that reports
 "passed" (PLAN 6.2).
 
-Nothing here writes to a notebook without an approved plan. :func:`scaffold_notebook` checks
+Nothing here writes to a notebook without an approved plan. :func:`sync_notebook` checks
 ``plan.approval`` and refuses, and there is no parameter to talk it out of that.
+
+**One way in, and it assumes nothing about what is already there.** :func:`sync_notebook` creates
+the cells the plan calls for that are missing, updates only those kedge wrote and nobody has
+touched since, and deletes nothing. It replaced a ``scaffold_notebook`` that created every cell
+unconditionally — right for the empty notebook the open sequence used to be the only route to,
+and wrong everywhere else: the second open of a scaffolded workbook died on ``CellNameError`` at
+the first cell, and a plan approved in the chat could not reach the notebook at all. Being
+indifferent to what is already in the notebook is what lets an approval — or an amendment — land
+while the user is looking at it.
 
 **Driver dependency.** ``kedge.notebook.driver`` is the only module permitted to touch
 ``marimo._code_mode``, and it is owned elsewhere. This module depends on the narrow
-:class:`CellCreator` protocol below — one method, matching the ``create_cell`` signature
-verified in ``docs/marimo-api.md`` §2. If that surface moves, this protocol is the single place
-to adapt.
+:class:`CellSyncer` protocol below — three methods, matching the ``create_cell``, ``edit_cell``
+and ``list_cells`` signatures verified in ``docs/marimo-api.md`` §2, and deliberately no
+``delete_cell``. If that surface moves, this protocol is the single place to adapt.
 
 References:
 - PLAN.md 2.2 (checkpoints), 2.5 (polars house rules), 2.6 (Excel semantics), 2.8 (hand-in
@@ -68,25 +77,29 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from kedge.analysis.model import ExcelPattern
-from kedge.errors import NotebookError
+from kedge.errors import KedgeError, NotebookError
 from kedge.plan.model import ProcessPlan, Stage, StageKind
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "HEAD_CELL_NAMES",
     "TAIL_CELL_NAMES",
-    "CellCreator",
     "CellRole",
+    "CellSource",
+    "CellSync",
+    "CellSyncer",
     "PlanNotApprovedError",
     "ScaffoldCell",
     "ScaffoldError",
+    "SyncOutcome",
+    "SyncResult",
     "build_cells",
     "cell_name_for",
-    "scaffold_notebook",
+    "sync_notebook",
 ]
 
 CellRole = Literal["setup", "handin", "stage", "checkpoint", "reconcile"]
@@ -172,25 +185,136 @@ class PlanNotApprovedError(ScaffoldError):
     """
 
 
-class CellCreator(Protocol):
-    """The slice of the notebook driver this module needs.
+class CellSource(Protocol):
+    """The two things :func:`sync_notebook` reads off a cell already in the notebook.
 
-    Matches ``AsyncCodeModeContext.create_cell`` as verified in ``docs/marimo-api.md`` §2, which
-    is the signature ``kedge.notebook.driver`` is expected to expose. Deliberately narrow: the
-    scaffolder should not be able to delete or run anything.
+    Matches :class:`kedge.notebook.model.CellInfo` structurally. ``code`` is ``None`` when the
+    cell was listed without its source, which is a state the sync never asks for and treats as
+    "not what kedge wrote" if it ever sees one.
     """
 
-    async def create_cell(self, code: str, *, name: str, hide_code: bool = False) -> object:
-        """Create one cell.
-
-        The return type is deliberately unconstrained. Both real implementations --
-        :class:`kedge.notebook.driver.NotebookDriver` and
-        :class:`kedge.notebook.filedriver.FileDriver` -- return a
-        :class:`~kedge.notebook.model.MutationResult`, but pinning that here would make this
-        module depend on the driver's vocabulary for a value it does not read. The scaffolder
-        knows the names it asked for and reports those; what came back is the caller's business.
-        """
+    @property
+    def name(self) -> str:
+        """The cell's name, or empty for an unnamed cell."""
         ...
+
+    @property
+    def code(self) -> str | None:
+        """The cell's source, or ``None`` if it was listed without it."""
+        ...
+
+
+class CellSyncer(Protocol):
+    """The slice of the notebook driver :func:`sync_notebook` needs.
+
+    Three methods, and no more. Reading the notebook is what makes the sync non-destructive,
+    creating is the scaffold itself, and editing is what lets an amendment reach a cell nobody has
+    touched. ``delete_cell`` is absent, and deliberately: a plan that no longer mentions a stage
+    is not the user consenting to lose the code that implemented it.
+
+    The return types are deliberately unconstrained. Both real implementations --
+    :class:`kedge.notebook.driver.NotebookDriver` and
+    :class:`kedge.notebook.filedriver.FileNotebookDriver` -- return a
+    :class:`~kedge.notebook.model.MutationResult`, but pinning that here would make this module
+    depend on the driver's vocabulary for a value it does not read. The sync knows the names it
+    asked for and reports those; what came back is the caller's business.
+    """
+
+    async def list_cells(self, *, with_code: bool = True) -> Sequence[CellSource]:
+        """Return every cell, in notebook order."""
+        ...
+
+    async def create_cell(
+        self,
+        code: str,
+        *,
+        name: str,
+        after: str | None = None,
+        hide_code: bool = False,
+    ) -> object:
+        """Create one cell, optionally behind a named neighbour."""
+        ...
+
+    async def edit_cell(self, target: str, code: str, *, run: bool = True) -> object:
+        """Replace one cell's source."""
+        ...
+
+
+SyncOutcome = Literal["created", "updated", "unchanged", "diverged", "refused"]
+"""What became of one cell the plan calls for.
+
+``diverged`` and ``refused`` both mean "left as it was", and they are kept apart because they
+read differently to the person holding the result: the first is a cell somebody has worked on,
+which is the normal and expected state of a notebook being converted, and the second is the
+kernel saying no, which is not.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class CellSync:
+    """What :func:`sync_notebook` did about one cell, and why where that needs saying."""
+
+    name: str
+    outcome: SyncOutcome
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SyncResult:
+    """Everything one :func:`sync_notebook` call did, in emission order."""
+
+    cells: tuple[CellSync, ...] = ()
+    obsolete: tuple[str, ...] = ()
+    """Cells the superseded plan put in the notebook that this one does not call for.
+
+    Named rather than removed. See :func:`sync_notebook` on why nothing here deletes.
+    """
+
+    def named(self, outcome: SyncOutcome) -> tuple[str, ...]:
+        """The names of the cells with this outcome, in emission order."""
+        return tuple(cell.name for cell in self.cells if cell.outcome == outcome)
+
+    @property
+    def wrote_anything(self) -> bool:
+        """Whether the notebook changed at all."""
+        return bool(self.named("created") or self.named("updated"))
+
+    def summary(self, version: int) -> str:
+        """One sentence for a step's detail line, a log record or a chat notice.
+
+        Silence about a cell that was left alone would be the wrong kind of quiet: "12 cells
+        written" beside a stage the sync declined to touch reads as a notebook that matches the
+        plan when it does not.
+        """
+        parts = []
+        for outcome, phrasing in (
+            ("created", "written"),
+            ("updated", "updated"),
+            ("unchanged", "already in line"),
+        ):
+            found = self.named(outcome)
+            if found:
+                parts.append(f"{len(found)} {phrasing}")
+        head = f"plan v{version}: " + (", ".join(parts) if parts else "nothing to write")
+
+        diverged = self.named("diverged")
+        if diverged:
+            head += (
+                f". {len(diverged)} cell(s) have been edited since kedge wrote them and were left "
+                f"alone ({', '.join(diverged)}) -- ask kedge in the chat to bring them into line "
+                f"if that is what you want"
+            )
+        refused = self.named("refused")
+        if refused:
+            head += f". The kernel refused {len(refused)}: " + "; ".join(
+                f"{cell.name} ({cell.detail})" for cell in self.cells if cell.outcome == "refused"
+            )
+        if self.obsolete:
+            head += (
+                f". {len(self.obsolete)} cell(s) implement stages this plan no longer has "
+                f"({', '.join(self.obsolete)}); nothing was deleted"
+            )
+        return head
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,8 +425,8 @@ def build_cells(
         contract_path: Where the hand-in contract lives. Defaults to ``contract.yaml`` in the
             project directory. It need not exist.
         allow_unapproved: Render a preview of an unapproved plan. This writes nothing;
-            :func:`scaffold_notebook` has no equivalent escape hatch, so an unapproved plan can
-            be looked at but never scaffolded.
+            :func:`sync_notebook` has no equivalent escape hatch, so an unapproved plan can be
+            looked at but never scaffolded.
 
     Returns:
         The cells in creation order: fixed head, stages in dependency order, fixed tail.
@@ -356,53 +480,6 @@ def _check_house_rules(cell: ScaffoldCell) -> None:
         raise ScaffoldError(msg) from exc
 
 
-async def scaffold_notebook(
-    plan: ProcessPlan,
-    driver: CellCreator,
-    *,
-    handins_dir: Path | None = None,
-    workbook_path: Path | None = None,
-    contract_path: Path | None = None,
-) -> list[str]:
-    """Write an approved plan into the notebook, one named cell per stage.
-
-    Refuses an unapproved plan, with no override. That refusal is the structural half of the
-    review gate: approval is state on the plan, and this is the one place that consumes it.
-
-    Args:
-        plan: The approved plan.
-        driver: The notebook driver, or anything satisfying :class:`CellCreator`.
-        handins_dir: Where hand-ins are persisted.
-        workbook_path: The workbook holding the reconciliation baseline.
-        contract_path: Where the hand-in contract lives.
-
-    Returns:
-        The names of the cells written, in creation order. Names rather than driver-assigned
-        ids: a name is what the user and the agent both address a cell by, it is stable across
-        a reopen, and it is the one thing this function knows for certain whatever the driver
-        hands back. ``NotebookDriver`` returns a ``MutationResult``, ``FileDriver`` returns a
-        ``MutationResult``, and neither is a cell id.
-
-    Raises:
-        PlanNotApprovedError: when ``plan.approval.state`` is not ``approved``.
-    """
-    if not plan.approval.approved:
-        raise _not_approved(plan)
-
-    cells = build_cells(
-        plan,
-        handins_dir=handins_dir,
-        workbook_path=workbook_path,
-        contract_path=contract_path,
-    )
-    written: list[str] = []
-    for cell in cells:
-        await driver.create_cell(cell.code, name=cell.name, hide_code=False)
-        written.append(cell.name)
-    logger.info("scaffolded %d cell(s) from plan v%d", len(written), plan.version)
-    return written
-
-
 def _not_approved(plan: ProcessPlan) -> PlanNotApprovedError:
     blockers = plan.approval_blockers()
     detail = "\n" + "\n".join(f"  - {item}" for item in blockers) if blockers else ""
@@ -411,6 +488,188 @@ def _not_approved(plan: ProcessPlan) -> PlanNotApprovedError:
         f"'approved'. Nothing is written to the notebook before the plan is approved."
         f"{detail}\nReview the plan, then approve it."
     )
+
+
+# =============================================================================
+# SYNCING AN ALREADY-SCAFFOLDED NOTEBOOK
+# =============================================================================
+
+
+async def sync_notebook(
+    plan: ProcessPlan,
+    driver: CellSyncer,
+    *,
+    previous: ProcessPlan | None = None,
+    handins_dir: Path | None = None,
+    workbook_path: Path | None = None,
+    contract_path: Path | None = None,
+) -> SyncResult:
+    """Bring a live notebook into line with an approved plan, without destroying anything.
+
+    The scaffolder this replaced created every cell unconditionally, which is right exactly once
+    and wrong every time after. It made the scaffold a thing that happened during the open
+    sequence and nowhere else: the second open of a scaffolded workbook died on ``CellNameError``
+    at the first cell and reported the whole plan as unscaffolded, and approving a plan in the
+    chat was a decision with no visible effect — the plan landed on disk and the notebook beside
+    it stayed empty until the user closed the workbook and opened it again. This is the same
+    emission, indifferent to what is already in the notebook.
+
+    **Nothing is overwritten unless kedge wrote it and nobody has touched it since.** That is the
+    whole rule, and it is the rule because by the time a plan is amended the stage cells have
+    usually been translated: the scaffolded body is a documented passthrough with a
+    ``TODO(kedge)`` in it, and the body beside it a week later is the user's and the agent's work.
+    A cell whose source differs from both what the plan says now and what the plan said before is
+    reported as diverged and left exactly as it is. There is no parameter that talks this out of
+    it, for the same reason there is none for approval.
+
+    **Nothing is deleted, ever.** A stage that has left the plan leaves its cell behind, named in
+    :attr:`SyncResult.obsolete`. Deleting a cell is a decision the user takes explicitly through
+    the pending-deletion gate (``kedge.agent.tools``), and a plan edit is not consent to lose the
+    code that implemented the old one.
+
+    Args:
+        plan: The approved plan the notebook should implement.
+        previous: The plan the notebook was last built from, where the caller knows it. Its
+            emission is what "kedge wrote this and nobody has touched it" is measured against, so
+            without it an unchanged scaffolded cell that the new plan would word differently is
+            reported as diverged rather than updated. Safe to omit; never required.
+        driver: The notebook driver, or anything satisfying :class:`CellSyncer`.
+        handins_dir: Where hand-ins are persisted.
+        workbook_path: The workbook holding the reconciliation baseline.
+        contract_path: Where the hand-in contract lives.
+
+    Returns:
+        What happened to every cell the plan calls for, in emission order.
+
+    Raises:
+        PlanNotApprovedError: when ``plan.approval.state`` is not ``approved``.
+        ScaffoldError: when the plan will not build into cells at all. A *single* cell the kernel
+            refuses does not raise -- it is recorded as ``refused`` and the rest are still
+            written, because a notebook that is nine tenths in line with the plan is worth more
+            than one that gave up at the first name collision.
+    """
+    if not plan.approval.approved:
+        raise _not_approved(plan)
+
+    target = build_cells(
+        plan,
+        handins_dir=handins_dir,
+        workbook_path=workbook_path,
+        contract_path=contract_path,
+    )
+    pristine = _previous_bodies(
+        previous,
+        handins_dir=handins_dir,
+        workbook_path=workbook_path,
+        contract_path=contract_path,
+    )
+
+    # `with_code=True` deliberately. Reading a cell's source records a read at its current
+    # version, which is exactly what marimo's staleness guard wants before the edits below, and
+    # it is the only way to tell a cell kedge wrote from a cell somebody has since rewritten.
+    existing = {cell.name: cell for cell in await driver.list_cells(with_code=True) if cell.name}
+
+    # Seeded from the listing and added to as cells are created, because the cell a new one should
+    # sit behind is as likely to be one this same sync just wrote -- an amendment adding two
+    # consecutive stages -- as one that was already there. Anchoring against the opening snapshot
+    # alone put every cell of a first scaffold at the end, in order by luck rather than by
+    # placement, and would have put the second of two new stages under the reconciliation tail.
+    placed = set(existing)
+    results: list[CellSync] = []
+    anchor: str | None = None
+    for cell in target:
+        results.append(await _sync_one(cell, driver, existing, pristine, placed, after=anchor))
+        anchor = cell.name
+
+    obsolete = tuple(
+        name for name in pristine if name in existing and name not in {cell.name for cell in target}
+    )
+    result = SyncResult(cells=tuple(results), obsolete=obsolete)
+    logger.info("synced the notebook to plan v%d: %s", plan.version, result.summary(plan.version))
+    return result
+
+
+async def _sync_one(
+    cell: ScaffoldCell,
+    driver: CellSyncer,
+    existing: dict[str, CellSource],
+    pristine: dict[str, str],
+    placed: set[str],
+    *,
+    after: str | None,
+) -> CellSync:
+    """Create, update or leave alone one cell, and say which of the three it was.
+
+    ``after`` places a newly created cell behind the one the plan emits before it, so a stage
+    added by an amendment lands where the plan puts it rather than beneath the reconciliation
+    tail. It is dropped when that neighbour is not in the notebook, because marimo appends in
+    that case anyway and position is presentation: execution order is the dataflow graph.
+    """
+    current = existing.get(cell.name)
+    if current is None:
+        try:
+            await driver.create_cell(
+                cell.code,
+                name=cell.name,
+                after=after if after in placed else None,
+                hide_code=False,
+            )
+        except KedgeError as exc:
+            return CellSync(cell.name, "refused", str(exc))
+        placed.add(cell.name)
+        return CellSync(cell.name, "created")
+
+    if current.code == cell.code:
+        return CellSync(cell.name, "unchanged")
+    if current.code != pristine.get(cell.name):
+        return CellSync(
+            cell.name,
+            "diverged",
+            "the cell in the notebook is not the one kedge wrote, so it was left alone",
+        )
+
+    try:
+        await driver.edit_cell(cell.name, cell.code, run=True)
+    except KedgeError as exc:
+        # StaleCellError lands here when the user edited the cell between the listing above and
+        # this call. That is a divergence found a moment late, and it is reported as one.
+        return CellSync(cell.name, "refused", str(exc))
+    return CellSync(cell.name, "updated")
+
+
+def _previous_bodies(
+    previous: ProcessPlan | None,
+    *,
+    handins_dir: Path | None,
+    workbook_path: Path | None,
+    contract_path: Path | None,
+) -> dict[str, str]:
+    """What the superseded plan would have emitted, keyed by cell name.
+
+    ``allow_unapproved`` because the caller is asking what this plan *renders as*, not writing it
+    anywhere -- and a plan whose approval was later withdrawn still explains the cells that were
+    scaffolded from it while it stood.
+
+    A previous plan that will not build is not an error here. It only costs the sync its evidence
+    that a cell is untouched, so every difference is reported as a divergence and left alone --
+    which is the safe direction, and the same answer as passing no previous plan at all.
+    """
+    if previous is None:
+        return {}
+    try:
+        return {
+            cell.name: cell.code
+            for cell in build_cells(
+                previous,
+                handins_dir=handins_dir,
+                workbook_path=workbook_path,
+                contract_path=contract_path,
+                allow_unapproved=True,
+            )
+        }
+    except (ScaffoldError, KedgeError) as exc:
+        logger.info("could not render plan v%d to compare against: %s", previous.version, exc)
+        return {}
 
 
 # =============================================================================

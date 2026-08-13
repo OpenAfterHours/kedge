@@ -30,6 +30,7 @@ from kedge.agent.tools import (
     ToolRegistry,
 )
 from kedge.analysis.model import CachedValueCoverage, WorkbookAnalysis
+from kedge.notebook.scaffold import build_cells
 from kedge.plan.model import DroppedRange, ProcessPlan, Stage
 from kedge.plan.review import (
     acknowledge_all_drops,
@@ -1224,6 +1225,194 @@ def test_a_proposal_that_cannot_be_approved_lands_as_a_draft_with_the_blockers(
     written = store.load(payload["version"])
     assert written.approval.approved is False
     assert written.generated_by == "llm"
+
+
+# ── an approved plan reaches the notebook on the click that approves it ──────────────────────
+#
+# Scaffolding used to belong to the open sequence alone, so approving a plan here wrote a file to
+# disk and left the notebook beside it empty until the user closed the workbook and opened it
+# again -- and until the notebook had cells in it there was nothing to iterate on and nothing to
+# run an ad-hoc question against. What is asserted is that the cells arrive, that nothing the user
+# has worked on is overwritten to get them there, and that a notebook out of reach costs a
+# sentence rather than the decision.
+
+
+class _SyncingDriver:
+    """A `CellSyncer` over a dict, standing in for a live kernel."""
+
+    def __init__(self, cells: dict[str, str] | None = None) -> None:
+        self.cells: dict[str, str] = dict(cells or {})
+        self.created: list[str] = []
+        self.edited: list[str] = []
+
+    async def list_cells(self, *, with_code: bool = True) -> tuple[SimpleNamespace, ...]:
+        return tuple(
+            SimpleNamespace(name=name, code=code if with_code else None)
+            for name, code in self.cells.items()
+        )
+
+    async def create_cell(
+        self, code: str, *, name: str, after: str | None = None, hide_code: bool = False
+    ) -> SimpleNamespace:
+        self.created.append(name)
+        self.cells[name] = code
+        return SimpleNamespace(ok=True)
+
+    async def edit_cell(self, target: str, code: str, *, run: bool = True) -> SimpleNamespace:
+        self.edited.append(target)
+        self.cells[target] = code
+        return SimpleNamespace(ok=True)
+
+
+def _as_scaffolded(plan: ProcessPlan, workspace: Workspace) -> dict[str, str]:
+    """A notebook already scaffolded from `plan`, as the route would have written it.
+
+    The workspace paths matter: the setup cell embeds the workbook, the hand-in directory and the
+    contract, so a seed built from `build_cells`' defaults differs from the route's emission in
+    exactly one cell and reports as a divergence nobody made.
+    """
+    return {
+        cell.name: cell.code
+        for cell in build_cells(
+            plan,
+            handins_dir=workspace.handins_dir,
+            workbook_path=workspace.workbook_path,
+            contract_path=workspace.contract_path,
+        )
+    }
+
+
+def test_approving_a_proposal_scaffolds_the_notebook_on_the_same_click(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+    workspace: Workspace,
+    tmp_path: Path,
+) -> None:
+    """The whole point: the decomposition and the cells implementing it land together."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    driver = _SyncingDriver()
+    registry = _tool_registry(plans=store, driver=driver)
+    registry.pending_proposals.append(
+        PendingProposal(plan=_proposed_plan(draft=acknowledge_all_drops(make_plan()).to_draft()))
+    )
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    assert payload["approved"] is True
+    assert payload["notebook"]["synced"] is True
+    written = store.load(payload["version"])
+    assert driver.cells == _as_scaffolded(written, workspace)
+    assert payload["notebook"]["created"] == driver.created
+
+
+def test_a_plan_that_landed_as_a_draft_scaffolds_nothing(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """An unacknowledged drop blocks approval, and nothing unapproved reaches the notebook."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    driver = _SyncingDriver()
+    registry = _tool_registry(plans=PlanStore(tmp_path / "plans"), driver=driver)
+    registry.pending_proposals.append(PendingProposal(plan=_proposed_plan()))
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={}).json()
+
+    assert payload["approved"] is False
+    assert payload["notebook"]["synced"] is False
+    assert driver.created == []
+    assert "draft" in payload["notebook"]["detail"]
+
+
+def test_an_approval_still_succeeds_when_there_is_no_notebook_to_write_to(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]], tmp_path: Path
+) -> None:
+    """Demo mode, or a marimo that never came up.
+
+    The plan write is what the user clicked for and it succeeded. Failing the request over the
+    notebook would report a decision as not taken when it was taken and recorded.
+    """
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = PlanStore(tmp_path / "plans")
+    registry = _tool_registry(plans=store)  # no driver
+    registry.pending_proposals.append(
+        PendingProposal(plan=_proposed_plan(draft=acknowledge_all_drops(make_plan()).to_draft()))
+    )
+    registries[session_id] = registry
+
+    response = client.post(f"/api/sessions/{session_id}/pending/proposals/0", json={})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["approved"] is True
+    assert store.load(payload["version"]).approval.approved is True
+    assert payload["notebook"]["synced"] is False
+    assert "no notebook kernel is attached" in payload["notebook"]["detail"]
+
+
+def test_approving_an_amendment_updates_the_stage_cell_it_names(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+    workspace: Workspace,
+    tmp_path: Path,
+) -> None:
+    """An amendment attaches a note to one stage, and the note reaches that stage's cell."""
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = _approved_plan_store(tmp_path / "plans")
+    in_force = store.latest_approved()
+    assert in_force is not None
+    driver = _SyncingDriver(_as_scaffolded(in_force, workspace))
+    registry = _tool_registry(plans=store, driver=driver)
+    registry.pending_amendments.append(
+        PendingAmendment(
+            change="State that FX rates come from Treasury.",
+            rationale="the source was ambiguous",
+            stage="apply_haircuts",
+        )
+    )
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={}).json()
+
+    assert payload["notebook"]["synced"] is True
+    assert driver.created == [], "an amendment adds no stages, so it creates no cells"
+    assert "apply_haircuts" in payload["notebook"]["updated"]
+    assert "FX rates come from Treasury." in driver.cells["apply_haircuts"]
+
+
+def test_an_approval_never_overwrites_a_cell_somebody_has_worked_on(
+    pending_client: tuple[TestClient, dict[str, ToolRegistry]],
+    workspace: Workspace,
+    tmp_path: Path,
+) -> None:
+    """The rule that matters most here.
+
+    By the time a plan is amended the stage cells have usually been translated, and the body
+    beside the plan is the user's and the agent's work. It is reported and left alone; the
+    remedy is to ask kedge in the chat, which is a conversation rather than a silent loss.
+    """
+    client, registries = pending_client
+    session_id = _new_session(client)
+    store = _approved_plan_store(tmp_path / "plans")
+    in_force = store.latest_approved()
+    assert in_force is not None
+    mine = "apply_haircuts = handin_frame.filter(pl.col('ead') > 0)  # mine, not kedge's"
+    driver = _SyncingDriver(_as_scaffolded(in_force, workspace) | {"apply_haircuts": mine})
+    registry = _tool_registry(plans=store, driver=driver)
+    registry.pending_amendments.append(
+        PendingAmendment(change="note the FX source", rationale="ambiguous", stage="apply_haircuts")
+    )
+    registries[session_id] = registry
+
+    payload = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={}).json()
+
+    assert driver.cells["apply_haircuts"] == mine
+    assert driver.edited == ["kedge_setup"], "the version header, and nothing anybody wrote"
+    assert payload["notebook"]["diverged"] == ["apply_haircuts"]
+    assert "left alone" in payload["notebook"]["detail"]
 
 
 def test_declining_a_proposal_leaves_no_trace(

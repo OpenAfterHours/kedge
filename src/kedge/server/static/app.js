@@ -1149,6 +1149,13 @@
             ? " and approved."
             : `, as a draft — it cannot be approved yet: ${(data.blockers || []).join("; ")}`);
       }
+      /* What the plan did to the notebook, which is the half of the answer the user is looking at
+         the other pane for. Never a failure banner: the plan write is what they clicked for and it
+         succeeded, so a notebook that could not be reached is a sentence after the version rather
+         than an error instead of it. */
+      if (data.notebook && data.notebook.detail) {
+        message += ` Notebook — ${data.notebook.detail}`;
+      }
       if (data.ok === false && data.detail) message = `The kernel refused: ${data.detail}`;
       notice(message);
     } catch (error) {

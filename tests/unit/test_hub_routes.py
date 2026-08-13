@@ -710,7 +710,7 @@ async def test_the_step_refuses_a_foreign_plan_itself_and_not_only_the_cli_befor
     `cli._require_usable_plan` refuses this before a marimo is spawned, and today that is the only
     way in -- `OpenWorkbookBody` has no plan field. The day it gains one, a refusal that lived only
     in the CLI would be gone with no test failing, which inverts the pattern the project states for
-    its own gate: `scaffold_notebook` refuses an unapproved plan structurally, with no parameter
+    its own gate: `sync_notebook` refuses an unapproved plan structurally, with no parameter
     that talks it out of it. So this drives the step directly, with no pre-flight in front of it.
     """
     from conftest import make_approved_plan
@@ -792,7 +792,7 @@ async def test_an_unapproved_plan_file_is_stepped_over_rather_than_scaffolded(
 ) -> None:
     """The review gate does not move because the user typed a path.
 
-    `scaffold_notebook` refuses an unapproved plan structurally and has no override, so the only
+    `sync_notebook` refuses an unapproved plan structurally and has no override, so the only
     question is how that refusal reaches the user: as a legible step, with the workbook open and
     the notebook empty, rather than as an exception out of the open sequence. Falling back to the
     store's approved plan would be worse still -- it would scaffold a decomposition nobody asked

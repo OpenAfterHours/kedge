@@ -950,6 +950,49 @@ async def test_a_cell_that_awaits_at_its_top_level_is_written_as_an_async_cell(
     assert (await driver.get_cell("waiter")).code == "import asyncio\nawait asyncio.sleep(0)"
 
 
+# ── the scaffolder's sync, against a real driver and a real file ─────────────────────────────
+#
+# `tests/unit/test_scaffold.py` proves what `sync_notebook` decides, against a dict. This proves
+# it against a driver that really parses and rewrites a notebook file: the emission survives the
+# round trip, and a second sync is a no-op down to the byte. That last one is the property the
+# open sequence depends on -- every open runs this step, and only the first finds an empty
+# notebook.
+
+
+async def test_syncing_a_plan_twice_leaves_the_notebook_file_untouched(notebook: Path) -> None:
+    from conftest import make_plan
+    from kedge.notebook.scaffold import sync_notebook
+    from kedge.plan.model import Approval, ApprovalState
+
+    plan = make_plan().model_copy(update={"approval": Approval(state=ApprovalState.APPROVED)})
+
+    first = await sync_notebook(plan, FileNotebookDriver(notebook))
+    written = notebook.read_text(encoding="utf-8")
+    second = await sync_notebook(plan, FileNotebookDriver(notebook))
+
+    assert first.named("created")
+    assert not second.named("created")
+    assert not second.named("updated")
+    assert set(second.named("unchanged")) == set(first.named("created"))
+    assert notebook.read_text(encoding="utf-8") == written
+    ast.parse(written)
+
+
+async def test_a_synced_notebook_reads_its_cells_back_verbatim(notebook: Path) -> None:
+    """A cell that does not survive the file round trip would report as diverged for ever."""
+    from conftest import make_plan
+    from kedge.notebook.scaffold import build_cells, sync_notebook
+    from kedge.plan.model import Approval, ApprovalState
+
+    plan = make_plan().model_copy(update={"approval": Approval(state=ApprovalState.APPROVED)})
+    driver = FileNotebookDriver(notebook)
+
+    await sync_notebook(plan, driver)
+
+    read_back = {cell.name: cell.code for cell in await driver.list_cells(with_code=True)}
+    assert all(read_back[cell.name] == cell.code for cell in build_cells(plan))
+
+
 # ── odds and ends ────────────────────────────────────────────────────────────────────────────
 
 

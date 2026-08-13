@@ -13,7 +13,7 @@ Four steps, and only one of them needs a model:
    structural facts. No code generation.
 3. :mod:`kedge.plan.review` — the user edits, reorders, splits, merges, answers open questions,
    and confirms or rejects drops. **Nothing is written to the notebook before approval.**
-4. :func:`kedge.notebook.scaffold.scaffold_notebook` — the approved plan becomes cells.
+4. :func:`kedge.notebook.scaffold.sync_notebook` — the approved plan becomes cells.
 
 Because steps 1, 3 and 4 need no LLM, a hand-written or previously-saved plan scaffolds instantly
 with no model call at all — which is exactly what is wanted the second time the same monthly
@@ -198,7 +198,7 @@ def run_plan(
     a **draft**, and only :func:`kedge.plan.review.approve` moves it past that.
 
     It writes nothing to a notebook: a plan reaches the notebook only after a human approves it
-    and :func:`kedge.notebook.scaffold.scaffold_notebook` is called with the approved version.
+    and :func:`kedge.notebook.scaffold.sync_notebook` is called with the approved version.
 
     Args:
         workbook: The workbook to plan.

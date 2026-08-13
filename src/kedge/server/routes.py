@@ -21,8 +21,17 @@ record a request and tell the model plainly that nothing has happened (``kedge.a
 ``/api/pending`` surfaces those requests and ``/api/pending/...`` acts on them, so the recorded
 intent has somewhere to go other than a log file. Confirming a deletion runs it through the same
 notebook driver the agent would have used; approving a proposal or an amendment writes a plan
-version through :mod:`kedge.plan.store`. None of them can be reached without an explicit request
-from the browser, which is the whole of PLAN 2.2's gate.
+version through :mod:`kedge.plan.store` and then carries it into the notebook through that same
+driver. None of them can be reached without an explicit request from the browser, which is the
+whole of PLAN 2.2's gate.
+
+That second half of an approval is what makes the pane a place to work rather than a place to
+file decisions. Scaffolding used to belong to the open sequence alone, so a plan approved here
+reached the notebook only when the user closed the workbook and opened it again — and until the
+notebook had cells in it there was nothing to iterate on, nothing to ask for changes to, and no
+notebook to run an ad-hoc question against. The plan and the cells implementing it now land on
+one click; from there ``propose_cell`` and ``edit_cell`` are unlocked and the conversation
+carries on against a live notebook.
 """
 
 from __future__ import annotations
@@ -31,7 +40,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -887,13 +896,13 @@ def dismiss_deletion(session_id: str, index: int, request: Request) -> dict[str,
 
 
 @router.post("/api/sessions/{session_id}/pending/amendments/{index}")
-def approve_amendment(
+async def approve_amendment(
     session_id: str,
     index: int,
     request: Request,
     body: DecisionBody = NO_NOTE,
 ) -> dict[str, Any]:
-    """Write an approved plan amendment as a new plan version.
+    """Write an approved plan amendment as a new plan version, and carry it into the notebook.
 
     The gate is not weakened by this, it is completed. The model's ``amend_plan`` call recorded a
     proposal and said so; this is the user reading it and deciding. What is written is a new
@@ -905,6 +914,11 @@ def approve_amendment(
     An amendment to a plan with an unacknowledged dropped range lands as a **draft**, with the
     blockers reported back, because ``approve`` refusing is the gate working rather than an error
     to route around.
+
+    The plan the notebook is synced against is the one that was in force a moment ago, which is
+    what lets an amendment reach the stage cell it names: the amended note is a comment in a body
+    the sync can prove kedge wrote. A stage already translated has diverged from that body and is
+    reported rather than overwritten -- see :func:`_carry_the_plan_into_the_notebook`.
     """
     state = get_state(request)
     _require_session(state, session_id)
@@ -918,22 +932,23 @@ def approve_amendment(
             detail="This session has no plan store, so there is no plan to amend.",
         )
     try:
-        result = _write_amendment(store, pending, note=body.note)
+        written = await run_in_threadpool(_write_amendment, store, pending, note=body.note)
     except KedgeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     logger.info("user approved a plan amendment in session %s", session_id)
-    return {**result, "pending": _pending_payload(registry)}
+    notebook = await _carry_the_plan_into_the_notebook(state, registry, written)
+    return {**written.payload, "notebook": notebook, "pending": _pending_payload(registry)}
 
 
 @router.post("/api/sessions/{session_id}/pending/proposals/{index}")
-def approve_proposal(
+async def approve_proposal(
     session_id: str,
     index: int,
     request: Request,
     body: DecisionBody = NO_NOTE,
 ) -> dict[str, Any]:
-    """Write a proposed process plan as a new plan version.
+    """Write a proposed process plan as a new plan version, and scaffold the notebook from it.
 
     The counterpart of :func:`approve_amendment`, and the same gate: ``propose_plan`` authored a
     plan and said plainly that it was not in force; this is the user reading it and deciding. What
@@ -947,6 +962,13 @@ def approve_proposal(
     Approval is recorded on it only when the plan is approvable on its own terms. A plan whose
     dropped ranges nobody has acknowledged lands as a **draft** with the blockers reported, for the
     same reason an amendment does: ``approve`` refusing is the gate working.
+
+    **The notebook is written here, not at the next open.** Scaffolding used to happen only inside
+    the open sequence (``hub._step_scaffold``), so approving a plan in this pane wrote a file to
+    disk and left the notebook beside it empty until the user closed the workbook and opened it
+    again. The decomposition and the cells implementing it now land on one click, which is also
+    what makes the rest of the conversation possible: ``propose_cell`` and ``edit_cell`` unlock on
+    exactly this approval, so the user can ask for changes to a notebook that is actually there.
     """
     state = get_state(request)
     _require_session(state, session_id)
@@ -960,12 +982,103 @@ def approve_proposal(
             detail="This session has no plan store, so there is nowhere to write the plan.",
         )
     try:
-        result = _write_proposal(store, pending, note=body.note)
+        written = await run_in_threadpool(_write_proposal, store, pending, note=body.note)
     except KedgeError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     logger.info("user approved a proposed plan in session %s", session_id)
-    return {**result, "pending": _pending_payload(registry)}
+    notebook = await _carry_the_plan_into_the_notebook(state, registry, written)
+    return {**written.payload, "notebook": notebook, "pending": _pending_payload(registry)}
+
+
+async def _carry_the_plan_into_the_notebook(
+    state: ServerState, registry: Any, written: _PlanWrite
+) -> dict[str, Any]:
+    """Bring the notebook into line with a plan just approved, and report what that did.
+
+    **Nothing here can fail the request.** The plan is on disk by the time this runs, that write
+    is the thing the user clicked for, and answering 500 over a notebook that could not be reached
+    would report a decision as not taken when it was taken and recorded. Every way this can go
+    wrong comes back as ``synced: false`` and a sentence, which the pane shows beside the version
+    it did write.
+
+    Four ways it declines, and they are four different sentences because they need four different
+    things done about them:
+
+    * The plan landed as a **draft** — the blockers are already in the payload, and scaffolding
+      an unapproved plan is the one thing :func:`~kedge.notebook.scaffold.sync_notebook` refuses
+      structurally. Saying "the notebook is untouched because this is not in force yet" is the
+      whole content of that refusal.
+    * There is **no driver** — demo mode, or a marimo that never came up. The plan is still
+      written and the next open scaffolds from it, which is the behaviour this route replaced and
+      is a perfectly good fallback for the case where there is no kernel to write to.
+    * There is **no workspace**, so the hand-in, workbook and contract paths the cells embed
+      cannot be resolved. The scaffolder has defaults for all three, but they are derived from the
+      plan rather than from the workspace, and a reconciliation cell pointed at the wrong workbook
+      degrades to "not reconciled" — safe, and needlessly unhelpful. Declining is the better half
+      of that trade when a driver without a workspace should not happen anyway.
+    * The plan **will not build into cells**. That is a plan the scaffolder cannot render, and it
+      is reported rather than raised for the same reason as the rest.
+    """
+    plan = written.plan
+    if plan is None or not plan.approval.approved:
+        return {
+            "synced": False,
+            "detail": (
+                "The notebook is untouched: this landed as a draft, and nothing is scaffolded "
+                "from a plan that is not in force. Clear the blockers above and approve it."
+            ),
+        }
+
+    driver = getattr(registry.context, "driver", None)
+    if driver is None:
+        return {
+            "synced": False,
+            "detail": (
+                f"Plan v{plan.version} is written, but no notebook kernel is attached, so nothing "
+                f"was scaffolded from it. Opening this workbook will scaffold it."
+            ),
+        }
+    workspace = state.workspace
+    if workspace is None:
+        return {
+            "synced": False,
+            "detail": (
+                f"Plan v{plan.version} is written, but no workbook is open on this server, so the "
+                f"paths its cells need could not be resolved and nothing was scaffolded."
+            ),
+        }
+
+    from kedge.notebook.scaffold import sync_notebook
+
+    try:
+        result = await sync_notebook(
+            plan,
+            driver,
+            previous=written.previous,
+            handins_dir=workspace.handins_dir,
+            workbook_path=workspace.workbook_path,
+            contract_path=workspace.contract_path,
+        )
+    except (KedgeError, OSError) as exc:
+        logger.warning("plan v%d was written but not scaffolded: %s", plan.version, exc)
+        return {
+            "synced": False,
+            "detail": f"Plan v{plan.version} is written, but the notebook could not be built "
+            f"from it: {exc}",
+        }
+
+    logger.info("scaffolded plan v%d into the live notebook", plan.version)
+    return {
+        "synced": True,
+        "created": list(result.named("created")),
+        "updated": list(result.named("updated")),
+        "unchanged": list(result.named("unchanged")),
+        "diverged": list(result.named("diverged")),
+        "refused": list(result.named("refused")),
+        "obsolete": list(result.obsolete),
+        "detail": result.summary(plan.version),
+    }
 
 
 @router.delete("/api/sessions/{session_id}/pending/proposals/{index}")
@@ -1237,7 +1350,23 @@ def _pop_pending(registry: Any, attribute: str, index: int) -> Any:
     return getattr(registry, attribute).pop(index)
 
 
-def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class _PlanWrite:
+    """One plan version written to the store, and what the caller needs to act on it.
+
+    ``payload`` is the JSON the route answers with. ``plan`` and ``previous`` are the objects
+    behind it, which the payload cannot carry and
+    :func:`_carry_the_plan_into_the_notebook` cannot do without: the first is what the notebook is
+    built from, the second is what tells a cell kedge wrote from a cell somebody has since
+    rewritten.
+    """
+
+    payload: dict[str, Any]
+    plan: Any
+    previous: Any = None
+
+
+def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> _PlanWrite:
     """Save the proposed plan, approving it where it is approvable on its own terms.
 
     The store is re-read here rather than trusted from the tool call. ``propose_plan`` refused if a
@@ -1245,6 +1374,10 @@ def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> dict[str,
     that can arrive minutes later, with an amendment approved in between. The check is cheap and
     the thing it protects — that a whole replacement decomposition never displaces an approved plan
     without going through amendment review — is the point of the tool refusing at all.
+
+    No ``previous`` comes back from here, and there is nothing to look for: this path runs only
+    where ``latest_approved()`` is None, so no plan has ever been in force, nothing has been
+    scaffolded, and every cell in the notebook is somebody's own work rather than kedge's.
     """
     from kedge.plan.review import PlanNotApprovableError, approve
     from kedge.plan.store import PlanStoreError
@@ -1273,17 +1406,20 @@ def _write_proposal(store: Any, proposal: Any, *, note: str | None) -> dict[str,
         blockers = plan.approval_blockers()
 
     stamped, path = store.save_next(plan)
-    return {
-        "version": stamped.version,
-        "based_on_version": stamped.based_on_version,
-        "approved": approved,
-        "blockers": blockers,
-        "path": str(path),
-        "stages": len(stamped.stages),
-    }
+    return _PlanWrite(
+        payload={
+            "version": stamped.version,
+            "based_on_version": stamped.based_on_version,
+            "approved": approved,
+            "blockers": blockers,
+            "path": str(path),
+            "stages": len(stamped.stages),
+        },
+        plan=stamped,
+    )
 
 
-def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[str, Any]:
+def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> _PlanWrite:
     """Derive, save and — where it is approvable — approve the amended plan.
 
     ``amend_plan``'s schema is free text: a rationale, a change stated in prose, and optionally
@@ -1328,14 +1464,21 @@ def _write_amendment(store: Any, amendment: Any, *, note: str | None) -> dict[st
         blockers = amended.approval_blockers()
 
     stamped, path = store.save_next(amended)
-    return {
-        "version": stamped.version,
-        "based_on_version": stamped.based_on_version,
-        "approved": approved,
-        "blockers": blockers,
-        "path": str(path),
-        "stage": amendment.stage if stage is not None else None,
-    }
+    return _PlanWrite(
+        payload={
+            "version": stamped.version,
+            "based_on_version": stamped.based_on_version,
+            "approved": approved,
+            "blockers": blockers,
+            "path": str(path),
+            "stage": amendment.stage if stage is not None else None,
+        },
+        plan=stamped,
+        # The plan that was in force until a line ago. Its emission is what the sync compares the
+        # notebook against, so the stage cell carrying the amended note is updated where nobody
+        # has touched it and reported where somebody has.
+        previous=plan,
+    )
 
 
 def _nothing_to_amend(latest: Any) -> str:
