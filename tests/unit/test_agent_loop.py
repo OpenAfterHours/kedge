@@ -1385,17 +1385,40 @@ async def test_a_refusal_the_model_cannot_fix_is_not_counted_as_an_attempt(
 # ── arguments kedge cannot decode ────────────────────────────────────────────────────────────
 
 
+@cache
+def nested_past_the_recursion_limit() -> str:
+    """JSON nested deeper than the C scanner on *this* platform will follow.
+
+    No single depth is deep enough everywhere, and hard-coding one is how these two tests came to
+    pass on Windows and mean nothing on Linux. `Py_C_RECURSION_LIMIT` — what `json`'s C scanner
+    spends one of per nesting level — is 3000 on Windows and 10000 elsewhere, so the 3000 this
+    used to say was the Windows limit exactly: `RecursionError` there, a cleanly parsed list on
+    Ubuntu, and a test asserting the raw string comes back that got the decoded one instead.
+    CPython 3.14 drops the constant for a check against the real stack, so the next such number
+    would go stale differently. Ask json where the edge is rather than predicting it.
+    """
+    depth = 1_000
+    while depth <= 1_000_000:
+        raw = "[" * depth + "1" + "]" * depth
+        try:
+            json.loads(raw)
+        except RecursionError:
+            return raw
+        depth *= 2
+    raise AssertionError("json followed a million levels of nesting; this test needs rethinking")
+
+
 def test_arguments_nested_past_the_recursion_limit_are_handed_back_rather_than_raised() -> None:
     """`RecursionError` is not a `JSONDecodeError`, and everything reaching the loop's catch-all
     is reported to the user as Fatal — a whole turn ended and the notebook's state put in doubt,
     over one tool call kedge was only trying to summarise for the activity trail."""
-    raw = "[" * 3_000 + "1" + "]" * 3_000
+    raw = nested_past_the_recursion_limit()
 
     assert _safe_arguments(raw) == {"arguments": raw}
 
 
 async def test_a_tool_call_kedge_cannot_decode_does_not_end_the_turn() -> None:
-    deep = "[" * 3_000 + "1" + "]" * 3_000
+    deep = nested_past_the_recursion_limit()
     rounds = [
         [
             ChatDelta(index=0, call_id="call_0", name="list_cells"),
