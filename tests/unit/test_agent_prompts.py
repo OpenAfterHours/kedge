@@ -45,6 +45,28 @@ def test_a_missing_part_degrades_to_empty_rather_than_raising() -> None:
     assert build_system_prompt(parts=("no-such-part.md",)) == ""
 
 
+def test_role_prompt_tells_the_model_to_show_the_query_behind_a_paste() -> None:
+    """A pasted query result is the other non-formula input, and this one is recoverable.
+
+    No scaffolder can place this cell: nothing in the code associates a connection with the range
+    it fills, so the instruction is the entire mechanism. Three parts make it worth a cell — the
+    query verbatim, the profile that says whether an export matches, and the command that drafts a
+    contract from the pasted sheet *before* the first export — and the fourth assertion is the
+    emission idiom, because a query interpolated through an f-string is either rejected or
+    silently rewritten.
+
+    `sketch` rather than `infer` is the whole point of naming a command here: `infer` needs a
+    hand-in, and the hand-in is the thing the user is trying to produce.
+    """
+    role = load_prompt("role.md")
+    assert 'inspect_workbook(section="connections")' in role
+    assert "m_source" in role
+    assert "kedge contract sketch" in role
+    assert 'r"""' in role and "f-string" in role
+    # And none of it may become licence to write a query the workbook does not record.
+    assert "never compose the query" in role
+
+
 def test_system_prompt_states_the_marimo_single_definition_rule_and_the_escape_hatch() -> None:
     prompt = build_system_prompt().lower()
     assert "exactly one cell" in prompt or "exactly one owning cell" in prompt

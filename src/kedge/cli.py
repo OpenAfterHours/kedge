@@ -1470,6 +1470,68 @@ def contract_infer(
     )
 
 
+@contract_app.command("sketch")
+def contract_sketch(
+    workbook: Annotated[
+        Path, typer.Argument(help="The workbook whose pasted sheet describes the hand-in.")
+    ],
+    sheet: Annotated[
+        str | None,
+        typer.Option("--sheet", help="The pasted sheet. Defaults to the only data sheet."),
+    ] = None,
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Write the contract YAML here. Defaults to the project's."),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Replace a contract that is already there.")
+    ] = False,
+) -> None:
+    """Sketch a hand-in contract from a workbook sheet, before the first hand-in exists (PLAN M5).
+
+    ``infer`` needs a real export and this does not, which is the whole point: a process fed by
+    somebody running a query and pasting the grid has no hand-in until the user makes one, and
+    nothing tells them which columns the notebook expects until the check fails. The pasted sheet
+    *is* last month's version of that file, so this describes it from the analyser's own column
+    profiles.
+
+    A separate verb rather than a flag on ``infer``. The two read the same argument name and mean
+    entirely different evidence by it -- a hand-in that happens to be a spreadsheet is a perfectly
+    ordinary ``infer`` argument -- and a flag that quietly changes what a file *is* would be the
+    kind of surface that makes a wrong contract easy to produce by accident.
+
+    The draft says in the file that it came from a workbook, and it never replaces a contract that
+    is already there: that one may have been tightened by somebody who knows the process.
+    """
+    if not workbook.is_file():
+        raise _fail(f"no such workbook: {workbook}")
+
+    from kedge.contracts.sketch import sketch, write_sketch
+
+    workspace = _workspace_for(workbook)
+    analyse = _resolve("kedge.analysis.analyse", "analyse", "M1 (the analyser)")
+    destination = out or workspace.contract_path
+    try:
+        drafted = sketch(analyse(workspace.workbook_path), sheet=sheet)
+        written = write_sketch(drafted, destination, overwrite=force)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    console = _console()
+    console.print(
+        f"[green]contract[/green] {written} "
+        f"[dim]({len(drafted.contract.columns)} column(s) from the "
+        f"'{_plain(drafted.sheet)}' sheet of {_plain(workbook.name)})[/dim]"
+    )
+    console.print(f"  [dim]sheet chosen because {_plain(drafted.reason)}[/dim]")
+    for entry in drafted.omitted:
+        console.print(f"  [yellow]omitted[/yellow] {_plain(entry)}")
+    console.print(
+        "  [yellow]this is a sketch of a paste, not a checked contract[/yellow]: read it, then "
+        "replace it with `kedge contract infer` once one real export has arrived."
+    )
+
+
 # ── config ───────────────────────────────────────────────────────────────────────────────────
 
 

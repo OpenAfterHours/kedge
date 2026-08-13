@@ -41,6 +41,17 @@ can read, re-run and sign off — not to produce something that merely looks fin
   "not reconciled" — never "passed".
 - **Refuse to invent.** Fourteen values typed by an analyst each month have no formula behind them
   and no logic to recover. That is a checkpoint, not a puzzle: say so and leave an approval step.
+- **Show the query behind a paste.** A stage fed by a pasted query result has no formula either,
+  and the workbook usually carries the query: `inspect_workbook(section="connections")` returns the
+  SQL as `command`, `section="power_query"` the M as `m_source`. Put it verbatim in a markdown cell
+  beside the stage that consumes it — the user is going to run it — with the pasted sheet's column
+  profile, so they can see whether their export matches what the cell expects, and
+  `kedge contract sketch <workbook>`, which drafts a contract from that sheet before any export.
+  Bind it to a cell-local raw literal, `_sql = r"""..."""`, and concatenate that into the markdown:
+  through an f-string, a brace or a backslash in real SQL is a syntax violation at best and a
+  silently altered query at worst, and it is the altered one the user runs. Where no query is
+  recorded, say the input is a paste of unknown origin — never compose the query that would have
+  produced it.
 - **Stop and ask** on iterative or circular calculation, and on any unresolvable external workbook
   link. Neither has a clean polars equivalent and both are on for a reason.
 

@@ -29,7 +29,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
-from kedge.plan.model import PlanError, ProcessPlan
+from kedge.plan.model import PLAN_SCHEMA_VERSION, PlanError, ProcessPlan
 
 logger = logging.getLogger(__name__)
 
@@ -300,15 +300,27 @@ class PlanStore:
         against an empty store is v1, but by the time it is saved the user may have hand-written
         one. This resolves that without silently clobbering anything.
 
+        **The schema stamp is refreshed here**, and only here, because this is the one place a
+        *new* plan file comes into existence. A 1.0 plan loaded from disk keeps its stamp — the
+        number dates the file, and rewriting it on load would claim the author wrote 1.1 — but
+        everything derived from it is a file written today, in today's schema, and must say so.
+        Left to propagate, a v7 written this afternoon still claims ``1.0`` and any future
+        migration keyed on the stamp mis-handles it. Neither of the two revision paths can do
+        this for itself: :func:`~kedge.plan.review._revise` rebuilds from ``model_dump``, which
+        carries the old stamp forward, and :func:`~kedge.plan.review.approve` uses
+        ``model_copy`` and never goes through ``_revise`` at all.
+
         Returns:
             The plan as written, and its path.
         """
         target = self.next_version()
-        stamped = (
-            plan
-            if plan.version == target
-            else plan.model_copy(update={"version": target, "based_on_version": plan.version})
-        )
+        updates: dict[str, Any] = {}
+        if plan.version != target:
+            updates["version"] = target
+            updates["based_on_version"] = plan.version
+        if plan.plan_schema_version != PLAN_SCHEMA_VERSION:
+            updates["plan_schema_version"] = PLAN_SCHEMA_VERSION
+        stamped = plan.model_copy(update=updates) if updates else plan
         return stamped, self.save(stamped)
 
     def seed(self) -> ProcessPlan | None:

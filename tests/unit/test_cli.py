@@ -510,6 +510,100 @@ def test_contract_infer_reports_a_file_it_cannot_describe_rather_than_tracebacki
     assert not (tmp_path / "cwd" / "empty.contract.yaml").exists()
 
 
+def _pasted_workbook(tmp_path: Path) -> Path:
+    """The committed fixture, copied where a command may write a project directory beside it."""
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "legacy_sql.xlsx"
+    if not fixture.is_file():  # pragma: no cover - the fixture is committed
+        pytest.skip("tests/fixtures/legacy_sql.xlsx has not landed yet")
+    destination = tmp_path / "cwd" / "legacy_sql.xlsx"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(fixture.read_bytes())
+    return destination
+
+
+def test_contract_sketch_drafts_from_the_workbooks_own_pasted_sheet(tmp_path: Path) -> None:
+    """The bootstrap: a contract before the first export, drawn off last month's paste."""
+    workbook = _pasted_workbook(tmp_path)
+    destination = tmp_path / "contract.yaml"
+
+    result = runner.invoke(app, ["contract", "sketch", str(workbook), "--out", str(destination)])
+
+    assert result.exit_code == 0, result.output
+    from kedge.contracts import load
+
+    contract = load(destination)
+    assert contract.column_names[:2] == ["trade_id", "counterparty_name"]
+    assert "legacy_sql.xlsx" in (contract.generated_from or "")
+    assert "sketch" in flattened(result.output)
+
+
+def test_contract_sketch_defaults_to_the_contract_the_notebook_reads(tmp_path: Path) -> None:
+    """Writing it anywhere else would leave the scaffolded check cell still enforcing nothing."""
+    workbook = _pasted_workbook(tmp_path)
+
+    result = runner.invoke(app, ["contract", "sketch", str(workbook)])
+
+    assert result.exit_code == 0, result.output
+    from kedge.workspace import Workspace
+
+    assert Workspace.for_workbook(workbook).contract_path.is_file()
+
+
+def test_contract_sketch_will_not_overwrite_a_contract_without_being_told(
+    tmp_path: Path,
+) -> None:
+    workbook = _pasted_workbook(tmp_path)
+    destination = tmp_path / "contract.yaml"
+    destination.write_text("name: tightened-by-hand\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["contract", "sketch", str(workbook), "--out", str(destination)])
+
+    assert result.exit_code == 1
+    assert "already a contract" in flattened(result.output)
+    assert destination.read_text(encoding="utf-8") == "name: tightened-by-hand\n"
+
+    forced = runner.invoke(
+        app, ["contract", "sketch", str(workbook), "--out", str(destination), "--force"]
+    )
+    assert forced.exit_code == 0, forced.output
+    assert "tightened-by-hand" not in destination.read_text(encoding="utf-8")
+
+
+def test_contract_sketch_reports_a_workbook_it_cannot_speak_for(tmp_path: Path) -> None:
+    """A named sheet that is not there is a message naming the ones that are."""
+    workbook = _pasted_workbook(tmp_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "contract",
+            "sketch",
+            str(workbook),
+            "--sheet",
+            "Trades",
+            "--out",
+            str(tmp_path / "c.yaml"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "has no sheet called 'Trades'" in flattened(result.output)
+    assert not (tmp_path / "c.yaml").exists()
+
+
+def test_contract_sketch_says_which_sheet_it_chose_and_why(tmp_path: Path) -> None:
+    workbook = _pasted_workbook(tmp_path)
+
+    result = runner.invoke(
+        app, ["contract", "sketch", str(workbook), "--out", str(tmp_path / "c.yaml")]
+    )
+
+    output = flattened(result.output)
+    assert "'Extract' sheet" in output
+    assert "only sheet" in output
+    assert "not a checked contract" in output
+
+
 def test_open_runs_the_same_sequence_the_hub_runs(
     workbook: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

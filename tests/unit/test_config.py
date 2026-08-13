@@ -156,6 +156,126 @@ def test_explicit_paths_override_the_discovered_locations(tmp_path: Path, kedge_
     assert loaded.files == (elsewhere,)
 
 
+# ── the policy allowlists ────────────────────────────────────────────────────────────────────
+
+
+def test_both_policy_allowlists_are_empty_until_a_file_says_otherwise(
+    kedge_home: Path, project: Path
+) -> None:
+    """The documented default, and until [policy] exists it is the only reachable state."""
+    loaded = load_config(project_dir=project)
+
+    assert loaded.config.policy.network_allowlist == ()
+    assert loaded.config.policy.database_allowlist == ()
+    assert loaded.origin("policy.database_allowlist") == "default"
+
+
+def test_a_project_file_can_permit_a_host_and_a_warehouse(kedge_home: Path, project: Path) -> None:
+    project_file = project / "kedge.toml"
+    project_file.write_text(
+        "[policy]\n"
+        'network_allowlist = ["rates.internal.bank"]\n'
+        'database_allowlist = ["RiskWarehouse", " warehouse.internal "]\n',
+        encoding="utf-8",
+    )
+
+    loaded = load_config(project_dir=project)
+
+    assert loaded.config.policy.network_allowlist == ("rates.internal.bank",)
+    # Folded and stripped on the way in, so the gate never has to wonder about 'RiskWarehouse'.
+    assert loaded.config.policy.database_allowlist == ("riskwarehouse", "warehouse.internal")
+    assert loaded.origin("policy.database_allowlist") == str(project_file)
+
+
+def test_a_url_in_an_allowlist_is_refused_with_what_the_list_wants_instead(
+    kedge_home: Path, project: Path
+) -> None:
+    bad = project / "kedge.toml"
+    bad.write_text(
+        '[policy]\nnetwork_allowlist = ["https://rates.internal.bank/v1"]\n', encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        load_config(project_dir=project)
+
+    message = str(excinfo.value)
+    assert str(bad) in message
+    assert "is a URL" in message
+    assert "rates.internal.bank" in message
+
+
+def test_a_connection_string_in_an_allowlist_is_refused_without_echoing_it(
+    kedge_home: Path, project: Path
+) -> None:
+    """A whole DSN loaded and was stored, inert but plaintext, in the one file kedge tells users
+    never to put a secret in. The refusal must not print it back out either — an error message
+    reaches a console and a log."""
+    bad = project / "kedge.toml"
+    bad.write_text(
+        '[policy]\ndatabase_allowlist = ["SERVER=warehouse.internal;UID=etl;PWD=hunter2"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        load_config(project_dir=project)
+
+    message = str(excinfo.value)
+    assert str(bad) in message
+    assert "hunter2" not in message
+    assert "connection string" in message
+    assert "keyring" in message
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["etl@warehouse.internal", "warehouse.internal;risk", "warehouse internal", "server=warehouse"],
+)
+def test_nothing_that_belongs_in_a_dsn_belongs_in_an_allowlist(
+    entry: str, kedge_home: Path, project: Path
+) -> None:
+    (project / "kedge.toml").write_text(
+        f"[policy]\ndatabase_allowlist = [{entry!r}]\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigValidationError):
+        load_config(project_dir=project)
+
+
+def test_a_project_allowlist_replaces_the_user_one_rather_than_widening_it(
+    kedge_home: Path, project: Path
+) -> None:
+    """Documented in SECURITY.md because it cuts both ways: `kedge.toml` travels with the
+    workbook, so a file arriving beside one can loosen this control as well as tighten it."""
+    (kedge_home / "config.toml").write_text(
+        '[policy]\ndatabase_allowlist = ["warehouse.internal"]\n', encoding="utf-8"
+    )
+    assert load_config(project_dir=project).config.policy.database_allowlist == (
+        "warehouse.internal",
+    )
+
+    project_file = project / "kedge.toml"
+    project_file.write_text('[policy]\ndatabase_allowlist = ["riskwarehouse"]\n', encoding="utf-8")
+    loaded = load_config(project_dir=project)
+
+    assert loaded.config.policy.database_allowlist == ("riskwarehouse",)
+    assert loaded.origin("policy.database_allowlist") == str(project_file)
+
+
+def test_an_unknown_policy_key_is_reported_with_a_suggestion(
+    kedge_home: Path, project: Path
+) -> None:
+    bad = project / "kedge.toml"
+    bad.write_text('[policy]\ndatabase_allowlists = ["warehouse.internal"]\n', encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        load_config(project_dir=project)
+
+    message = str(excinfo.value)
+    assert str(bad) in message
+    assert "policy.database_allowlists" in message
+    assert "did you mean 'database_allowlist'" in message
+
+
 # ── error messages ───────────────────────────────────────────────────────────────────────────
 
 

@@ -1254,6 +1254,10 @@ def test_the_card_carries_what_render_plan_shows_a_reviewer(
     assert stages["apply_haircuts"]["operations"] == ["calc_h2_h500"]
     assert stages["apply_haircuts"]["excel_pattern"] == "vlookup_exact"
     assert stages["load_handin"]["checkpoint"] is None
+    # Rendered rather than structured, because the card is a reading surface and `app.js` joins
+    # these into a line. `render_plan` shows the same words.
+    assert stages["load_handin"]["sources"] == ["handin"]
+    assert stages["apply_haircuts"]["sources"] == ["range Calc!H2:H500", "range Ref!A1:D50"]
 
 
 def test_the_card_carries_the_question_a_checkpoint_will_ask(

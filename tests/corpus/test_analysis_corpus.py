@@ -107,6 +107,7 @@ FINDING_KIND_BY_PROPOSED_NAME: dict[str, FindingKind] = {
     "circular_reference": FindingKind.CIRCULAR_REFERENCE,
     "dates_stored_as_text": FindingKind.MIXED_DATE_FORMAT,
     "dead_region": FindingKind.DEAD_REGION,
+    "document_attached_by_filename": FindingKind.DOCUMENT_ATTACHED_BY_FILENAME,
     "duplicate_headers": FindingKind.DUPLICATE_HEADER,
     "error_cell": FindingKind.ERROR_VALUE,
     "external_workbook_link": FindingKind.EXTERNAL_LINK,
@@ -1503,11 +1504,19 @@ def test_the_defined_name_over_a_deleted_range_does_not_resolve(
 # =============================================================================
 
 
-#: `docs.sidecar_documents` matches Word files by conventional filename, so
+#: `docs.sidecar_documents` matches documents by conventional filename, so
 #: `documented_procedure.docx` and `procedure_legacy.doc` attach to every workbook in
 #: tests/fixtures. Documented behaviour rather than a defect, but it has to be subtracted
 #: before a fixture's own note sources can be claimed exactly.
-_SIDECAR_NOTE_SOURCES = frozenset({"docx", "doc_stub"})
+_COMPANION_NOTE_SOURCES = frozenset({"docx", "doc_stub"})
+
+#: The same rule reaches `tests/fixtures/README.md`, because `readme` is in the filename
+#: vocabulary and a README is the one markdown file almost every directory has. It is
+#: subtracted for the same reason as the Word companions, but deliberately not *required*:
+#: that README is repository housekeeping, and a corpus assertion that depends on it would
+#: fail the day somebody renames it. `document_attached_by_filename` is where that guess is
+#: claimed instead, fixture by fixture, in the manifest.
+_SIDECAR_NOTE_SOURCES = _COMPANION_NOTE_SOURCES | frozenset({"markdown", "plain_text"})
 
 
 @pytest.mark.parametrize("expectation", _fixture_params())
@@ -1523,7 +1532,7 @@ def test_the_note_sources_are_exactly_the_ones_the_workbook_itself_carries(
     sources = {note.source for note in analyses[expectation.filename].notes}
 
     assert sources - _SIDECAR_NOTE_SOURCES == set(expectation.note_sources)
-    assert sources >= _SIDECAR_NOTE_SOURCES, "the two Word companions attach to every fixture"
+    assert sources >= _COMPANION_NOTE_SOURCES, "the two Word companions attach to every fixture"
 
 
 def test_the_documentation_sheet_prose_is_recovered_whole(
@@ -1850,6 +1859,9 @@ def _drive_docs(path: Path) -> object:
     hostile.xlsx carries no prose of its own, but it does not have to: the two Word
     companions in tests/fixtures attach to every workbook in the directory, so the extractor
     has something to find here and an empty list is a failure rather than a pass.
+
+    Neither companion shares hostile.xlsx's stem, so both are attached on their filenames and
+    both say so. That is the second kind here, and the reason this is not a single-kind claim.
     """
     with open_workbook(path) as handle:
         notes, findings = extract_notes(handle)
@@ -1858,7 +1870,11 @@ def _drive_docs(path: Path) -> object:
         "the .doc must fail loudly, not quietly"
     )
     assert findings, "and the unreadable companion must be reported"
-    assert all(finding.kind is FindingKind.UNSUPPORTED_FORMAT for finding in findings)
+    assert any(finding.kind is FindingKind.UNSUPPORTED_FORMAT for finding in findings)
+    assert all(
+        finding.kind in (FindingKind.UNSUPPORTED_FORMAT, FindingKind.DOCUMENT_ATTACHED_BY_FILENAME)
+        for finding in findings
+    )
     return notes
 
 

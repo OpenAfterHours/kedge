@@ -214,6 +214,46 @@ def test_caps_come_from_config() -> None:
     assert caps.max_payload_bytes == workspace.config.sampling.max_payload_bytes
 
 
+def test_the_policy_allowlists_reach_the_gate_from_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This is the only production construction of `Policy`, so an allowlist that does not
+    arrive here is an allowlist no user can reach."""
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "rwa_monthly.xlsx"
+    _write_workbook(workbook)
+    (tmp_path / "kedge.toml").write_text(
+        "[policy]\n"
+        'network_allowlist = ["rates.internal.bank"]\n'
+        'database_allowlist = ["RiskWarehouse"]\n',
+        encoding="utf-8",
+    )
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+
+    context = ToolContext.for_workspace(workspace)
+
+    assert context.policy.allows_host("rates.internal.bank")
+    assert context.policy.permits_database("riskwarehouse")
+    assert not context.policy.permits_database("warehouse.internal")
+    assert context.policy.working_dir == workspace.project_dir
+
+
+def test_with_no_policy_section_the_gate_permits_neither_network_nor_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "rwa_monthly.xlsx"
+    _write_workbook(workbook)
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+
+    context = ToolContext.for_workspace(workspace)
+
+    assert context.policy.network_allowlist == frozenset()
+    assert context.policy.database_allowlist == frozenset()
+
+
 # ── volatility ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -1154,6 +1194,13 @@ def test_the_propose_plan_schema_costs_far_less_than_the_json_schema_would() -> 
 # all, since it is paid for in the endpoint's bill rather than in anything a test would notice.
 # Both sit a little under a tenth above what the surface costs today, which is enough headroom to
 # reword a description and not enough to add a tool or double one without saying so out loud.
+#
+# That claim is only true while it is checked. `propose_plan` grew to 1,975 characters against
+# LARGEST_SCHEMA_BUDGET -- 1.3% of headroom, on a budget whose whole point is that there is enough
+# room to reword something. Raising the ceiling would have been the wrong half of the trade: the
+# number is the only place growth in the surface is visible, so moving it to fit the schema makes
+# it decorative. The schema was trimmed back to ~1,820 instead, which is the tenth the comment
+# above claims. If it creeps up again, cut words before moving the number.
 TOOL_BLOCK_BUDGET = 12_000
 LARGEST_SCHEMA_BUDGET = 2_000
 

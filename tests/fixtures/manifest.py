@@ -94,12 +94,15 @@ SHEET_ROLES = ("data", "calculation", "parameters", "documentation", "output")
 # out to be produced by fixtures that had never needed to name them:
 # `dead_region` (a formula region nothing else reads) and `unsupported_format`
 # (the .doc companion, which attaches to every workbook in this directory).
+# `document_attached_by_filename` arrived the same way and for the same reason:
+# the companions attach on their names, and so does this directory's README.md.
 FINDING_KINDS = (
     "blank_columns",
     "blank_rows",
     "circular_reference",
     "dates_stored_as_text",
     "dead_region",
+    "document_attached_by_filename",
     "duplicate_headers",
     "error_cell",
     "external_workbook_link",
@@ -468,7 +471,12 @@ CLEAN_PIPELINE = FixtureExpectation(
     # already says nothing reads. `unsupported_format` is procedure_legacy.doc,
     # which attaches to every workbook in this directory exactly as the two Word
     # note sources do. No cached-value finding: this is the fixture that has one.
-    finding_kinds=("dead_region", "hardcoded_constant", "unsupported_format"),
+    finding_kinds=(
+        "dead_region",
+        "document_attached_by_filename",
+        "hardcoded_constant",
+        "unsupported_format",
+    ),
     cached_values_present=True,
     cached_value_coverage=1.0,
     dependency_edges=(
@@ -549,7 +557,12 @@ POWERQUERY = FixtureExpectation(
     # label on A9 sits on the last populated row — a totals row at the bottom,
     # which is normal and not a finding. The mashup lives in the archive rather
     # than in a cell, so it produces no finding of its own.
-    finding_kinds=("dead_region", "no_cached_values", "unsupported_format"),
+    finding_kinds=(
+        "dead_region",
+        "document_attached_by_filename",
+        "no_cached_values",
+        "unsupported_format",
+    ),
     dependency_edges=(("Report!B9", "Report!C2"),),
     # Two operations and one edge between them. C2:C7 is =ROUND(B2/$B$9,4), so it
     # reads the total below it; B9 is =SUM(B2:B7) over typed values, so it reads
@@ -621,7 +634,12 @@ LEGACY_SQL = FixtureExpectation(
     # SUMIF and COUNTIF carry no numeric literals at all. The
     # connections extractor raises a finding only for a connection it cannot
     # read, and the whole point of this fixture is that both of these parse.
-    finding_kinds=("dead_region", "no_cached_values", "unsupported_format"),
+    finding_kinds=(
+        "dead_region",
+        "document_attached_by_filename",
+        "no_cached_values",
+        "unsupported_format",
+    ),
     # Deliberately empty, and complete: both Summary columns aggregate the typed
     # Extract sheet and neither reads the other, so this workbook has two
     # operations and no dependencies at all. An edge here would be invented.
@@ -765,7 +783,13 @@ CROSS_SHEET_CHAIN = FixtureExpectation(
     # and the D_Report metrics that feed no other cell. Every numeric literal in
     # the workbook is either a ROUND digit count or an IFERROR fallback of 0, so
     # none of them is the kind of embedded rate the constant finding is for.
-    finding_kinds=("dead_region", "iferror_swallow", "no_cached_values", "unsupported_format"),
+    finding_kinds=(
+        "dead_region",
+        "document_attached_by_filename",
+        "iferror_swallow",
+        "no_cached_values",
+        "unsupported_format",
+    ),
     dependency_edges=(
         ("B_Enrich!C2", "C_Aggregate!C2"),
         ("B_Enrich!C2", "C_Aggregate!D2"),
@@ -910,6 +934,7 @@ MOSTLY_MANUAL = FixtureExpectation(
     # the strict xfail that says so.
     finding_kinds=(
         "dead_region",
+        "document_attached_by_filename",
         "hardcoded_constant",
         "manual_override_block",
         "no_cached_values",
@@ -969,7 +994,12 @@ DOCUMENTED = FixtureExpectation(
     # companion is this fixture's own, which is why it is the one that asserts
     # the conversion hint. The three cell comments and the Process Notes prose
     # are notes, not findings — nothing about documenting a workbook is a fault.
-    finding_kinds=("dead_region", "no_cached_values", "unsupported_format"),
+    finding_kinds=(
+        "dead_region",
+        "document_attached_by_filename",
+        "no_cached_values",
+        "unsupported_format",
+    ),
     # Four operations on one sheet and nothing merges, so this is the whole DAG.
     # Only Calc!D reads another formula column; Calc!A, B and C all read the
     # typed Data and Ref sheets, and nothing reads Calc!A at all.
@@ -1267,6 +1297,7 @@ HOSTILE = FixtureExpectation(
         "circular_reference",
         "dates_stored_as_text",
         "dead_region",
+        "document_attached_by_filename",
         "duplicate_headers",
         "error_cell",
         "external_workbook_link",
@@ -1401,6 +1432,7 @@ NO_CACHED_VALUES = FixtureExpectation(
     # with the terminal Output metrics is the dead region.
     finding_kinds=(
         "dead_region",
+        "document_attached_by_filename",
         "hardcoded_constant",
         "no_cached_values",
         "unsupported_format",

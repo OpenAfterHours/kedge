@@ -36,6 +36,8 @@ system message. Before you answer, work through this silently:
 2. Which operations belong together as one business step, and which sprawling region is really
    several? Group by intent, not by sheet.
 3. What arrives from outside — a hand-in, a query, a Power Query table — and what is computed?
+   Every input goes in that stage's `sources` with its `origin`: `manual` for anything a person
+   types or pastes, `unknown` where you cannot tell. Both are worth saying out loud.
 4. Which steps are not automatable and need `kind: checkpoint`?
 5. What is dead, and can you justify dropping it in one sentence a reviewer would accept?
 6. What do you genuinely not understand? Those are the open questions, and they are the most

@@ -10,8 +10,10 @@ usually would:
 
 - **Stages are free-form in count and naming.** There is no template and no enum of allowed
   stage ids. A workbook that wants four stages gets four; one that wants fifteen gets fifteen.
-  The only controlled vocabulary is :class:`StageKind`, and it exists solely because the
-  scaffolder has to branch on it (PLAN 2.2, 6.2).
+  There are exactly two controlled vocabularies: :class:`StageKind`, which exists because the
+  scaffolder has to branch on it, and :class:`SourceOrigin`, which exists because "where does
+  this input come from" has a small, known set of answers and a free-form string is an answer
+  nothing can check and nothing can reason about (PLAN 2.2, 6.2).
 - **``open_questions`` is structurally required.** Not optional-with-default: the model must
   actively decide the list is empty rather than omitting the field and never considering it. An
   empty one on a complex workbook is itself suspicious, which
@@ -30,9 +32,11 @@ References:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -40,7 +44,19 @@ from kedge.analysis.model import SCHEMA_VERSION as ANALYSIS_SCHEMA_VERSION
 from kedge.analysis.model import ExcelPattern, WorkbookAnalysis
 from kedge.errors import KedgeError
 
-PLAN_SCHEMA_VERSION = "1.0"
+if TYPE_CHECKING:
+    from collections.abc import Collection
+
+PLAN_SCHEMA_VERSION = "1.1"
+"""The schema plans are written in.
+
+``1.1`` structured ``Stage.sources``: a list of bare strings became a list of
+:class:`StageSource`, each carrying a :class:`SourceOrigin`. The change is backward compatible by
+construction — a ``1.0`` plan is a list of strings, every one of which
+:func:`_classify_bare_source` reads into an origin and a ref without ever failing — so there is no
+migration step to run and no version gate anywhere. The number is here to date a file, not to
+admit it.
+"""
 
 __all__ = [
     "ANALYSIS_SCHEMA_VERSION",
@@ -55,8 +71,10 @@ __all__ = [
     "PlanDraft",
     "PlanError",
     "ProcessPlan",
+    "SourceOrigin",
     "Stage",
     "StageKind",
+    "StageSource",
     "topological_stages",
 ]
 
@@ -87,19 +105,57 @@ class Confidence(StrEnum):
 
 
 class StageKind(StrEnum):
-    """The only controlled vocabulary in the stage schema.
+    """What a stage *is*, in the only terms the scaffolder branches on.
 
     Kept to four members because each one changes what the scaffolder emits, and nothing else
     does. ``checkpoint`` is the flexibility escape hatch: a stage that is deliberately *not*
     automated — a judgement call, an override agreed with another team, a sanity check — which
     scaffolds to an ``mo.ui`` approval cell that blocks everything downstream until a decision
     and a note are recorded (PLAN 2.2).
+
+    A fifth member for "this stage reads from outside the workbook" was the obvious place to put
+    an input's provenance and would have been wrong twice over. It would have earned its place
+    only if the scaffolder emitted something different for it, and it cannot: a stage may read a
+    hand-in *and* a query *and* an upstream frame, so provenance is a property of each input
+    rather than of the stage. That is :class:`SourceOrigin`, on :class:`StageSource`.
     """
 
     LOAD = "load"
     TRANSFORM = "transform"
     OUTPUT = "output"
     CHECKPOINT = "checkpoint"
+
+
+class SourceOrigin(StrEnum):
+    """Where one of a stage's inputs comes from.
+
+    ``prompts/propose_user.md`` has always asked the model "what arrives from outside — a hand-in,
+    a query, a Power Query table — and what is computed?". Until this vocabulary existed there was
+    nowhere to put the answer: ``sources`` was a list of bare strings that nothing validated and
+    nothing could reason about, so a query could not be associated with the stage it feeds and a
+    workbook wholly dependent on a manual paste looked exactly like one that reads its own cells.
+
+    The members are not a taxonomy for its own sake — each is something kedge already
+    distinguishes elsewhere. ``RANGE`` and ``STAGE`` are the two the schema can check on its own:
+    one is a location in the workbook, the other is an edge in the stage graph, and
+    :func:`_check_stage_graph` now validates it exactly as it validates ``depends_on``. ``QUERY``
+    and ``POWER_QUERY`` are the analyser's own two ingestion extractors
+    (:attr:`~kedge.analysis.model.WorkbookAnalysis.connections` and ``power_query``). ``HANDIN``
+    and ``EXTERNAL`` are the two inputs the system prompt already tells the model to plan as
+    inputs rather than as calculations. ``MANUAL`` is a person typing, which is the one origin
+    nobody can reproduce and the one a reviewer most needs to see named. ``UNKNOWN`` is the
+    honest answer, and like an unknown :class:`~kedge.analysis.model.ExcelPattern` it should come
+    with an open question rather than a guess.
+    """
+
+    RANGE = "range"
+    STAGE = "stage"
+    HANDIN = "handin"
+    QUERY = "query"
+    POWER_QUERY = "power_query"
+    EXTERNAL = "external"
+    MANUAL = "manual"
+    UNKNOWN = "unknown"
 
 
 class ApprovalState(StrEnum):
@@ -164,6 +220,189 @@ class Checkpoint(_PlanModel):
         return cleaned
 
 
+_ORIGIN_ALIASES: dict[str, SourceOrigin] = {
+    "upload": SourceOrigin.HANDIN,
+    "upstream": SourceOrigin.STAGE,
+    "upstream_stage": SourceOrigin.STAGE,
+    "sheet": SourceOrigin.RANGE,
+    "worksheet": SourceOrigin.RANGE,
+    "cells": SourceOrigin.RANGE,
+    "named_range": SourceOrigin.RANGE,
+    "sql": SourceOrigin.QUERY,
+    "database": SourceOrigin.QUERY,
+    "connection": SourceOrigin.QUERY,
+    "powerquery": SourceOrigin.POWER_QUERY,
+    "external_workbook": SourceOrigin.EXTERNAL,
+    "external_link": SourceOrigin.EXTERNAL,
+    "typed": SourceOrigin.MANUAL,
+    "pasted": SourceOrigin.MANUAL,
+    "override": SourceOrigin.MANUAL,
+}
+"""Words a model reaches for that mean an origin kedge already has. Cheaper than a repair."""
+
+_HANDIN_WORDS = frozenset({"handin", "hand_in", "the_hand_in", "handin_file"})
+
+_A1_RANGE = re.compile(
+    r"^\$?[A-Za-z]{1,3}\$?\d+(:\$?[A-Za-z]{1,3}\$?\d+)?$|^\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}$"
+)
+"""``H2``, ``H2:H500``, ``$A$1:$D$50``, ``AK:AP`` — an unqualified range, with no sheet on it."""
+
+_REF_REQUIRED = (SourceOrigin.RANGE, SourceOrigin.STAGE)
+
+
+def _normalise(text: str) -> str:
+    """Fold a vocabulary word to its canonical form: lower case, underscores for gaps."""
+    return text.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _classify_bare_source(text: str, stage_ids: Collection[str] = ()) -> dict[str, Any]:
+    """Read a pre-1.1 bare source string as an origin and a ref. Never fails.
+
+    Every plan written before schema 1.1 holds a list of these, documented as "sheet-qualified
+    ranges, 'handin', or the id of an upstream stage", so all three have to survive the trip.
+
+    The order of the tests is the order of how sure each one is, and *evidence* is what makes one
+    test surer than another, not how memorable the vocabulary word is:
+
+    1. A ``!`` says sheet-qualified, and nothing else in the vocabulary carries one. Unambiguous.
+    2. An exact match against another stage id of *this* plan. The plan is the strongest evidence
+       available — stronger than a shape and stronger than a keyword, because it is a fact about
+       the file being read rather than a guess about what a string looks like.
+    3. An A1 *shape*. Only a shape: ``q1``, ``fx1``, ``vat2`` and ``s1`` are all perfectly good
+       stage ids that happen to look like cells, which is exactly why 2 is tested first.
+    4. The literal ``handin``, which was in the vocabulary and in the PLAN's own worked example —
+       but ``load_handin`` is that example's stage name, so a plan whose stage is called ``handin``
+       is entirely plausible, and 2 has to win there. This is the one lossy branch (the ref is
+       dropped, because the origin is the whole answer), so it is also the one that must go last.
+
+    Anything left is ``unknown`` with the text kept as the ref, which is the whole reason this
+    cannot fail: an old plan naming something kedge cannot classify — a named range, a stage that
+    was later renamed, a note somebody typed into the list — still loads, still renders, and
+    still says what it said. Guessing ``stage`` instead would turn that plan into a validation
+    error months after anyone could fix it.
+
+    Args:
+        text: The bare string from a 1.0 plan, or from a model that sent one anyway.
+        stage_ids: The *other* stages in the plan being loaded, where the caller knows them. A
+            stage's own id is excluded by :func:`_stage_with_read_sources`: under 1.0 a stage was
+            often named after the region it reads and naming itself was ordinary, so reading that
+            as a stage edge would refuse a committed plan under a rule that did not exist when it
+            was written.
+
+    Returns:
+        Keyword arguments for a :class:`StageSource`.
+    """
+    cleaned = text.strip()
+    if "!" in cleaned:
+        return {"origin": SourceOrigin.RANGE.value, "ref": cleaned}
+    if cleaned in stage_ids:
+        return {"origin": SourceOrigin.STAGE.value, "ref": cleaned}
+    if _A1_RANGE.match(cleaned):
+        return {"origin": SourceOrigin.RANGE.value, "ref": cleaned}
+    if _normalise(cleaned) in _HANDIN_WORDS:
+        return {"origin": SourceOrigin.HANDIN.value, "ref": None}
+    return {"origin": SourceOrigin.UNKNOWN.value, "ref": cleaned}
+
+
+class StageSource(_PlanModel):
+    """One input to a stage, and where it comes from.
+
+    A bare string is accepted on load and classified by :func:`_classify_bare_source`, because
+    every plan written before schema 1.1 is a list of them and those plans are on disk, in git,
+    and reviewed. That acceptance is a load-time convenience only: the JSON schema the model is
+    given describes the object, so a proposal is asked for the structured form.
+
+    Example:
+        >>> StageSource.model_validate("Calc!H2:H500").origin
+        <SourceOrigin.RANGE: 'range'>
+        >>> StageSource(origin=SourceOrigin.QUERY, ref="MonthlyExposures").render()
+        'query MonthlyExposures'
+    """
+
+    origin: SourceOrigin = Field(description="What kind of input this is.")
+    ref: str | None = Field(
+        default=None,
+        description="What it names: the sheet-qualified range, the id of the upstream stage, the "
+        "connection or query name, the linked workbook, or where a manual entry lands. Required "
+        "for `range` and `stage`; elsewhere the origin alone can be the whole answer.",
+    )
+
+    # ── normalisation ────────────────────────────────────────────────────
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_bare_string(cls, value: Any) -> Any:
+        """Take a bare 1.0 string or the 1.1 object, and name both when it is neither.
+
+        Pydantic's own message for ``sources: [42]`` is "Input should be a valid dictionary or
+        instance of StageSource", which is true and misleading: a bare string is accepted too, and
+        somebody hand-editing a plan reads that message as "strings are not allowed" and rewrites
+        a file that was fine.
+        """
+        if isinstance(value, str):
+            return _classify_bare_source(value)
+        if isinstance(value, Mapping | StageSource):
+            return value
+        msg = (
+            f"a source must be an object like {{origin: range, ref: 'Calc!H2:H500'}}, or the bare "
+            f"string schema 1.0 wrote — 'Calc!H2:H500', 'handin', or the id of an upstream stage. "
+            f"Got {type(value).__name__}: {value!r}"
+        )
+        raise ValueError(msg)
+
+    @field_validator("origin", mode="before")
+    @classmethod
+    def _coerce_origin(cls, value: Any) -> Any:
+        """Accept the vocabulary case-insensitively; map anything unrecognised to ``unknown``.
+
+        The same bargain :meth:`Stage._coerce_pattern` strikes, for the same reason. A model that
+        writes ``Hand-In`` or ``SQL`` has understood the question and spelled the answer its own
+        way, and burning a repair round trip on that buys nothing; a word the vocabulary genuinely
+        does not have becomes ``unknown``, which is information rather than a silent invention.
+        """
+        if value is None or isinstance(value, SourceOrigin) or not isinstance(value, str):
+            return value
+        normalised = _normalise(value)
+        if normalised in _HANDIN_WORDS:
+            return SourceOrigin.HANDIN
+        if normalised in _ORIGIN_ALIASES:
+            return _ORIGIN_ALIASES[normalised]
+        try:
+            return SourceOrigin(normalised)
+        except ValueError:
+            return SourceOrigin.UNKNOWN
+
+    @field_validator("ref")
+    @classmethod
+    def _blank_ref_is_no_ref(cls, value: str | None) -> str | None:
+        cleaned = (value or "").strip()
+        return cleaned or None
+
+    @model_validator(mode="after")
+    def _ref_where_the_origin_needs_one(self) -> StageSource:
+        if self.origin in _REF_REQUIRED and not self.ref:
+            msg = (
+                f"a {self.origin.value!r} source must say what it reads: a sheet-qualified range "
+                f"like 'Calc!H2:H500', or the id of an upstream stage"
+            )
+            raise ValueError(msg)
+        return self
+
+    # ── rendering ────────────────────────────────────────────────────────
+
+    def render(self) -> str:
+        """One line for a review pane, a notebook comment or the approval card.
+
+        ``range Calc!H2:H500``, ``stage load_handin``, ``handin``. The origin leads because it is
+        the part a reader is scanning for; a bare ``Calc!AK:AP`` never says whether anyone knew
+        where it came from.
+        """
+        return f"{self.origin.value} {self.ref}" if self.ref else self.origin.value
+
+    def __str__(self) -> str:
+        return self.render()
+
+
 class Stage(_PlanModel):
     """One step of the process, as the plan proposes it.
 
@@ -182,10 +421,11 @@ class Stage(_PlanModel):
     intent: str = Field(description="What this step is for, in the business's own terms.")
     kind: StageKind = StageKind.TRANSFORM
 
-    sources: list[str] = Field(
+    sources: list[StageSource] = Field(
         default_factory=list,
-        description="Where the inputs come from: sheet-qualified ranges, 'handin', or the id "
-        "of an upstream stage.",
+        description="Where this stage's inputs come from, one entry each: a range in the "
+        "workbook, an upstream stage, a hand-in, a query, a Power Query table, a linked "
+        "workbook, or a person typing.",
     )
     depends_on: list[str] = Field(
         default_factory=list,
@@ -272,12 +512,46 @@ class Stage(_PlanModel):
         except ValueError:
             return ExcelPattern.UNKNOWN
 
+    # ── construction ─────────────────────────────────────────────────────
+
+    @classmethod
+    def validate_in_plan(cls, value: Any, stage_ids: Collection[str]) -> Stage:
+        """Validate one stage's raw mapping with the rest of the plan's stage ids in hand.
+
+        :meth:`model_validate` has no plan context, so a bare ``"load_handin"`` in ``sources``
+        classifies as ``unknown`` there while the identical text inside a plan mapping classifies
+        as ``stage``. That asymmetry is invisible until somebody hits it:
+        :func:`kedge.plan.review.edit_stage` validates a single stage and would silently downgrade
+        an edge the same edit expressed in YAML would keep. Anything editing one stage of a plan
+        it already holds should come through here instead.
+
+        Args:
+            value: The raw stage mapping. Anything else is passed through to ``model_validate``.
+            stage_ids: The plan's stage ids. The stage's own id is excluded, exactly as it is on
+                load — see :func:`_stage_with_read_sources`.
+        """
+        return cls.model_validate(_stage_with_read_sources(value, set(stage_ids)))
+
     # ── accessors ────────────────────────────────────────────────────────
 
     @property
     def is_checkpoint(self) -> bool:
         """Whether this stage is a deliberate human decision rather than code."""
         return self.kind is StageKind.CHECKPOINT
+
+    @property
+    def upstream_stage_ids(self) -> list[str]:
+        """The ids of the stages this one reads, from its sources.
+
+        Distinct from ``depends_on``, which is ordering: a stage can be gated by a checkpoint it
+        reads nothing from, and — until somebody lists it — can read a frame it forgot to depend
+        on. :func:`kedge.plan.review.review_warnings` reports the second.
+        """
+        return [
+            source.ref
+            for source in self.sources
+            if source.origin is SourceOrigin.STAGE and source.ref is not None
+        ]
 
     @property
     def needs_review_marker(self) -> bool:
@@ -418,7 +692,12 @@ class Approval(_PlanModel):
 
 
 def _check_stage_graph(stages: list[Stage]) -> None:
-    """Validate stage ids, dependency references, and acyclicity.
+    """Validate stage ids, dependency references, source references, and acyclicity.
+
+    A ``stage`` source is checked exactly as ``depends_on`` is, and for the same reason: both
+    name a stage, and a name that resolves to nothing is a plan describing a step that reads
+    something which does not exist. It was silent while ``sources`` was free-form, because
+    ``"laod_handin"`` and ``"Ref!A1:D50"`` are the same kind of thing to a list of strings.
 
     Raises:
         ValueError: with a message naming the offending stage, so a failed LLM proposal can be
@@ -442,6 +721,13 @@ def _check_stage_graph(stages: list[Stage]) -> None:
                 raise ValueError(msg)
             if dependency not in seen:
                 msg = f"stage {stage.id!r} depends on unknown stage {dependency!r}"
+                raise ValueError(msg)
+        for upstream in stage.upstream_stage_ids:
+            if upstream == stage.id:
+                msg = f"stage {stage.id!r} lists itself as one of its own sources"
+                raise ValueError(msg)
+            if upstream not in seen:
+                msg = f"stage {stage.id!r} reads unknown stage {upstream!r} in its sources"
                 raise ValueError(msg)
 
     ordered = topological_stages(stages, strict=False)
@@ -491,6 +777,75 @@ def topological_stages(stages: list[Stage], *, strict: bool = True) -> list[Stag
 
 
 # =============================================================================
+# LOADING A PLAN WRITTEN BEFORE SCHEMA 1.1
+# =============================================================================
+
+
+def _read_bare_sources(value: Any) -> Any:
+    """Classify a plan's bare 1.0 source strings before its stages are validated.
+
+    :class:`StageSource` classifies a bare string on its own, and on its own it cannot tell an
+    upstream stage id from a named range: both are one word. A plan can, because it holds every
+    stage id — so this runs first, on the raw mapping, and hands those ids to
+    :func:`_classify_bare_source`.
+
+    Only exact matches against *other* stages are upgraded, which is what makes this safe on a
+    plan written months ago: a string that matches no stage id stays whatever
+    :class:`StageSource` makes of it on its own, so a stage renamed since is a source that reads
+    ``unknown``, never a plan that will not load. The exclusion of a stage's own id lives in
+    :func:`_stage_with_read_sources`, which explains why.
+
+    Raw mappings only — the YAML and JSON paths, which is where every pre-1.1 plan arrives. A
+    :class:`Stage` built in Python has already classified its sources, and an ``unknown`` there
+    is as likely to be a deliberate "I could not tell" as an unresolved id. Rewriting it would be
+    inventing a fact; code that means an upstream stage should say
+    ``StageSource(origin=SourceOrigin.STAGE, ref=...)``.
+    """
+    if not isinstance(value, dict):
+        return value
+    stages = value.get("stages")
+    if not isinstance(stages, list):
+        return value
+    stage_ids = {
+        stage["id"].strip()
+        for stage in stages
+        if isinstance(stage, dict) and isinstance(stage.get("id"), str)
+    }
+    if not stage_ids:
+        return value
+    return {**value, "stages": [_stage_with_read_sources(item, stage_ids) for item in stages]}
+
+
+def _stage_with_read_sources(stage: Any, stage_ids: set[str]) -> Any:
+    """Classify one stage's bare sources against every stage id *but its own*.
+
+    A 1.0 stage naming itself was ordinary, because a stage was often named after the region it
+    reads: ``id: adjustments`` with ``sources: [adjustments]`` meant "the adjustments region",
+    written when nothing in the schema could have meant anything else. Reading that as a stage
+    edge makes :func:`_check_stage_graph` refuse a file somebody committed months ago, under a
+    rule that did not exist when they wrote it — the worst thing a schema change can do. Excluded
+    from the candidates, it falls through to ``unknown``, keeps its text, and loads.
+
+    ``_check_stage_graph`` is deliberately left alone: a self-source *written* as
+    ``origin: stage`` in a 1.1 plan is a genuine error and still says so.
+    """
+    if not isinstance(stage, dict):
+        return stage
+    sources = stage.get("sources")
+    if not isinstance(sources, list) or not any(isinstance(item, str) for item in sources):
+        return stage
+    own = stage.get("id")
+    others = stage_ids - {own.strip()} if isinstance(own, str) else stage_ids
+    return {
+        **stage,
+        "sources": [
+            _classify_bare_source(item, others) if isinstance(item, str) else item
+            for item in sources
+        ],
+    }
+
+
+# =============================================================================
 # THE PLAN
 # =============================================================================
 
@@ -512,6 +867,11 @@ class PlanDraft(_PlanModel):
     summary: str | None = Field(
         default=None, description="One or two sentences on the shape of the process overall."
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _classify_bare_sources(cls, value: Any) -> Any:
+        return _read_bare_sources(value)
 
     @model_validator(mode="after")
     def _validate_graph(self) -> PlanDraft:
@@ -564,6 +924,11 @@ class ProcessPlan(_PlanModel):
 
     # ── review ───────────────────────────────────────────────────────────
     approval: Approval = Field(default_factory=Approval)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _classify_bare_sources(cls, value: Any) -> Any:
+        return _read_bare_sources(value)
 
     @model_validator(mode="after")
     def _validate_graph(self) -> ProcessPlan:
@@ -690,7 +1055,14 @@ class ProcessPlan(_PlanModel):
             )
         rejected = [drop for drop in self.dropped if drop.rejected]
         for drop in rejected:
-            if not any(drop.range in stage.sources for stage in self.stages):
+            # The same test it always was — is this exact range named by some stage — moved from
+            # the string to the ref it became. A reviewer who clears this blocker by typing the
+            # range into a stage's `sources`, which is what the CLI tells them to do, writes a
+            # bare string that loads as a `range` source with that ref, so the remedy still works.
+            claimed = any(
+                source.ref == drop.range for stage in self.stages for source in stage.sources
+            )
+            if not claimed:
                 blockers.append(
                     f"dropped range {drop.range!r} was rejected — it must be kept — but no stage "
                     f"lists it as a source"

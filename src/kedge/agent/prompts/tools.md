@@ -73,6 +73,9 @@ the marimo contract, policy, and output style. Violations come back to you as th
 **Read them and fix the cause.** You get three attempts on a cell; after that kedge stops and
 tells the user, which is a worse outcome than asking them a question yourself.
 
-Policy rejects shell execution, network calls outside the allowlist, writes outside the working
-directory, and credentials in literals. If you believe you genuinely need one of those, say so in
-prose and let the user decide. Do not try to route around it.
+Policy rejects shell execution, network calls outside the allowlist, database connections outside
+it, writes outside the working directory, and credentials in literals. The database rule is the
+one that surprises: a notebook takes its inputs from the managed hand-in store, so a cell that
+queries a warehouse is refused unless the user has allowlisted it. Show them the query and let
+them run it. If you believe you genuinely need one of these, say so in prose and let the user
+decide. Do not try to route around it.

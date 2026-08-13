@@ -25,8 +25,10 @@ from kedge.plan.model import (
     OpenQuestion,
     PlanError,
     ProcessPlan,
+    SourceOrigin,
     Stage,
     StageKind,
+    StageSource,
 )
 from kedge.plan.review import (
     PlanNotApprovableError,
@@ -218,6 +220,76 @@ def test_renaming_a_stage_repoints_everything_that_depended_on_it() -> None:
     assert "apply_collateral_haircuts" in downstream.depends_on
 
 
+def test_renaming_a_stage_repoints_the_sources_that_read_it_as_well() -> None:
+    """Sources travel with dependencies: since 1.1 both name a stage and both are validated, so a
+    rename that rewrote one and not the other would fail on the reviewer's own edit."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="load_handin", intent="Read the hand-in", kind=StageKind.LOAD),
+            Stage(
+                id="apply_haircuts",
+                intent="Look up haircuts",
+                sources=[StageSource(origin=SourceOrigin.STAGE, ref="load_handin")],
+                depends_on=["load_handin"],
+            ),
+        ]
+    )
+
+    renamed = edit_stage(plan, "load_handin", id="read_exposures")
+
+    downstream = renamed.stage("apply_haircuts")
+    assert downstream is not None
+    assert downstream.upstream_stage_ids == ["read_exposures"]
+
+
+def test_editing_a_stage_reads_a_bare_source_with_the_rest_of_the_plan_in_hand() -> None:
+    """The same text in YAML gives `stage`; the edit verb has no excuse for giving `unknown`.
+
+    `Stage.model_validate` alone cannot tell an upstream stage id from a named range, and
+    `edit_stage` holds the plan that can — so it goes through `Stage.validate_in_plan`. Left
+    asymmetric, an edit expressed the way the CLI documents would quietly weaken the graph.
+    """
+    plan = _clean_plan(
+        stages=[
+            Stage(id="load_handin", intent="Read the hand-in", kind=StageKind.LOAD),
+            Stage(id="apply_haircuts", intent="Look up haircuts", depends_on=["load_handin"]),
+        ]
+    )
+
+    edited = edit_stage(plan, "apply_haircuts", sources=["load_handin"])
+
+    stage = edited.stage("apply_haircuts")
+    assert stage is not None
+    assert stage.sources == [StageSource(origin=SourceOrigin.STAGE, ref="load_handin")]
+    assert stage.upstream_stage_ids == ["load_handin"]
+
+
+def test_renaming_a_stage_whose_id_looks_like_a_cell_still_repoints_what_reads_it() -> None:
+    """The consequence of reading `q1` as a range: nothing follows the rename, and the source
+    ends up pointing at a stage that is no longer in the plan."""
+    plan = ProcessPlan.model_validate(
+        {
+            **make_plan().model_dump(mode="python"),
+            "stages": [
+                {"id": "q1", "intent": "Quarterly figures", "kind": "load"},
+                {
+                    "id": "apply_haircuts",
+                    "intent": "Look up haircuts",
+                    "sources": ["q1"],
+                    "depends_on": ["q1"],
+                },
+            ],
+        }
+    )
+    assert plan.stages[1].upstream_stage_ids == ["q1"]
+
+    renamed = edit_stage(plan, "q1", id="quarter_one")
+
+    downstream = renamed.stage("apply_haircuts")
+    assert downstream is not None
+    assert downstream.upstream_stage_ids == ["quarter_one"]
+
+
 def test_editing_an_unknown_stage_lists_the_ones_that_exist() -> None:
     with pytest.raises(PlanError) as caught:
         edit_stage(_clean_plan(), "ghost", notes="x")
@@ -253,6 +325,30 @@ def test_removing_a_stage_detaches_dependencies_rather_than_guessing_a_replaceme
     downstream = without.stage("write_output")
     assert downstream is not None
     assert downstream.depends_on == ["manual_overrides"]
+
+
+def test_removing_a_stage_detaches_the_sources_that_read_it_too() -> None:
+    """A source pointing at a stage that is no longer in the plan would not validate."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="load_handin", intent="Read the hand-in", kind=StageKind.LOAD),
+            Stage(
+                id="apply_haircuts",
+                intent="Look up haircuts",
+                sources=[
+                    StageSource(origin=SourceOrigin.STAGE, ref="load_handin"),
+                    StageSource(origin=SourceOrigin.RANGE, ref="Ref!A1:D50"),
+                ],
+                depends_on=["load_handin"],
+            ),
+        ]
+    )
+
+    without = remove_stage(plan, "load_handin")
+
+    survivor = without.stage("apply_haircuts")
+    assert survivor is not None
+    assert survivor.sources == [StageSource(origin=SourceOrigin.RANGE, ref="Ref!A1:D50")]
 
 
 def test_removing_the_last_stage_is_not_a_review_action() -> None:
@@ -308,7 +404,10 @@ def test_merging_unions_the_content_and_takes_the_lowest_confidence() -> None:
                     id="second",
                     intent="Coerce the dtypes",
                     kind=StageKind.TRANSFORM,
-                    sources=["first", "handin"],
+                    sources=[
+                        StageSource(origin=SourceOrigin.STAGE, ref="first"),
+                        StageSource(origin=SourceOrigin.HANDIN),
+                    ],
                     depends_on=["first"],
                     confidence=Confidence.LOW,
                     assumptions=["amounts are text"],
@@ -325,7 +424,9 @@ def test_merging_unions_the_content_and_takes_the_lowest_confidence() -> None:
     third = merged.stage("third")
     assert combined is not None and third is not None
 
-    assert combined.sources == ["handin", "first"]
+    # The hand-in survives; `second` reading `first` does not, because after the merge those two
+    # are one stage and an edge inside a stage is not an input.
+    assert combined.sources == [StageSource(origin=SourceOrigin.HANDIN)]
     assert combined.assumptions == ["header on row 1", "amounts are text"]
     assert combined.operations == ["op_a", "op_b"]
     assert combined.confidence is Confidence.LOW
@@ -333,6 +434,63 @@ def test_merging_unions_the_content_and_takes_the_lowest_confidence() -> None:
     assert combined.notes == "from the shared drive"
     assert third.depends_on == ["load_and_clean"]
     assert merged.stage_ids == ["load_and_clean", "third"]
+
+
+def test_a_source_a_stage_legitimately_lists_twice_survives_an_unrelated_merge() -> None:
+    """Repointing de-duplicates the edges *it* collapsed, and nothing else.
+
+    A merge genuinely turns two edges into one and the second is then noise. A stage that already
+    listed the same range twice said so deliberately — under 1.0 repeating a bare string was how
+    you said "twice" — and a merge somewhere else in the plan is no reason to edit it.
+    """
+    twice = [
+        StageSource(origin=SourceOrigin.RANGE, ref="Calc!H2:H500"),
+        StageSource(origin=SourceOrigin.RANGE, ref="Calc!H2:H500"),
+    ]
+    plan = make_plan(
+        draft=make_draft(
+            stages=[
+                Stage(id="first", intent="Read the hand-in", kind=StageKind.LOAD),
+                Stage(id="second", intent="Clean it", depends_on=["first"]),
+                Stage(id="bystander", intent="Reads the same block twice", sources=twice),
+            ],
+            dropped=[],
+        )
+    )
+
+    merged = merge_stages(plan, ["first", "second"], into_id="load_and_clean")
+
+    bystander = merged.stage("bystander")
+    assert bystander is not None
+    assert bystander.sources == twice
+
+
+def test_a_merge_still_collapses_the_two_edges_it_turned_into_one() -> None:
+    """The other half of the bargain: the de-duplication the merge does need is still there."""
+    plan = make_plan(
+        draft=make_draft(
+            stages=[
+                Stage(id="first", intent="Read the hand-in", kind=StageKind.LOAD),
+                Stage(id="second", intent="Clean it", depends_on=["first"]),
+                Stage(
+                    id="downstream",
+                    intent="Reads both",
+                    sources=[
+                        StageSource(origin=SourceOrigin.STAGE, ref="first"),
+                        StageSource(origin=SourceOrigin.STAGE, ref="second"),
+                    ],
+                    depends_on=["first", "second"],
+                ),
+            ],
+            dropped=[],
+        )
+    )
+
+    merged = merge_stages(plan, ["first", "second"], into_id="load_and_clean")
+
+    downstream = merged.stage("downstream")
+    assert downstream is not None
+    assert downstream.upstream_stage_ids == ["load_and_clean"]
 
 
 def test_merging_accepts_an_explicit_intent_for_the_combined_stage() -> None:
@@ -784,6 +942,41 @@ def test_a_stage_listed_before_something_it_depends_on_is_reported() -> None:
     assert any("is listed before" in warning for warning in review_warnings(plan))
 
 
+def test_a_stage_reading_another_it_does_not_depend_on_is_reported() -> None:
+    """`sources` says what a stage reads; `depends_on` says what runs first. The scaffolder emits
+    in the second order, so a stage that has only the first may find no frame there."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="first", intent="x", confidence=Confidence.HIGH),
+            Stage(
+                id="second",
+                intent="y",
+                sources=[StageSource(origin=SourceOrigin.STAGE, ref="first")],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert any(
+        "reads first but does not depend on it" in warning for warning in review_warnings(plan)
+    )
+
+
+def test_a_stage_that_both_reads_and_depends_on_another_is_not_reported() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="first", intent="x", confidence=Confidence.HIGH),
+            Stage(
+                id="second",
+                intent="y",
+                sources=[StageSource(origin=SourceOrigin.STAGE, ref="first")],
+                depends_on=["first"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert not any("does not depend on" in warning for warning in review_warnings(plan))
+
+
 def test_a_clean_plan_against_its_own_analysis_warns_about_nothing_structural() -> None:
     analysis = make_analysis()
     plan = _clean_plan(
@@ -825,6 +1018,71 @@ def test_the_rendered_stage_shows_its_kind_confidence_dependencies_and_checkpoin
     assert "options: approve, reject" in rendered
     assert "pattern: vlookup_exact" in rendered
     assert "assumes: header on row 1" in rendered
+
+
+def test_the_rendered_stage_says_where_each_of_its_inputs_comes_from() -> None:
+    """A bare `Calc!H2:H500` never said whether anyone knew where it came from; the origin does."""
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="load_exposures",
+                intent="Pull exposures and this month's adjustments",
+                kind=StageKind.LOAD,
+                sources=[
+                    StageSource(origin=SourceOrigin.QUERY, ref="MonthlyExposures"),
+                    StageSource(origin=SourceOrigin.HANDIN),
+                    StageSource(origin=SourceOrigin.MANUAL, ref="Adjustments!B2:B15"),
+                ],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="apply_haircuts",
+                intent="Collateral haircut lookup",
+                sources=[
+                    StageSource(origin=SourceOrigin.STAGE, ref="load_exposures"),
+                    StageSource(origin=SourceOrigin.RANGE, ref="Ref!A1:D50"),
+                ],
+                depends_on=["load_exposures"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+
+    rendered = render_plan(plan, show_warnings=False)
+
+    assert "sources: query MonthlyExposures, handin, manual Adjustments!B2:B15" in rendered
+    assert "sources: stage load_exposures, range Ref!A1:D50" in rendered
+
+
+def test_a_sources_list_too_long_for_one_line_never_splits_an_origin_from_its_ref() -> None:
+    """Wrapping introduced a space a 1.0 source never had, and prose wraps at any space.
+
+    A line ending `power_query` with the ref on the next reads as an origin nobody named — the
+    reviewer sees a Power Query table the plan did not identify, when the plan identified it.
+    """
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="load_everything",
+                intent="Pull every input this month needs",
+                kind=StageKind.LOAD,
+                sources=[
+                    StageSource(origin=SourceOrigin.POWER_QUERY, ref=f"CounterpartyRatings{n}")
+                    for n in range(6)
+                ],
+                confidence=Confidence.HIGH,
+            )
+        ]
+    )
+
+    lines = render_plan(plan, show_warnings=False).splitlines()
+
+    assert any(line.strip().startswith("sources:") for line in lines)
+    for line in lines:
+        assert line.strip() not in {"power_query", "sources: power_query"}
+        assert not line.rstrip().endswith("power_query")
+    for index in range(6):
+        assert any(f"power_query CounterpartyRatings{index}" in line for line in lines)
 
 
 def test_everything_optional_on_a_plan_renders_when_it_is_present() -> None:
@@ -942,6 +1200,24 @@ def test_an_added_and_a_removed_stage_are_both_reported() -> None:
     assert diff.added_stages == ("archive",)
     assert diff.removed_stages == ("write_output",)
     assert not diff.is_empty
+
+
+def test_a_changed_source_diffs_as_the_line_a_reviewer_reads() -> None:
+    """A diff is read, not parsed: the mapping each source dumps to is three times the width."""
+    before = _clean_plan()
+    after = edit_stage(
+        before,
+        "apply_haircuts",
+        sources=[
+            StageSource(origin=SourceOrigin.RANGE, ref="Calc!H2:H500"),
+            StageSource(origin=SourceOrigin.RANGE, ref="Calc!AK:AP"),
+        ],
+    )
+
+    rendered = render_diff(diff_plans(before, after))
+
+    assert "sources: ['range Calc!H2:H500', 'range Ref!A1:D50']" in rendered
+    assert "['range Calc!H2:H500', 'range Calc!AK:AP']" in rendered
 
 
 def test_a_reorder_is_reported_as_a_reorder_not_as_four_changes() -> None:

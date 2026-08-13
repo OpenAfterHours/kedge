@@ -15,7 +15,17 @@ import pytest
 import yaml
 
 from conftest import make_draft, make_plan
-from kedge.plan.model import Approval, ApprovalState, Confidence, ProcessPlan, Stage
+from kedge.plan.model import (
+    PLAN_SCHEMA_VERSION,
+    Approval,
+    ApprovalState,
+    Confidence,
+    ProcessPlan,
+    SourceOrigin,
+    Stage,
+    StageSource,
+)
+from kedge.plan.review import approve, edit_stage
 from kedge.plan.store import (
     PLAN_FILENAME_PATTERN,
     PlanStore,
@@ -376,6 +386,57 @@ def test_save_next_leaves_a_correctly_numbered_plan_alone(store: PlanStore) -> N
     assert path.name == "plan-v001.yaml"
 
 
+# ── the schema stamp on a file written today ────────────────────────────────
+
+
+def test_a_new_file_derived_from_a_1_0_plan_is_stamped_at_todays_schema(store: PlanStore) -> None:
+    """The stamp dates a file. Propagated, a v7 written this afternoon still claims 1.0.
+
+    `_revise` rebuilds from `model_dump`, which carries the old stamp across every content edit,
+    so without a stamp at the point a new file is created the claim survives indefinitely and any
+    future migration keyed on it mis-handles a file it has never seen the shape of.
+    """
+    store.directory.mkdir(parents=True)
+    store.path_for(1).write_text(_PLAN_V1_0_YAML, encoding="utf-8")
+    loaded = store.load(1)
+    assert loaded.plan_schema_version == "1.0"
+
+    edited = edit_stage(loaded, "apply_haircuts", intent="Collateral haircuts, by asset class")
+    stamped, path = store.save_next(edited)
+
+    assert path.name == "plan-v002.yaml"
+    assert stamped.plan_schema_version == PLAN_SCHEMA_VERSION == "1.1"
+    assert "plan_schema_version: '1.1'" in path.read_text(encoding="utf-8")
+    assert store.load(1).plan_schema_version == "1.0"
+
+
+def test_the_approval_path_stamps_the_schema_too(store: PlanStore) -> None:
+    """`approve` uses `model_copy` and never goes through `_revise`, so fixing `_revise` alone
+    would leave the whole approval route stamping 1.0 on a file written today."""
+    store.directory.mkdir(parents=True)
+    store.path_for(1).write_text(_PLAN_V1_0_YAML, encoding="utf-8")
+
+    approved = approve(store.load(1), by="phil")
+    stamped, _ = store.save_next(approved)
+
+    assert stamped.approval.approved
+    assert stamped.plan_schema_version == PLAN_SCHEMA_VERSION
+
+
+def test_saving_a_1_0_plan_at_its_own_version_leaves_its_stamp_alone(store: PlanStore) -> None:
+    """`save` writes a plan *at* its version; only `save_next` creates a new file.
+
+    Stamping here would rewrite history — and break the idempotent re-save `save` promises, since
+    the bytes on disk would no longer match the plan that produced them.
+    """
+    plan = _at(1).model_copy(update={"plan_schema_version": "1.0"})
+
+    path = store.save(plan)
+
+    assert store.load(1).plan_schema_version == "1.0"
+    assert store.save(plan) == path  # and the re-save is still a no-op, not a refusal
+
+
 # =============================================================================
 # RE-SEEDING THE NEXT PROPOSAL
 # =============================================================================
@@ -422,3 +483,132 @@ def test_a_saved_plan_reloads_as_the_same_object_including_review_state(store: P
     assert reloaded == approved
     assert reloaded.is_approvable
     assert reloaded.approval.by == "phil"
+
+
+# =============================================================================
+# SOURCES, ACROSS THE SCHEMA VERSIONS THEY WERE WRITTEN IN
+# =============================================================================
+
+
+_PLAN_V1_0_YAML = """\
+# kedge process plan. Edit freely: this file is a review artifact, not generated code.
+plan_schema_version: '1.0'
+version: 1
+created_at: '2026-06-30T09:00:00Z'
+workbook: rwa_monthly_v13.xlsx
+workbook_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+analysis_schema_version: '1.0'
+generated_by: llm
+assessment:
+  convertible: 0.8
+  blockers: []
+stages:
+- id: load_handin
+  intent: Read counterparty exposures from the hand-in
+  kind: load
+  sources:
+  - handin
+  confidence: high
+- id: apply_haircuts
+  intent: Collateral haircut lookup by asset class
+  kind: transform
+  sources:
+  - Calc!H2:H500
+  - Ref!A1:D50
+  - load_handin
+  depends_on:
+  - load_handin
+  confidence: high
+open_questions:
+- question: Column AF is computed but never referenced. Dead, or read manually?
+dropped: []
+approval:
+  state: approved
+  by: phil
+  at: '2026-06-30T11:15:00Z'
+"""
+"""Last quarter's plan, as schema 1.0 wrote it. Not derived from a dump: the point of the test is
+a file somebody committed months ago, so it is spelled out the way that file is."""
+
+
+def test_a_plan_file_written_before_sources_had_origins_still_opens(store: PlanStore) -> None:
+    """The failure this guards against is quiet and total: a history that will not load."""
+    store.directory.mkdir(parents=True)
+    store.path_for(1).write_text(_PLAN_V1_0_YAML, encoding="utf-8")
+
+    plan = store.load(1)
+
+    assert plan.plan_schema_version == "1.0"
+    assert plan.approval.approved
+    assert [source.render() for source in plan.stages[0].sources] == ["handin"]
+    assert [source.render() for source in plan.stages[1].sources] == [
+        "range Calc!H2:H500",
+        "range Ref!A1:D50",
+        "stage load_handin",
+    ]
+    assert store.latest_approved() == plan
+    assert store.seed() == plan
+
+
+def test_an_old_plan_reseeds_the_next_one_with_its_sources_carried_across(
+    store: PlanStore,
+) -> None:
+    """`to_draft()` is how last quarter's plan is offered to the model; origins go with it."""
+    store.directory.mkdir(parents=True)
+    store.path_for(1).write_text(_PLAN_V1_0_YAML, encoding="utf-8")
+
+    draft = store.load(1).to_draft()
+
+    assert draft.stages[1].upstream_stage_ids == ["load_handin"]
+
+
+def test_a_source_origin_survives_the_trip_to_disk_and_back(store: PlanStore) -> None:
+    plan = make_plan(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_exposures",
+                    intent="Pull exposures from the warehouse",
+                    sources=[
+                        StageSource(origin=SourceOrigin.QUERY, ref="MonthlyExposures"),
+                        StageSource(origin=SourceOrigin.POWER_QUERY, ref="Ratings"),
+                        StageSource(origin=SourceOrigin.MANUAL, ref="Adjustments!B2:B15"),
+                        StageSource(origin=SourceOrigin.HANDIN),
+                    ],
+                    confidence=Confidence.HIGH,
+                )
+            ],
+            dropped=[],
+        )
+    )
+    store.save(plan)
+
+    reloaded = store.load(1)
+    assert reloaded == plan
+    assert [source.origin for source in reloaded.stages[0].sources] == [
+        SourceOrigin.QUERY,
+        SourceOrigin.POWER_QUERY,
+        SourceOrigin.MANUAL,
+        SourceOrigin.HANDIN,
+    ]
+
+
+def test_an_origin_that_names_nothing_writes_no_null_line_for_a_reviewer_to_read_past() -> None:
+    plan = make_plan(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_handin",
+                    intent="Read the hand-in",
+                    sources=[StageSource(origin=SourceOrigin.HANDIN)],
+                    confidence=Confidence.HIGH,
+                )
+            ],
+            dropped=[],
+        )
+    )
+    body = plan_to_yaml(plan)
+    # The load-bearing half. The other half only asserts the origin survived at all — spelled
+    # without PyYAML's indentation, which is its choice to change and not what this test is about.
+    assert "ref: null" not in body
+    assert "origin: handin" in body

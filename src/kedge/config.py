@@ -58,6 +58,7 @@ __all__ = [
     "MarimoConfig",
     "MissingApiKeyError",
     "ModelConfig",
+    "PolicyConfig",
     "ReconciliationConfig",
     "RedactionConfig",
     "SamplingConfig",
@@ -182,6 +183,81 @@ class AgentConfig(_Section):
     """
 
 
+class PolicyConfig(_Section):
+    """What the validation gate permits generated code to reach for (PLAN M4).
+
+    Both lists are empty by default, which is the whole policy on a machine with no ``[policy]``
+    section: no network, no database. They are read once into
+    :class:`kedge.agent.validate.Policy`, and that gate is a quality gate rather than a sandbox —
+    it matches names in an AST, so what it can permit is bounded by what it can recognise.
+
+    Two lists rather than one, because a hostname and a connection target are not the same kind of
+    name. ``network_allowlist`` is matched against the host in an ``http(s)://`` literal;
+    ``database_allowlist`` is matched against whatever a connection actually names, which is
+    frequently an ODBC DSN entry or a Snowflake account locator with no host in it anywhere. A
+    single list would have to pretend those are interchangeable, and permitting a warehouse write
+    is not the same decision as permitting an HTTPS read.
+    """
+
+    network_allowlist: tuple[str, ...] = ()
+    """Hostnames a generated cell may fetch over HTTP. Matched exactly or as a parent domain, so
+    ``internal.bank`` also permits ``rates.internal.bank``."""
+
+    database_allowlist: tuple[str, ...] = ()
+    """What a generated cell may connect to over a database driver.
+
+    Any of: the target kedge can read out of the connection string — a hostname, an ODBC ``DSN=``
+    name, a Snowflake account; the driver module itself (``pyodbc``, ``duckdb``) where the
+    connection is assembled at run time and there is nothing in the cell to read; or the entry
+    point (``read_database``, ``read_database_uri``, ``write_database``, ``create_engine``) where
+    marimo's single-definition rule has put the engine in one cell and the read in the next, so
+    the reading cell names no host and imports no driver. The last two forms are the blunt ones
+    and say so by being a module or function name rather than a place.
+
+    Neither list is unioned across layers. ``kedge.toml`` beside the workbook replaces whatever
+    ``~/.kedge/config.toml`` set, so a project file that travels with a workbook can widen *or
+    narrow* both — see SECURITY.md.
+    """
+
+    @field_validator("network_allowlist", "database_allowlist")
+    @classmethod
+    def _normalise_allowlist(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        entries: list[str] = []
+        for raw in value:
+            entry = raw.strip().lower()
+            if not entry:
+                msg = "an allowlist entry cannot be empty"
+                raise ValueError(msg)
+            if "://" in entry or "/" in entry:
+                msg = (
+                    f"{raw!r} is a URL; this list holds bare hostnames, DSN names, driver names "
+                    f"and entry points (for example 'rates.internal.bank')"
+                )
+                raise ValueError(msg)
+            offending = next(
+                (
+                    "whitespace" if character.isspace() else repr(character)
+                    for character in entry
+                    if character.isspace() or character in "=;@,'\""
+                ),
+                None,
+            )
+            if offending is not None:
+                # Deliberately not echoing the value: the entry this exists to catch is a whole
+                # DSN, and `SERVER=warehouse;UID=etl;PWD=hunter2` in an error message is the
+                # password printed to a console and a log by the module that forbids exactly that.
+                msg = (
+                    f"an entry in this list contains {offending}, so it is a connection string "
+                    f"rather than a name. A connection string in a config file may carry a "
+                    f"password, and kedge keeps credentials in the OS keyring; this list holds "
+                    f"bare hostnames, DSN names, driver names and entry points (for example "
+                    f"'warehouse.internal', 'riskwarehouse', 'pyodbc')"
+                )
+                raise ValueError(msg)
+            entries.append(entry)
+        return tuple(entries)
+
+
 class ContextConfig(_Section):
     """Context window budget and the eviction knobs from PLAN M4."""
 
@@ -291,6 +367,7 @@ class Config(_Section):
 
     model: ModelConfig = Field(default_factory=ModelConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
     reconciliation: ReconciliationConfig = Field(default_factory=ReconciliationConfig)
     redaction: RedactionConfig = Field(default_factory=RedactionConfig)

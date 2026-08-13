@@ -100,14 +100,35 @@ What is sent, and what limits it:
   and no request is made. The analyser, the scaffold and the notebook all work with no endpoint
   configured.
 
-**The outbound payload log** records what left, at `~/.kedge/logs/outbound-<session>.jsonl`: one
-JSON line per value-returning tool call carrying timestamp, session, turn, tool, sheet, column
-names, row count, byte count, whether it was truncated and how many columns were redacted. It does
-not carry values, and that is structural rather than a matter of remembering — `OutboundRecord`
-has a fixed set of scalar fields, every one a name or a count, and there is no field a cell value
-could travel in. Column names are the one judgement call: they are metadata, capped at 64 names of
-64 characters, and a log that cannot say which columns went out answers none of the questions it
-exists to answer.
+**The outbound payload log** records what left *through a tool call*, at
+`~/.kedge/logs/outbound-<session>.jsonl`: one JSON line per value-returning tool call carrying
+timestamp, session, turn, tool, sheet, column names, row count, byte count, whether it was
+truncated and how many columns were redacted. It does not carry values, and that is structural
+rather than a matter of remembering — `OutboundRecord` has a fixed set of scalar fields, every one
+a name or a count, and there is no field a cell value could travel in. Column names are the one
+judgement call: they are metadata, capped at 64 names of 64 characters, and a log that cannot say
+which columns went out answers none of the questions it exists to answer.
+
+**It is not a complete account of what leaves the machine, and reading it as one would be a
+mistake.** Two things are outside it:
+
+- **The log is per chat session.** It is opened against a session id when the agent loop builds
+  that session's tool registry, so a request made outside a chat session writes no line at all.
+  `kedge plan propose` is the case to know about: it speaks to the same endpoint through its own
+  client and sends the workbook digest, the column profiles and the logical operations with their
+  R1C1 formulas, and logs nothing anywhere. Its profiles carry **cell values**: the top five
+  distinct values of each of up to 100 columns go out unconditionally, and it is only the head and
+  tail rows that sit behind `include_sample_values`. Redacted columns contribute none of it.
+- **The pinned system header is never a tool call.** Every completion of every turn re-sends the
+  whole prompt, and pinned into it is the workbook analysis block: the sheet names, and for up to
+  60 columns the header, dtype, row/null/distinct counts, min/max/sum and the first three values
+  of the column, each truncated to 24 characters. Redacted columns contribute no values. None of
+  this is a tool result, so none of it appears in the log, and it goes out again on every step of
+  every turn rather than once.
+
+So the log answers "which sampled payloads did the model ask for", accurately and per session. It
+does not answer "what has this endpoint seen about this workbook" — for that, the honest answers
+are the ones above and the design choice at the top of this section.
 
 The endpoint itself is yours to choose and yours to trust. kedge speaks to whatever
 OpenAI-compatible `base_url` is configured, over TLS if you give it an `https` URL and not if you
@@ -149,15 +170,66 @@ the issuer rather than completing an unverified handshake to read it for you.
 The agent generates polars code and kedge runs it in the marimo kernel. Every cell passes the
 validation gate in `kedge.agent.validate` first — syntax, then the marimo single-definition
 contract against the live graph, then policy, then output style — and a rejected cell goes back to
-the model rather than to the kernel. The policy stage refuses shell execution (`subprocess`, `pty`
-and friends), refuses network access unless a hostname is explicitly allowlisted (the allowlist is
-empty by default), and refuses writes outside the working directory.
+the model rather than to the kernel. The policy stage refuses five things:
+
+- **Shell execution.** `subprocess`, `pty` and friends, by import and by call, plus the calls that
+  delete files.
+- **Network access**, unless the hostname in the cell is listed in `[policy] network_allowlist`.
+  Recognised by import: the HTTP and socket clients (`requests`, `httpx`, `urllib`, `socket`,
+  `paramiko` and the rest of that list).
+- **Database access**, unless what the connection names is listed in `[policy]
+  database_allowlist`. Recognised three ways, because one is not enough: by import, for the
+  drivers that exist only to connect (`pyodbc`, `psycopg`, `pymssql`, `snowflake`, `connectorx`,
+  `oracledb`, `asyncpg`, the `adbc_driver_*` family and so on); by call, for `pl.read_database`,
+  `pl.read_database_uri`, `DataFrame.write_database` and `sqlalchemy.create_engine`, which import
+  nothing suspicious — a cell that reads a warehouse through polars imports only polars, and the
+  import-shaped check above cannot see it; and by literal, for a string that *is* a connection
+  string naming a server, which is what an unlisted driver still leaves behind.
+- **Writes outside the working directory.** A relative path is fine; an absolute one has to sit
+  under the project directory.
+- **A string literal that looks like a credential** — including a connection string with an
+  embedded password, in either the `connection_string = "mssql+pyodbc://user:pass@host"` spelling
+  or the same URI handed straight to a call. This one rejects the cell exactly as the other four
+  do, and it is reported first when a DSN trips both it and an allowlist.
+
+**Both allowlists are empty by default**, so out of the box no recognised driver or entry point in
+a generated cell reaches the network or a database. `[policy]` in `~/.kedge/config.toml` or in the
+`kedge.toml` beside the workbook is where you widen that, and the two lists are separate on
+purpose: `network_allowlist` holds hostnames, matched against the host in an `http(s)://` literal,
+while a database connection frequently names no host at all — an ODBC `DSN=RiskWarehouse` entry, a
+Snowflake account locator, or a DSN assembled at run time, in which case what there is to permit
+is the driver (`pyodbc`) or the entry point (`read_database`, `write_database`, `create_engine`).
+The last of those is not a nicety: marimo's single-definition rule puts the engine in one cell and
+the read in the next, and the reading cell contains no host and no import to name. A refusal names
+what it found and which entry would permit it.
+
+**Each connection is judged on its own targets**, not on the cell's. A permitted warehouse named
+anywhere in a cell used to excuse every other connection beside it, which turned widening the list
+— the only reason it exists — into a way of disarming the check.
+
+**Neither list is unioned across config layers.** The `kedge.toml` beside the workbook replaces
+whatever `~/.kedge/config.toml` set, key by key. That file often travels with the workbook, so it
+is the one setting by which a file arriving from elsewhere can loosen a security control without
+saying so; `kedge config` prints which file each value came from.
 
 **This is a quality gate, not a sandbox.** It is static analysis over an AST, it is deliberately
 approximate in the direction of false passes rather than false rejections, and the kernel it feeds
-runs with your privileges. If you point kedge at a model endpoint you do not trust, you are running
-that endpoint's code on your machine. Treat the model as a fast, well-read colleague with commit
-access, and read the notebook.
+runs with your privileges. Concretely, in the direction that matters here: it recognises names, so
+a driver not on the list *and* not naming its server in a literal, a connection opened through a
+wrapper it has not heard of, or a URL assembled from parts all go through. `duckdb` and
+`sqlalchemy` are refused only where a call on them shows a connection — otherwise a duckdb query
+over a local parquet file would be refused as database access — so `duckdb.connect("md:...")`
+against MotherDuck and `duckdb.sql("select * from 'https://host/x.parquet'")` are both false
+passes kedge accepts knowingly. On the network side the hosts are still read cell-wide rather than
+per call, because a URL is routinely composed from a base and a path and refusing that would be a
+false rejection; only a network call naming no literal at all is refused outright, so
+`httpx.get(f"{BASE}/latest")` is permitted by an allowlisted `BASE` while `httpx.get(build_url())`
+is not. And the gate sees the cells *kedge* submits: a cell you type into the notebook yourself is
+between you and marimo.
+
+If you point kedge at a model endpoint you do not trust, you are running that endpoint's code on
+your machine. Treat the model as a fast, well-read colleague with commit access, and read the
+notebook.
 
 Workbooks are read as data and never executed. `.xlsx` and `.xlsm` are the readable formats;
 `.xlsb` and `.xls` are refused with a finding rather than half-parsed. A macro-enabled workbook is

@@ -719,7 +719,7 @@ def _stage_cell(
         *_comment("Intent", stage.intent),
     ]
     if stage.sources:
-        lines.extend(_comment("Sources", ", ".join(stage.sources)))
+        lines.extend(_comment_items("Sources", [source.render() for source in stage.sources]))
     if stage.depends_on:
         lines.extend(_comment("After", ", ".join(names[item] for item in stage.depends_on)))
     if stage.excel_pattern is not None:
@@ -866,6 +866,21 @@ def _comment(label: str, text: str, *, width: int = 92) -> list[str]:
     """Wrap prose into comment lines, so a long intent is not a 300-column line."""
     wrapped = textwrap.wrap(f"{label}: {text}", width=width) or [f"{label}:"]
     return [f"# {line}" for line in wrapped]
+
+
+def _comment_items(label: str, items: list[str], *, width: int = 92) -> list[str]:
+    """Comment lines for a list, one item per line where the joined list would wrap.
+
+    :func:`_comment` breaks prose at any space, and since schema 1.1 a rendered source *has* a
+    space in it — ``power_query Ratings``. Wrapped, a long list could end a line at
+    ``power_query`` and put the ref on the next, which reads as an origin nobody named. An item
+    is never split across two lines here; where they all fit on one, nothing changes.
+    """
+    joined = _comment(label, ", ".join(items), width=width)
+    if len(joined) <= 1:
+        return joined
+    continuation = " " * (len(label) + 2)
+    return [f"# {label}: {items[0]}", *(f"# {continuation}{item}" for item in items[1:])]
 
 
 # =============================================================================

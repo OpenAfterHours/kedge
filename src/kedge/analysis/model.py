@@ -100,6 +100,13 @@ class FindingKind(StrEnum):
 
     This list is the "extra control" pitch made concrete (PLAN §M1) and is expected to
     grow. Adding a member is additive; renaming one is a contract change.
+
+    Every member but one describes something found *in* the workbook.
+    `DOCUMENT_ATTACHED_BY_FILENAME` describes a decision kedge made about it: a sidecar
+    document was attached because its filename looked like a process document, not because
+    it shares the workbook's stem, so the association is a guess. It belongs here for the
+    same reason as the rest — the user is the only one who can tell whether the guess was
+    right, and a note silently attributed to the wrong workbook is worse than no note.
     """
 
     CIRCULAR_REFERENCE = "circular_reference"
@@ -127,6 +134,7 @@ class FindingKind(StrEnum):
     UNSUPPORTED_FORMAT = "unsupported_format"
     ITERATIVE_CALCULATION = "iterative_calculation"
     DEAD_REGION = "dead_region"
+    DOCUMENT_ATTACHED_BY_FILENAME = "document_attached_by_filename"
 
 
 class ExcelPattern(StrEnum):
@@ -333,9 +341,19 @@ class NamedRange(_Frozen):
 
 
 class ProcessNote(_Frozen):
-    """Prose describing the process, recovered from a sheet, a comment, or a Word file."""
+    """Prose describing the process, recovered from a sheet, a comment, or a sibling document.
 
-    source: Literal["sheet", "cell_comment", "docx", "doc_stub"]
+    `source` names what the prose had to be read out of, and it is user-facing: the report
+    renders it into the notes table and the planner sends it to the model. So `markdown` and
+    `plain_text` are two members rather than one. They differ in exactly the way the rest of
+    this field distinguishes its members — by what kedge could recover — since a markdown file
+    carries headings that can fill `heading`, and a `.txt` carries none, which makes an absent
+    `heading` mean "the file had none to give" in one case and "this part had none" in the
+    other. The distinction also warns the model that `#` and `-` in a markdown note are
+    structure rather than prose.
+    """
+
+    source: Literal["sheet", "cell_comment", "docx", "doc_stub", "markdown", "plain_text"]
     origin: str = Field(description="Sheet name or file path.")
     location: str | None = None
     text: str
@@ -516,6 +534,14 @@ class WorkbookAnalysis(_Frozen):
 
         Deliberately excludes formula bodies, references and sample values — those come
         back through `inspect_workbook` on demand. Progressive disclosure, not a dump.
+
+        Every string here is at full fidelity, the workbook-authored ones — the filename, the
+        sheet names — included, and bounding them is the business of whatever renders this rather
+        than of this method. Two consumers, two different needs: `kedge.plan.propose` seeds a plan
+        from this dict and that plan is written to disk, so a name clipped at the source would be
+        clipped in the artifact; `kedge.agent.context.build_analysis_block` pins it into a system
+        message and bounds its own copy there. Clipping here would corrupt the first to serve the
+        second.
         """
         return {
             "workbook": self.workbook.filename,

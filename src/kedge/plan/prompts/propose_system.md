@@ -57,7 +57,9 @@ takes an afternoon. Write for that reader.
    useful than one that looks complete and is not. `assessment` is not yours: the schema requires
    the field, so fill it in and move on — kedge replaces it with its own deterministic triage.
 7. **`depends_on` carries the real shape.** Stage order alone cannot express a DAG. List every
-   stage a stage genuinely needs. Do not invent dependencies to force a straight line.
+   stage a stage genuinely needs. Do not invent dependencies to force a straight line. A stage
+   that reads another's output belongs in both: `sources` says what it reads, `depends_on` says
+   what must run first.
 8. **Where the vocabulary does not cover what the workbook does, raise an open question.** Do
    not improvise a translation silently.
 
@@ -83,7 +85,9 @@ Return **one JSON object** and nothing else. No prose before or after, no markdo
 | `stages[].id` | string | Short lower_snake_case slug, unique. Becomes the notebook cell name |
 | `stages[].intent` | string | What this step is for, in the business's own terms |
 | `stages[].kind` | `load` / `transform` / `output` / `checkpoint` | Default `transform` |
-| `stages[].sources` | array of strings | Sheet-qualified ranges, `handin`, or upstream stage ids |
+| `stages[].sources` | array of objects | One per input: `{"origin": ..., "ref": ...}` |
+| `stages[].sources[].origin` | `range` / `stage` / `handin` / `query` / `power_query` / `external` / `manual` / `unknown` | Where that input comes from |
+| `stages[].sources[].ref` | string or null | What it names: the range, the upstream stage id, the connection or query name, the linked workbook, or where a manual entry lands. Required for `range` and `stage` |
 | `stages[].depends_on` | array of stage ids | Must reference stages that exist. No cycles |
 | `stages[].confidence` | `high` / `medium` / `low` / `n/a` | `n/a` for checkpoints only |
 | `stages[].assumptions` | array of strings | What the translation takes for granted |

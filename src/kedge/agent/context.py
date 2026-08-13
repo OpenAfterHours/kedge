@@ -87,12 +87,15 @@ __all__ = [
     "CARRY_BLOCK_TURNS",
     "CARRY_BUDGET_SHARE",
     "DIGEST_BUDGET_SHARE",
+    "MAX_ANOMALY_CHARS",
     "MAX_CARRIED_MESSAGES",
     "MAX_DIGEST_PROSE_CHARS",
     "MAX_DIGEST_PROSE_LINES",
     "MAX_EVICTED_ARGUMENT_CHARS",
     "MAX_EVICTED_SHAPE_CHARS",
+    "MAX_HEADER_CHARS",
     "MAX_REGISTRY_NAMES",
+    "MAX_WORKBOOK_NAME_CHARS",
     "CellFacts",
     "ContextMessage",
     "ConversationWindow",
@@ -167,6 +170,39 @@ render as, so it bounds what a session holds as well as what it sends."""
 MAX_PROFILE_ROWS = 60
 """Column profiles shipped by default. Full detail comes through ``inspect_workbook``."""
 
+MAX_HEADER_CHARS = 80
+"""Characters of a column header rendered into the analysis block (:func:`_clipped`).
+
+More than a sample value gets, because a header is a *name*: the model writes ``pl.col`` against
+it, :mod:`kedge.agent.validate` anchors on it, and a header cut to twenty-four characters stops
+being recognisable as the column the user calls by it. Eighty holds a full descriptive header —
+"Exposure at default after credit conversion factor (GBP)" is fifty-five — while leaving the rest
+of the profile line inside a sensible width, and it bounds the header cell that holds a paragraph
+instead: Excel allows 32,767 characters in a cell, and the profiler only strips the whitespace at
+either end of one, so unbounded this is the largest thing in a block re-sent on every completion of
+every turn."""
+
+MAX_ANOMALY_CHARS = 120
+"""Characters of one ``format_anomalies`` entry rendered into the analysis block.
+
+These are a fixed vocabulary, written by :func:`kedge.analysis.profile._anomalies` and not by the
+workbook: the longest member is "inconsistent casing (N value(s) differ only by case or padding in
+what looks like a key column)" at ninety-nine characters with its count filled in. A hundred and
+twenty clears every one of them, so in the ordinary case this bound never bites. It is here for the
+profile that did not come from that function — :func:`kedge.ingest.drift.profile_frame` builds the
+same :class:`~kedge.analysis.model.ColumnProfile`, and the model contract lets a caller put anything
+in the list — so that the field is bounded by the block rather than by whoever happened to fill
+it."""
+
+MAX_WORKBOOK_NAME_CHARS = 120
+"""Characters of a name the workbook supplies: sheet names, the filename, the summary's strings.
+
+Excel caps a worksheet name at thirty-one characters, so no name a workbook can legally carry is
+touched by this; a filename can reach the platform limit of two hundred and fifty-five, of which a
+hundred and twenty holds all but the most florid whole. What it bounds is the pathological case —
+a hand-built ``xlsx``, or a profile assembled by something other than the analyser — where a single
+name would otherwise be re-sent on every completion of every turn."""
+
 MAX_EVICTED_ARGUMENT_CHARS = 100
 """Ceiling on the arguments rendered into an eviction stub.
 
@@ -233,6 +269,17 @@ _DIGEST_DROPPED_PATTERN = re.compile(r"^- \[(\d+) earlier digest entr")
 :meth:`ConversationWindow.set_digest` does not forget how much it has already let go of."""
 
 _UNANSWERED_TOOL_CALL = "[no result — the turn stopped before this call completed]"
+
+_ELIDED = "…[+{count} chars]"
+"""What marks a workbook-authored name that was cut short (:func:`_clipped`).
+
+Visible, and carrying how much went, because these are names the model writes code against. A
+header quietly shortened to look whole is a ``pl.col`` for a column that does not exist, and that
+failure arrives at the kernel rather than here; a header that says it was cut sends the model to
+``inspect_workbook`` for the whole of it, which the block already tells it how to do."""
+
+_BACKTICK_RUN = re.compile("`+")
+"""Finds the longest run of backticks in the rendered summary, so the fence can outlast it."""
 
 
 # ── token counting ───────────────────────────────────────────────────────────────────────────
@@ -589,6 +636,15 @@ def build_analysis_block(
     so honestly, since it has :attr:`~kedge.analysis.model.WorkbookAnalysis.generated_at` in hand,
     and the cheapest place to say it: first in the pinned order, so it sits in the part of the
     prompt a cache keeps.
+
+    Every string the *workbook* supplies is bounded on the way in (:func:`_clipped`), because this
+    block is pinned into the system message and is line-oriented: a sheet name or a column header
+    holding a newline splits one profile line into two and the second half is read as a line of the
+    block's own, and one holding nothing in particular but a great deal of it is re-sent on every
+    completion of every turn, up to ``[agent] max_steps`` of them. What that buys is a block whose
+    structure and whose size are kedge's rather than the workbook's. It is not a fence around the
+    text itself, which still reaches the system message and still reads there with the authority
+    the system message has.
     """
     if analysis is None:
         return (
@@ -597,12 +653,14 @@ def build_analysis_block(
             "the workbook's structure."
         )
 
+    summary = json.dumps(_bounded_summary(analysis.summary()), indent=2, default=str)
+    fence = _fence_for(summary)
     lines = [
         "## Workbook analysis — summary",
         "",
-        "```json",
-        json.dumps(analysis.summary(), indent=2, default=str),
-        "```",
+        f"{fence}json",
+        summary,
+        fence,
         "",
         f"This describes the workbook as it was read at {analysis.generated_at:%Y-%m-%d %H:%M}; "
         "if the user tells you they have saved it from Excel since, this summary and every cached "
@@ -624,14 +682,13 @@ def build_analysis_block(
                     f" min={_short(profile.numeric.min)} max={_short(profile.numeric.max)}"
                     f" sum={_short(profile.numeric.sum)}"
                 )
-            anomalies = (
-                f" anomalies={'; '.join(profile.format_anomalies)}"
-                if profile.format_anomalies
-                else ""
-            )
+            marked = [_clipped(item, MAX_ANOMALY_CHARS) for item in profile.format_anomalies]
+            anomalies = f" anomalies={'; '.join(marked)}" if marked else ""
             redacted = " [redacted]" if profile.redacted else ""
+            sheet = _clipped(profile.sheet, MAX_WORKBOOK_NAME_CHARS)
+            header = _clipped(profile.header or "", MAX_HEADER_CHARS) or "(no header)"
             lines.append(
-                f"{profile.sheet}!{profile.column} {profile.header or '(no header)'}: "
+                f"{sheet}!{profile.column} {header}: "
                 f"{profile.dtype}, rows={profile.row_count}, nulls={profile.null_count}, "
                 f"distinct={profile.distinct_count}{numeric}{anomalies}{redacted} "
                 f"head=[{head}]"
@@ -677,7 +734,8 @@ def build_plan_block(plan: ProcessPlan | None) -> str:
         lines.append(f"- {stage.id} ({stage.kind.value}, {stage.confidence.value}){marker}{review}")
         lines.append(f"    intent: {stage.intent}")
         if stage.sources:
-            lines.append(f"    sources: {', '.join(stage.sources)}")
+            rendered = ", ".join(source.render() for source in stage.sources)
+            lines.append(f"    sources: {rendered}")
         if stage.depends_on:
             lines.append(f"    depends on: {', '.join(stage.depends_on)}")
         for assumption in stage.assumptions:
@@ -689,9 +747,88 @@ def build_plan_block(plan: ProcessPlan | None) -> str:
 
 
 def _short(value: Any, limit: int = 24) -> str:
-    text = "null" if value is None else str(value)
-    text = " ".join(text.split())
+    text = _flat("null" if value is None else value)
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _flat(value: Any) -> str:
+    """Render ``value`` as a single line, collapsing every run of whitespace to one space.
+
+    ``str.split`` with no separator splits on everything Python calls whitespace, which includes
+    every separator that renders as a line break: ``\\n``, ``\\r``, the vertical tab and form feed,
+    ``\\x85``, and ``\\u2028`` / ``\\u2029``. So what comes back cannot contain a line break
+    whatever the cell it came from held.
+    """
+    return " ".join(str(value).split())
+
+
+def _clipped(text: str, limit: int) -> str:
+    """Return a workbook-authored string on one line, bounded, and marked where it was cut.
+
+    Three things go wrong when this is skipped, and none of them is a security property.
+
+    The block is line-oriented and the model reads it by position and shape, so a value carrying a
+    newline does not merely look untidy: it splits one profile line into two, and the second half
+    is read as a line of the block's own. A value shaped like ``## Workbook analysis`` then reads
+    as a second section heading in a message the model treats as instructions. And an unbounded
+    value is re-sent on every completion of every turn — up to ``[agent] max_steps`` of them — and
+    lands ahead of everything a prompt cache would otherwise have kept behind it.
+
+    All three are fixed by making the string's shape and size kedge's rather than the workbook's.
+    None of that fences the *text*, which still reaches the system message and still reads there
+    with the authority the system message has; a clip is not a defence against text that is read
+    as instructions, and treating it as one would be worse than leaving it unbounded, because it
+    would let the next contributor believe the surface is fenced. What it narrows, it narrows by
+    accident and only in passing.
+
+    Args:
+        text: The workbook-authored string — a column header, a sheet name, an anomaly.
+        limit: Characters kept before the elision marker.
+
+    Returns:
+        One line of at most ``limit`` characters, with :data:`_ELIDED` appended where anything
+        was dropped. Empty in, empty out — the caller decides what an absent name renders as.
+    """
+    flat = _flat(text)
+    if len(flat) <= limit:
+        return flat
+    kept = flat[:limit].rstrip()
+    return kept + _ELIDED.format(count=len(flat) - len(kept))
+
+
+def _bounded_summary(value: Any) -> Any:
+    """Bound every string in a rendered summary, whatever key it arrived under.
+
+    Recursive rather than field by field, so that this does not restate the shape of
+    :meth:`~kedge.analysis.model.WorkbookAnalysis.summary` in a second place: a field added there
+    arrives here bounded rather than raw, which is exactly the way this defect got in. Values only.
+    The keys are kedge's own literals and are not the workbook's to write, and clipping two long
+    keys could collide them into one, which would lose a field rather than shorten it.
+
+    The clipping belongs here rather than in ``summary()`` because that dict is not only the
+    prompt's: :mod:`kedge.plan.propose` seeds a plan from it, and a plan is written to disk. What
+    is stored keeps full fidelity; only this copy is bounded.
+    """
+    if isinstance(value, str):
+        return _clipped(value, MAX_WORKBOOK_NAME_CHARS)
+    if isinstance(value, dict):
+        return {key: _bounded_summary(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_bounded_summary(item) for item in value]
+    return value
+
+
+def _fence_for(payload: str) -> str:
+    """Return a code fence long enough to outlast any run of backticks inside ``payload``.
+
+    CommonMark closes a fenced block on the first fence at least as long as the one that opened it,
+    and :func:`json.dumps` escapes a newline but not a backtick — so a sheet named ```` ``` ````,
+    which Excel permits since it bans only ``\\ / ? * [ ] :``, would close the fence early and
+    spill the rest of the block out of it. Three in the ordinary case, so the bytes a prompt cache
+    is holding do not move for the sake of a workbook that has none.
+    """
+    longest = max((len(run.group()) for run in _BACKTICK_RUN.finditer(payload)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 # ── the conversation window ──────────────────────────────────────────────────────────────────

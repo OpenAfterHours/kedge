@@ -436,6 +436,89 @@ def test_the_analysis_step_writes_the_analysis_and_the_report_beside_the_workboo
     assert client.get(f"/api/hub/report/{key}").status_code == 200
 
 
+# ── the contract the analysis step sketches ──────────────────────────────────────────────────
+
+
+def _pasted_workbook(tmp_path: Path) -> Path:
+    """The committed fixture: an `Extract` sheet holding the pasted result of a stored query."""
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "legacy_sql.xlsx"
+    if not fixture.is_file():  # pragma: no cover - the fixture is committed
+        pytest.skip("tests/fixtures/legacy_sql.xlsx has not landed yet")
+    destination = tmp_path / "processes" / "legacy_sql.xlsx"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(fixture.read_bytes())
+    return destination
+
+
+def test_opening_a_workbook_leaves_a_contract_the_notebook_can_enforce(
+    client: TestClient, tmp_path: Path, no_marimo: None, home: Path
+) -> None:
+    """The bootstrapping hole: no hand-in until there is a contract, no contract until a hand-in.
+
+    A process fed by a pasted query result has neither on the first run, and the scaffolded
+    check cell says plainly that it is enforcing nothing. The pasted sheet is last month's
+    version of the file the user is about to export, so opening the workbook leaves a contract
+    describing it -- and says in the step, and in the file, that it is a paste rather than an
+    export anybody has checked.
+    """
+    workbook = _pasted_workbook(tmp_path)
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+
+    job_id = client.post("/api/hub/open", json={"key": key}).json()["job_id"]
+    frames = _frames(client.get(f"/api/hub/open/{job_id}").text)
+
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    assert workspace.contract_path.is_file()
+    body = workspace.contract_path.read_text(encoding="utf-8")
+    assert "SKETCHED" in body
+    assert "trade_id" in body
+
+    analysed = [
+        frame
+        for frame in frames
+        if frame["type"] == "open_progress"
+        and frame["step"] == "analysing"
+        and frame["state"] == "ok"
+    ]
+    assert "Sketched contract.yaml from the 'Extract' sheet" in analysed[-1]["detail"]
+    assert "read it" in analysed[-1]["detail"]
+
+
+def test_a_contract_that_is_already_there_is_never_replaced_by_a_sketch(
+    tmp_path: Path, home: Path
+) -> None:
+    """It may have been tightened by somebody who knows what the process receives."""
+    from kedge.analysis.analyse import analyse
+    from kedge.server.hub import _sketch_contract
+
+    workbook = _pasted_workbook(tmp_path)
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.contract_path.write_text("name: tightened-by-hand\n", encoding="utf-8")
+
+    detail = _sketch_contract(workspace, analyse(workbook))
+
+    assert workspace.contract_path.read_text(encoding="utf-8") == "name: tightened-by-hand\n"
+    assert "left as it is" in detail
+
+
+def test_a_workbook_with_no_pasted_sheet_opens_anyway_and_says_why(
+    tmp_path: Path, home: Path
+) -> None:
+    """No contract is the state every workbook was in before this existed. It is never fatal."""
+    from kedge.analysis.analyse import analyse
+    from kedge.server.hub import _sketch_contract
+
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+
+    detail = _sketch_contract(workspace, analyse(workbook))
+
+    assert not workspace.contract_path.exists()
+    assert detail.startswith("No contract was sketched:")
+
+
 def test_the_stream_replays_everything_a_finished_job_said(client: TestClient) -> None:
     """A reloaded tab must be caught up, not join a sequence it cannot infer the start of."""
     state = _state(client)

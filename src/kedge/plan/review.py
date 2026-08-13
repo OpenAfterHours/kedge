@@ -38,12 +38,14 @@ from kedge.plan.model import (
     OpenQuestion,
     PlanError,
     ProcessPlan,
+    SourceOrigin,
     Stage,
+    StageSource,
 )
 from kedge.plan.triage import complexity
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from kedge.analysis.model import WorkbookAnalysis
     from kedge.plan.triage import TriageResult
@@ -150,6 +152,12 @@ def reorder_stages(plan: ProcessPlan, order: Sequence[str]) -> ProcessPlan:
 def edit_stage(plan: ProcessPlan, stage_id: str, **changes: Any) -> ProcessPlan:
     """Replace named fields on one stage.
 
+    Sources are classified with the rest of the plan in hand, through
+    :meth:`~kedge.plan.model.Stage.validate_in_plan`. ``Stage.model_validate`` on its own cannot
+    tell an upstream stage id from a named range, so an edit passing ``sources=["load_handin"]``
+    would land as ``unknown`` where the identical text in the plan's YAML lands as ``stage`` — the
+    edit verb quietly weakening a plan it is holding open.
+
     Args:
         plan: The plan to revise.
         stage_id: The stage to edit.
@@ -158,7 +166,7 @@ def edit_stage(plan: ProcessPlan, stage_id: str, **changes: Any) -> ProcessPlan:
     stage = _require_stage(plan, stage_id)
     raw = stage.model_dump(mode="python")
     raw.update(changes)
-    updated = Stage.model_validate(raw)
+    updated = Stage.validate_in_plan(raw, plan.stage_ids)
     stages = [updated if item.id == stage_id else item for item in plan.stages]
     renamed = updated.id != stage_id
     if renamed:
@@ -182,11 +190,12 @@ def add_stage(plan: ProcessPlan, stage: Stage, *, after: str | None = None) -> P
 
 
 def remove_stage(plan: ProcessPlan, stage_id: str) -> ProcessPlan:
-    """Remove a stage, detaching any dependencies on it.
+    """Remove a stage, detaching any dependency on it and any source that read it.
 
     Dependencies are dropped rather than rewired: guessing which of the removed stage's own
     dependencies should take its place is exactly the sort of silent decision this whole module
-    exists to prevent.
+    exists to prevent. A source naming it goes the same way, for the same reason — and because a
+    source pointing at a stage that is no longer in the plan will not validate.
     """
     _require_stage(plan, stage_id)
     remaining = [stage for stage in plan.stages if stage.id != stage_id]
@@ -194,7 +203,16 @@ def remove_stage(plan: ProcessPlan, stage_id: str) -> ProcessPlan:
         msg = "a plan needs at least one stage; removing the last one is not a review action"
         raise PlanError(msg)
     detached = [
-        stage.model_copy(update={"depends_on": [d for d in stage.depends_on if d != stage_id]})
+        stage.model_copy(
+            update={
+                "depends_on": [d for d in stage.depends_on if d != stage_id],
+                "sources": [
+                    source
+                    for source in stage.sources
+                    if not (source.origin is SourceOrigin.STAGE and source.ref == stage_id)
+                ],
+            }
+        )
         for stage in remaining
     ]
     return _revise(plan, stages=[stage.model_dump(mode="python") for stage in detached])
@@ -245,6 +263,9 @@ def merge_stages(
     the merged stages themselves; anything depending on any of them now depends on the merged
     stage. Confidence takes the lowest of the merged stages, because a merged step is only as
     trustworthy as its weakest part.
+
+    A source naming one of the merged stages drops out of the union along with the dependency on
+    it: an edge between two stages that are now one stage is not an input any more.
     """
     if len(stage_ids) < 2:
         msg = "merging needs at least two stages"
@@ -261,7 +282,12 @@ def merge_stages(
         id=into_id,
         intent=intent or "; ".join(stage.intent for stage in merged),
         kind=merged[0].kind,
-        sources=_unique(source for stage in merged for source in stage.sources),
+        sources=_unique(
+            source
+            for stage in merged
+            for source in stage.sources
+            if not (source.origin is SourceOrigin.STAGE and source.ref in ids)
+        ),
         depends_on=_unique(
             dependency
             for stage in merged
@@ -298,19 +324,53 @@ _CONFIDENCE_RANK = {
 
 
 def _repoint(stage: Stage, mapping: dict[str, str]) -> Stage:
-    """Rewrite a stage's dependencies through an id mapping, dropping self-references."""
+    """Rewrite a stage's dependencies *and* its stage sources through an id mapping.
+
+    Sources travel with dependencies because both name a stage and, since schema 1.1, both are
+    validated. A rename or a merge that rewrote one and left the other would point a source at an
+    id that no longer exists, and the revalidation :func:`_revise` runs would then reject the
+    *edit* — a reviewer renaming a stage would be told their plan reads an unknown one.
+
+    Self-references are dropped rather than kept: after a merge, a source naming one of the merged
+    stages is describing the stage it is now part of.
+
+    Only sources the mapping *moved* are de-duplicated. A merge legitimately collapses two edges
+    onto one stage and the second is then noise, but a stage that already listed the same range
+    twice said so deliberately — under 1.0 a source was a bare string and repeating one was how
+    you said "twice" — and a rename somewhere else in the plan is no reason to edit it.
+    """
     repointed = _unique(
         mapping.get(dependency, dependency)
         for dependency in stage.depends_on
         if mapping.get(dependency, dependency) != stage.id
     )
-    if repointed == stage.depends_on:
+    sources: list[StageSource] = []
+    for original in stage.sources:
+        source = _moved(original, mapping)
+        if source.origin is SourceOrigin.STAGE and source.ref == stage.id:
+            continue
+        if source is not original and source in sources:
+            continue
+        sources.append(source)
+    if repointed == stage.depends_on and sources == stage.sources:
         return stage
-    return stage.model_copy(update={"depends_on": repointed})
+    return stage.model_copy(update={"depends_on": repointed, "sources": sources})
 
 
-def _unique(values: Any) -> list[str]:
-    """Order-preserving de-duplication."""
+def _moved(source: StageSource, mapping: dict[str, str]) -> StageSource:
+    """A stage source pointing at wherever the stage it names has gone."""
+    if source.origin is not SourceOrigin.STAGE or source.ref not in mapping:
+        return source
+    return source.model_copy(update={"ref": mapping[source.ref]})
+
+
+def _unique[T](values: Iterable[T]) -> list[T]:
+    """Order-preserving de-duplication.
+
+    Generic because it de-duplicates two different things now: dependency ids, and the frozen
+    :class:`~kedge.plan.model.StageSource` objects a merge unions. Both are hashable; a frozen
+    pydantic model is.
+    """
     return list(dict.fromkeys(values))
 
 
@@ -634,6 +694,19 @@ def review_warnings(
 
     warnings.extend(plan.ordering_warnings())
 
+    for stage in plan.stages:
+        unlisted = [
+            upstream
+            for upstream in stage.upstream_stage_ids
+            if upstream not in stage.depends_on and upstream != stage.id
+        ]
+        if unlisted:
+            warnings.append(
+                f"stage {stage.id!r} reads {', '.join(unlisted)} but does not depend on "
+                f"{'them' if len(unlisted) > 1 else 'it'} — the scaffolder emits in depends_on "
+                f"order, so that frame may not exist yet when this stage runs"
+            )
+
     low = plan.low_confidence_stages
     if low:
         warnings.append(
@@ -768,7 +841,7 @@ def _render_stage(index: int, stage: Stage) -> list[str]:
     if stage.depends_on:
         lines.append(f"      after: {', '.join(stage.depends_on)}")
     if stage.sources:
-        lines.append(_wrap(f"sources: {', '.join(stage.sources)}", indent="      "))
+        lines.append(_render_sources(stage))
     if stage.excel_pattern is not None:
         lines.append(f"      pattern: {stage.excel_pattern.value}")
     if stage.operations:
@@ -784,6 +857,24 @@ def _render_stage(index: int, stage: Stage) -> list[str]:
     if stage.notes:
         lines.append(_wrap(f"note: {stage.notes}", indent="      "))
     return lines
+
+
+def _render_sources(stage: Stage, *, indent: str = "      ") -> str:
+    """The ``sources`` line, or one line per source where they will not fit on one.
+
+    ``_wrap`` breaks prose at any space, and since 1.1 a rendered source *has* a space in it —
+    ``power_query Ratings``. A wrapped list could therefore end a line at ``power_query`` and put
+    the ref on the next, which reads as a bare origin: the reader sees a Power Query table with no
+    name where the plan named one. One source per line costs a few rows and cannot say that.
+    """
+    rendered = [source.render() for source in stage.sources]
+    one_line = _wrap(f"sources: {', '.join(rendered)}", indent=indent)
+    if "\n" not in one_line:
+        return one_line
+    continuation = indent + " " * len("sources: ")
+    return "\n".join(
+        [f"{indent}sources: {rendered[0]}", *(continuation + item for item in rendered[1:])]
+    )
 
 
 def _wrap(text: str, *, indent: str, width: int = 96) -> str:
@@ -861,6 +952,19 @@ _DIFFED_STAGE_FIELDS = (
 )
 
 
+def _diffable(stage: Stage) -> dict[str, Any]:
+    """A stage as flat JSON, with its sources rendered rather than dumped.
+
+    A diff is read, not parsed. ``sources: ['range Calc!H2:H500'] -> [...]`` is the line somebody
+    reviewing a change wants; the mapping each source dumps to is the same information spelled at
+    three times the width. Rendering loses nothing a diff needs, because two sources render the
+    same only when their origin and ref are the same.
+    """
+    raw = stage.model_dump(mode="json")
+    raw["sources"] = [source.render() for source in stage.sources]
+    return raw
+
+
 def diff_plans(before: ProcessPlan, after: ProcessPlan) -> PlanDiff:
     """Compare two plan versions field by field.
 
@@ -884,8 +988,8 @@ def diff_plans(before: ProcessPlan, after: ProcessPlan) -> PlanDiff:
         new = after.stage(stage_id)
         if old is None or new is None:
             continue
-        old_raw = old.model_dump(mode="json")
-        new_raw = new.model_dump(mode="json")
+        old_raw = _diffable(old)
+        new_raw = _diffable(new)
         differing = tuple(
             name for name in _DIFFED_STAGE_FIELDS if old_raw.get(name) != new_raw.get(name)
         )

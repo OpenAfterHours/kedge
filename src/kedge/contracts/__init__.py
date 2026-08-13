@@ -17,6 +17,12 @@ everybody can correct a generated one -- so a draft is generated from a real han
 :func:`to_yaml` renders it with a comment against every guess saying what it was derived from
 and what would make it better.
 
+:func:`sketch` bootstraps the bootstrap. A process fed by a pasted query result has no hand-in
+until the user produces one, and nothing tells them what the notebook expects until the check
+fails -- so a contract is sketched from the pasted sheet's own column profiles instead, which
+is last month's version of the file they are about to export. It says so in the file, and it is
+deliberately looser than an inferred draft.
+
 The intended notebook sequence::
 
     contract = kedge.contracts.load(Path("contracts/exposures.yaml"))
@@ -26,7 +32,7 @@ The intended notebook sequence::
 
 from __future__ import annotations
 
-from kedge.contracts.infer import infer, infer_with_notes, to_yaml, write_yaml
+from kedge.contracts.infer import Commentary, infer, infer_with_notes, to_yaml, write_yaml
 from kedge.contracts.model import (
     CheckResult,
     CheckStatus,
@@ -39,6 +45,7 @@ from kedge.contracts.model import (
     load_contract,
     save_contract,
 )
+from kedge.contracts.sketch import SheetSketch, sketch, write_sketch
 from kedge.contracts.validate import validate, validate_frame, validate_path
 
 load = load_contract
@@ -52,9 +59,11 @@ __all__ = [
     "CheckStatus",
     "ChecksumMode",
     "ColumnContract",
+    "Commentary",
     "Contract",
     "ContractFileError",
     "ContractViolationError",
+    "SheetSketch",
     "ValidationReport",
     "infer",
     "infer_with_notes",
@@ -62,9 +71,11 @@ __all__ = [
     "load_contract",
     "save",
     "save_contract",
+    "sketch",
     "to_yaml",
     "validate",
     "validate_frame",
     "validate_path",
+    "write_sketch",
     "write_yaml",
 ]

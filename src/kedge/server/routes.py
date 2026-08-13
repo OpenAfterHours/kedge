@@ -649,7 +649,9 @@ def _proposal_payload(
                 "kind": stage.kind.value,
                 "intent": stage.intent,
                 "confidence": stage.confidence.value,
-                "sources": list(stage.sources),
+                # Rendered rather than structured: the card is a reading surface, and `app.js`
+                # joins these into a line. `range Calc!H2:H500` says more than the bare range did.
+                "sources": [source.render() for source in stage.sources],
                 "depends_on": list(stage.depends_on),
                 "assumptions": list(stage.assumptions),
                 "operations": list(stage.operations),

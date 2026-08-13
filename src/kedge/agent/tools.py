@@ -650,30 +650,28 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         name="propose_plan",
         description=(
             "Author the process plan: the stages in order, what each is for, where its inputs "
-            "come from, what it assumes, and what you still do not know. Read the workbook first "
-            "and call this once you can defend the decomposition — a plan is a reading of the "
-            "workbook, not a guess at one, and it is refused outright until you have used "
-            "inspect_workbook, sample_data, profile_column or read_range at least once. An "
-            "account left in the chat is compacted away as the conversation grows; a plan is on "
-            "disk, versioned, diffable and in front of you on every later turn. Requires the "
-            "user's approval exactly like the original planning step, so this records the "
-            "proposal and surfaces it; it writes nothing and changes no instructions. Refused "
-            "once a plan has been approved, and refused outright for a workbook kedge's own "
-            "triage has recommended against converting."
+            "come from, what it assumes, and what you still do not know. Read the workbook "
+            "first — a plan is a reading of it, not a guess at one, and this is refused until you "
+            "have used inspect_workbook, sample_data, profile_column or read_range at least once. "
+            "An account left in the chat is compacted away as the conversation grows; a plan is "
+            "on disk, versioned and in front of you on every later turn. Requires the user's "
+            "approval like the original planning step: it records the proposal and surfaces it, "
+            "writing nothing and changing no instructions. Refused once a plan is approved, and "
+            "for a workbook kedge's triage recommended against converting."
         ),
         properties={
             "plan": _string(
                 'The plan as a JSON object: {"summary": one or two sentences on the shape of the '
                 'process, "stages": [{"id": short slug, becomes the cell name, "intent": what the '
-                'step is for in the business\'s own terms, "kind": load|transform|output|'
-                'checkpoint, "sources": sheet-qualified ranges, "handin", or upstream stage ids, '
-                '"depends_on": stage ids that must run first, "confidence": high|medium|low, '
-                '"assumptions": what the translation takes for granted, "operations": ids of the '
-                'analysis operations this implements, "excel_pattern": the pattern it translates'
-                '}], "open_questions": what you could not work out — required, and an empty list '
-                'on a complex workbook is itself suspicious, "dropped": [{"range": ..., "reason": '
-                "...}]}. Only id and intent are required of a stage. Send no assessment: "
-                "convertibility is scored by kedge's own triage, not by you."
+                'step is for in the business\'s terms, "kind": load|transform|output|checkpoint, '
+                '"sources": [{"origin": range|stage|handin|query|power_query|external|manual|'
+                'unknown, "ref": what it names}], "depends_on": stage ids that must run first, '
+                '"confidence": high|medium|low, "assumptions": what the translation takes for '
+                'granted, "operations": ids of the analysis operations it implements, '
+                '"excel_pattern": the pattern it translates}], "open_questions": what you could '
+                "not work out — required, and an empty list on a complex workbook is itself "
+                'suspicious, "dropped": [{"range": ..., "reason": ...}]}. Only id and intent are '
+                "required. Send no assessment: convertibility is scored by kedge's triage."
             )
         },
         required=("plan",),
@@ -832,7 +830,12 @@ class ToolContext:
         driver: NotebookBridge | None = None,
         plans: PlanStore | None = None,
     ) -> ToolContext:
-        """Build a context from a workspace, reading the caps and redaction rules from config."""
+        """Build a context from a workspace, reading caps, redaction and ``[policy]`` from config.
+
+        The allowlists are the only route by which anything ever reaches
+        :class:`~kedge.agent.validate.Policy`, so a machine with no ``[policy]`` section gets the
+        documented default: no network, no database.
+        """
         from kedge.plan.store import PlanStore as _PlanStore
 
         config = workspace.config
@@ -843,7 +846,11 @@ class ToolContext:
             driver=driver,
             plans=plans or _PlanStore.for_workspace(workspace),
             caps=Caps.from_config(config),
-            policy=Policy(working_dir=workspace.project_dir),
+            policy=Policy(
+                working_dir=workspace.project_dir,
+                network_allowlist=frozenset(config.policy.network_allowlist),
+                database_allowlist=frozenset(config.policy.database_allowlist),
+            ),
             rounding=RoundingContext.from_analysis(analysis),
             knowledge_dir=_first_existing(workspace, "context"),
             utils_dir=_first_existing(workspace, "utils"),

@@ -758,10 +758,15 @@ async def _step_cleanup(workspace: Workspace, job: OpenJob, *, reattach: bool) -
 
 
 async def _step_analyse(workspace: Workspace, job: OpenJob) -> Any:
-    """Analyse the workbook offline, and write both the analysis and the HTML report.
+    """Analyse the workbook offline, and write the artifacts that come off the analysis.
 
     The report is written here rather than on demand so that the hub's "Report" link is real the
-    first time a workbook is opened, instead of being a button that generates something.
+    first time a workbook is opened, instead of being a button that generates something. The
+    contract sketch is written here for a stronger reason, in :func:`_sketch_contract`.
+
+    The sketch rides on this step's frame rather than getting its own because ``OpenStep`` is a
+    closed vocabulary shared with the client (``server/events.py``), and this is the step that
+    already turns the analysis into files. Its detail line says what was written.
     """
     from kedge.analysis.analyse import analyse
     from kedge.report import write_report
@@ -773,14 +778,53 @@ async def _step_analyse(workspace: Workspace, job: OpenJob) -> Any:
     workspace.analysis_path.write_text(analysis.model_dump_json(indent=2), encoding="utf-8")
     with contextlib.suppress(OSError):
         await run_in_threadpool(write_report, analysis, report_path_for(workspace))
+    contract = await run_in_threadpool(_sketch_contract, workspace, analysis)
 
     job.step(
         "analysing",
         "ok",
         f"{len(analysis.sheets)} sheet(s), {len(analysis.operations)} logical operation(s), "
-        f"{len(analysis.findings)} finding(s) of which {len(analysis.errors)} error(s)",
+        f"{len(analysis.findings)} finding(s) of which {len(analysis.errors)} error(s). "
+        f"{contract}",
     )
     return analysis
+
+
+def _sketch_contract(workspace: Workspace, analysis: Any) -> str:
+    """Draft the hand-in contract from the workbook's own pasted sheet, and say what happened.
+
+    The bootstrapping hole this closes: a process fed by a pasted query result has no hand-in
+    until the user produces one, and until there is a contract the scaffolded check cell enforces
+    nothing and says so. Both ends of that wait for the other. The workbook itself breaks the
+    deadlock -- the pasted sheet is last month's version of the file they are about to export --
+    so the notebook opens with something to read rather than with a blank where the agreement
+    should be.
+
+    Three rules keep it honest. An existing contract is never touched, because it may have been
+    hand-tuned and a sketch is the weaker description. A workbook the sketch cannot speak for --
+    no pasted sheet, several of them, no header row -- is left alone, and the reason is reported
+    rather than guessed past. And nothing here is fatal: a notebook that opens with no contract
+    is the state every workbook was in before this existed.
+
+    Returns:
+        One sentence for the step's detail line. Never raises.
+    """
+    from kedge.contracts.sketch import sketch, write_sketch
+
+    path = workspace.contract_path
+    if path.exists():
+        return f"The contract at {path.name} was left as it is."
+    try:
+        drafted = sketch(analysis)
+        write_sketch(drafted, path)
+    except (KedgeError, OSError, ValueError) as exc:
+        logger.info("no contract sketched for %s: %s", workspace.workbook_path.name, exc)
+        return f"No contract was sketched: {exc}"
+    return (
+        f"Sketched {path.name} from the '{drafted.sheet}' sheet "
+        f"({len(drafted.contract.columns)} column(s)) so the notebook has one before the first "
+        f"hand-in -- it describes a paste, not an export kedge has checked, so read it."
+    )
 
 
 async def _step_plan(workspace: Workspace, job: OpenJob) -> Any:

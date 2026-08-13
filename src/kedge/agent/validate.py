@@ -108,6 +108,89 @@ _NETWORK_MODULES = frozenset(
     }
 )
 
+_DATABASE_MODULES = frozenset(
+    {
+        "MySQLdb",
+        "aioodbc",
+        "asyncpg",
+        "clickhouse_connect",
+        "connectorx",
+        "cx_Oracle",
+        "ibm_db",
+        "ibm_db_dbi",
+        "mariadb",
+        "mysql",
+        "oracledb",
+        "psycopg",
+        "psycopg2",
+        "pyhive",
+        "pymssql",
+        "pymysql",
+        "pyodbc",
+        "redshift_connector",
+        "snowflake",
+        "teradatasql",
+        "turbodbc",
+        "vertica_python",
+    }
+)
+"""Drivers whose only purpose is to open a connection to a database server.
+
+Importing one is the whole signal: there is nothing else to do with ``pyodbc``. These are absent
+from :data:`_NETWORK_MODULES` on purpose — the refusal a database connection needs says something
+different from the one an HTTP fetch needs, because a DSN is not a URL.
+
+The list will never be complete, which is why :func:`_check_database` also treats a literal that
+*is* a connection string as a signal in its own right: an unlisted driver handed a
+``postgresql://warehouse.internal/risk`` is still a connection to a warehouse."""
+
+_DATABASE_MODULE_PREFIXES = ("adbc_driver_",)
+"""ADBC ships one distribution per backend — ``adbc_driver_postgresql``,
+``adbc_driver_snowflake`` — so the family is matched by prefix rather than enumerated and left to
+go stale as backends are added."""
+
+_DUAL_USE_DATABASE_MODULES = frozenset({"duckdb", "sqlalchemy"})
+"""Modules that reach a server only sometimes.
+
+``duckdb`` over a local parquet file is not network access at all, and ``sqlalchemy`` is imported
+by plenty of code that never connects, so importing these is not enough: they count only where a
+*call* on them shows a connection — a server-shaped DSN in its own arguments, or a database entry
+point. The trade is deliberate and it buys a false pass — a MotherDuck ``md:`` connection names no
+recognised scheme and goes through, as does ``duckdb`` reading an ``https://`` parquet file."""
+
+_POLARS_DATABASE_CALLS = frozenset({"read_database", "read_database_uri"})
+"""polars' own database readers. Module functions, so the receiver is ``pl`` or ``polars``."""
+
+_FRAME_DATABASE_CALLS = frozenset({"write_database"})
+"""``DataFrame.write_database``: a *method*, so there is no module receiver to require — the
+receiver is whatever the frame is called. Matched on the tail alone for that reason, and it is the
+one entry point where that trade is clearly worth it: a write to a warehouse is the failure in
+this module a reviewer cannot undo."""
+
+_ENGINE_CALLS = frozenset({"create_engine"})
+"""``sqlalchemy.create_engine``, recognised on ``sqlalchemy.create_engine(...)`` or on a bare
+``create_engine(...)`` this cell imported from sqlalchemy itself."""
+
+_DATABASE_CALLS = _POLARS_DATABASE_CALLS | _FRAME_DATABASE_CALLS | _ENGINE_CALLS
+"""Database entry points that import nothing suspicious, so the call is the only thing to match.
+
+``pl.read_database_uri(...)`` hands the URI to connectorx *inside* polars, and a cell that reads
+or writes a warehouse through it imports only ``polars``. ``create_engine`` is here from the other
+direction: importing ``sqlalchemy`` proves nothing, but calling it is unambiguous.
+
+Each is matched with its receiver root rather than on the tail alone, which is what keeps
+``handins.read_database("rates_2024")`` and ``create_engine("mpl")`` out of the gate's way. The
+receiver is not resolved through this cell's alias map — under marimo's single-definition rule the
+``import polars as pl`` lives in another cell — so ``pl`` and ``polars`` are both accepted as
+written. The cost is a false pass on ``sa.create_engine(...)`` where the alias is bound elsewhere,
+and a false pass is the direction this module errs in.
+
+Every name here is also a valid ``[policy] database_allowlist`` entry: the two-cell shape marimo
+forces — the engine in one cell, the read in the next — leaves the reading cell with nothing but
+the entry point to name."""
+
+_POLARS_ROOTS = frozenset({"pl", "polars"})
+
 _WRITE_CALLS = frozenset(
     {
         "open",
@@ -156,8 +239,14 @@ _CREDENTIAL_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         "a credential",
     ),
     (
+        # Any `scheme://user:password@host`, and the scheme may carry a SQLAlchemy driver suffix.
+        # Naming the schemes and anchoring on `\b` was the earlier spelling and it had a hole
+        # exactly where it mattered: there is no word boundary inside "pyodbc", so
+        # `mssql+pyodbc://user:pass@host` — the tidiest way to write the worst literal in this
+        # file — matched nothing, while the same URI assigned to `connection_string` was caught by
+        # _CREDENTIAL_NAMES. The scheme is not the interesting part; the `:secret@` is.
         re.compile(
-            r"(?i)\b(?:jdbc|odbc|mongodb|postgres(?:ql)?|mysql|redis)://[^\s'\"]*:[^\s'\"@]+@"
+            r"(?i)(?<![A-Za-z0-9])[a-z][a-z0-9]*(?:\+[a-z0-9_]+)?://[^\s'\"/@]*:[^\s'\"/@]+@"
         ),
         "a connection string with an embedded password",
     ),
@@ -167,6 +256,43 @@ _CREDENTIAL_NAMES = re.compile(
     r"(?i)^_*(?:api_?key|apikey|secret|password|passwd|pwd|token|access_?token|"
     r"client_?secret|private_?key|conn(?:ection)?_?string)$"
 )
+
+_DSN_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:jdbc|odbc|postgres(?:ql)?|mysql|mariadb|mssql|sqlserver|oracle|"
+    r"snowflake|databricks|clickhouse|redshift|trino|presto|hive|mongodb|bigquery|athena|"
+    r"teradata|db2|vertica|cockroachdb)(?:\+[a-z0-9_]+)?://(?P<authority>[^\s'\"/?#]*)"
+)
+"""A connection string that names a *server*, with its ``user:password@host:port`` authority.
+
+``sqlite://`` and ``duckdb://`` are deliberately absent: they name a local file, and treating them
+as connections is what would make the gate reject a duckdb cell reading a parquet file off the
+disk beside the notebook."""
+
+_ODBC_DSN_PATTERN = re.compile(r"(?i)(?:\A|;)\s*(?:server|dsn|host|account)\s*=\s*([^;\s]+)")
+"""The other spelling of a connection target: ``DRIVER={...};SERVER=warehouse.internal;...``.
+
+Also matches a libpq keyword string (``host=warehouse dbname=risk``), since the key is at the
+start there. A ``DSN=`` name is not a hostname and never will be, which is the whole reason
+:attr:`Policy.database_allowlist` is a separate list from :attr:`Policy.network_allowlist`.
+
+The captured value is filtered by :func:`_odbc_target` rather than trusted, because this pattern
+also fires inside SQL: ``select 1 where c = 'a;server=prod'`` reaches ``;server=prod'``, and a
+refusal telling the user to allowlist ``"prod'"`` is worse than no refusal at all."""
+
+_HOST_SHAPED = re.compile(r"\A[A-Za-z0-9_][A-Za-z0-9._\-]*\Z")
+"""What an ODBC value has to look like before kedge will call it a connection target: a hostname,
+a DSN entry name or an account locator, and nothing that has come out of a SQL string by
+accident."""
+
+_CONNECTION_STRING_HEAD = re.compile(
+    r"(?i)\A\s*(?:[a-z][a-z0-9]*(?:\+[a-z0-9_]+)?://|[a-z_]\w*\s*=)"
+)
+"""Whether a literal *is* a connection string rather than prose that mentions one.
+
+Only literals that begin with a scheme or a keyword pair count when there is no recognised call to
+attribute them to (:func:`_unattributed_connection_strings`). A sentence that names the system
+being replaced — ``"mirrors the query that ran against postgresql://warehouse.internal/risk"`` —
+is what good conversion work looks like, and refusing it teaches the model to stop writing it."""
 
 
 # ── vocabulary ───────────────────────────────────────────────────────────────────────────────
@@ -213,31 +339,62 @@ class CellNames:
         return tuple(name for name in self.defs if not name.startswith("_"))
 
 
+def _allowlisted(target: str, allowed: frozenset[str]) -> bool:
+    """Whether ``target`` is on ``allowed``, exactly or as a child of an allowed parent."""
+    needle = target.lower().strip()
+    return any(needle == entry.lower() or needle.endswith("." + entry.lower()) for entry in allowed)
+
+
 @dataclass(frozen=True, slots=True)
 class Policy:
     """What generated code is allowed to reach for.
 
-    ``working_dir`` bounds writes. ``network_allowlist`` holds hostnames; it is empty by default,
-    which means no network at all — a conversion notebook reads a workbook and a hand-in from
-    disk, and anything else is a question for the user rather than a default.
+    ``working_dir`` bounds writes. The two allowlists are empty by default, which means no network
+    and no database at all — a conversion notebook reads a workbook and a hand-in from disk, and
+    anything else is a question for the user rather than a default. Both are populated from
+    ``[policy]`` in config (:class:`kedge.config.PolicyConfig`); until that section exists on the
+    machine, the default *is* the whole policy.
+
+    They are separate lists because they answer different questions. ``network_allowlist`` holds
+    hostnames and is matched against what :func:`urllib.parse.urlparse` finds in an ``http(s)://``
+    literal. ``database_allowlist`` is matched against whatever a connection names, which is often
+    not a hostname at all: an ODBC ``DSN=RiskWarehouse`` entry, a Snowflake account locator, or —
+    where the DSN is assembled at run time and there is nothing in the cell to read — the driver
+    module itself. One list matching both would have to pretend those are the same kind of name.
 
     Example:
         >>> Policy(network_allowlist=frozenset({"internal.example"})).allows_host("internal.example")
+        True
+        >>> Policy(database_allowlist=frozenset({"pyodbc"})).permits_database("pyodbc")
         True
     """
 
     working_dir: Path | None = None
     network_allowlist: frozenset[str] = frozenset()
+    database_allowlist: frozenset[str] = frozenset()
     allow_pandas: bool = False
     """The explicit escape hatch PLAN 2.5 asks for. Off, and expected to stay off."""
 
     def allows_host(self, host: str) -> bool:
         """Whether ``host`` is on the allowlist, matching subdomains of an allowed domain."""
-        target = host.lower().strip()
-        return any(
-            target == allowed.lower() or target.endswith("." + allowed.lower())
-            for allowed in self.network_allowlist
-        )
+        return _allowlisted(host, self.network_allowlist)
+
+    def permits_database(self, target: str) -> bool:
+        """Whether a connection target, driver module or entry point is allowlisted.
+
+        Matched the same way a hostname is, so an entry of ``internal.bank`` also permits
+        ``warehouse.internal.bank``. A DSN name has no parent domain, so for one of those this is
+        exact-match with the case folded.
+
+        Four kinds of name reach here, and all four are things a user writes in
+        ``database_allowlist``: a host (``warehouse.internal``), a DSN entry or account locator
+        (``riskwarehouse``), a driver module (``pyodbc``) and an entry point
+        (``read_database``, ``write_database``, ``create_engine``). The last exists because
+        marimo's single-definition rule splits the ordinary workflow across two cells — the engine
+        in one, the read in the next — and the reading cell contains no host, no driver import and
+        nothing else a user could name.
+        """
+        return _allowlisted(target, self.database_allowlist)
 
     def permits_write(self, target: str) -> bool:
         """Whether a literal write path is inside the working directory.
@@ -469,6 +626,39 @@ def _dotted(node: ast.expr) -> str:
     return ".".join(reversed(parts))
 
 
+def _receiver_chain(node: ast.expr) -> str:
+    """The dotted name a call is made *on*, or ``""`` when a call sits in the receiver chain.
+
+    :func:`_dotted` looks through a chained call on purpose, so ``Path("x").write_text`` still
+    reads as a write. For deciding what a call *is*, that is wrong in both directions:
+    ``requests.get(url).json()`` is a call on a response object rather than on ``requests``, and
+    ``pyodbc.connect(dsn).cursor()`` is one connection, not two.
+    """
+    parts: list[str] = []
+    current: ast.expr = node
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return ""
+    parts.append(current.id)
+    return ".".join(reversed(parts))
+
+
+def _call_name(node: ast.Call, aliases: dict[str, str]) -> tuple[str, str, str]:
+    """A call's receiver-resolved name, split into ``(dotted, root, tail)``.
+
+    Empty strings where the receiver is not a plain name chain, which reads as "not a call on
+    anything this module recognises".
+    """
+    chain = _receiver_chain(node.func)
+    if not chain:
+        return "", "", ""
+    head, _, rest = chain.partition(".")
+    resolved = f"{aliases.get(head, head)}.{rest}" if rest else aliases.get(head, head)
+    return resolved, resolved.partition(".")[0], resolved.rpartition(".")[2]
+
+
 def _root_name(node: ast.expr) -> str:
     dotted = _dotted(node)
     return dotted.split(".", maxsplit=1)[0] if dotted else ""
@@ -507,9 +697,32 @@ def _imported_modules(tree: ast.Module) -> set[str]:
     return modules
 
 
-def _string_constants(tree: ast.AST) -> Iterator[tuple[str, int]]:
+_DOCSTRING_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _docstring_ids(tree: ast.AST) -> frozenset[int]:
+    """``id()`` of every constant that is a module, class or function docstring."""
+    found: set[int] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        if not isinstance(node, _DOCSTRING_OWNERS) or ast.get_docstring(node) is None:
+            continue
+        first = node.body[0]
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+            found.add(id(first.value))
+    return frozenset(found)
+
+
+def _string_constants(tree: ast.AST, *, prose: bool = True) -> Iterator[tuple[str, int]]:
+    """Every string literal in ``tree``, optionally without the docstrings.
+
+    ``prose=False`` drops module, class and function docstrings. The checks that infer *intent*
+    from a literal want that: a cell whose docstring says which warehouse it replaces is the
+    documentation this project asks for, not a connection to one. The credential check keeps
+    them — a password in a docstring is still a password in source.
+    """
+    skip = frozenset() if prose else _docstring_ids(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
             yield node.value, getattr(node, "lineno", 0)
 
 
@@ -572,9 +785,13 @@ def _check_policy(tree: ast.Module, policy: Policy) -> list[Violation]:
     aliases = _import_aliases(tree)
     found: list[Violation] = []
     found += _check_shell(tree, aliases)
-    found += _check_network(tree, policy)
-    found += _check_writes(tree, aliases, policy)
+    # Credentials before the two allowlist checks: a password in the source is the one thing here
+    # the model must fix whatever the user has permitted, so it should be the first line it reads
+    # when a DSN trips both.
     found += _check_credentials(tree)
+    found += _check_network(tree, aliases, policy)
+    found += _check_database(tree, aliases, policy)
+    found += _check_writes(tree, aliases, policy)
     return found
 
 
@@ -620,31 +837,348 @@ def _check_shell(tree: ast.Module, aliases: dict[str, str]) -> list[Violation]:
     return found
 
 
-def _check_network(tree: ast.Module, policy: Policy) -> list[Violation]:
+def _has_string_argument(node: ast.Call) -> bool:
+    """Whether any argument of ``node`` contains a string literal anywhere inside it."""
+    return any(
+        isinstance(inner, ast.Constant) and isinstance(inner.value, str)
+        for argument in (*node.args, *(keyword.value for keyword in node.keywords))
+        for inner in ast.walk(argument)
+    )
+
+
+def _opaque_network_calls(tree: ast.Module, aliases: dict[str, str]) -> list[str]:
+    """Calls on a network module that carry no literal at all, so name no destination.
+
+    ``httpx.get(build_url())`` is the case. Without this the hosts below are scraped cell-wide,
+    and one allowlisted URL literal anywhere in the cell would permit every other request in it —
+    the check would be disarmed by exactly the configuration that exists to widen it.
+
+    This is deliberately weaker than the per-call attribution :func:`_check_database` does. A URL
+    is routinely composed — ``httpx.get(f"{BASE}/latest")``, ``requests.get(BASE + path)`` — and
+    demanding that the *destination* be readable per call would reject that, while a DSN is handed
+    to a connect call whole. So the rule here is only that a call naming nothing at all is not
+    covered by a literal somewhere else; a call carrying a fragment still falls back to them.
+    """
+    opaque: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        resolved, root, _ = _call_name(node, aliases)
+        if root in _NETWORK_MODULES and not _has_string_argument(node):
+            opaque.append(f"{resolved}(...)")
+    return sorted(set(opaque))
+
+
+def _check_network(tree: ast.Module, aliases: dict[str, str], policy: Policy) -> list[Violation]:
     used = _imported_modules(tree) & _NETWORK_MODULES
     if not used:
         return []
     hosts = {
         parsed.hostname
-        for text, _ in _string_constants(tree)
+        for text, _ in _string_constants(tree, prose=False)
         if (parsed := urlparse(text)).scheme in ("http", "https") and parsed.hostname
     }
-    if hosts and all(policy.allows_host(host) for host in hosts):
+    opaque = _opaque_network_calls(tree, aliases)
+    if hosts and not opaque and all(policy.allows_host(host) for host in hosts):
         logger.debug("network use permitted for hosts %s", sorted(hosts))
         return []
     allowed = ", ".join(sorted(policy.network_allowlist)) or "nothing (the allowlist is empty)"
-    refused = ", ".join(sorted(hosts)) if hosts else "an address kedge could not read statically"
+    if opaque:
+        refused = (
+            f"to an address kedge cannot read from the source — {', '.join(opaque)} names no "
+            f"literal, and a URL allowlisted elsewhere in the cell does not cover it"
+        )
+    elif hosts:
+        refused = f"to {', '.join(sorted(hosts))}"
+    else:
+        refused = "to an address kedge could not read statically"
     return [
         Violation(
             stage=ValidationStage.POLICY,
             message=(
-                f"this cell reaches the network via `{', '.join(sorted(used))}`, to {refused}. The "
+                f"this cell reaches the network via `{', '.join(sorted(used))}`, {refused}. The "
                 f"allowlist permits: {allowed}. A reproducible notebook takes its inputs from the "
                 f"managed hand-in store, not from a live endpoint whose contents change between "
                 f"runs. Load the data through the hand-in instead."
             ),
         )
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class _Connection:
+    """One place in a cell that opens, or names, a connection to a database server.
+
+    Attribution is per site rather than per cell, and that is the whole design. Scraping targets
+    cell-wide meant one permitted target disarmed the check for every other connection beside it:
+    with ``database_allowlist = ["riskwarehouse"]``, a cell holding ``"SERVER=RiskWarehouse"``
+    passed while calling ``pyodbc.connect(build_dsn())`` two lines later.
+    """
+
+    subject: str
+    """What the refusal names, already back-quoted: ```pyodbc.connect(...)``` or ```pyodbc```."""
+
+    permits: frozenset[str]
+    """Allowlist entries that permit this site by *name* — the driver module, the entry point, or
+    both. Empty for a bare connection string, where the target is the only thing to name."""
+
+    targets: frozenset[str]
+    """Connection targets read from this site's own literals. Empty means unreadable, not absent:
+    a DSN assembled at run time leaves nothing in the source to match."""
+
+    line: int | None = None
+
+    def permitted(self, policy: Policy) -> bool:
+        """Whether the allowlist covers this site, by target or by name.
+
+        Two ways, because the two-cell shape marimo forces leaves some sites with no readable
+        target at all. Naming the driver or the entry point is the blunter permission and reads
+        that way in config; naming the target is the precise one.
+        """
+        if self.targets and all(policy.permits_database(target) for target in self.targets):
+            return True
+        return any(policy.permits_database(name) for name in self.permits)
+
+
+def _odbc_target(raw: str) -> str | None:
+    """The host-shaped value of an ODBC or libpq keyword, or ``None`` when it is not one.
+
+    ``SERVER=tcp:warehouse.internal,1433`` is the SQL Server spelling of one host, and braces are
+    ODBC's quoting. Everything else is filtered: a value carrying a quote came out of a SQL string
+    (``'a;server=prod'``), and a value that is only digits is a column predicate
+    (``"account=4100"``), not a place.
+    """
+    value = raw.strip().strip("{}")
+    if value.lower().startswith("tcp:"):
+        value = value[4:]
+    value = value.split(",", maxsplit=1)[0]
+    if not value or value.isdigit() or not _HOST_SHAPED.match(value):
+        return None
+    return value.lower()
+
+
+def _connection_targets(text: str) -> set[str]:
+    """Connection targets readable from one string literal.
+
+    A hostname from a ``scheme://user:pass@host:port/db`` DSN, or the value of ``SERVER=``,
+    ``DSN=``, ``HOST=`` or ``ACCOUNT=`` in a keyword-style connection string.
+    """
+    targets: set[str] = set()
+    for match in _DSN_PATTERN.finditer(text):
+        authority = match.group("authority").rpartition("@")[2]
+        host = authority.split(":", maxsplit=1)[0].strip("[]")
+        if host:
+            targets.add(host.lower())
+    for match in _ODBC_DSN_PATTERN.finditer(text):
+        if (value := _odbc_target(match.group(1))) is not None:
+            targets.add(value)
+    return targets
+
+
+def _string_bindings(tree: ast.Module) -> dict[str, str]:
+    """Module-level ``name = "literal"`` assignments, so a DSN held in a variable is still read.
+
+    ``_dsn = "postgresql://warehouse.internal/risk"`` followed by ``asyncpg.connect(_dsn)`` is the
+    ordinary spelling, and without this the call's target is unreadable — which would refuse the
+    cell with a remedy naming the driver while the host sat two lines above, allowlistable and
+    ignored.
+    """
+    bindings: dict[str, str] = {}
+    for node in _module_statements(tree.body):
+        if isinstance(node, ast.Assign):
+            targets: Sequence[ast.expr] = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = (node.target,)
+        else:
+            continue
+        value = node.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        for target in targets:
+            for name in _target_names(target):
+                bindings[name] = value.value
+    return bindings
+
+
+def _call_targets(node: ast.Call, bindings: dict[str, str]) -> set[str]:
+    """Connection targets readable from one call's own arguments.
+
+    A call with no literal argument — ``pyodbc.connect(build_dsn())`` — has an unknown target and
+    says so by returning nothing, which is what sends it to the by-name branch of the refusal.
+    """
+    targets: set[str] = set()
+    for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+        for inner in ast.walk(argument):
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                targets |= _connection_targets(inner.value)
+            elif isinstance(inner, ast.Name) and (text := bindings.get(inner.id)):
+                targets |= _connection_targets(text)
+    return targets
+
+
+def _is_database_module(name: str) -> bool:
+    """Whether ``name`` is a driver whose only purpose is to connect."""
+    return name in _DATABASE_MODULES or name.startswith(_DATABASE_MODULE_PREFIXES)
+
+
+def _is_database_entry_point(root: str, tail: str) -> bool:
+    """Whether ``root.tail(...)`` is one of the entry points that connects without importing.
+
+    The receiver root is required, which is the difference between ``pl.read_database(...)`` and
+    ``handins.read_database("rates_2024")``. ``write_database`` is the exception and is matched on
+    the tail alone: it is a frame method, so there is no module receiver to insist on.
+    """
+    if tail in _FRAME_DATABASE_CALLS:
+        return True
+    if tail in _POLARS_DATABASE_CALLS:
+        return root in _POLARS_ROOTS
+    return tail in _ENGINE_CALLS and root == "sqlalchemy"
+
+
+def _database_call_sites(tree: ast.Module, aliases: dict[str, str]) -> list[_Connection]:
+    """Every call in the cell that opens a database connection, with its own targets.
+
+    Receivers are matched by module *name* as well as through this cell's imports, because
+    marimo's single-definition rule puts ``import pyodbc`` in one cell and ``pyodbc.connect(...)``
+    in another. Dual-use modules join only where the call shows a connection: ``duckdb.sql`` over a
+    parquet file beside the notebook is local work (:data:`_DUAL_USE_DATABASE_MODULES`).
+    """
+    bindings = _string_bindings(tree)
+    sites: list[_Connection] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        resolved, root, tail = _call_name(node, aliases)
+        if not resolved:
+            continue
+        targets = _call_targets(node, bindings)
+        permits: set[str] = set()
+        if _is_database_module(root) or (
+            root in _DUAL_USE_DATABASE_MODULES and (targets or tail in _DATABASE_CALLS)
+        ):
+            permits.add(root)
+        if _is_database_entry_point(root, tail):
+            permits.add(tail)
+        if permits:
+            sites.append(
+                _Connection(
+                    subject=f"`{resolved}(...)`",
+                    permits=frozenset(permits),
+                    targets=frozenset(targets),
+                    line=node.lineno,
+                )
+            )
+    return sites
+
+
+def _unattributed_connection_strings(tree: ast.Module, attributed: set[str]) -> list[_Connection]:
+    """Literals that *are* connection strings without a recognised call to attribute them to.
+
+    This is what closes the unlisted-driver class. ``_DATABASE_MODULES`` will never be complete —
+    a cell importing ``asyncpg`` and holding a full ``postgresql://warehouse.internal/risk`` used
+    to pass on both counts — so a literal that is itself a connection string naming a server is a
+    signal on its own, and one the refusal can name precisely enough to be lifted.
+
+    Prose is excluded twice over: docstrings never reach here, and a literal that merely *mentions*
+    a DSN mid-sentence does not begin with one (:data:`_CONNECTION_STRING_HEAD`).
+    """
+    found: list[_Connection] = []
+    seen: set[str] = set(attributed)
+    for text, line in _string_constants(tree, prose=False):
+        if not _CONNECTION_STRING_HEAD.match(text):
+            continue
+        targets = _connection_targets(text) - seen
+        if not targets:
+            continue
+        seen |= targets
+        found.append(
+            _Connection(
+                subject="a connection string literal",
+                permits=frozenset(),
+                targets=frozenset(targets),
+                line=line,
+            )
+        )
+    return found
+
+
+def _check_database(tree: ast.Module, aliases: dict[str, str], policy: Policy) -> list[Violation]:
+    """Refuse a database connection that is not allowlisted.
+
+    Policy rather than style, and beside :func:`_check_network` rather than after it, because it
+    is the same question — data leaving or arriving over a wire that a reviewer re-running the
+    notebook cannot reproduce — asked in a vocabulary the network check cannot see. That check is
+    gated on HTTP-shaped imports, and ``pl.read_database_uri(...)`` imports nothing but polars.
+
+    Each connection is judged on its own targets, and a driver imported but never called is a
+    connection with no readable target rather than no connection at all. The refusal is
+    deliberately not the network one: telling a user to allowlist a *hostname* would be nonsense
+    for ``DSN=RiskWarehouse``, and telling them nothing at all was the state this replaced.
+    """
+    sites = _database_call_sites(tree, aliases)
+    called = {name for site in sites for name in site.permits}
+    loose = _unattributed_connection_strings(tree, {t for site in sites for t in site.targets})
+    imported = [
+        module
+        for module in sorted(_imported_modules(tree))
+        if _is_database_module(module) and module not in called
+    ]
+    if imported:
+        # A driver imported here and a connection string sitting beside it are one connection, not
+        # two. Kept together, either the host or the driver lifts it; split apart, the user has to
+        # discover that permitting the host they can see is not enough.
+        adopted = frozenset(target for connection in loose for target in connection.targets)
+        sites += [
+            _Connection(subject=f"`{module}`", permits=frozenset({module}), targets=adopted)
+            for module in imported
+        ]
+        if adopted:
+            loose = []
+    sites += loose
+
+    refused = [site for site in sites if not site.permitted(policy)]
+    if not refused:
+        if sites:
+            logger.debug("database access permitted for %d site(s)", len(sites))
+        return []
+    return [
+        _database_violation(site, policy)
+        for site in sorted(refused, key=lambda site: (site.line or 0, site.subject))
+    ]
+
+
+def _database_violation(site: _Connection, policy: Policy) -> Violation:
+    """The refusal for one connection: what it found, and the one line of config that lifts it."""
+    allowed = ", ".join(sorted(policy.database_allowlist)) or "nothing (the allowlist is empty)"
+    unpermitted = sorted(target for target in site.targets if not policy.permits_database(target))
+    if unpermitted:
+        found = f"to {', '.join(unpermitted)}"
+        remedy = (
+            f"If the user has decided to permit this connection, it goes in "
+            f"`[policy] database_allowlist` in kedge.toml as "
+            f"{', '.join(repr(target) for target in unpermitted)}."
+        )
+    else:
+        found = (
+            "to a target kedge cannot read from the source — a DSN name, an environment variable "
+            "or a string built at run time"
+        )
+        remedy = (
+            f"There is no target in this cell to name, so permitting it means allowlisting what "
+            f"opens the connection: {', '.join(repr(name) for name in sorted(site.permits))} in "
+            f"`[policy] database_allowlist` in kedge.toml."
+        )
+    return Violation(
+        stage=ValidationStage.POLICY,
+        message=(
+            f"this cell opens a database connection via {site.subject}, {found}. The database "
+            f"allowlist permits: {allowed}. A reproducible notebook takes its inputs from the "
+            f"managed hand-in store, not from a live connection whose contents change between "
+            f"runs — and a write to one is not something a reviewer can undo. Load the data "
+            f"through the hand-in instead. {remedy}"
+        ),
+        line=site.line,
+    )
 
 
 def _write_target(node: ast.Call, tail: str) -> str | None:

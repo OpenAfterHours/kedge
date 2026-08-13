@@ -37,7 +37,15 @@ from kedge.analysis.model import (
 )
 from kedge.config import Config, ModelConfig
 from kedge.plan import PlanRun, iter_plan_history, load_analysis, run_plan
-from kedge.plan.model import Assessment, PlanDraft, PlanError, ProcessPlan, Stage
+from kedge.plan.model import (
+    Assessment,
+    PlanDraft,
+    PlanError,
+    ProcessPlan,
+    SourceOrigin,
+    Stage,
+    StageSource,
+)
 from kedge.plan.propose import (
     CompletionRequest,
     OpenAICompleter,
@@ -338,6 +346,23 @@ def test_the_schema_describes_a_draft_not_a_whole_plan() -> None:
     assert "approval" not in schema["properties"]
 
 
+def test_the_schema_asks_for_a_structured_source_rather_than_a_string() -> None:
+    """A free-form string is an answer nothing can validate and nothing can reason about."""
+    source = plan_json_schema()["$defs"]["StageSource"]
+    assert sorted(source["properties"]) == ["origin", "ref"]
+    assert source["additionalProperties"] is False
+
+    origins = plan_json_schema()["$defs"]["SourceOrigin"]["enum"]
+    assert sorted(origins) == sorted(origin.value for origin in SourceOrigin)
+
+
+def test_the_system_prompt_explains_every_origin_the_schema_will_accept() -> None:
+    """A schema the prompt does not explain produces a model that guesses at it."""
+    prompt = load_prompt("propose_system.md")
+    for origin in SourceOrigin:
+        assert f"`{origin.value}`" in prompt, f"{origin.value} is in the schema, not in the prompt"
+
+
 # =============================================================================
 # PARSING WHAT MODELS ACTUALLY RETURN
 # =============================================================================
@@ -387,6 +412,43 @@ def test_a_plan_whose_stage_graph_is_broken_is_rejected_here_not_in_the_scaffold
     raw["stages"][1]["depends_on"] = ["a_stage_that_does_not_exist"]
     with pytest.raises(ValidationError, match="unknown stage"):
         parse_draft(json.dumps(raw))
+
+
+def test_a_stage_reading_a_stage_that_does_not_exist_is_a_repair_instruction() -> None:
+    """`sources` is validated now, so the retry loop can correct a mistyped upstream id."""
+    raw = json.loads(make_draft().model_dump_json())
+    raw["stages"][1]["sources"] = [{"origin": "stage", "ref": "laod_handin"}]
+    with pytest.raises(ValidationError, match="reads unknown stage"):
+        parse_draft(json.dumps(raw))
+
+
+def test_structured_sources_arrive_with_their_origins_intact() -> None:
+    raw = json.loads(make_draft().model_dump_json())
+    raw["stages"][0]["sources"] = [
+        {"origin": "query", "ref": "MonthlyExposures"},
+        {"origin": "manual", "ref": "Adjustments!B2:B15"},
+    ]
+
+    draft = parse_draft(json.dumps(raw))
+
+    assert draft.stages[0].sources == [
+        StageSource(origin=SourceOrigin.QUERY, ref="MonthlyExposures"),
+        StageSource(origin=SourceOrigin.MANUAL, ref="Adjustments!B2:B15"),
+    ]
+
+
+def test_a_model_that_sends_the_old_bare_strings_is_read_rather_than_repaired() -> None:
+    """It will: the seed plan it is shown may be a 1.0 plan, and models copy their examples."""
+    raw = json.loads(make_draft().model_dump_json())
+    raw["stages"][1]["sources"] = ["Calc!H2:H500", "load_handin", "handin"]
+
+    draft = parse_draft(json.dumps(raw))
+
+    assert [source.render() for source in draft.stages[1].sources] == [
+        "range Calc!H2:H500",
+        "stage load_handin",
+        "handin",
+    ]
 
 
 # =============================================================================
@@ -458,6 +520,26 @@ def test_a_model_cannot_answer_its_own_open_questions(assessment) -> None:
     assert question.answered is False
     assert question.answer is None
     assert question.answered_at is None
+
+
+def test_a_source_origin_is_a_claim_about_the_workbook_and_survives_the_strip() -> None:
+    """The other side of the same seam, and the reason `sources` is not stripped with the rest.
+
+    Every member of the vocabulary states something about where an input comes from — a hand-in,
+    a query, a person typing — which is a reading of the workbook a reviewer can see in
+    `render_plan` and correct with `edit_stage`, exactly like `intent` or `excel_pattern`. None of
+    them records a decision a *reviewer* took, which is what `acknowledged` and `answer` do and
+    why those two are rebuilt from their defaults. `handin` is the one worth stating out loud: it
+    proposes that an input should arrive as a managed hand-in, and proposing is all it does —
+    nothing downstream treats the word as evidence that anyone has supplied one, and the
+    scaffolder emits the same hand-in head either way.
+    """
+    raw = json.loads(make_draft().model_dump_json())
+    raw["stages"][0]["sources"] = [{"origin": "handin", "ref": None}]
+
+    draft = parse_draft(json.dumps(raw))
+
+    assert draft.stages[0].sources == [StageSource(origin=SourceOrigin.HANDIN)]
 
 
 # =============================================================================

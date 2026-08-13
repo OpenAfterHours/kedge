@@ -48,8 +48,10 @@ from kedge.plan.model import (
     ApprovalState,
     Checkpoint,
     ProcessPlan,
+    SourceOrigin,
     Stage,
     StageKind,
+    StageSource,
 )
 from kedge.reconcile.model import ReconciliationStatus
 
@@ -928,6 +930,71 @@ def test_a_stage_listing_its_checkpoint_first_still_builds_on_a_frame() -> None:
     code = named(build_cells(plan), "summarise").code
     assert "summarise = load_it" in code
     assert '_gate_summarise = sign_off["decision"]' in code
+
+
+# ── what a stage cell tells the person who has to finish it ──────────────────
+
+
+def test_a_stage_cell_says_where_each_of_its_inputs_comes_from() -> None:
+    """The comment is what somebody reads before writing the translation. `manual` and `query`
+    are the two it most needs to say: one is a value nobody can reproduce, the other is a table
+    that arrives from outside the workbook entirely."""
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_exposures",
+                    intent="Pull exposures and this month's adjustments",
+                    kind=StageKind.LOAD,
+                    sources=[
+                        StageSource(origin=SourceOrigin.QUERY, ref="MonthlyExposures"),
+                        StageSource(origin=SourceOrigin.HANDIN),
+                        StageSource(origin=SourceOrigin.MANUAL, ref="Adjustments!B2:B15"),
+                    ],
+                )
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    code = named(build_cells(plan), "load_exposures").code
+
+    assert "# Sources: query MonthlyExposures, handin, manual Adjustments!B2:B15" in code
+
+
+def test_a_long_sources_comment_never_splits_an_origin_from_its_ref() -> None:
+    """`_comment` wraps prose at any space, and since 1.1 a rendered source has one in it.
+
+    Wrapped, a long list could end a comment line at `power_query` and put the ref on the next,
+    which reads to the person finishing the cell as a table the plan never identified.
+    """
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_everything",
+                    intent="Pull every input this month needs",
+                    kind=StageKind.LOAD,
+                    sources=[
+                        StageSource(
+                            origin=SourceOrigin.POWER_QUERY, ref=f"CounterpartyRatings{index}"
+                        )
+                        for index in range(6)
+                    ],
+                )
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    lines = named(build_cells(plan), "load_everything").code.splitlines()
+
+    for line in lines:
+        assert not line.rstrip().endswith("power_query")
+    for index in range(6):
+        assert any(f"power_query CounterpartyRatings{index}" in line for line in lines)
 
 
 # ── the reconciliation tail ──────────────────────────────────────────────────
