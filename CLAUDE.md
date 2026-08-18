@@ -85,6 +85,8 @@ uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole 
 uv run python tests/fixtures/generate.py   # regenerate the fixture corpus
 uv run python evals/adjustment_signoff/build_workbook.py   # regenerate the eval workbook
 uv run python evals/run.py adjustment_signoff              # grade the reference conversion
+uv run python evals/run.py adjustment_signoff --model M   # can model M plan it? cost, time, why not
+uv run python evals/run.py adjustment_signoff --convert M # can model M write the notebook?
 uv run kedge --help
 ```
 
@@ -232,6 +234,25 @@ including the contract tests. `ty` gates merges: its three long-standing diagnos
   output directly beneath the sentence telling a blocked user what to type -- and it put the
   proof that the arithmetic matches the workbook *after* the approval it is proof for.
   `_with_reconciliation` now emits it straight after the last stage declaring any operations.
+- **Placing that panel correctly was not enough; it also has to be *reachable*.** Mapping a
+  hand-off's `operations` to the hand-off's own cell made the panel a dataflow descendant of the
+  checkpoint gating it, so marimo would not render the evidence until after the decision it is
+  evidence for -- defeating `_with_reconciliation` from a completely different direction, and
+  invisible in the committed reference conversion because that one is hand-written. A hand-off
+  reproduces nothing anyway: kedge renders the statement through `kedge.sql`, so there is no
+  cached text to match, and mapping it also reported that region **failed** rather than unchecked.
+  Those operations now go to `not_reproduced` with a reason. The region map is a cell of its own
+  (`reconciliation_values`) carrying a `TODO(kedge)` marker, because which column reproduces which
+  range is a translation judgement the scaffolder cannot make -- and while it carried no marker,
+  nothing that fills the scaffolder's holes was ever asked to finish it.
+- **`mutates` is a claim; the statement is the fact.** A plan declaring `mutates: false` over an
+  `UPDATE` told the scaffolder to emit no confirmation, so the next selector had no token to gate
+  on and the re-extract box rendered from the moment the notebook opened. `Handoff.
+  needs_confirmation` is now `mutates or statement_writes`, so the notebook errs towards a
+  tick-box rather than towards losing the only record that a statement was carried out, and
+  `review_warnings` names the contradiction because the approval card still renders the flag.
+  Whether a statement writes is `kedge.sql.changes_data` -- non-negotiable 3, and the reason it
+  belongs there is that a prefix match calls `SELECT ... FOR UPDATE` a write.
 - **A blocking message must lead with the instruction.** "A reason is required, not optional --
   it is the whole improvement over somebody typing a number into Excel" tells a stuck user why
   the rule exists and never where to type. Instruction first, justification after; the eval

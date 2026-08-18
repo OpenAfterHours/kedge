@@ -20,6 +20,9 @@ right: the corpus is *supposed* to have exactly one positive reconciliation path
 | Path | What it is |
 |---|---|
 | `harness/` | The runner: drives a runbook headlessly, grades it, renders the report. Case-independent. |
+| `harness/live.py` | What a model call cost and, when it failed, why. The one place a failure is attributed. |
+| `harness/sweep.py` | Phase 1: propose a plan per model, grade the structural tier, tabulate cost. |
+| `harness/cellprompt.py`, `cellgen.py`, `render.py`, `align.py`, `findings.py`, `convert.py` | Phase 2: scaffold a plan, have a model fill every hole, render, drive, grade. |
 | `run.py` | The CLI. |
 | `adjustment_signoff/` | A four-tab manual process — extract, adjust, re-extract, sign off — and whether kedge turns it back into the runbook it came from. |
 
@@ -29,9 +32,17 @@ uv run python evals/run.py adjustment_signoff         # grade the reference conv
 uv run python evals/run.py adjustment_signoff \
     --notebook path/to/converted.py --plan path/to/plan.yaml
 uv run python evals/run.py adjustment_signoff --json  # for a CI step
+
+uv run python evals/run.py adjustment_signoff --model MODEL --repeats 3   # plan, per model
+uv run python evals/run.py adjustment_signoff --convert MODEL             # notebook, per model
+uv run python evals/run.py adjustment_signoff --model MODEL --dry-run     # resolve, spend nothing
 ```
 
-Exit code is 0 when nothing gradeable failed.
+Exit code is 0 when nothing gradeable failed — and non-zero when *nothing was graded at all*,
+because a sweep whose every leg skipped has not passed, it has not run.
+
+The first three call no model. The last three do, and they are the only things here that spend
+money or touch a network.
 
 ## `adjustment_signoff`
 
@@ -213,13 +224,90 @@ broken conversion; folding them into `PASS` is the reconciliation sin.
 So a report always carries **two numbers**: the score and what it was taken over. `20/20` over a
 rubric of sixteen items is not a pass, and the headline will not render it as one.
 
+## Measuring a model
+
+Everything above grades committed artifacts, and scores 63/63 with no model anywhere in the loop.
+That proves the graders work. It says nothing about whether the model a user has configured can
+do the job — which matters, because this workbook is one of the *simplest* processes a user will
+bring. Two modes answer that, at two different seams and two very different prices.
+
+**`--model` grades the planning seam.** One call per repeat: propose a plan, grade it against the
+structural tier, record tokens, seconds and — when it fails — why. Repeat with `--repeats`; one
+sample is noise, and the table prints the spread rather than a mean that hides it.
+
+**`--convert` grades the code-generation seam.** Scaffold an approved plan, ask the model for
+every `TODO(kedge)` body, gate each through `kedge.agent.validate`, render, drive, grade. Many
+calls, so it costs materially more. It sends the product's own prompt parts — computed by
+subtraction from `SYSTEM_PARTS`, in the product's own message roles, carrying `tools.md`'s
+validation rules quoted rather than paraphrased — because an eval whose prompt differs from what
+ships measures something no user experiences.
+
+They are deliberately separate, and `run.py` refuses to run both at once. Handing the committed
+reference notebook to a model-written plan would print a near-perfect total made mostly of points
+a human earned, under a model's name: the exact false confidence this whole apparatus exists to
+remove, and almost invisible in a tidy table.
+
+### Attribution is the point
+
+A model that scores nothing may have refused the JSON schema, refused an explicit temperature,
+timed out, been rate-limited, been unreachable, had no key in the keyring, been declined by
+kedge's own triage, returned a 404 because that id is not enabled for the account, or produced
+prose no repair round could turn into a plan. **Only the last of those, and a plan that validates
+but is poor, are the model's judgement failing.** Everything else is a fact about the integration,
+the account or the sweep's pacing, and `Failure.about_the_model` is where that distinction is
+encoded rather than assumed — so those legs skip, loudly, under a heading that says they were
+asked and did not answer.
+
+A timeout skips for a reason worth repeating: `[model] timeout_seconds` is httpx's gap *between
+reads*, not a budget for the whole answer, so an endpoint that goes quiet while a reasoning model
+thinks trips it while working perfectly. Scoring that against the model replaces a good model over
+a setting. This project has already had one live run where misattribution produced 24 failed
+requests and the wrong diagnosis (`tests/llm/README.md`).
+
+Cost is reported in tokens and seconds. Currency is opt-in via `--prices`, because a price table
+committed here would be wrong within a month and wrong invisibly. An endpoint that volunteers no
+`usage` block reports "not reported", never `0` — a model nobody measured must not come top of a
+cost column.
+
+### What generating a conversion found
+
+Grading a *generated* notebook rather than the committed one surfaced five defects, all of which
+the reference conversion had been hand-written around and none of which running the offline eval
+could ever have shown:
+
+| Defect | Consequence |
+|---|---|
+| Reconciliation mapped a hand-off's operation to the hand-off's cell | The panel became a dataflow descendant of the checkpoint, so the evidence for a decision would not render until after it |
+| The same mapping bound a *statement* to a region of cached values | The region reported `failed` rather than unchecked -- permanently amber, unclearable |
+| The region map carried no `TODO(kedge)` | Nothing that fills the scaffolder's holes was ever asked to finish it |
+| The fixed head hand-in was emitted even when every stage declared its own | Dead cells, a contract gate with no consumers, and `check_translation` cited the wrong digest |
+| The head hand-in never called `previous_handin` | Reopening a runbook stopped in the third cell |
+| `mutates: false` on an `UPDATE ... SET` | No confirmation, so no token, so the re-extract box rendered from the moment the notebook opened |
+
+All are fixed. `EXPECTED_DEFECTS` in `tests/unit/test_evals_convert.py` is now an exact **empty**
+set, and each defect has a test pinning the *mechanism* rather than the absence of a string, so one
+returning by another route is still caught. The reference bodies replayed through the pipeline score
+**60/63**, up from 47/63 -- and 13 of those points came from fixing kedge, not from touching a
+grader.
+
+One item stays red on purpose: `progressive_disclosure` wants `extract_query` on screen at once,
+and a scaffolded notebook blocks it with *"Step 1 of 8 ... fill in the inputs above"* because it has
+no period end yet. The reference conversion passes by defaulting the date picker, and defaulting it
+is the part worth arguing about -- a runbook that opens with a query already scoped to a date nobody
+chose is how somebody extracts the wrong period. Recorded as a difference until someone decides
+which a runbook should do.
+
+That is the argument for this mode in one paragraph. The reference conversion is a worked example of
+the destination; it was never evidence that kedge can get there.
+
 ## What this eval does not cover
 
 - **Nothing about the chat loop.** This is workbook in, notebook out. Whether the agent
   *converses* well about the conversion is a different eval.
-- **The harness cannot drive a notebook that names its widgets differently.** The script is keyed
-  by variable name, so a conversion that calls its selector something else is reported as unused
-  inputs. Honest, but a real limitation of grading a runbook without a kernel.
+- **Widget names are aliased, but only where the alias is provable.** A candidate must be assigned
+  from `mo.ui.*` and match the stage cell's own name exactly; anything looser bound strings and
+  reported the run as driven while the scripted action went nowhere. What still cannot be played
+  is reported as `NOT DRIVEN`, which is its own category and never a skip.
 - **No knowledge-pack item.** `consults_the_knowledge_pack` skips: `context/databases/example.yaml`
   describes a different schema. Adding a pack for `fin.accruals` would make it gradeable.
 - **One workbook, one process shape.** A monthly adjustment with a sign-off. Nothing here says

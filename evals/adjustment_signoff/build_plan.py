@@ -185,6 +185,11 @@ STAGES = [
             template=UPDATE_TEMPLATE,
             built_from="adjust",
             connection="FinanceWarehouse",
+            # An UPDATE against a production ledger. Declared, because it is what makes the
+            # notebook require somebody to confirm the statement was run before the re-extract
+            # box appears at all -- and a re-extract taken beforehand looks exactly like one
+            # taken after, with no way to tell afterwards which it was.
+            mutates=True,
         ),
         operations=["adjustment_g17_g92"],
         notes=(

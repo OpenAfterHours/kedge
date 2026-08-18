@@ -722,6 +722,17 @@ def review_warnings(
     warnings.extend(plan.ordering_warnings())
 
     for stage in plan.stages:
+        if stage.is_handoff and stage.effective_handoff().contradicts_its_own_statement:
+            # Nothing here blocks, and this one does not need to: `Handoff.needs_confirmation`
+            # answers from the statement, so the notebook gates on a confirmation whatever the
+            # flag says. What the flag still costs is truthfulness -- the approval card renders
+            # it, and a reviewer told a production UPDATE changes nothing is being misled about
+            # the one stage of the plan that touches live data.
+            warnings.append(
+                f"stage {stage.id!r} hands over a statement that writes but declares "
+                f"`mutates: false` — the notebook will require a confirmation that it was run "
+                f"regardless, but the plan says the opposite of what the statement does"
+            )
         unlisted = [
             upstream
             for upstream in stage.upstream_stage_ids
