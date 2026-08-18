@@ -424,10 +424,15 @@ def build_proposal_context(
                 for query in analysis.power_query.queries
             ],
         },
+        # `location` is not decoration. The plan's `briefing` refuses to carry prose about why
+        # a process exists without citing where that came from, and a model cannot cite a cell
+        # reference it was never shown -- it would have to invent one, which is precisely what
+        # the citation requirement exists to prevent.
         "process_notes": [
             {
                 "source": note.source,
                 "origin": note.origin,
+                "location": note.location,
                 "heading": note.heading,
                 "text": _clip(note.text, _MAX_NOTE_CHARS),
             }

@@ -64,9 +64,12 @@ __all__ = [
     "Approval",
     "ApprovalState",
     "Assessment",
+    "Briefing",
     "Checkpoint",
     "Confidence",
     "DroppedRange",
+    "Handoff",
+    "HandoffMedium",
     "OpenQuestion",
     "PlanDraft",
     "PlanError",
@@ -107,23 +110,29 @@ class Confidence(StrEnum):
 class StageKind(StrEnum):
     """What a stage *is*, in the only terms the scaffolder branches on.
 
-    Kept to four members because each one changes what the scaffolder emits, and nothing else
-    does. ``checkpoint`` is the flexibility escape hatch: a stage that is deliberately *not*
-    automated — a judgement call, an override agreed with another team, a sanity check — which
-    scaffolds to an ``mo.ui`` approval cell that blocks everything downstream until a decision
-    and a note are recorded (PLAN 2.2).
+    Membership is decided by one test and no other: **does the scaffolder emit something
+    different for it?** ``checkpoint`` is the flexibility escape hatch -- a stage that is
+    deliberately *not* automated, a judgement call, an override agreed with another team, a
+    sanity check -- which scaffolds to an ``mo.ui`` approval cell that blocks everything
+    downstream until a decision and a note are recorded (PLAN 2.2). ``handoff`` scaffolds to a
+    panel holding a statement for the user to take away and run somewhere kedge cannot reach,
+    and no assignment at all: it is the one stage kind that computes nothing.
 
-    A fifth member for "this stage reads from outside the workbook" was the obvious place to put
-    an input's provenance and would have been wrong twice over. It would have earned its place
-    only if the scaffolder emitted something different for it, and it cannot: a stage may read a
+    A member for "this stage reads from outside the workbook" was the obvious place to put an
+    input's provenance and would have been wrong twice over. It would have earned its place only
+    if the scaffolder emitted something different for it, and it cannot: a stage may read a
     hand-in *and* a query *and* an upstream frame, so provenance is a property of each input
-    rather than of the stage. That is :class:`SourceOrigin`, on :class:`StageSource`.
+    rather than of the stage. That is :class:`SourceOrigin`, on :class:`StageSource`. Note the
+    contrast with ``handoff``, which passes the same test the other way: a hand-off is not an
+    input at all, and there is nothing on :class:`StageSource` that could carry an *outbound*
+    artifact.
     """
 
     LOAD = "load"
     TRANSFORM = "transform"
     OUTPUT = "output"
     CHECKPOINT = "checkpoint"
+    HANDOFF = "handoff"
 
 
 class SourceOrigin(StrEnum):
@@ -156,6 +165,21 @@ class SourceOrigin(StrEnum):
     EXTERNAL = "external"
     MANUAL = "manual"
     UNKNOWN = "unknown"
+
+
+class HandoffMedium(StrEnum):
+    """What kind of artifact a hand-off puts in front of the user.
+
+    ``sql`` renders in a SQL code block and is the case the vocabulary exists for: a statement
+    to run in a database client. ``text`` is anything else somebody has to take elsewhere -- a
+    filename to request, a ticket to raise, an instruction to a colleague -- and renders as
+    prose. The distinction is presentational and nothing branches on it beyond the fence
+    language, which is the point: a hand-off is text and a person, and kedge is not in the
+    middle of it.
+    """
+
+    SQL = "sql"
+    TEXT = "text"
 
 
 class ApprovalState(StrEnum):
@@ -220,6 +244,211 @@ class Checkpoint(_PlanModel):
         return cleaned
 
 
+class Briefing(_PlanModel):
+    """Why this process exists, for whoever opens the notebook in eight months.
+
+    A converted notebook outlives the person who converted it and, usually, the person who ran
+    it last. What survives in the workbook is a Sign-off tab holding Purpose, Background and
+    Known issues — prose somebody wrote precisely so the next person would not have to guess —
+    and the conversion used to throw all of it away, leaving a technically perfect notebook that
+    said nothing about what it was for. The analyser already recovers it
+    (:attr:`~kedge.analysis.model.WorkbookAnalysis.notes`, with the sheet and cells each note
+    came from); this is where it goes.
+
+    **``sources`` is required wherever there is prose, and that is the whole design.** A
+    fabricated business rationale in a finance notebook is worse than none: it is confident,
+    plausible and unattributable, and the next person has no way to tell it from the real thing.
+    Every sentence here has to be traceable to something in the workbook — a documentation
+    sheet, a cell comment, a companion procedure — or to a person who said it. Where the
+    workbook explains nothing, the honest briefing says so and the field stays empty.
+
+    Example:
+        >>> Briefing(purpose="Quarterly accrual uplift", sources=["Sign-off!A3:A4"]).purpose
+        'Quarterly accrual uplift'
+    """
+
+    purpose: str | None = Field(
+        default=None,
+        description="What this process is for, in the business's own terms. One or two "
+        "sentences: what it produces and what that is used for.",
+    )
+    background: str | None = Field(
+        default=None,
+        description="Why it exists and why it is done this way — the decision, the policy, the "
+        "history. This is the part nobody can reconstruct from the code.",
+    )
+    cadence: str | None = Field(
+        default=None,
+        description="How often it runs and what triggers it: 'quarterly, after the reforecast "
+        "is agreed'. A reader's first question after 'what is this'.",
+    )
+    audience: str | None = Field(
+        default=None,
+        description="Who relies on the output, and who signs it off.",
+    )
+    watch_for: list[str] = Field(
+        default_factory=list,
+        description="Known issues, gotchas, and things that have gone wrong before. Taken from "
+        "the workbook where it says; this is the section people actually reread.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Where each part of this was learned: 'Sign-off!A3:A4 (Purpose)', 'cell "
+        "comment on Calc!C1', 'procedure.docx'. Required wherever there is prose.",
+    )
+
+    @model_validator(mode="after")
+    def _prose_must_be_attributable(self) -> Briefing:
+        """Refuse a briefing that explains a process without saying how it knows.
+
+        The one rule this type exists to enforce. Everything else here is a text field.
+        """
+        if (self.purpose or self.background or self.watch_for) and not self.sources:
+            msg = (
+                "a briefing that says what a process is for must say where that came from: a "
+                "documentation sheet, a cell comment, a companion procedure, or the person who "
+                "told you. Invented background is worse than none -- it is plausible, "
+                "confident, and the next reader cannot tell it from the real thing. If the "
+                "workbook explains nothing, leave the fields empty and say so in `sources`."
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether this says nothing at all, which is a legitimate answer for some workbooks."""
+        return not (
+            self.purpose or self.background or self.cadence or self.audience or self.watch_for
+        )
+
+
+class Handoff(_PlanModel):
+    """A statement the user takes away, runs elsewhere, and comes back from.
+
+    This is the half of a manual process that a data pipeline has no way to express. The
+    workbook it comes from says: run this extract, look at what came back, work out the
+    adjustment, run *this* update, then re-extract to check it took. kedge cannot run any of it
+    -- it holds no connection and issues no statement (see :mod:`kedge.sql`) -- and it should
+    not want to. What it can do is hold the state between the steps, do the arithmetic in the
+    middle where a formula column used to, generate the second statement from the first
+    statement's results, and refuse to go on until the evidence comes back.
+
+    Two shapes, and the difference is where the text comes from:
+
+    - **Static.** ``statement`` carries it verbatim -- normally an extract query the analyser
+      recovered from ``xl/connections.xml``. ``parameters`` names the placeholders the notebook
+      should fill from its own inputs, so a period end typed once reaches the query.
+    - **Generated.** ``built_from`` names an upstream stage and ``template`` is rendered once
+      per row of that stage's frame, through :func:`kedge.sql.render_all`. This is the
+      ``="UPDATE ... "&F2&"..."`` column that real workbooks are full of, translated into
+      something reviewable: the adjustment is computed in polars where it can be checked, and
+      the SQL is a rendering of it rather than the place it lives.
+
+    ``instruction`` is not decoration. The user is about to run something against a production
+    warehouse, and the sentence telling them where, in what order, and what to bring back is the
+    part that makes the notebook a runbook rather than a printout.
+
+    Example:
+        >>> Handoff(instruction="Run against RiskWarehouse", statement="SELECT 1").medium
+        <HandoffMedium.SQL: 'sql'>
+    """
+
+    instruction: str = Field(
+        description="What the user should do with this: where to run it, and what to bring "
+        "back. Written to somebody who has the client open and the workbook closed."
+    )
+    medium: HandoffMedium = HandoffMedium.SQL
+    statement: str | None = Field(
+        default=None,
+        description="The statement verbatim, where it is fixed. Mutually exclusive with "
+        "`template`.",
+    )
+    built_from: str | None = Field(
+        default=None,
+        description="Id of the stage whose frame the statement is rendered from, one statement "
+        "per row. Required with `template`.",
+    )
+    template: str | None = Field(
+        default=None,
+        description="Statement template rendered once per row of `built_from`, with "
+        "`{column_name}` where values belong. Mutually exclusive with `statement`.",
+    )
+    connection: str | None = Field(
+        default=None,
+        description="The connection or database this is meant to be run against, named as the "
+        "workbook names it. Carried so the notebook can say it rather than the user recalling "
+        "it.",
+    )
+    parameters: list[str] = Field(
+        default_factory=list,
+        description="Names of `{placeholders}` in a static `statement` that the notebook should "
+        "fill from its own inputs -- a period end, an entity list -- rather than hardcode.",
+    )
+    mutates: bool = Field(
+        default=False,
+        description="Whether running this changes data. An UPDATE, INSERT, DELETE or MERGE "
+        "does; a SELECT does not. True makes the notebook require an explicit confirmation "
+        "that the statement was run before anything downstream of it appears.",
+    )
+
+    @property
+    def needs_confirmation(self) -> bool:
+        """Whether the notebook must record that this was carried out before going on.
+
+        Tied to :attr:`mutates` rather than being a separate switch, because the two questions
+        have one answer. A read-only query needs no confirmation: the hand-in that follows *is*
+        the evidence it was run, and asking as well is friction with nothing behind it. A
+        statement that changes data is different in both directions -- nothing downstream is
+        evidence it ran, and pasting a re-extract taken *before* it ran is a mistake a user can
+        make in one click and nobody can detect afterwards.
+
+        So a mutating hand-off gates what follows on somebody saying they ran it, and that
+        assertion goes in the run record with a time against it.
+        """
+        return self.mutates
+
+    @model_validator(mode="after")
+    def _one_source_of_text(self) -> Handoff:
+        """A hand-off has exactly one body, and a generated one says what it is generated from.
+
+        Both failures are the same class of plan error -- a proposal that named the shape but
+        not the substance -- and both scaffold into a panel that shows the user nothing. Better
+        to reject the plan at review, where there is somebody to ask.
+        """
+        if self.statement and self.template:
+            msg = (
+                "a hand-off carries either a fixed `statement` or a `template` rendered per "
+                "row, not both. Which is it?"
+            )
+            raise ValueError(msg)
+        if not self.statement and not self.template:
+            msg = (
+                "a hand-off must carry the text the user is being handed: a fixed `statement`, "
+                "or a `template` plus the `built_from` stage to render it against"
+            )
+            raise ValueError(msg)
+        if self.template and not self.built_from:
+            msg = (
+                "a hand-off with a `template` must name the stage it is rendered from in "
+                "`built_from`: one statement per row of that stage's frame"
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def is_generated(self) -> bool:
+        """Whether the text is rendered from an upstream frame rather than fixed."""
+        return self.template is not None
+
+    def render(self) -> str:
+        """One line for a review pane or an approval card."""
+        where = f" against {self.connection}" if self.connection else ""
+        changes = ", changes data" if self.mutates else ""
+        if self.is_generated:
+            return f"{self.medium.value} generated from {self.built_from}{where}{changes}"
+        return f"{self.medium.value} statement{where}{changes}"
+
+
 _ORIGIN_ALIASES: dict[str, SourceOrigin] = {
     "upload": SourceOrigin.HANDIN,
     "upstream": SourceOrigin.STAGE,
@@ -248,6 +477,14 @@ _A1_RANGE = re.compile(
 """``H2``, ``H2:H500``, ``$A$1:$D$50``, ``AK:AP`` — an unqualified range, with no sheet on it."""
 
 _REF_REQUIRED = (SourceOrigin.RANGE, SourceOrigin.STAGE)
+
+_NO_CODE_KINDS: frozenset[str] = frozenset({StageKind.CHECKPOINT.value, StageKind.HANDOFF.value})
+"""Kinds that translate to no code, and so have nothing for a confidence to be about.
+
+Module level rather than a class attribute because pydantic claims any name a model class
+declares with a leading underscore as a private attribute, and reading it back through ``cls``
+then yields the descriptor rather than the set.
+"""
 
 
 def _normalise(text: str) -> str:
@@ -453,6 +690,12 @@ class Stage(_PlanModel):
         default=None,
         description="Required in spirit for `kind: checkpoint`; synthesised if absent.",
     )
+    handoff: Handoff | None = Field(
+        default=None,
+        description="A statement the user takes away and runs elsewhere. Required in spirit "
+        "for `kind: handoff`. Also valid on a `load` stage, where it means 'here is the query, "
+        "and here is where you paste what it returns' -- one step of the process, two cells.",
+    )
     notes: str | None = None
 
     # ── normalisation ────────────────────────────────────────────────────
@@ -460,11 +703,33 @@ class Stage(_PlanModel):
     @model_validator(mode="before")
     @classmethod
     def _default_checkpoint_confidence(cls, value: Any) -> Any:
-        """A checkpoint with no stated confidence means 'n/a', not 'unknown'."""
-        checkpoint = isinstance(value, dict) and value.get("kind") == StageKind.CHECKPOINT.value
-        if checkpoint and not value.get("confidence"):
+        """A stage that generates no code and has no stated confidence means 'n/a', not 'unknown'.
+
+        Both kinds it covers are human steps. Leaving them ``unknown`` would put a review marker
+        on a cell with nothing in it to review, and would drag the plan's own confidence summary
+        down by counting decisions nobody was ever asked to be confident about.
+        """
+        no_code = isinstance(value, dict) and value.get("kind") in _NO_CODE_KINDS
+        if no_code and not value.get("confidence"):
             return {**value, "confidence": Confidence.NOT_APPLICABLE.value}
         return value
+
+    @model_validator(mode="after")
+    def _a_generated_handoff_runs_after_what_it_renders(self) -> Stage:
+        """Add ``built_from`` to ``depends_on`` where the plan left it out.
+
+        Ordering comes from ``depends_on`` alone (:func:`topological_stages`), so a hand-off
+        rendered from a frame that has not been computed yet scaffolds above the cell that
+        defines it. In marimo that is not a subtle bug -- it is a cell that cannot run at all.
+        A forward reference is a sequencing slip rather than a decomposition error, so this
+        fixes it in place, exactly as :func:`topological_stages` fixes plan order.
+        """
+        if self.handoff is None or not self.handoff.built_from:
+            return self
+        built_from = self.handoff.built_from
+        if built_from != self.id and built_from not in self.depends_on:
+            object.__setattr__(self, "depends_on", [*self.depends_on, built_from])
+        return self
 
     @field_validator("id")
     @classmethod
@@ -540,18 +805,39 @@ class Stage(_PlanModel):
         return self.kind is StageKind.CHECKPOINT
 
     @property
+    def is_handoff(self) -> bool:
+        """Whether this stage hands the user something to run elsewhere rather than computing."""
+        return self.kind is StageKind.HANDOFF
+
+    @property
+    def generates_no_code(self) -> bool:
+        """Whether this stage scaffolds to a panel rather than to a translation.
+
+        The two human kinds, asked as one question, because every caller that cares about one
+        cares about the other: neither gets a review marker, neither gets a passthrough
+        assignment, and neither belongs in a count of how much of the workbook became code.
+        """
+        return self.kind in (StageKind.CHECKPOINT, StageKind.HANDOFF)
+
+    @property
     def upstream_stage_ids(self) -> list[str]:
-        """The ids of the stages this one reads, from its sources.
+        """The ids of the stages this one reads, from its sources and its hand-off.
 
         Distinct from ``depends_on``, which is ordering: a stage can be gated by a checkpoint it
         reads nothing from, and — until somebody lists it — can read a frame it forgot to depend
         on. :func:`kedge.plan.review.review_warnings` reports the second.
+
+        A generated hand-off's ``built_from`` counts as a read, because it is one: the statement
+        is rendered row by row out of that stage's frame.
         """
-        return [
+        ids = [
             source.ref
             for source in self.sources
             if source.origin is SourceOrigin.STAGE and source.ref is not None
         ]
+        if self.handoff is not None and self.handoff.built_from:
+            ids.append(self.handoff.built_from)
+        return ids
 
     @property
     def needs_review_marker(self) -> bool:
@@ -560,7 +846,7 @@ class Stage(_PlanModel):
         ``unknown`` counts. A stage whose confidence was never stated must not scaffold looking
         as finished as one the model was sure about.
         """
-        if self.is_checkpoint:
+        if self.generates_no_code:
             return False
         return self.confidence in (Confidence.LOW, Confidence.UNKNOWN)
 
@@ -569,6 +855,26 @@ class Stage(_PlanModel):
         if self.checkpoint is not None:
             return self.checkpoint
         return Checkpoint(question=f"Approve: {self.intent}")
+
+    def effective_handoff(self) -> Handoff:
+        """Return this stage's hand-off spec, synthesising a placeholder one if absent.
+
+        Unlike a checkpoint, a hand-off cannot be meaningfully synthesised: a checkpoint's whole
+        content is a question, and the intent *is* the question, but nobody can guess a
+        statement. So the synthesised one carries the intent as its instruction and a statement
+        saying in as many words that the plan did not supply it. That scaffolds to a panel the
+        user can see is unfinished, which is the honest outcome -- an exception here would put
+        one malformed stage between the user and a notebook that is otherwise fine.
+        """
+        if self.handoff is not None:
+            return self.handoff
+        return Handoff(
+            instruction=self.intent,
+            statement=(
+                "-- TODO(kedge): the plan marked this stage a hand-off but supplied no "
+                "statement.\n-- Paste the query or command this step runs, then re-approve."
+            ),
+        )
 
 
 # =============================================================================
@@ -729,6 +1035,12 @@ def _check_stage_graph(stages: list[Stage]) -> None:
             if upstream not in seen:
                 msg = f"stage {stage.id!r} reads unknown stage {upstream!r} in its sources"
                 raise ValueError(msg)
+        if stage.handoff is not None and stage.handoff.built_from == stage.id:
+            msg = (
+                f"stage {stage.id!r} renders its hand-off from itself. A generated statement "
+                f"is rendered from an upstream stage's frame."
+            )
+            raise ValueError(msg)
 
     ordered = topological_stages(stages, strict=False)
     if len(ordered) != len(stages):
@@ -867,6 +1179,13 @@ class PlanDraft(_PlanModel):
     summary: str | None = Field(
         default=None, description="One or two sentences on the shape of the process overall."
     )
+    briefing: Briefing | None = Field(
+        default=None,
+        description="Why this process exists, drawn from the workbook's own documentation. "
+        "Distinct from `summary`, which describes the shape of the conversion: this describes "
+        "the *business* process, and it is what the next person to open the notebook in eight "
+        "months needs. Every claim must cite where it came from.",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -921,6 +1240,7 @@ class ProcessPlan(_PlanModel):
     open_questions: list[OpenQuestion]
     dropped: list[DroppedRange] = Field(default_factory=list)
     summary: str | None = None
+    briefing: Briefing | None = None
 
     # ── review ───────────────────────────────────────────────────────────
     approval: Approval = Field(default_factory=Approval)
@@ -968,6 +1288,7 @@ class ProcessPlan(_PlanModel):
             open_questions=draft.open_questions,
             dropped=draft.dropped,
             summary=draft.summary,
+            briefing=draft.briefing,
         )
 
     @classmethod
@@ -1000,6 +1321,7 @@ class ProcessPlan(_PlanModel):
             open_questions=self.open_questions,
             dropped=self.dropped,
             summary=self.summary,
+            briefing=self.briefing,
         )
 
     # ── accessors ────────────────────────────────────────────────────────

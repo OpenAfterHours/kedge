@@ -337,6 +337,7 @@ def test_the_schema_describes_a_draft_not_a_whole_plan() -> None:
     schema = plan_json_schema()
     assert sorted(schema["required"]) == [
         "assessment",
+        "briefing",
         "dropped",
         "open_questions",
         "stages",
@@ -1179,3 +1180,47 @@ def test_the_plan_history_is_iterable_straight_off_a_workspace(workbook: Path, a
     run_plan(workbook, analysis=analysis, completer=scripted_from_plan(make_draft()))
     run_plan(workbook, analysis=analysis, completer=scripted_from_plan(make_draft()))
     assert [plan.version for plan in iter_plan_history(space)] == [1, 2]
+
+
+def test_the_payload_gives_the_model_the_cell_references_it_is_asked_to_cite(
+    analysis_factory: Any,
+) -> None:
+    """`briefing.sources` demands citations, so the notes must arrive with their locations.
+
+    They did not, for one release. The schema refused prose without a citation and the payload
+    handed over the sheet and the heading but never the cells -- so the only way to satisfy the
+    validator was to invent a range, which is precisely the failure the requirement exists to
+    prevent. A rule the model cannot obey honestly is worse than no rule.
+    """
+    from kedge.analysis.model import ProcessNote
+
+    analysis = analysis_factory(
+        notes=[
+            ProcessNote(
+                source="sheet",
+                origin="Sign-off",
+                location="A3:A4",
+                heading="Purpose",
+                text="To record the quarterly uplift.",
+            )
+        ]
+    )
+
+    note = build_proposal_context(analysis, triage(analysis))["process_notes"][0]
+
+    assert note["location"] == "A3:A4"
+    assert note["origin"] == "Sign-off"
+    assert note["heading"] == "Purpose"
+
+
+def test_the_planner_is_asked_about_hand_offs_and_the_briefing() -> None:
+    """The silent checklist is what actually shapes the answer, so it has to be current."""
+    prompt = load_prompt("propose_user.md")
+
+    assert "briefing" in prompt
+    assert "handoff" in prompt
+    assert "mutates" in prompt
+    assert "`ref`" in prompt
+    # The dead-region trap: a column of generated SQL has a person as its consumer. Asserted
+    # on a fragment that does not straddle the prompt's line wrapping.
+    assert "have a person as its consumer" in prompt

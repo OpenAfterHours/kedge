@@ -1452,3 +1452,38 @@ def test_every_kind_of_change_has_a_line_in_the_rendered_diff() -> None:
     assert "- question: Column AF is computed" in removed
     assert "- drop Calc!AK:AP" in removed
     assert "- drop Calc!BB:BD" in removed
+
+
+def test_the_review_pane_shows_the_briefing_and_its_citations() -> None:
+    """Approving a plan means approving what the notebook will tell people the process is for.
+
+    That text goes into the notebook and outlives everybody who touched it. A reviewer who never
+    saw it has signed off prose they cannot vouch for -- and the `sources` requirement, which
+    exists so invented background is detectable, is worth nothing if the citations are never put
+    in front of the person who could check them.
+    """
+    from kedge.plan.model import Briefing
+
+    plan = make_plan(
+        draft=make_draft(
+            briefing=Briefing(
+                purpose="Records the quarterly accrual uplift.",
+                background="Agreed at the June finance committee.",
+                watch_for=["One trade carries no accrual value."],
+                sources=["Sign-off!A3:A4 (Purpose)", "Sign-off!A6:A7 (Background)"],
+            )
+        )
+    )
+
+    rendered = render_plan(plan)
+
+    assert "BRIEFING" in rendered
+    assert "Records the quarterly accrual uplift." in rendered
+    assert "Sign-off!A3:A4 (Purpose)" in rendered
+    assert "One trade carries no accrual value." in rendered
+    assert "Check these against the workbook" in rendered
+
+
+def test_a_plan_with_no_briefing_renders_without_an_empty_section() -> None:
+    """A workbook that documents nothing is a legitimate case, not an empty heading."""
+    assert "BRIEFING" not in render_plan(make_plan())
