@@ -501,6 +501,7 @@ def reconcile_region(
     *,
     tolerance: Tolerance,
     max_mismatch_rows: int = _DEFAULT_MISMATCH_ROWS,
+    not_reproduced: Mapping[str, str] | None = None,
 ) -> RegionResult:
     """Reconcile one region and explain the outcome.
 
@@ -547,11 +548,21 @@ def reconcile_region(
         )
 
     if actual is None:
+        # Two very different situations, and telling a user the wrong one costs them an hour.
+        # "The notebook produced nothing for this, check your variable names" is right when a
+        # cell failed to run; it is actively misleading when the notebook was never going to
+        # reproduce the region -- a column of generated SQL the conversion improves on, say.
+        # Either way it is not a pass, which is the invariant; what changes is whether the
+        # reader goes looking for a bug.
+        declared = (not_reproduced or {}).get(spec.id)
+        reason = (
+            NotReconciledReason.NOT_REPRODUCED if declared else NotReconciledReason.NO_ACTUAL_VALUES
+        )
         return RegionResult(
             **common,
             status=ReconciliationStatus.NOT_RECONCILED,
-            reason=NotReconciledReason.NO_ACTUAL_VALUES,
-            detail=NotReconciledReason.NO_ACTUAL_VALUES.explanation,
+            reason=reason,
+            detail=f"{reason.explanation} {declared}" if declared else reason.explanation,
             rows_expected=len(baseline.values),
         )
 
@@ -703,6 +714,7 @@ def reconcile_values(
     analysis: WorkbookAnalysis | None = None,
     spec_source: SpecSource = "provided",
     notes: Sequence[str] = (),
+    not_reproduced: Mapping[str, str] | None = None,
 ) -> ReconciliationReport:
     """Build a report from values already in hand.
 
@@ -736,6 +748,7 @@ def reconcile_values(
             actuals.get(spec.id),
             tolerance=tolerance,
             max_mismatch_rows=max_mismatch_rows,
+            not_reproduced=not_reproduced,
         )
         for spec in specs
     ]
@@ -792,6 +805,7 @@ def reconcile_workbook(
     analysis: WorkbookAnalysis | None = None,
     spec_source: SpecSource | None = None,
     notes: Sequence[str] = (),
+    not_reproduced: Mapping[str, str] | None = None,
 ) -> ReconciliationReport:
     """Read the workbook's baselines and reconcile the supplied values against them.
 
@@ -807,6 +821,12 @@ def reconcile_workbook(
             function can: a caller that inferred them itself passes ``"inferred"`` so the
             report does not claim they were declared.
         notes: Caveats about the run itself.
+        not_reproduced: Region id to the reason the notebook does not reproduce it. Such a
+            region is still ``NOT_RECONCILED`` -- nothing is claimed about it, and nothing here
+            can make a region a pass -- but it is reported as a decision somebody made rather
+            than as a cell that failed to run. The distinction matters: a conversion that
+            deliberately improves on a workbook column, rather than copying it, would otherwise
+            be told to go and fix a bug that is not there.
 
     Returns:
         A complete report. A workbook that cannot be opened produces a NOT_RECONCILED report
@@ -863,6 +883,7 @@ def reconcile_workbook(
             analysis=analysis,
             spec_source=spec_source,
             notes=run_notes,
+            not_reproduced=not_reproduced,
         )
     finally:
         handle.close()

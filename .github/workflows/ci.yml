@@ -40,14 +40,14 @@ jobs:
         run: uv run python scripts/guardrails.py
 
   types:
-    name: ty (advisory)
+    name: ty
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Advisory on purpose. `ty check src/` reports 3 known diagnostics, all of them mypy-dialect
-    # `# type: ignore` comments ty does not honour: regions.py:632 and watch.py:343-344. Each is
-    # catalogued in docs/ty-diagnostics.md with the one-line fix. Clearing them is the whole
-    # prerequisite for deleting this line and letting the job gate merges.
-    continue-on-error: true
+    # No longer advisory. `ty check src/` was carrying three diagnostics -- regions.py:632 and
+    # watch.py:343-344, all of them mypy-dialect `# type: ignore` comments ty does not honour --
+    # and docs/ty-diagnostics.md said clearing them was the whole prerequisite for letting this
+    # job gate merges. They are cleared, so it does. A checker that is always red is one nobody
+    # reads, which is the same reason the reconciliation panel stopped being permanently amber.
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v9.0.0
@@ -75,7 +75,11 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --locked
+      # `--group evals` pulls in duckdb, which the eval harness uses to *execute* generated SQL
+      # rather than read it. Without it that grader skips, and the harness's own test -- which
+      # asserts the reference conversion scores full marks -- would go red on a missing
+      # dependency rather than on a regression.
+      - run: uv sync --locked --group evals
       # The default addopts deselect `contract` and `llm`; this is unit plus corpus.
       # Coverage is measured on one leg only. Four legs reporting four slightly different
       # numbers -- the platform branches in `lifecycle` and `ingest/watch` differ by OS -- is

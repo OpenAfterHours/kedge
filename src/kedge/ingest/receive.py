@@ -32,7 +32,8 @@ from typing import TYPE_CHECKING, Any
 
 from kedge.errors import IngestError
 from kedge.ingest import store
-from kedge.ingest.model import HandIn, HandInSource, Upload, utcnow
+from kedge.ingest.model import HandIn, HandInSource, Paste, Upload, utcnow
+from kedge.ingest.paste import PasteError, normalise_paste
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "UPLOAD_SIZE_LIMIT_BYTES",
     "EmptySelectionError",
+    "PasteError",
     "UnsupportedPayloadError",
     "UploadTooLargeError",
     "exceeds_upload_limit",
@@ -154,6 +156,21 @@ def _normalise_one(payload: Any, *, source: HandInSource | None) -> _Incoming | 
     if isinstance(payload, Upload):
         return _Incoming(name=payload.name, source=source or "dropped", contents=payload.contents)
 
+    if isinstance(payload, Paste):
+        # The one payload whose bytes are not what arrived: pasted text is normalised to CSV
+        # here, so everything downstream of the store sees an ordinary comma-delimited file
+        # and read_frame picks the right separator off the extension. A paste holding nothing
+        # is the untouched text area on a notebook's first run, which is EmptySelectionError
+        # for the same reason an untouched file browser is -- not an error, just not yet.
+        if not payload.text.strip():
+            return None
+        result = normalise_paste(payload.text)
+        return _Incoming(
+            name=_csv_name(payload.name),
+            source=source or "pasted",
+            contents=result.csv_bytes,
+        )
+
     if _is_upload_shaped(payload):
         return _Incoming(
             name=str(payload.name), source=source or "dropped", contents=bytes(payload.contents)
@@ -174,11 +191,24 @@ def _normalise_one(payload: Any, *, source: HandInSource | None) -> _Incoming | 
     return _unsupported(payload)
 
 
+def _csv_name(name: str) -> str:
+    """Give a pasted hand-in a ``.csv`` name, because CSV is what was stored.
+
+    ``read_frame`` reads the separator off the suffix. A paste named ``extract.tsv`` holding
+    normalised CSV would be read as one tab-delimited column of commas -- green all the way
+    through ingestion and wrong at the first calculation.
+    """
+    cleaned = name.strip() or "pasted.csv"
+    stem = cleaned.rsplit(".", 1)[0] if "." in cleaned else cleaned
+    return f"{stem or 'pasted'}.csv"
+
+
 def _unsupported(payload: Any) -> _Incoming:
     msg = (
         f"cannot receive a hand-in from {type(payload).__name__}. Pass the value of "
         f"mo.ui.file (FileUploadResults: name + contents), the value of mo.ui.file_browser "
-        f"(FileBrowserFileInfo: path + name), a kedge.ingest.Upload, or a filesystem path."
+        f"(FileBrowserFileInfo: path + name), a kedge.ingest.Upload, a kedge.ingest.Paste "
+        f"(delimited text from a result grid), or a filesystem path."
     )
     raise UnsupportedPayloadError(msg)
 

@@ -1,13 +1,15 @@
 # The `ty` diagnostics, one by one
 
 `ty` is the project's type checker (`CONVENTIONS.md`: "Type checker is `ty` (Astral), not mypy"),
-and in CI it is **advisory**: the `types` job in `.github/workflows/ci.yml` carries
-`continue-on-error: true`. That comment used to say "six known diagnostics" and nothing tracked
-what they were, so nothing could say when the line was safe to delete. This document is that list;
-the comment now names the count and the files, and both move together.
+and in CI it **gates merges**. It did not always: the `types` job carried `continue-on-error:
+true`, the comment beside it said "six known diagnostics", and nothing tracked what they were, so
+nothing could say when the line was safe to delete. This document was that list.
 
-**Clearing every entry below is the whole prerequisite for removing `continue-on-error` and
-letting the job gate merges.** There is nothing else in the way.
+**Every entry below is now cleared, and `continue-on-error` is gone.** The document is kept
+because the entries record what each diagnostic actually was and why the suppression behind it
+was wrong -- three of the five turned out to be annotations that said less than the code knew,
+not dialect noise -- and because the next person to add a suppression should read what happened
+to the last five.
 
 ## The measurement
 
@@ -16,7 +18,7 @@ uv run ty check src/
 ```
 
 ```
-Found 6 diagnostics
+Found 6 diagnostics    # at the time of writing; `Found no diagnostics` today
 ```
 
 Measured with **ty 0.0.63** on Windows 11 / Python 3.13, against a clean tree at commit
@@ -84,7 +86,7 @@ a real annotation fix that is barely longer. Prefer the fix.
 
 ## The six
 
-### 1. `src/kedge/analysis/regions.py:632` — `invalid-argument-type`
+### 1. `src/kedge/analysis/regions.py:632` — `invalid-argument-type` — CLEARED
 
 ```
 error[invalid-argument-type]: Argument is incorrect
@@ -97,12 +99,13 @@ error[invalid-argument-type]: Argument is incorrect
 `LogicalOperation.orientation` is declared `Literal["column", "row", "block", "single"]`. ty is
 right that `str` is wider than the field, and the mypy suppression was never doing anything.
 
-**What it needs.** Narrow the helper's return annotation to the same `Literal`, and delete the
-suppression. The literal is spelled out in `analysis/model.py:228`; declaring a shared alias there
-and using it in both places would stop the two drifting. `analysis/model.py` is the analyser's
-contract, so adding an alias to it is a cross-cutting change and should be announced as one.
+**What it needed, and what was done.** `analysis.model.Orientation` is now the one declaration
+of the vocabulary; the field uses it and `_orientation` returns it, so the two cannot drift. The
+suppression is gone. ty was right that it was never doing anything: the producer was annotated
+`str`, which is wider than the field accepts, so the loose annotation was the actual defect and
+the ignore comment was hiding it.
 
-### 2 and 3. `src/kedge/ingest/watch.py:305–306` — `unresolved-attribute`
+### 2 and 3. `src/kedge/ingest/watch.py:305–306` — `unresolved-attribute` — CLEARED
 
 ```
 error[unresolved-attribute]: Object of type `~None` has no attribute `stop`
@@ -115,15 +118,17 @@ function-local and the class it yields is platform-dependent — `WindowsApiObse
 `InotifyObserver` on Linux. Narrowing past the `is None` guard leaves `object`, which has neither
 method. Nothing is wrong at runtime; the annotation just says less than the code knows.
 
-**What it needs.** watchdog ships `py.typed`, and every platform variant derives from one base:
+**What it needed, and what was done.** watchdog ships `py.typed`, and every platform variant
+derives from one base:
 
 ```python
 if TYPE_CHECKING:
     from watchdog.observers.api import BaseObserver
 ```
 
-Then `self._observer: BaseObserver | None = None`, and both suppressions go. The import stays
-behind `TYPE_CHECKING`, so the runtime cost of the function-local import is preserved.
+`self._observer` is now `BaseObserver | None` and both suppressions are gone. The import stays
+behind `TYPE_CHECKING`, so the runtime cost of the function-local import is preserved -- the
+class that actually loads watchdog is still resolved at call time, on the platform it runs on.
 
 ### 4. `src/kedge/plan/__init__.py:158` — `unused-ignore-comment` (warning) — CLEARED
 

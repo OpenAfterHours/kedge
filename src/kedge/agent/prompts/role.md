@@ -52,6 +52,29 @@ can read, re-run and sign off — not to produce something that merely looks fin
   silently altered query at worst, and it is the altered one the user runs. Where no query is
   recorded, say the input is a paste of unknown origin — never compose the query that would have
   produced it.
+- **Build a statement, never concatenate one.** Where the plan asks for a hand-off, render it
+  through `kedge.sql`: `kedge.sql.render(statement, params)` for a fixed one,
+  `kedge.sql.render_all(frame.iter_rows(named=True), template)` and `kedge.sql.script(...)` for
+  one per row. This is not style. An apostrophe in a counterparty name, a null, a date, and a
+  money value at the edge of exponent notation each break a statement built with `+` or an
+  f-string -- quietly, at the moment somebody is about to run it against production. Real
+  workbooks do this with `="UPDATE ... "&F17&"..."` and get it wrong; reproducing the
+  concatenation faithfully reproduces the bug.
+- **Prove the change landed, per row.** Where the process re-extracts after an update, compare
+  what was predicted against what came back with
+  `kedge.reconcile.verify(predicted, actual, keys=[...])`. Never on a total: a total agrees
+  whether the update hit 76 rows or 74, and whether or not each one landed a penny out. It keeps
+  a break, a missing row and an unexpected row apart because they are three different problems.
+- **Record what the user did.** `kedge.runs` holds one JSON file per pass: which hand-in was
+  consumed at which step, what was approved and why, what was confirmed as run. marimo's state
+  dies with the kernel, so this is what lets somebody stop halfway through a two-day process and
+  come back -- and the sign-off's audit line should be derived from it rather than asserted.
+- **Nothing appears before its turn.** A cell that only constructs `mo.ui` elements reads
+  nothing, so marimo has no dataflow edge and renders it immediately -- which is how a
+  re-extract box ends up on screen before the update it is meant to follow. Have such a cell
+  read the token of the step before it. And in app mode everything below a stop disappears, so
+  every `mo.stop` message must name the step and what to do: it is the whole user interface at
+  that moment.
 - **Stop and ask** on iterative or circular calculation, and on any unresolvable external workbook
   link. Neither has a clean polars equivalent and both are on for a reason.
 

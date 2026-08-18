@@ -41,6 +41,7 @@ import polars as pl
 from kedge.analysis.model import ColumnProfile, NumericStats, Severity
 from kedge.errors import IngestError
 from kedge.ingest import store
+from kedge.ingest.coerce import Coercion, coerce_numeric_text
 from kedge.ingest.model import (
     DriftItem,
     DriftKind,
@@ -52,6 +53,7 @@ from kedge.ingest.model import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from kedge.config import RedactionConfig, SamplingConfig
@@ -428,6 +430,14 @@ class Layout:
     header_row: int
     preamble_rows: int
     totals_row_excluded: bool
+    coercions: tuple[Coercion, ...] = ()
+    """Text columns read as numbers. See :mod:`kedge.ingest.coerce` for what qualifies.
+
+    Carried here rather than reported separately because this is already the record of "what
+    had to be done to the file to get at its data", and a type conversion is exactly that. It
+    also means the notebook's existing layout panel surfaces it with no new wiring -- a
+    conversion nobody was told about is the thing worth avoiding.
+    """
 
     def notes(self) -> list[str]:
         """Return plain-English notes on anything non-obvious about the layout."""
@@ -436,6 +446,7 @@ class Layout:
             notes.append(f"skipped {self.preamble_rows} preamble row(s) above the header")
         if self.totals_row_excluded:
             notes.append("excluded a totals row from the bottom")
+        notes.extend(coercion.note() for coercion in self.coercions)
         return notes
 
 
@@ -444,6 +455,8 @@ def read_data(
     *,
     sheet: str | None = None,
     header_row: int | None = None,
+    coerce: bool = True,
+    keep_as_text: Sequence[str] = (),
 ) -> tuple[pl.DataFrame, Layout]:
     """Read the *data* of a hand-in: preamble skipped, totals row excluded.
 
@@ -456,9 +469,15 @@ def read_data(
         path: The hand-in to read.
         sheet: Worksheet name for spreadsheet formats. ``None`` reads the first sheet.
         header_row: Override the detected header row.
+        coerce: Read unambiguously numeric text columns as numbers, reporting each on the
+            layout. On by default, because a hand-in that arrived through the paste box is all
+            text and the alternative is an arithmetic error four operations downstream.
+        keep_as_text: Columns to leave as text whatever they look like. A contract that declares
+            a column ``string`` passes its name here: the agreement outranks the guess.
 
     Returns:
-        ``(frame, layout)`` -- the data, and what had to be skipped to reach it.
+        ``(frame, layout)`` -- the data, what had to be skipped to reach it, and what had to be
+        converted.
 
     Raises:
         HandInReadError: If the file cannot be read.
@@ -472,8 +491,19 @@ def read_data(
     if has_totals:
         logger.info("excluding a totals row from the data view of %s", path.name)
         frame = frame.head(frame.height - 1)
+
+    # Typed after the totals row is dropped, not before: a totals row often carries a label in
+    # the first column and a formatted number in the rest, and judging a column's type against a
+    # row that is not data is how a numeric column gets left as text.
+    coercions: tuple[Coercion, ...] = ()
+    if coerce:
+        frame, coercions = coerce_numeric_text(frame, skip=keep_as_text)
+
     return frame, Layout(
-        header_row=header_row, preamble_rows=preamble, totals_row_excluded=has_totals
+        header_row=header_row,
+        preamble_rows=preamble,
+        totals_row_excluded=has_totals,
+        coercions=coercions,
     )
 
 

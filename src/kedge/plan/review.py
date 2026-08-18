@@ -801,6 +801,35 @@ def render_plan(
     if plan.summary:
         lines.extend(["", _wrap(plan.summary, indent="  ")])
 
+    # The briefing is rendered here, before anything technical, because approving a plan means
+    # approving what the notebook will *tell people this process is for* -- and that text goes
+    # into the notebook and outlives everyone. A reviewer who never saw it has signed off prose
+    # they cannot vouch for, which is exactly the failure the `sources` requirement exists to
+    # make visible: the citations are here so they can be checked against the workbook.
+    briefing = plan.briefing
+    if briefing is not None and not briefing.is_empty:
+        lines.extend(["", "BRIEFING", "  what the notebook will say this process is for"])
+        for label, value in (
+            ("purpose", briefing.purpose),
+            ("background", briefing.background),
+            ("cadence", briefing.cadence),
+            ("audience", briefing.audience),
+        ):
+            if value:
+                lines.extend(["", f"  {label}:", _wrap(value, indent="    ")])
+        if briefing.watch_for:
+            lines.extend(["", "  watch for:"])
+            lines.extend(_wrap(f"- {item}", indent="    ") for item in briefing.watch_for)
+        lines.extend(["", "  sources:"])
+        lines.extend(f"    {source}" for source in briefing.sources)
+        lines.append(
+            _wrap(
+                "Check these against the workbook. Prose here that no source supports is "
+                "invented, and it will read as authoritative for as long as the notebook lives.",
+                indent="  ",
+            )
+        )
+
     lines.extend(
         [
             "",

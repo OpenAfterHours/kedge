@@ -19,7 +19,21 @@ with an AI copilot that operates the notebook through a controlled tool surface.
    open questions, and what it intends to drop.
 3. **Scaffolds** a marimo notebook from the approved plan.
 4. **Reconciles** the generated Python against the values Excel last cached, so the
-   translation checks itself against evidence rather than declaring itself finished.
+   translation checks itself against evidence rather than declaring itself finished. That is an
+   acceptance test on the *conversion*: it is measured once, recorded, and cited afterwards —
+   the workbook is no baseline for next quarter's data.
+
+Most of the spreadsheets worth converting are not calculations. They are the record of a
+**process**: run an extract, work out an adjustment, run an update, re-extract to prove it took,
+write a memo somebody signs. So the notebook kedge produces is a **runbook**, not a pipeline. It
+hands the user each statement in turn, takes the results back through a managed hand-in, does
+the arithmetic in between where it can be checked, blocks on a recorded decision before anything
+touches production, and verifies the re-extract row by row against what it predicted.
+
+kedge runs none of that SQL. It holds no database connection and issues no statement. What it
+does is work out exactly what needs running, say where, wait, and refuse to claim the change
+worked until it has seen evidence that it did — keeping the state on disk in between, because a
+process that takes two days is one you have to be able to walk away from.
 
 ## Quick start
 

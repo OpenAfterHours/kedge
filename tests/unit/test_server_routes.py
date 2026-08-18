@@ -1410,7 +1410,11 @@ def test_an_approval_never_overwrites_a_cell_somebody_has_worked_on(
     payload = client.post(f"/api/sessions/{session_id}/pending/amendments/0", json={}).json()
 
     assert driver.cells["apply_haircuts"] == mine
-    assert driver.edited == ["kedge_setup"], "the version header, and nothing anybody wrote"
+    # The setup cell names the plan version and the briefing names it too, so an amendment
+    # rewrites both headers. Neither is a cell anybody has worked on, which is the point.
+    assert driver.edited == ["kedge_setup", "kedge_briefing"], (
+        "the version headers, and nothing anybody wrote"
+    )
     assert payload["notebook"]["diverged"] == ["apply_haircuts"]
     assert "left alone" in payload["notebook"]["detail"]
 

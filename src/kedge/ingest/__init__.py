@@ -34,6 +34,7 @@ the contract's ``sheet`` and ``header_row`` to all three calls, or none of them.
 
 from __future__ import annotations
 
+from kedge.ingest.coerce import Coercion, coerce_numeric_text
 from kedge.ingest.drift import (
     HandInReadError,
     check_drift,
@@ -53,8 +54,10 @@ from kedge.ingest.model import (
     HandIn,
     HandInProfile,
     HandInSource,
+    Paste,
     Upload,
 )
+from kedge.ingest.paste import PasteError, PasteResult, normalise_paste, sniff_delimiter
 from kedge.ingest.receive import (
     UPLOAD_SIZE_LIMIT_BYTES,
     EmptySelectionError,
@@ -80,6 +83,7 @@ from kedge.ingest.watch import WatchedFolder, WatchError, scan_once, watch
 
 __all__ = [
     "UPLOAD_SIZE_LIMIT_BYTES",
+    "Coercion",
     "DriftItem",
     "DriftKind",
     "DriftReport",
@@ -88,6 +92,9 @@ __all__ = [
     "HandInProfile",
     "HandInReadError",
     "HandInSource",
+    "Paste",
+    "PasteError",
+    "PasteResult",
     "StoreError",
     "UnsupportedPayloadError",
     "Upload",
@@ -96,6 +103,7 @@ __all__ = [
     "WatchedFolder",
     "accept_profile",
     "check_drift",
+    "coerce_numeric_text",
     "compare",
     "detect_layout",
     "detect_totals_row",
@@ -106,6 +114,7 @@ __all__ = [
     "history",
     "last_accepted_profile",
     "load_profile",
+    "normalise_paste",
     "profile_frame",
     "profile_handin",
     "read_data",
@@ -116,5 +125,6 @@ __all__ = [
     "receive_paths",
     "scan_once",
     "size_guidance",
+    "sniff_delimiter",
     "watch",
 ]

@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING
 from openpyxl.formula.tokenizer import Token
 
 from kedge.analysis.formulas import ParsedFormula, parse_formula, to_a1, tokenise
-from kedge.analysis.model import ExcelPattern, Inconsistency, LogicalOperation
+from kedge.analysis.model import ExcelPattern, Inconsistency, LogicalOperation, Orientation
 from kedge.analysis.values import cell_ref
 
 if TYPE_CHECKING:
@@ -298,7 +298,7 @@ def _ranges(sheet: str, coordinates: list[tuple[int, int]]) -> list[str]:
     return rendered
 
 
-def _orientation(rows: int, cols: int, count: int) -> str:
+def _orientation(rows: int, cols: int, count: int) -> Orientation:
     """Describe a region's shape."""
     if count == 1:
         return "single"
@@ -629,7 +629,7 @@ def detect_regions(
                 anchor=anchor,
                 ranges=_ranges(scan.name, component),
                 cell_count=len(component),
-                orientation=orientation,  # type: ignore[arg-type]
+                orientation=orientation,
                 r1c1=r1c1,
                 sample_a1=sample_a1,
                 functions=list(dict.fromkeys(parsed.functions)),

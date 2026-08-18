@@ -44,6 +44,7 @@ __all__ = [
     "LogicalOperation",
     "NamedRange",
     "NumericStats",
+    "Orientation",
     "PowerQuery",
     "PowerQueryExtraction",
     "ProcessNote",
@@ -220,6 +221,17 @@ class Inconsistency(_Frozen):
     note: str | None = None
 
 
+Orientation = Literal["column", "row", "block", "single"]
+"""The shape of a compressed formula region.
+
+An alias rather than the literal spelled out at the field, because it is spelled out in two
+places -- here and in :func:`kedge.analysis.regions._orientation`, which produces it -- and two
+copies of a closed vocabulary drift. They had already: the producer was annotated `str`, which
+is wider than the field accepts, and the mypy suppression at the call site was never doing
+anything (see docs/ty-diagnostics.md).
+"""
+
+
 class LogicalOperation(_Frozen):
     """One R1C1-compressed formula region: a single logical operation.
 
@@ -233,7 +245,7 @@ class LogicalOperation(_Frozen):
     anchor: str = Field(description="Top-left cell of the region, e.g. 'H2'.")
     ranges: list[str] = Field(description="Source ranges, sheet-qualified.")
     cell_count: int
-    orientation: Literal["column", "row", "block", "single"] = "column"
+    orientation: Orientation = "column"
 
     r1c1: str = Field(description="The normalised relative formula that defines the region.")
     sample_a1: str = Field(description="The A1 formula at the anchor, for humans to read.")

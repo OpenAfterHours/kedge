@@ -10,8 +10,15 @@ Read `PLAN.md` for *what* to build. This file is *how*. It is binding: reviewers
 2. **`marimo._code_mode` is imported in exactly one place**: `src/kedge/notebook/driver.py`.
    Nothing else in the repo may reference it, import it, or emit code that mentions it.
    Grep `_code_mode` — if it appears outside `driver.py` and its tests, that is a bug (PLAN §6.1).
-3. **Excel semantics go through `kedge.xl`.** Never open-code half-away-from-zero rounding or
-   null-as-zero arithmetic. If `kedge.xl` lacks what you need, add it there with tests.
+3. **Excel semantics go through `kedge.xl`, and SQL literals through `kedge.sql`.** Never
+   open-code half-away-from-zero rounding or null-as-zero arithmetic; never build a statement
+   with `+` or an f-string. If either module lacks what you need, add it there with tests. The
+   SQL half is the same class of bug as the Excel half: an apostrophe in a counterparty name, a
+   null, a date, a money value at the edge of exponent notation. Every one is ordinary in a
+   finance extract and every one breaks a concatenated statement, silently, at the moment
+   somebody runs it against production. Unlike 1, 2, 6 and 7 this one is **not** machine
+   enforced -- no AST pass can tell SQL-shaped string building from any other -- so it holds
+   only as long as reviewers hold it.
 4. **Every extractor degrades gracefully.** An analyser sub-extractor returns an "absent" or
    "unparseable" result and keeps going. It never raises past its own boundary. A malformed
    workbook produces a `Finding`, not a traceback (PLAN §M1).

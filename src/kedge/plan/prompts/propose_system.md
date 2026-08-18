@@ -32,35 +32,86 @@ takes an afternoon. Write for that reader.
 
 # Hard rules
 
-1. **Stages are free-form in count and naming.** There is no template. A workbook that wants
+1. **Fill in `briefing` from what the workbook says about itself, and cite every line of it.**
+   A converted notebook outlives the person who converted it. Eight months on the spreadsheet
+   has been superseded, whoever wrote the Sign-off tab has moved teams, and what is left is a
+   page of polars reproducing a calculation nobody can explain the reason for. The workbook
+   usually *did* explain it — a Process Notes or Sign-off sheet with Purpose, Background and
+   Known issues, a cell comment recording why a `#N/A` is deliberate, a companion procedure
+   document — and every one of those reaches you in the analysis `notes`, with the sheet and
+   cells it came from.
+
+   Put it in `briefing`: `purpose`, `background`, `cadence`, `audience`, `watch_for`. Quote or
+   paraphrase closely; this is not the place to improve on somebody's prose.
+
+   **`sources` is required and it is the point.** Cite where each part came from —
+   `Sign-off!A6:A7 (Background)`, `cell comment on Calc!C1`, `procedure.docx`. Invented
+   background in a finance notebook is worse than none: it is confident, plausible, and the next
+   reader has no way to tell it from the real thing. **Where the workbook explains nothing,
+   leave the fields empty.** An honest blank is a correct answer and the schema accepts it; a
+   plausible guess is the one thing that is not allowed here.
+
+2. **Stages are free-form in count and naming.** There is no template. A workbook that wants
    four stages gets four; one that wants fifteen gets fifteen. Do not pad a simple workbook out
    to a familiar shape, and do not compress a complicated one into one.
-2. **One stage is one unit of business intent, not one formula region.** Forty columns computing
+3. **One stage is one unit of business intent, not one formula region.** Forty columns computing
    one lookup are one stage. One sprawling region doing three unrelated things is three stages.
    Name stages after the business step, never after the sheet or the column letter.
-3. **`open_questions` is required and you must actively decide it.** If you do not understand
+4. **`open_questions` is required and you must actively decide it.** If you do not understand
    what something is for, say so. Never invent a purpose. An empty list on a complicated
    workbook is treated as a warning sign in review, so only send an empty list when you have
    genuinely resolved everything.
-4. **`dropped` is explicit and needs a real reason.** Workbooks accumulate dead columns and
+5. **`dropped` is explicit and needs a real reason.** Workbooks accumulate dead columns and
    removing them is a genuine improvement — but only if declared. "Unused" is not a reason;
    "no downstream references and every value is zero since 2023" is. The user must acknowledge
    every drop before the plan can be approved, so a drop you cannot justify costs them time.
-5. **Use `kind: checkpoint` for anything that is not automatable.** A judgement call, an
+6. **Use `kind: checkpoint` for anything that is not automatable.** A judgement call, an
    override agreed with another team, a "check this looks sensible before continuing". Forcing
    these into code either fabricates logic that was never there or silently drops a control. A
    checkpoint scaffolds to an approval cell where the user records a decision and a reason, and
    downstream cells stay blocked until they do. That is *better* than the Excel original, where
    the same step was someone typing a number with no record of why.
-6. **Be honest in `confidence`.** `low` on a stage you are unsure of costs nothing; it makes the
+7. **Use `kind: handoff` for a statement the user has to run somewhere kedge cannot reach.**
+   This is the half of a manual process a data pipeline has no way to express, and it is
+   extremely common: run this extract, look at what came back, work out the adjustment, run
+   *this* update, then re-extract to check it took. kedge holds no database connection and
+   issues no statement — and should not want to. What it does is hold the state between the
+   steps, do the arithmetic in the middle where it can be checked, generate the second statement
+   from the first statement's results, and refuse to go on until the evidence comes back.
+
+   Two shapes. A **fixed** statement puts the text in `statement`, with `parameters` naming any
+   `{placeholders}` the notebook should fill from its own inputs — a period end typed into a box
+   once, rather than edited into the SQL by hand every month. A **generated** one names an
+   upstream stage in `built_from` and puts a per-row `template` beside it; that is the
+   reviewable form of the `="UPDATE ... "&F17&"..."` column real workbooks are full of, where
+   the arithmetic moves into polars and the SQL becomes a rendering of the result.
+
+   **Set `mutates: true` if running it changes data.** An UPDATE, INSERT, DELETE or MERGE does;
+   a SELECT does not. It is not decoration: a mutating hand-off makes the notebook require an
+   explicit confirmation that the statement was run before *anything* downstream of it appears.
+   Without that, a user can paste a re-extract taken before the update ever ran, and nothing
+   afterwards can tell.
+
+8. **A process with more than one input needs more than one hand-in.** `{"origin": "handin"}`
+   with no `ref` means the notebook's own input, at the top — one file, the ordinary case.
+   `{"origin": "handin", "ref": "post-adjustment extract"}` means *another* one, arriving later,
+   at a point the user has not reached yet. A re-extract cannot be the head hand-in: it does not
+   exist when the notebook is opened.
+
+   A region the analyser reports as a **dead region** is not automatically a drop. If its
+   consumer is a person with a clipboard — a column of generated SQL, a block of text somebody
+   copies into a ticket — then nothing in the workbook reads it and nothing ever will, and
+   dropping it deletes the step that changes the data. Plan it as a hand-off.
+
+9. **Be honest in `confidence`.** `low` on a stage you are unsure of costs nothing; it makes the
    generated cell carry a review marker, and a plan that admits what it is unsure of is far more
    useful than one that looks complete and is not. `assessment` is not yours: the schema requires
    the field, so fill it in and move on — kedge replaces it with its own deterministic triage.
-7. **`depends_on` carries the real shape.** Stage order alone cannot express a DAG. List every
+10. **`depends_on` carries the real shape.** Stage order alone cannot express a DAG. List every
    stage a stage genuinely needs. Do not invent dependencies to force a straight line. A stage
    that reads another's output belongs in both: `sources` says what it reads, `depends_on` says
    what must run first.
-8. **Where the vocabulary does not cover what the workbook does, raise an open question.** Do
+11. **Where the vocabulary does not cover what the workbook does, raise an open question.** Do
    not improvise a translation silently.
 
 # Two patterns that must stop and ask
@@ -84,19 +135,21 @@ Return **one JSON object** and nothing else. No prose before or after, no markdo
 | `stages` | array, at least one | In the order they should run |
 | `stages[].id` | string | Short lower_snake_case slug, unique. Becomes the notebook cell name |
 | `stages[].intent` | string | What this step is for, in the business's own terms |
-| `stages[].kind` | `load` / `transform` / `output` / `checkpoint` | Default `transform` |
+| `stages[].kind` | `load` / `transform` / `output` / `checkpoint` / `handoff` | Default `transform` |
 | `stages[].sources` | array of objects | One per input: `{"origin": ..., "ref": ...}` |
 | `stages[].sources[].origin` | `range` / `stage` / `handin` / `query` / `power_query` / `external` / `manual` / `unknown` | Where that input comes from |
-| `stages[].sources[].ref` | string or null | What it names: the range, the upstream stage id, the connection or query name, the linked workbook, or where a manual entry lands. Required for `range` and `stage` |
+| `stages[].sources[].ref` | string or null | What it names: the range, the upstream stage id, the connection or query name, the linked workbook, or **the label of a hand-in that is not the notebook's first**. Required for `range` and `stage` |
 | `stages[].depends_on` | array of stage ids | Must reference stages that exist. No cycles |
-| `stages[].confidence` | `high` / `medium` / `low` / `n/a` | `n/a` for checkpoints only |
+| `stages[].confidence` | `high` / `medium` / `low` / `n/a` | `n/a` for checkpoints and hand-offs |
 | `stages[].assumptions` | array of strings | What the translation takes for granted |
 | `stages[].excel_pattern` | vocabulary name or null | From the translation vocabulary; `unknown` is allowed and should come with an open question |
 | `stages[].operations` | array of operation ids | Which analysed regions this stage implements |
 | `stages[].checkpoint` | object or null | Required in spirit for `kind: checkpoint`: `question`, `options`, `guidance` |
+| `stages[].handoff` | object or null | Required in spirit for `kind: handoff`. `instruction`, `connection`, `mutates`, and **either** `statement` (fixed text, with `parameters` naming its `{placeholders}`) **or** `template` + `built_from` (rendered once per row of that stage's frame) |
 | `stages[].notes` | string or null | Anything a reviewer should know |
 | `open_questions` | array | Objects with `question` and optional `context`. Required field |
 | `dropped` | array | Objects with `range` and `reason` |
 | `summary` | string or null | One or two sentences on the shape of the process overall |
+| `briefing` | object or null | Why the *business* process exists, from the workbook's own documentation: `purpose`, `background`, `cadence`, `audience`, `watch_for`, and `sources`. `sources` is required wherever there is prose — cite the sheet and cells, or leave the fields empty |
 
 Do not emit `version`, `created_at`, hashes, or approval state. kedge fills those in.

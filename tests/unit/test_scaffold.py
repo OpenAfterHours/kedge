@@ -33,12 +33,13 @@ import kedge.contracts
 import kedge.ingest
 import kedge.ingest.drift
 import kedge.reconcile
+import kedge.reconcile.acceptance
+import kedge.runs
 from conftest import make_draft, make_plan
 from kedge.notebook import scaffold
 from kedge.notebook.driver import CellNameError, StaleCellError
 from kedge.notebook.scaffold import (
     HEAD_CELL_NAMES,
-    TAIL_CELL_NAMES,
     PlanNotApprovedError,
     ScaffoldCell,
     ScaffoldError,
@@ -169,12 +170,18 @@ def run_head(
     store: Path,
     picked: Path | None = None,
     contract: Path | None = None,
+    pasted: str = "",
+    run_mode: str = "resume the run in progress",
 ) -> dict[str, Any]:
     """Execute the five head cells below the selector against the real ingest machinery.
 
     The setup and selector cells are supplied rather than run: one imports marimo for real and
     the other builds UI elements that need a kernel. Everything below them is ordinary Python
     and is exactly what this is here to exercise.
+
+    ``pasted`` stands in for the third entry point. Its value is a string rather than a tuple
+    because that is what ``mo.ui.text_area`` yields, and the head cell's precedence rule depends
+    on the difference.
     """
     import datetime as datetime_module
     import pathlib
@@ -188,10 +195,20 @@ def run_head(
         "HANDIN_DIR": store,
         "CONTRACT_PATH": contract if contract is not None else store / "absent.yaml",
         "WORKBOOK": store / "absent.xlsx",
+        "RUNS_DIR": store / "runs",
         "handin_drop": Selection(),
         "handin_pick": Selection((picked,) if picked is not None else ()),
+        "handin_paste": Selection(pasted),
+        "kedge_run_mode": Selection(run_mode),
     }
-    for name in HEAD_CELL_NAMES[2:]:
+    # Three cells are supplied rather than run: `kedge_setup` imports marimo for real, and the
+    # two selector cells build UI elements that need a kernel. Everything else is ordinary
+    # Python -- including the resume logic, which is exercised here rather than mocked, because
+    # "does reopening pick the same run up" is the whole point of it.
+    supplied = {"kedge_setup", "kedge_briefing", "kedge_run_mode", "handin_source"}
+    for name in HEAD_CELL_NAMES:
+        if name in supplied:
+            continue
         exec(compile(named(cells, name).code, f"<{name}>", "exec"), namespace)
     return namespace
 
@@ -203,7 +220,14 @@ def run_reconciliation(cell: ScaffoldCell, workbook: Path, **frames: Any) -> Any
     globals, so supplying those is the whole of the harness. `mo` is deliberately absent: the
     tail must not need marimo to state that nothing was checked.
     """
-    namespace: dict[str, Any] = {"WORKBOOK": workbook, "kedge": kedge, **frames}
+    namespace: dict[str, Any] = {
+        "WORKBOOK": workbook,
+        "ACCEPTANCE_PATH": workbook.parent / "reconciliation.json",
+        "handin": SimpleNamespace(sha256="a" * 64),
+        "kedge": kedge,
+        "__file__": str(workbook.parent / "notebook.py"),
+        **frames,
+    }
     exec(compile(cell.code, "<reconciliation>", "exec"), namespace)
     return namespace["reconciliation"]
 
@@ -401,7 +425,7 @@ async def test_sync_notebook_updates_a_cell_it_can_prove_it_wrote_itself() -> No
     assert name in result.named("updated")
     # The setup cell names the version it was generated from, so a bump rewrites its header too.
     # Both are cells kedge wrote and nobody has touched, which is the whole test.
-    assert set(driver.edited) == {name, "kedge_setup"}
+    assert set(driver.edited) == {name, "kedge_setup", "kedge_briefing"}
     assert not result.named("diverged")
 
 
@@ -543,19 +567,52 @@ def test_no_cell_mentions_pandas_or_the_private_marimo_api() -> None:
 # ── names, ordering and the single-definition rule ───────────────────────────
 
 
-def test_the_head_the_stages_and_the_tail_are_emitted_in_that_order() -> None:
+def test_the_head_comes_first_and_the_stages_follow_in_dependency_order() -> None:
     cells = cells_for()
     names = [cell.name for cell in cells]
 
     assert names[: len(HEAD_CELL_NAMES)] == list(HEAD_CELL_NAMES)
-    assert names[-len(TAIL_CELL_NAMES) :] == list(TAIL_CELL_NAMES)
-    assert names[len(HEAD_CELL_NAMES) : -len(TAIL_CELL_NAMES)] == [
+    # Reconciliation sits after `apply_haircuts`, the last stage that names any analysis
+    # operations -- so the evidence that the arithmetic matches the workbook is in front of the
+    # user *before* the checkpoint asking them to approve it, rather than in a footnote below.
+    assert [name for name in names if name not in HEAD_CELL_NAMES] == [
         "load_handin",
         "apply_haircuts",
+        "reconciliation",
         "manual_overrides_ui",
         "manual_overrides",
         "write_output",
     ]
+
+
+def test_reconciliation_lands_after_the_last_stage_it_can_report_on() -> None:
+    """Not at the end of the file, which is where it used to be and where it read as a footnote.
+
+    The panel depends only on the computing stages, so marimo runs it as soon as those are done.
+    Left at the bottom that meant a user blocked at an approval three steps earlier got a wall
+    of reconciliation output directly beneath the sentence telling them what to type -- and it
+    put the evidence *after* the decision it is evidence for. Reconciliation against the
+    workbook's own cached values is exactly what somebody wants in front of them when they
+    approve a change to production.
+    """
+    plan = make_plan()
+    last_computing = [
+        stage.id for stage in plan.ordered_stages() if stage.operations and not stage.is_checkpoint
+    ][-1]
+    names = [cell.name for cell in cells_for(approved())]
+
+    assert names.index("reconciliation") == names.index(last_computing) + 1
+
+
+def test_a_plan_whose_stages_name_no_operations_keeps_reconciliation_at_the_end() -> None:
+    """There is nothing to place it relative to, so it stays where it was."""
+    draft = make_draft()
+    bare = draft.model_copy(
+        update={"stages": [stage.model_copy(update={"operations": []}) for stage in draft.stages]}
+    )
+    names = [cell.name for cell in cells_for(approved(draft=bare))]
+
+    assert names[-1] == "reconciliation"
 
 
 def test_the_head_reports_drift_before_the_contract_check() -> None:
@@ -779,6 +836,41 @@ def test_the_head_runs_end_to_end_with_no_contract(tmp_path: Path) -> None:
     assert namespace["handin_contract"] is None
     assert namespace["handin_check"] is None
     assert namespace["handin_frame"].collect().height == 3
+
+
+def test_the_head_takes_a_pasted_grid_and_stores_it_as_a_managed_csv(tmp_path: Path) -> None:
+    """The third entry point, end to end through the real ingest machinery.
+
+    The step before this one is usually "run this query", and what comes back is a grid on the
+    clipboard rather than a file on disk. What lands in the store has to be readable by the same
+    reader as a file, or the notebook is green through ingestion and wrong at the first
+    calculation.
+    """
+    namespace = run_head(
+        cells_for(),
+        store=tmp_path / "store",
+        pasted="id\tead\nA\t100.0\nB\t200.0\n(2 rows affected)",
+    )
+
+    handin = namespace["handin"]
+    assert handin.source == "pasted"
+    assert handin.path.suffix == ".csv"
+    assert handin.path.parent.is_relative_to(tmp_path / "store")
+    frame = namespace["handin_frame"].collect()
+    assert frame.columns == ["id", "ead"]
+    assert frame.height == 2  # the SSMS trailer is not a row
+
+
+def test_a_selected_file_wins_over_a_paste_left_in_the_box(tmp_path: Path) -> None:
+    """Precedence is by reproducibility. A stale paste must not override a chosen file."""
+    picked = handin_file(tmp_path / "incoming")
+
+    namespace = run_head(
+        cells_for(), store=tmp_path / "store", picked=picked, pasted="id,ead\nZ,1.0\n"
+    )
+
+    assert namespace["handin"].source == "selected"
+    assert namespace["handin"].original_name == "exposures.csv"
 
 
 def test_the_head_waits_rather_than_erroring_when_nothing_is_selected(tmp_path: Path) -> None:
@@ -1017,9 +1109,15 @@ def test_a_checkpoint_scaffolds_a_ui_cell_and_a_blocking_gate() -> None:
 
 
 def test_the_gate_blocks_on_anything_but_the_first_option() -> None:
-    """The first option is the one that unblocks; everything else stops the graph."""
+    """The first option is the one that unblocks; everything else stops the graph.
+
+    The comparison is against `_decision` rather than the widget, because a decision already
+    recorded against this run stands: marimo's widget state dies with the kernel, so a reopened
+    notebook must not re-ask for something somebody already signed.
+    """
     gate = named(cells_for(), "manual_overrides").code
-    assert "manual_overrides_decision.value != 'approve'" in gate
+    assert "manual_overrides_decision.value or (_recorded.decision if _recorded else None)" in gate
+    assert "_decision != 'approve'" in gate
 
 
 def test_a_checkpoint_that_does_not_require_a_note_gets_one_gate_not_two() -> None:
@@ -1177,7 +1275,7 @@ def test_a_long_sources_comment_never_splits_an_origin_from_its_ref() -> None:
 
 def test_the_tail_calls_reconcile_rather_than_asserting_an_outcome() -> None:
     code = named(cells_for(), "reconciliation").code
-    assert "kedge.reconcile.reconcile_panel(WORKBOOK, reconciliation_values)" in code
+    assert "kedge.reconcile.check_translation(" in code
 
 
 def test_the_tail_maps_analysis_operation_ids_to_the_cells_that_reproduce_them() -> None:
@@ -1268,7 +1366,9 @@ def test_the_tail_survives_a_reconciliation_that_raises(
     def explode(*_args: Any, **_kwargs: Any) -> Any:
         raise kedge.ReconciliationError("the workbook is a zip bomb")
 
-    monkeypatch.setattr(kedge.reconcile, "reconcile_panel", explode)
+    # Patched on the module the acceptance layer calls through, not on the package: a converted
+    # notebook now goes via `check_translation`, and what has to survive is the whole path.
+    monkeypatch.setattr(kedge.reconcile.acceptance, "reconcile_workbook", explode)
     workbook = plain_workbook(tmp_path / "unreadable.xlsx")
 
     panel = run_reconciliation(
