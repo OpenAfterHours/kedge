@@ -31,6 +31,12 @@ nothing checked.
 
 from __future__ import annotations
 
+from kedge.reconcile.acceptance import (
+    Acceptance,
+    AcceptanceStore,
+    TranslationCheck,
+    check_translation,
+)
 from kedge.reconcile.baseline import (
     BaselineVector,
     infer_regions,
@@ -71,10 +77,19 @@ from kedge.reconcile.model import (
     signed_delta,
     worst_status,
 )
+from kedge.reconcile.verify import (
+    MAX_REPORTED,
+    RowBreak,
+    VerificationReport,
+    verify,
+)
 
 __all__ = [
     "DECLARED_REGIONS_NAME",
+    "MAX_REPORTED",
     "SCHEMA_VERSION",
+    "Acceptance",
+    "AcceptanceStore",
     "BaselineVector",
     "Comparison",
     "Diagnosis",
@@ -88,7 +103,11 @@ __all__ = [
     "ReconciliationStatus",
     "RegionResult",
     "RegionSpec",
+    "RowBreak",
     "Tolerance",
+    "TranslationCheck",
+    "VerificationReport",
+    "check_translation",
     "compare_vectors",
     "declared_regions",
     "diagnose",
@@ -109,5 +128,6 @@ __all__ = [
     "specs_from_mapping",
     "split_reference",
     "to_vector",
+    "verify",
     "worst_status",
 ]

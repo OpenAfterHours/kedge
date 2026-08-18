@@ -175,6 +175,7 @@ class NotReconciledReason(StrEnum):
     BASELINE_TRUNCATED = "baseline_truncated"
     NO_ACTUAL_VALUES = "no_actual_values"
     NOTEBOOK_FAILED = "notebook_failed"
+    NOT_REPRODUCED = "not_reproduced"
 
     @property
     def explanation(self) -> str:
@@ -211,6 +212,11 @@ _REASON_TEXT: dict[NotReconciledReason, str] = {
         "The workbook range named for this region is longer than the reconciler will read in "
         "one pass, so only its first rows were compared. The region as a whole is NOT signed "
         "off. Split it into smaller regions, or raise the read ceiling."
+    ),
+    NotReconciledReason.NOT_REPRODUCED: (
+        "The notebook deliberately does not reproduce this region, and says why below. Nothing "
+        "is claimed about it either way -- a region nobody checked is not a pass -- but this is "
+        "a decision somebody made rather than a gap to go and fix."
     ),
     NotReconciledReason.NO_ACTUAL_VALUES: (
         "The notebook produced no values for this region, so there was nothing to compare. "
@@ -654,14 +660,33 @@ class ReconciliationReport(_Frozen):
         """Return the result for one region id, or None."""
         return next((r for r in self.regions if r.spec_id == spec_id), None)
 
+    @property
+    def declared_not_reproduced(self) -> list[RegionResult]:
+        """Regions the notebook says it deliberately does not reproduce.
+
+        Still not passes -- nothing here can make an unchecked region one. They are counted
+        apart because a signal that is permanently amber is one people learn to ignore, and a
+        conversion that deliberately improves on a workbook column would otherwise sit at
+        NOT RECONCILED for ever with nothing anybody could do about it.
+        """
+        return [
+            region for region in self.regions if region.reason is NotReconciledReason.NOT_REPRODUCED
+        ]
+
     def headline(self) -> str:
         """The single sentence that goes at the top of the panel and the CLI output."""
         status = self.status
         if not self.regions:
             return f"NOT RECONCILED - {NotReconciledReason.NO_REGIONS.explanation}"
+        declared = self.declared_not_reproduced
+        unchecked = [region for region in self.not_reconciled if region not in declared]
         counts = (
-            f"{len(self.passed)} passed, {len(self.failed)} failed, "
-            f"{len(self.not_reconciled)} not reconciled"
+            f"{len(self.passed)} passed, {len(self.failed)} failed, {len(unchecked)} not reconciled"
+        )
+        aside = (
+            f" {len(declared)} region(s) declared not reproduced by this notebook, with reasons."
+            if declared
+            else ""
         )
         if status is ReconciliationStatus.PASSED:
             return (
@@ -669,10 +694,20 @@ class ReconciliationReport(_Frozen):
                 f"all within {self.tolerance.describe()}"
             )
         if status is ReconciliationStatus.FAILED:
-            return f"FAILED - {counts} (tolerance {self.tolerance.describe()})"
+            return f"FAILED - {counts} (tolerance {self.tolerance.describe()}).{aside}"
+        if declared and not unchecked and not self.failed:
+            # Everything that was claimed passed, and what was not claimed was declared. Still
+            # not a pass -- one region of the workbook is unverified and saying otherwise would
+            # be the false claim this module exists to prevent -- but the reader is not being
+            # sent to look for a defect.
+            return (
+                f"CHECKED WITH EXCEPTIONS - {len(self.passed)} of {len(self.passed)} claimed "
+                f"regions passed within {self.tolerance.describe()}.{aside} Nothing is claimed "
+                f"about those, so this is not a clean pass."
+            )
         return (
             f"NOT RECONCILED - {counts}. Regions that could not be checked are NOT passes; "
-            f"nothing is claimed about them."
+            f"nothing is claimed about them.{aside}"
         )
 
     def to_dict(self) -> dict[str, Any]:
