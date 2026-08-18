@@ -206,7 +206,7 @@ def infer_with_notes(
     else:
         path, source_name, checksum = source, source.name, hash_file(source)
 
-    frame, _layout = read_data(path, sheet=sheet)
+    frame, layout = read_data(path, sheet=sheet)
     _require_columns(frame, source_name)
     contract, notes = _draft(
         frame,
@@ -215,6 +215,20 @@ def infer_with_notes(
         source_name=source_name,
         checksum=checksum,
     )
+
+    # A column the reader typed is described here as numeric, which is what the process will
+    # actually receive -- every reader goes through `read_data`, so the contract, the validation
+    # and the notebook cannot disagree about it. But the file itself holds text, and a contract
+    # that said `float` with no explanation would be a surprise to anyone who opened the source.
+    # So the conversion is stated rather than assumed, per column, with a sample.
+    for coercion in layout.coercions:
+        notes.setdefault(coercion.column, []).append(
+            f"arrived as text and was read as a number ({coercion.rows:,} values; "
+            f"e.g. {', '.join(repr(value) for value in coercion.samples)}). Numbers stored as "
+            f"text are the usual cause -- a grid pasted out of Excel carries its displayed "
+            f"formatting. Declare the column `string` in this contract if it is genuinely an "
+            f"identifier and the conversion is wrong."
+        )
     logger.info(
         "drafted contract '%s' from %s: %d columns, %d rows",
         contract.name,

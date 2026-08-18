@@ -65,13 +65,35 @@ def empty_as_zero(expr: pl.Expr) -> pl.Expr:
     The primitive the rest of this module is built from, exposed because a translated
     formula often needs it once and then uses ordinary polars operators.
 
+    **Cast first, then fill, and the order is the whole point.** Given a ``String`` column this
+    used to be a silent no-op: a pasted grid has no nulls, it has empty *strings*, so there was
+    nothing to fill and the text passed straight through. The failure then surfaced several
+    operations later as ``arithmetic on dtypes str and dyn float is not allowed``, from inside a
+    query plan, pointing nowhere near the column that caused it -- and in marimo's app mode the
+    cell rendered nothing at all. Casting strictly turns that into an error at this expression,
+    naming this column.
+
+    The cast is to ``Float64`` unconditionally, matching
+    :func:`~kedge.xl.rounding.round_half_away`: Excel has one numeric type, and keeping the
+    semantics uniform is worth more here than preserving an ``Int64``.
+
+    If the column really is text-formatted numbers, the answer is
+    :func:`~kedge.xl.nulls.to_number`, which knows about thousands separators, currency symbols
+    and parenthesised negatives -- and note that :func:`kedge.ingest.read_data` now does that
+    conversion on the way in, so a hand-in should not reach here as text at all.
+
     Args:
-        expr: A numeric expression.
+        expr: A numeric expression, or one castable to a number.
 
     Returns:
-        The same expression with nulls replaced by ``0``.
+        A ``Float64`` expression with nulls replaced by ``0``.
+
+    Raises:
+        polars.exceptions.InvalidOperationError: at collect time, if the values are not numeric.
+            Deliberately not caught: a caller that meant text wants ``to_number`` first, and a
+            caller that did not wants to know.
     """
-    return expr.fill_null(0)
+    return expr.cast(pl.Float64, strict=True).fill_null(0)
 
 
 def add(a: Operand, b: Operand) -> pl.Expr:

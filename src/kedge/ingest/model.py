@@ -31,7 +31,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from kedge.analysis.model import ColumnProfile, Severity
 
@@ -44,17 +44,24 @@ __all__ = [
     "HandIn",
     "HandInProfile",
     "HandInSource",
+    "Paste",
     "Upload",
     "sort_drift",
     "utcnow",
 ]
 
-HandInSource = Literal["dropped", "selected", "watched"]
+HandInSource = Literal["dropped", "selected", "watched", "pasted"]
 """How a hand-in reached the managed store.
 
 ``dropped`` came through ``mo.ui.file`` as bytes, ``selected`` through
-``mo.ui.file_browser`` as a path, ``watched`` from a folder kedge is monitoring. The record
-that results is the same in all three cases; only this label differs.
+``mo.ui.file_browser`` as a path, ``watched`` from a folder kedge is monitoring, ``pasted``
+from a text area holding a result grid someone copied out of a database client. The record
+that results is the same in all four cases; only this label differs.
+
+The label is not decoration. ``pasted`` is the one source whose bytes kedge *rewrote* on the
+way in -- :mod:`kedge.ingest.paste` normalises to CSV -- so a reader asking "is this hash a
+claim about a file the user still holds?" needs to be able to tell. For ``pasted`` it is a
+claim about the managed copy alone, which is the only copy there has ever been.
 """
 
 _SEVERITY_RANK: dict[Severity, int] = {
@@ -91,6 +98,35 @@ class Upload:
     def __repr__(self) -> str:
         # Contents can be a hundred megabytes; never render them into a traceback.
         return f"Upload(name={self.name!r}, contents=<{len(self.contents)} bytes>)"
+
+
+@dataclass(frozen=True, slots=True)
+class Paste:
+    """A rectangle of delimited text someone copied out of a result grid.
+
+    The third input shape, alongside :class:`Upload`'s bytes and the file browser's path, and
+    the only one with no file behind it. :func:`kedge.ingest.receive` accepts it exactly as it
+    accepts the other two and returns the same record; what differs is that the bytes stored
+    are :mod:`kedge.ingest.paste`'s normalised CSV rather than the text as pasted. The module
+    docstring there says why.
+
+    ``name`` is what the receipt records as the original name. It defaults to something that
+    reads honestly in an audit line -- there was no original file, and a receipt claiming
+    ``exposures.csv`` when nobody ever had a file by that name is a small lie in the one
+    record that exists to be trustworthy.
+
+    Example:
+        >>> handin = receive(Paste(text="id\tamount\nA\t1\n"), store_dir=root)
+        >>> handin.source
+        'pasted'
+    """
+
+    text: str
+    name: str = "pasted.csv"
+
+    def __repr__(self) -> str:
+        # A paste can be a hundred thousand rows; never render it into a traceback.
+        return f"Paste(name={self.name!r}, text=<{len(self.text)} chars>)"
 
 
 # =============================================================================
@@ -182,12 +218,28 @@ class HandIn:
             raise ValueError(msg) from exc
 
 
+_HANDIN_SOURCES: tuple[HandInSource, ...] = get_args(HandInSource)
+"""The accepted labels, read off the Literal so the two cannot drift apart.
+
+They did, once: ``pasted`` was added to :data:`HandInSource` and this check kept its own
+hand-written tuple, so every receipt a pasted hand-in wrote was one that could not be read back.
+"""
+
+
 def _coerce_source(value: object) -> HandInSource:
+    """Read a receipt's source label back, or say which labels exist.
+
+    Written as a loop over the tuple rather than a set membership test so that the returned name
+    is one a type checker has already narrowed to :data:`HandInSource`. The set version needed a
+    ``type: ignore`` on the return, and an ignore comment on a two-line function is a small
+    permanent cost to avoid a one-line rewrite.
+    """
     text = str(value)
-    if text not in ("dropped", "selected", "watched"):
-        msg = f"unknown hand-in source {value!r}"
-        raise ValueError(msg)
-    return text  # type: ignore[return-value]
+    for known in _HANDIN_SOURCES:
+        if text == known:
+            return known
+    msg = f"unknown hand-in source {value!r}. Known: {', '.join(sorted(_HANDIN_SOURCES))}"
+    raise ValueError(msg)
 
 
 # =============================================================================

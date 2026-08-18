@@ -195,19 +195,30 @@ def test_the_notes_say_what_each_guess_was_derived_from(tmp_path: Path) -> None:
     assert any("delete allowed_values" in note for note in notes["comment"])
 
 
-def test_a_text_column_full_of_numbers_is_called_out_as_the_join_failure_it_causes(
+def test_a_text_column_full_of_numbers_is_typed_and_the_conversion_is_reported(
     tmp_path: Path,
 ) -> None:
+    """The reader now types it, so the contract describes what the process receives.
+
+    This used to assert a warning that the column *would* break a join. It no longer would:
+    `read_data` converts an unambiguously numeric text column and records the conversion, so
+    the contract, the validation and the notebook all see a number. What has to survive is the
+    *telling* -- a contract that quietly said `float` about a file full of `"1,004"` would be a
+    surprise to the next person who opened the source.
+    """
     path = tmp_path / "exposures.csv"
     path.write_text(
         "counterparty,account\n" + "".join(f'cp{i:03d},"1,00{i}"\n' for i in range(5)),
         encoding="utf-8",
     )
 
-    _contract, notes = infer_with_notes(path)
+    contract, notes = infer_with_notes(path)
 
-    assert any("numbers stored as text" in note for note in notes["account"])
-    assert any("PLAN 2.6" in note for note in notes["account"])
+    assert next(column.dtype for column in contract.columns if column.name == "account") == (
+        "Float64"
+    )
+    assert any("arrived as text and was read as a number" in note for note in notes["account"])
+    assert any("'1,000'" in note for note in notes["account"])
 
 
 # ── the round trip that matters most ────────────────────────────────────────
