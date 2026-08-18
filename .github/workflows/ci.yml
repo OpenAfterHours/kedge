@@ -40,14 +40,14 @@ jobs:
         run: uv run python scripts/guardrails.py
 
   types:
-    name: ty (advisory)
+    name: ty
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Advisory on purpose. `ty check src/` reports 3 known diagnostics, all of them mypy-dialect
-    # `# type: ignore` comments ty does not honour: regions.py:632 and watch.py:343-344. Each is
-    # catalogued in docs/ty-diagnostics.md with the one-line fix. Clearing them is the whole
-    # prerequisite for deleting this line and letting the job gate merges.
-    continue-on-error: true
+    # No longer advisory. `ty check src/` was carrying three diagnostics -- regions.py:632 and
+    # watch.py:343-344, all of them mypy-dialect `# type: ignore` comments ty does not honour --
+    # and docs/ty-diagnostics.md said clearing them was the whole prerequisite for letting this
+    # job gate merges. They are cleared, so it does. A checker that is always red is one nobody
+    # reads, which is the same reason the reconciliation panel stopped being permanently amber.
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v9.0.0

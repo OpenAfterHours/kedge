@@ -89,8 +89,8 @@ uv run kedge --help
 ```
 
 CI runs all of the above on Ubuntu and Windows across 3.12 and 3.13 (`.github/workflows/ci.yml`),
-including the contract tests. `ty` is advisory there until its three known diagnostics are cleared
-(`docs/ty-diagnostics.md`). One matrix leg — Ubuntu, 3.12 — also measures coverage against the
+including the contract tests. `ty` gates merges: its three long-standing diagnostics are cleared and
+`docs/ty-diagnostics.md` records what each one was. One matrix leg — Ubuntu, 3.12 — also measures coverage against the
 `fail_under` in `pyproject.toml`.
 
 ## Testing

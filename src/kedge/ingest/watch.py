@@ -40,6 +40,12 @@ from kedge.ingest.receive import receive_many
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    # watchdog ships `py.typed`, and every platform variant -- `WindowsApiObserver` here,
+    # `InotifyObserver` on Linux -- derives from this one base. Naming it costs nothing at
+    # run time, because the import that actually loads watchdog stays function-local, and it
+    # is what lets `stop()` and `join()` be checked rather than suppressed.
+    from watchdog.observers.api import BaseObserver
+
     from kedge.ingest.model import HandIn
 
 logger = logging.getLogger(__name__)
@@ -243,7 +249,7 @@ class WatchedFolder:
         self.copy_on_select = copy_on_select
         self.dedupe = dedupe
         self.settle_seconds = settle_seconds
-        self._observer: object | None = None
+        self._observer: BaseObserver | None = None
         self._lock = threading.Lock()
         self._stopped = threading.Event()
 
@@ -340,8 +346,8 @@ class WatchedFolder:
         self._stopped.set()
         if observer is None:
             return
-        observer.stop()  # type: ignore[attr-defined]
-        observer.join(timeout_seconds)  # type: ignore[attr-defined]
+        observer.stop()
+        observer.join(timeout_seconds)
         logger.info("stopped watching %s", self.directory)
 
     def __enter__(self) -> WatchedFolder:
