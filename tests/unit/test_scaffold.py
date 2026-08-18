@@ -213,12 +213,17 @@ def run_head(
     return namespace
 
 
-def run_reconciliation(cell: ScaffoldCell, workbook: Path, **frames: Any) -> Any:
-    """Execute the reconciliation cell body and hand back the panel it produced.
+def run_reconciliation(cells: Iterable[ScaffoldCell], workbook: Path, **frames: Any) -> Any:
+    """Execute the reconciliation cells in order and hand back the panel they produced.
 
-    The cell reads `WORKBOOK`, `kedge` and the stage cells' frames out of the notebook's
-    globals, so supplying those is the whole of the harness. `mo` is deliberately absent: the
-    tail must not need marimo to state that nothing was checked.
+    Every ``reconcile`` cell, not one: the region map and the panel are separate cells because
+    they are owned by different people -- the map is a translation judgement carrying a
+    ``TODO(kedge)``, the panel is machinery that stays kedge's -- and the panel reads what the map
+    defines. Running only one of them would test a notebook nobody will ever have.
+
+    They read `WORKBOOK`, `kedge` and the stage cells' frames out of the notebook's globals, so
+    supplying those is the whole of the harness. `mo` is deliberately absent: the tail must not
+    need marimo to state that nothing was checked.
     """
     namespace: dict[str, Any] = {
         "WORKBOOK": workbook,
@@ -228,7 +233,10 @@ def run_reconciliation(cell: ScaffoldCell, workbook: Path, **frames: Any) -> Any
         "__file__": str(workbook.parent / "notebook.py"),
         **frames,
     }
-    exec(compile(cell.code, "<reconciliation>", "exec"), namespace)
+    for cell in cells:
+        if cell.role != "reconcile":
+            continue
+        exec(compile(cell.code, f"<{cell.name}>", "exec"), namespace)
     return namespace["reconciliation"]
 
 
@@ -575,9 +583,13 @@ def test_the_head_comes_first_and_the_stages_follow_in_dependency_order() -> Non
     # Reconciliation sits after `apply_haircuts`, the last stage that names any analysis
     # operations -- so the evidence that the arithmetic matches the workbook is in front of the
     # user *before* the checkpoint asking them to approve it, rather than in a footnote below.
+    # Two cells, not one: the region map is a translation judgement and carries a TODO, the panel
+    # is machinery and stays kedge's. They must stay adjacent and in this order, because the
+    # panel reads what the map defines.
     assert [name for name in names if name not in HEAD_CELL_NAMES] == [
         "load_handin",
         "apply_haircuts",
+        "reconciliation_values",
         "reconciliation",
         "manual_overrides_ui",
         "manual_overrides",
@@ -597,11 +609,16 @@ def test_reconciliation_lands_after_the_last_stage_it_can_report_on() -> None:
     """
     plan = make_plan()
     last_computing = [
-        stage.id for stage in plan.ordered_stages() if stage.operations and not stage.is_checkpoint
+        stage.id
+        for stage in plan.ordered_stages()
+        if stage.operations and not stage.generates_no_code
     ][-1]
     names = [cell.name for cell in cells_for(approved())]
 
-    assert names.index("reconciliation") == names.index(last_computing) + 1
+    # The map, then the panel, immediately after the last stage either could report on. The panel
+    # reads what the map defines, so a gap between them would be a name defined below its reader.
+    assert names.index("reconciliation_values") == names.index(last_computing) + 1
+    assert names.index("reconciliation") == names.index(last_computing) + 2
 
 
 def test_a_plan_whose_stages_name_no_operations_keeps_reconciliation_at_the_end() -> None:
@@ -720,10 +737,23 @@ def test_cell_name_for_gives_up_loudly_rather_than_returning_a_duplicate() -> No
 
 
 def test_the_head_carries_no_unfinished_markers() -> None:
-    """The stage cells legitimately carry TODOs; the plumbing around them does not."""
-    fixed = [cell for cell in cells_for() if cell.role in ("setup", "handin", "reconcile")]
+    """The plumbing carries no TODOs. Stage cells do, and so does the region map.
+
+    ``reconciliation_values`` is the exception, and a deliberate one: which column of which frame
+    reproduces a given workbook region is a translation judgement the scaffolder cannot make, so
+    it is a hole like any other and is found the same way -- by the marker. It used to carry none,
+    which meant nothing that fills the scaffolder's holes was ever asked to finish it. The panel
+    beside it stays free of markers, because that one is machinery and stays kedge's.
+    """
+    fixed = [
+        cell
+        for cell in cells_for()
+        if cell.role in ("setup", "handin", "reconcile") and cell.name != "reconciliation_values"
+    ]
     for cell in fixed:
         assert "TODO" not in cell.code, cell.name
+
+    assert "TODO(kedge)" in named(cells_for(), "reconciliation_values").code
 
 
 def test_the_handin_cell_calls_ingest_rather_than_hashing_by_hand() -> None:
@@ -1280,7 +1310,7 @@ def test_the_tail_calls_reconcile_rather_than_asserting_an_outcome() -> None:
 
 def test_the_tail_maps_analysis_operation_ids_to_the_cells_that_reproduce_them() -> None:
     """`Stage.operations` is the link back to the facts, and this is what consumes it."""
-    code = named(cells_for(), "reconciliation").code
+    code = named(cells_for(), "reconciliation_values").code
     assert "'calc_h2_h500': apply_haircuts," in code
 
 
@@ -1302,7 +1332,7 @@ def test_an_operation_claimed_by_two_stages_is_mapped_once() -> None:
         )
     )
 
-    code = named(build_cells(plan), "reconciliation").code
+    code = named(build_cells(plan), "reconciliation_values").code
     assert code.count("'calc_h2_h500':") == 1
     assert "'calc_h2_h500': first," in code
 
@@ -1317,9 +1347,9 @@ def test_a_stage_naming_no_operation_contributes_no_region() -> None:
         )
     )
 
-    code = named(build_cells(plan), "reconciliation").code
+    code = named(build_cells(plan), "reconciliation_values").code
     assert "reconciliation_values = {}" in code
-    assert "never as" in code and "passed" in code
+    assert "nothing to map" in code
 
 
 def test_the_tail_never_uses_the_word_passed_as_a_verdict() -> None:
@@ -1331,10 +1361,8 @@ def test_the_tail_never_uses_the_word_passed_as_a_verdict() -> None:
 
 def test_a_missing_workbook_reconciles_to_not_reconciled(tmp_path: Path) -> None:
     """Non-negotiable 6, executed rather than asserted on the text."""
-    cell = named(cells_for(), "reconciliation")
-
     panel = run_reconciliation(
-        cell,
+        cells_for(),
         tmp_path / "never-existed.xlsx",
         apply_haircuts=pl.DataFrame({"haircut": [0.1, 0.2]}),
     )
@@ -1348,9 +1376,9 @@ def test_a_missing_workbook_reconciles_to_not_reconciled(tmp_path: Path) -> None
 def test_a_workbook_with_no_cached_values_reconciles_to_not_reconciled(tmp_path: Path) -> None:
     """The dangerous case: a real workbook, a real run, and nothing to compare against."""
     workbook = plain_workbook(tmp_path / "no-formulas.xlsx")
-    cell = named(cells_for(), "reconciliation")
-
-    panel = run_reconciliation(cell, workbook, apply_haircuts=pl.DataFrame({"haircut": [0.1, 0.2]}))
+    panel = run_reconciliation(
+        cells_for(), workbook, apply_haircuts=pl.DataFrame({"haircut": [0.1, 0.2]})
+    )
 
     assert panel.status is ReconciliationStatus.NOT_RECONCILED
     assert not panel
@@ -1372,7 +1400,7 @@ def test_the_tail_survives_a_reconciliation_that_raises(
     workbook = plain_workbook(tmp_path / "unreadable.xlsx")
 
     panel = run_reconciliation(
-        named(cells_for(), "reconciliation"),
+        cells_for(),
         workbook,
         apply_haircuts=pl.DataFrame({"haircut": [0.1]}),
     )
@@ -1397,6 +1425,6 @@ def test_the_tail_scaffolds_for_a_plan_that_is_nothing_but_checkpoints() -> None
         )
     )
 
-    code = named(build_cells(plan), "reconciliation").code
+    code = named(build_cells(plan), "reconciliation_values").code
     ast.parse(code)
     assert "reconciliation_values = {}" in code

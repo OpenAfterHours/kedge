@@ -240,3 +240,36 @@ def test_every_scored_item_declares_a_weight(rubric: dict[str, Any]) -> None:
         for item in rubric[tier]:
             assert isinstance(item.get("weight"), int), f"{tier}/{item['id']} has no weight"
             assert item.get("check"), f"{tier}/{item['id']} says nothing to check"
+
+
+# ── the reference plan says what the statement does ──────────────────────────
+
+
+def test_the_committed_plan_declares_the_update_as_a_statement_that_writes() -> None:
+    """``mutates`` is what puts a confirmation step between the UPDATE and the re-extract.
+
+    This plan carried ``mutates: false`` over an ``UPDATE fin.accruals``, and the notebook it
+    scaffolded therefore had no confirmation cell, no token for the re-extract selector to read,
+    and so a re-extract box on screen from the moment the notebook opened -- inviting a grid
+    taken *before* the update ran, which looks exactly like one taken after and cannot be told
+    apart afterwards. Asserted on the committed file rather than on the generator, because the
+    committed file is what every other test loads.
+    """
+    from kedge.plan.store import plan_from_yaml
+    from kedge.sql import changes_data
+
+    plan = plan_from_yaml((EVAL_DIR / "plan.yaml").read_text(encoding="utf-8"))
+    handoffs = [stage for stage in plan.stages if stage.is_handoff]
+    assert handoffs, "the reference plan has stopped handing anything over"
+
+    writing = [
+        stage
+        for stage in handoffs
+        if changes_data(stage.effective_handoff().template or stage.effective_handoff().statement)
+    ]
+    assert [stage.id for stage in writing] == ["update_statement"]
+    for stage in writing:
+        handoff = stage.effective_handoff()
+        assert handoff.mutates, f"{stage.id} writes but the plan declares it read-only"
+        assert handoff.needs_confirmation
+        assert not handoff.contradicts_its_own_statement

@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from kedge.analysis.model import SCHEMA_VERSION as ANALYSIS_SCHEMA_VERSION
 from kedge.analysis.model import ExcelPattern, WorkbookAnalysis
 from kedge.errors import KedgeError
+from kedge.sql import changes_data
 
 if TYPE_CHECKING:
     from collections.abc import Collection
@@ -388,24 +389,54 @@ class Handoff(_PlanModel):
         default=False,
         description="Whether running this changes data. An UPDATE, INSERT, DELETE or MERGE "
         "does; a SELECT does not. True makes the notebook require an explicit confirmation "
-        "that the statement was run before anything downstream of it appears.",
+        "that the statement was run before anything downstream of it appears. Leaving it false "
+        "over a statement that writes is checked and reported at review, and the notebook "
+        "requires the confirmation regardless.",
     )
+
+    @property
+    def statement_writes(self) -> bool:
+        """Whether the text this hands over would change data, judged from the text itself.
+
+        The check against which :attr:`mutates` is a *claim*. Only asked of a SQL hand-off:
+        ``text`` is a filename to request or a colleague to ask, and no verb at the front of it
+        means anything to :func:`kedge.sql.changes_data`.
+        """
+        if self.medium is not HandoffMedium.SQL:
+            return False
+        return changes_data(self.statement or self.template or "")
+
+    @property
+    def contradicts_its_own_statement(self) -> bool:
+        """Whether this hand-off declares itself read-only over a statement that writes.
+
+        A plan that says "run this UPDATE" and "this changes nothing" is self-contradictory, and
+        it is worth naming rather than silently compensating for -- :func:`kedge.plan.review.
+        review_warnings` is where a reviewer is told, because the fix belongs in the plan.
+        """
+        return self.statement_writes and not self.mutates
 
     @property
     def needs_confirmation(self) -> bool:
         """Whether the notebook must record that this was carried out before going on.
 
-        Tied to :attr:`mutates` rather than being a separate switch, because the two questions
-        have one answer. A read-only query needs no confirmation: the hand-in that follows *is*
-        the evidence it was run, and asking as well is friction with nothing behind it. A
-        statement that changes data is different in both directions -- nothing downstream is
-        evidence it ran, and pasting a re-extract taken *before* it ran is a mistake a user can
-        make in one click and nobody can detect afterwards.
+        One question with one answer, which is why this is derived rather than being a switch of
+        its own. A read-only query needs no confirmation: the hand-in that follows *is* the
+        evidence it was run, and asking as well is friction with nothing behind it. A statement
+        that changes data is different in both directions -- nothing downstream is evidence it
+        ran, and pasting a re-extract taken *before* it ran is a mistake a user can make in one
+        click and nobody can detect afterwards.
 
-        So a mutating hand-off gates what follows on somebody saying they ran it, and that
-        assertion goes in the run record with a time against it.
+        So it is answered from the evidence and not from :attr:`mutates` alone. ``mutates`` is
+        what the plan *claims*; a statement opening ``UPDATE`` is what it *is*, and where the two
+        disagree the notebook must take the safe side. That disagreement is not hypothetical --
+        this project's own reference plan carried ``mutates: false`` over an
+        ``UPDATE fin.accruals``, and the notebook it scaffolded put the re-extract box on screen
+        from the moment it opened, inviting a re-extract taken before the update had been run.
+        Erring towards a confirmation costs a tick-box; erring away from one loses the only
+        record that the statement was ever carried out.
         """
-        return self.mutates
+        return self.mutates or self.statement_writes
 
     @model_validator(mode="after")
     def _one_source_of_text(self) -> Handoff:

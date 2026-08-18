@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "MAX_STATEMENTS",
     "SqlRenderError",
+    "changes_data",
     "literal",
     "placeholders",
     "render",
@@ -150,6 +151,122 @@ def literal(value: Any) -> str:
         f"the notebook before the statement is built."
     )
     raise SqlRenderError(msg)
+
+
+_WRITING_VERBS = frozenset(
+    {"insert", "update", "delete", "merge", "upsert", "replace", "truncate", "drop", "alter"}
+)
+"""Statement openers that change what a later extract will return.
+
+``create`` is deliberately absent. ``CREATE TEMP TABLE ... AS SELECT`` is an ordinary way to
+write a read-only extract, and treating every one of them as a write would put a confirmation
+step in front of a query that changes nothing -- which is how a control becomes a box people
+tick without reading. The verbs here all change rows or objects that were already there.
+"""
+
+_MAIN_VERBS = frozenset({"select", "insert", "update", "delete", "merge"})
+"""What may follow a ``WITH`` prefix. A CTE's *name* can never be one: they are reserved words."""
+
+
+def _statement_words(text: str) -> list[list[str]]:
+    """Bare words at bracket depth zero, grouped by top-level statement.
+
+    The scanner exists so that :func:`changes_data` can look at the verb a statement *opens
+    with* rather than at whether the word appears anywhere in it. Everything it skips is
+    somewhere the word ``update`` means something other than an update: inside a string literal
+    (``WHERE action = 'update'``), inside a quoted identifier, inside a comment, or inside
+    brackets, where a sub-select's own verb belongs to the sub-select. ``last_update`` survives
+    as one word rather than as ``update``, because words are taken whole.
+    """
+    statements: list[list[str]] = [[]]
+    depth = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if text.startswith("--", index):
+            newline = text.find("\n", index)
+            index = length if newline == -1 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end == -1 else end + 2
+            continue
+        if char in "'\"`":
+            index = _skip_delimited(text, index, char)
+            continue
+        if char == "[":
+            end = text.find("]", index + 1)
+            index = length if end == -1 else end + 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif char == ";" and depth == 0:
+            statements.append([])
+        elif char.isalpha() or char == "_":
+            start = index
+            while index < length and (text[index].isalnum() or text[index] == "_"):
+                index += 1
+            if depth == 0:
+                statements[-1].append(text[start:index].lower())
+            continue
+        index += 1
+    return [words for words in statements if words]
+
+
+def _skip_delimited(text: str, start: int, delimiter: str) -> int:
+    """Index just past a quoted run, honouring the doubled-delimiter escape SQL uses."""
+    index = start + 1
+    while index < len(text):
+        if text[index] != delimiter:
+            index += 1
+            continue
+        if text.startswith(delimiter * 2, index):
+            index += 2
+            continue
+        return index + 1
+    return len(text)
+
+
+def changes_data(statement: str) -> bool:
+    """Whether running this text would change data, judged from the verb it opens with.
+
+    kedge never runs a statement, so the only thing it can know about one is what it says. That
+    matters in exactly one place and it matters a lot: a hand-off that writes has to be
+    confirmed as having been run before anything downstream appears, because nothing downstream
+    is evidence it ran -- a re-extract taken beforehand looks exactly like one taken after, and
+    there is no way to tell afterwards. A plan that hands over an ``UPDATE`` and declares it
+    read-only produces precisely that notebook.
+
+    Judged on the **opening verb of each top-level statement**, never on whether a word appears.
+    ``SELECT a.last_update FROM t FOR UPDATE`` is a locking read; ``WHERE action = 'update'`` is
+    a string; ``-- update the accruals first`` is a comment. Every one of those would be a false
+    positive, and a false positive here is a confirmation step in front of a query that changes
+    nothing. A ``WITH`` prefix is followed through to the statement it introduces, because
+    ``WITH scoped AS (...) DELETE FROM ...`` is a delete.
+
+    Args:
+        statement: The statement text, or a template with ``{placeholders}`` still in it --
+            the verb is in the same place either way.
+
+    Returns:
+        Whether any top-level statement in the text writes.
+
+    Example:
+        >>> changes_data("UPDATE fin.accruals SET x = {y} WHERE id = {id}")
+        True
+        >>> changes_data("SELECT trade_id, last_update FROM fin.accruals FOR UPDATE")
+        False
+    """
+    for words in _statement_words(statement):
+        verb = words[0]
+        if verb == "with":
+            verb = next((word for word in words[1:] if word in _MAIN_VERBS), "")
+        if verb in _WRITING_VERBS:
+            return True
+    return False
 
 
 def placeholders(template: str) -> tuple[str, ...]:

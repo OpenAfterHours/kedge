@@ -2,7 +2,7 @@
 # Nothing reaches the notebook until approval.state is 'approved' (PLAN 2.2).
 plan_schema_version: '1.1'
 version: 2
-created_at: '2026-08-18T12:30:16.148384Z'
+created_at: '2026-08-18T16:27:25.191734Z'
 workbook: q2_accrual_adjustment.xlsx
 workbook_sha256: 8f3cee46fd4774314e2220026106eaa5a72e4bfc5e4fe00e2bc9ab52014eeccc
 analysis_schema_version: '1.0'
@@ -114,7 +114,7 @@ stages:
       WHERE trade_id = {trade_id}
     connection: FinanceWarehouse
     parameters: []
-    mutates: false
+    mutates: true
   notes: 'Adjustment!G is a column of =''UPDATE ... ''&F17&''...'' filled down 76 rows. The analyser reports
     it as a dead region because nothing in the workbook reads it -- its consumer is a person with a clipboard.
     Rendered through kedge.sql rather than reproduced: the workbook''s own statement is invalid SQL for
@@ -177,7 +177,7 @@ dropped:
   acknowledged: true
   accepted: true
   note: Impact summary confirmed stale; recomputing.
-  acknowledged_at: '2026-08-18T12:30:16.148212Z'
+  acknowledged_at: '2026-08-18T16:27:25.191189Z'
 summary: 'A quarterly statutory accrual uplift: extract, compute, approve, apply by statement, re-extract,
   verify, sign off. Four of the seven steps are a person doing something kedge cannot do, so the notebook
   is a runbook rather than a pipeline.'
@@ -210,4 +210,4 @@ briefing:
 approval:
   state: approved
   by: evals/adjustment_signoff/build_plan.py
-  at: '2026-08-18T12:30:16.148638Z'
+  at: '2026-08-18T16:27:25.192128Z'
