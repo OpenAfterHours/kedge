@@ -78,10 +78,10 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from kedge.analysis.model import ExcelPattern
 from kedge.errors import KedgeError, NotebookError
-from kedge.plan.model import ProcessPlan, Stage, StageKind
+from kedge.plan.model import Handoff, ProcessPlan, SourceOrigin, Stage, StageKind
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +102,13 @@ __all__ = [
     "sync_notebook",
 ]
 
-CellRole = Literal["setup", "handin", "stage", "checkpoint", "reconcile"]
+CellRole = Literal["setup", "handin", "stage", "checkpoint", "handoff", "reconcile"]
 
 HEAD_CELL_NAMES = (
     "kedge_setup",
+    "kedge_briefing",
+    "kedge_run_mode",
+    "kedge_run",
     "handin_source",
     "handin",
     "handin_contract",
@@ -114,6 +117,13 @@ HEAD_CELL_NAMES = (
     "handin_frame",
 )
 """The fixed head, in emission order (PLAN 2.8).
+
+The briefing comes first because it is what somebody opening this in eight months needs
+before anything else: what the process is for, and what the conversion left unsettled. The run
+cells follow because everything after them is *part of* a run: which hand-in was consumed
+and which decision was recorded are facts about a pass through the process, not about the
+notebook. Resuming has to happen before anything reads a hand-in, and the banner they render is
+what a user coming back after two days needs before they read anything else.
 
 The contract is loaded before the drift panel because it names the sheet and the header row,
 and the profile, the check and the frame all have to read the same rows or the check is a
@@ -130,6 +140,9 @@ TAIL_CELL_NAMES = ("reconciliation",)
 _RESERVED = {
     *HEAD_CELL_NAMES,
     *TAIL_CELL_NAMES,
+    "KEDGE_RUNS",
+    "KEDGE_RUN_ID",
+    "RUNS_DIR",
     "handin_drop",
     "handin_pick",
     "handin_profile",
@@ -145,6 +158,10 @@ _RESERVED = {
 }
 
 _IDENTIFIER_UNSAFE = re.compile(r"[^0-9a-zA-Z_]+")
+_DATE_PARAMETER = re.compile(
+    r"(?:^|_)(?:date|day|period|month|quarter|year|as_of|cob)(?:_|$)", re.IGNORECASE
+)
+"""Parameter names that mean a date, so the input is a date picker rather than a text box."""
 _BANNED_IMPORT = re.compile(r"\b(?:import\s+pandas|from\s+pandas\s+import)\b", re.IGNORECASE)
 
 _PATTERN_HINTS: dict[ExcelPattern, str] = {
@@ -387,10 +404,15 @@ def _name_map(plan: ProcessPlan) -> dict[str, str]:
     used: set[str] = set()
     for stage in plan.ordered_stages():
         name = cell_name_for(stage.id, used)
-        if stage.is_checkpoint:
-            while any(satellite in used for satellite in _satellite_names(name)):
+        satellites = _satellite_names if stage.is_checkpoint else None
+        if stage.is_handoff:
+            satellites = _handoff_satellites
+        if _named_handin(stage) is not None:
+            satellites = _handin_satellites
+        if satellites is not None:
+            while any(taken in used for taken in satellites(name)):
                 name = cell_name_for(name, used | {name})
-            used.update(_satellite_names(name))
+            used.update(satellites(name))
         names[stage.id] = name
         used.add(name)
     return names
@@ -440,21 +462,93 @@ def build_cells(
 
     names = _name_map(plan)
     checkpoints = {stage.id for stage in plan.stages if stage.is_checkpoint}
+    gated = _gate_map(plan, names)
     cells: list[ScaffoldCell] = list(_head_cells(plan, handins_dir, workbook_path, contract_path))
 
     ordered = plan.ordered_stages()
     for index, stage in enumerate(ordered, start=1):
         if stage.is_checkpoint:
-            cells.extend(_checkpoint_cells(stage, index, len(ordered), names))
+            cells.extend(_checkpoint_cells(stage, index, len(ordered), names, gated))
+            continue
+        # A stage that reads a hand-in of its own gets the three receiver cells first, and its
+        # own cell then computes on the frame they define. Emitted before the stage rather than
+        # instead of it, so a stage that both receives and transforms keeps both.
+        label = _named_handin(stage)
+        if label is not None:
+            cells.extend(_handin_cells(stage, index, len(ordered), names[stage.id], label, gated))
+        if stage.is_handoff:
+            cells.extend(_handoff_cells(stage, index, len(ordered), names, gated))
             continue
         cells.append(_stage_cell(stage, index, len(ordered), names, checkpoints))
 
-    cells.extend(_tail_cells(plan, names))
+    cells = _with_reconciliation(cells, _tail_cells(plan, names), ordered, names)
 
     for cell in cells:
         _check_house_rules(cell)
     logger.info("built %d cell(s) from plan v%d for %s", len(cells), plan.version, plan.workbook)
     return cells
+
+
+def _gate_map(plan: ProcessPlan, names: dict[str, str]) -> dict[str, str]:
+    """Stage id to the token a downstream cell must read to be allowed to render.
+
+    Two kinds of stage produce one. A checkpoint's token is its decision record; a mutating
+    hand-off's is its confirmation. Both mean the same thing to the cell that reads it -- *a
+    person has done something, and until they had, you were not to be shown* -- which is why one
+    map covers both rather than the scaffolder branching on kind at every use.
+    """
+    gates: dict[str, str] = {}
+    for stage in plan.stages:
+        if stage.is_checkpoint:
+            gates[stage.id] = names[stage.id]
+        elif stage.is_handoff and stage.effective_handoff().needs_confirmation:
+            gates[stage.id] = f"{names[stage.id]}_confirmed"
+    return gates
+
+
+def _with_reconciliation(
+    cells: list[ScaffoldCell],
+    tail: list[ScaffoldCell],
+    ordered: Sequence[Stage],
+    names: dict[str, str],
+) -> list[ScaffoldCell]:
+    """Put the reconciliation panel after the last stage it can report on, not at the very end.
+
+    It used to be the last cell in the file, and in a pipeline that is right -- everything is
+    computed by then. In a *runbook* it is wrong twice over.
+
+    It renders too early and in the wrong place. The panel depends only on the computing stages,
+    so marimo runs it as soon as those are done -- which means a user blocked at an approval
+    three steps earlier gets a wall of reconciliation output directly beneath the sentence
+    telling them what to type, including regions reported as NOT RECONCILED because the steps
+    that would fill them have not happened yet. That reads as a broken notebook.
+
+    And it is in the wrong place *for what it is*. Reconciliation against the workbook's own
+    cached values is exactly the evidence somebody wants in front of them when they approve a
+    change: the arithmetic matches the spreadsheet this replaced, now decide. Putting it before
+    the checkpoint makes it an argument; leaving it at the bottom makes it a footnote nobody
+    reaches until the decision is already made.
+
+    So it is emitted immediately after the last stage that declares any analysis operations --
+    the last stage it could possibly have something to say about. A plan whose stages declare no
+    operations keeps the old position, because there is nothing to place it relative to.
+    """
+    last = next(
+        (
+            stage.id
+            for stage in reversed(ordered)
+            if stage.operations and not stage.generates_no_code
+        ),
+        None,
+    )
+    if last is None:
+        return [*cells, *tail]
+    anchor = names[last]
+    position = next(
+        (index for index, cell in enumerate(cells) if cell.name == anchor),
+        len(cells) - 1,
+    )
+    return [*cells[: position + 1], *tail, *cells[position + 1 :]]
 
 
 def _check_house_rules(cell: ScaffoldCell) -> None:
@@ -693,6 +787,19 @@ import kedge.contracts
 import kedge.ingest
 import kedge.reconcile
 
+# One JSON file per pass through this process: which hand-ins were consumed, what was
+# approved, what was confirmed as run, and when. marimo's own state dies with the kernel, so
+# this is what lets somebody close the notebook halfway through and come back to it -- and it
+# is what the sign-off's audit line is derived from rather than asserted.
+import kedge.runs
+
+# Statements a hand-off cell hands the user are rendered here and nowhere else. kedge runs
+# none of them; what this buys is literals that are correct -- an apostrophe in a
+# counterparty name, a null, a date, a money value at the edge of exponent notation. Every
+# one of those breaks a statement built by concatenation, at the point somebody is about to
+# run it against production.
+import kedge.sql
+
 # Importing kedge.xl registers the Excel-semantics expression namespace: col("x").xl.round(2),
 # .xl.add, .xl.div. Excel and polars disagree about rounding at .5, empty cells in arithmetic,
 # and division by zero. Every one of those disagreements produces silently wrong numbers rather
@@ -711,33 +818,110 @@ WORKBOOK = pathlib.Path({workbook_path!r})
 
 # Where the hand-in contract lives. It does not have to exist: with no contract the notebook
 # still runs and the check cell says, in as many words, that nothing is enforced (PLAN M5).
-CONTRACT_PATH = pathlib.Path({contract_path!r})"""
+CONTRACT_PATH = pathlib.Path({contract_path!r})
+
+# Where this notebook's runs are recorded. One file per run, never overwritten.
+RUNS_DIR = pathlib.Path({runs_dir!r})
+
+# Whether this translation was ever reconciled against the workbook it came from. One record,
+# written once and cited afterwards -- see the translation-check cell for why it is not a live
+# comparison on every run.
+ACCEPTANCE_PATH = pathlib.Path({acceptance_path!r})"""
+
+_RUN_MODE_CELL = """# Which run is this? A runbook takes hours or days -- run the extract, go to a meeting, come
+# back, get an approval, run the update the next morning. marimo's own state does not survive
+# any of that: close the tab and every paste box is empty and every dropdown is unset.
+#
+# So the run is kept on disk (kedge.runs), and reopening the notebook resumes it. Starting
+# fresh is a deliberate choice rather than what happens by accident, and it never erases
+# anything -- a new run is written beside the old one, because last quarter's record is
+# evidence.
+kedge_run_mode = mo.ui.dropdown(
+    options=["resume the run in progress", "start a new run"],
+    value="resume the run in progress",
+    label="Run",
+)
+kedge_run_mode"""
+
+_RUN_CELL = """# The run this notebook is working through, resumed or started.
+#
+# Starting a new run is idempotent on purpose. This cell re-executes whenever anything above it
+# changes, and a naive `if starting_fresh: start()` would mint a run every time -- so a fresh
+# run is started only when the current one has something in it. Re-running then finds the new,
+# empty run and resumes that instead.
+KEDGE_RUNS = kedge.runs.RunStore(RUNS_DIR)
+_latest = KEDGE_RUNS.latest()
+_wants_fresh = kedge_run_mode.value == "start a new run"
+if _latest is None or (_wants_fresh and (_latest.handins or _latest.decisions)):
+    kedge_run = KEDGE_RUNS.start(workbook=WORKBOOK.name)
+else:
+    kedge_run = _latest
+KEDGE_RUN_ID = kedge_run.run_id
+
+_done = kedge_run.audit_lines()
+_lines = [f"### Run `{KEDGE_RUN_ID}`"]
+if _done:
+    _lines.append(
+        f"Resumed, started {kedge_run.started_at:%d %b %Y at %H:%M} UTC. "
+        f"{len(kedge_run.handins)} hand-in(s) and {len(kedge_run.decisions)} decision(s) so far:"
+    )
+    _lines.append("")
+    _lines.extend(f"- {_line}" for _line in _done)
+    _lines.append("")
+    _lines.append(
+        "_Everything below picks up from here. Choose **start a new run** above to begin "
+        "again; this record is kept either way._"
+    )
+else:
+    _lines.append("New run. Work down the page: each step appears once the one above it is done.")
+mo.md("\\n".join(_lines))"""
 
 _SOURCE_CELL = """# The hand-in selector. Swapping the file here re-runs everything below it in dataflow
 # order, the contract re-validates, and the reconciliation panel goes green or red. That is
 # the moment the conversion pays off, and it is precisely what the Excel process cannot do
 # (PLAN 2.8).
 #
-# Two entry points that return different things: the drop zone holds the whole file in kernel
-# memory and has no path, so an uploaded hand-in is NOT reproducible tomorrow; the browser
-# returns a path and no bytes. They converge in the next cell.
+# Three entry points that return different things. The drop zone holds the whole file in
+# kernel memory and has no path, so an uploaded hand-in is NOT reproducible tomorrow; the
+# browser returns a path and no bytes; the paste box returns text and no file at all. They
+# converge in the next cell, where kedge.ingest.receive turns all three into one record.
+#
+# The paste box is there because the step before this one is usually "run this query", and
+# what comes back is a result grid on the clipboard rather than a file on disk. Requiring a
+# save-as first is friction with nothing behind it.
 handin_drop = mo.ui.file(kind="area", label="Drop the hand-in here")
 handin_pick = mo.ui.file_browser(multiple=False, label="...or select one on this machine")
-handin_source = mo.ui.tabs({"Drop": handin_drop, "Select": handin_pick})
+handin_paste = mo.ui.text_area(
+    label="...or paste the result grid, header row included",
+    placeholder="trade_id,counterparty,notional -- or tab-separated, straight from SSMS",
+    full_width=True,
+    rows=8,
+)
+handin_source = mo.ui.tabs(
+    {"Drop": handin_drop, "Select": handin_pick, "Paste": handin_paste}
+)
 handin_source"""
 
-_HANDIN_CELL = """# Both entry points converge here, and kedge.ingest.receive does the whole job: a dropped
-# file's bytes are written into the managed store, a selected path is copied into it, both are
-# hashed and deduplicated against what is already there, and a receipt is recorded. `handin` is
-# a HandIn record whose `path` is always the managed copy and never the transient upload --
-# which is what makes this notebook re-runnable tomorrow, when the uploaded bytes are gone.
+_HANDIN_CELL = """# All three entry points converge here, and kedge.ingest.receive does the whole job: a
+# dropped file's bytes are written into the managed store, a selected path is copied into it,
+# pasted text is sniffed for its delimiter and normalised to CSV, every one of them is hashed
+# and deduplicated against what is already there, and a receipt is recorded. `handin` is a
+# HandIn record whose `path` is always the managed copy and never the transient upload --
+# which is what makes this notebook re-runnable tomorrow, when the uploaded bytes are gone
+# and the clipboard holds something else entirely.
+_pasted = (handin_paste.value or "").strip()
 mo.stop(
-    not handin_drop.value and not handin_pick.value,
-    mo.md("**Waiting for a hand-in.** Drop a file above, or select one."),
+    not handin_drop.value and not handin_pick.value and not _pasted,
+    mo.md("**Waiting for a hand-in.** Drop a file above, select one, or paste a grid."),
 )
 
-# A selected path wins over dropped bytes where both are present: it is the reproducible one.
-handin = kedge.ingest.receive(handin_pick.value or handin_drop.value, store_dir=HANDIN_DIR)
+# Precedence is by reproducibility, most reproducible first. A selected path is a file that
+# still exists; dropped bytes are a file that existed; a paste is neither, and is last because
+# leaving a stale paste in the box must not override a file the user has just chosen.
+handin = kedge.ingest.receive(
+    handin_pick.value or handin_drop.value or kedge.ingest.Paste(text=_pasted),
+    store_dir=HANDIN_DIR,
+)
 mo.md(f"**Hand-in** `{handin.audit_line()}`")"""
 
 _CONTRACT_CELL = """# The contract, loaded once and read by all three cells below it: the shape profile, the check,
@@ -903,17 +1087,19 @@ def _fixed_paths(
     workbook_path: Path | None,
     contract_path: Path | None,
 ) -> dict[str, str]:
-    """The three filesystem constants the head cells close over.
+    """The four filesystem constants the head cells close over.
 
     Each default assumes the standard workspace layout -- a ``<workbook>.kedge`` directory
-    beside the workbook, with ``handins`` inside it -- and each is emitted as a plain constant
-    rather than something computed at run time, so a user whose files have moved corrects one
-    line instead of reading the scaffolder.
+    beside the workbook, with ``handins`` and ``runs`` inside it -- and each is emitted as a
+    plain constant rather than something computed at run time, so a user whose files have moved
+    corrects one line instead of reading the scaffolder.
     """
     store = handins_dir if handins_dir is not None else Path("handins")
     project = store.parent
     return {
         "store": str(store),
+        "runs_dir": str(project / "runs"),
+        "acceptance_path": str(project / "reconciliation.json"),
         "workbook_path": str(
             workbook_path if workbook_path is not None else project.parent / plan.workbook
         ),
@@ -921,6 +1107,130 @@ def _fixed_paths(
             contract_path if contract_path is not None else project / "contract.yaml"
         ),
     }
+
+
+def _briefing_cell(plan: ProcessPlan) -> ScaffoldCell:
+    """What this process is for, and what the conversion of it left unsettled.
+
+    The first cell in the notebook, because it is the first thing anybody opening it needs. A
+    converted notebook outlives the person who converted it: eight months on, the workbook it
+    came from has been superseded, the analyst who wrote the Sign-off tab has moved teams, and
+    what is left is a page of polars that reproduces a calculation nobody can explain the reason
+    for. The workbook *did* explain it -- Purpose, Background, Known issues, written by somebody
+    for exactly this reader -- and the conversion used to discard every word.
+
+    Two halves, and they are reliable in different ways.
+
+    The **business half** comes from :class:`~kedge.plan.model.Briefing`, which the model fills
+    from the workbook's own documentation and which refuses to hold prose without citing where
+    it came from. Rendered with those citations attached, so a reader can weigh a sentence
+    rather than take it on trust.
+
+    The **conversion half** is derived here from the plan, with no model anywhere near it: which
+    workbook, which plan version, what was dropped and acknowledged, what the plan asked that
+    nobody answered, and which stages were translated at low confidence. That is the part a
+    reader most needs and is least likely to be told -- an unanswered open question is a caveat
+    on every number below it, and it should not be discoverable only by opening a YAML file.
+
+    In an accordion, collapsed. It is orientation, not instruction: essential once, then in the
+    way. The unanswered questions are pulled out above it, because those are not orientation --
+    they qualify the output every time it runs.
+    """
+    briefing = plan.briefing
+    unanswered = [question for question in plan.open_questions if not question.answer]
+
+    body: list[str] = []
+    if briefing is not None and not briefing.is_empty:
+        if briefing.purpose:
+            body.extend(["**What this is for**", "", briefing.purpose, ""])
+        if briefing.background:
+            body.extend(["**Why it exists**", "", briefing.background, ""])
+        for label, value in (
+            ("How often", briefing.cadence),
+            ("Who relies on it", briefing.audience),
+        ):
+            if value:
+                body.extend([f"**{label}**", "", value, ""])
+        if briefing.watch_for:
+            body.extend(["**Watch for**", ""])
+            body.extend(f"- {item}" for item in briefing.watch_for)
+            body.append("")
+        if briefing.sources:
+            body.extend(
+                [
+                    "_Taken from " + "; ".join(briefing.sources) + "._",
+                    "",
+                ]
+            )
+    else:
+        body.extend(
+            [
+                "The workbook this was converted from carried no description of what the "
+                "process is for, so none is offered here. That is a gap in the original, not "
+                "something kedge can fill in: an invented rationale in a finance notebook is "
+                "worse than none, because the next reader cannot tell it from the real thing.",
+                "",
+            ]
+        )
+
+    body.extend(["**Where this came from**", ""])
+    approved = f", approved {plan.approval.at:%d %b %Y}" if plan.approval.at is not None else ""
+    body.append(f"- Converted from `{plan.workbook}` by kedge, plan v{plan.version}{approved}.")
+    if plan.summary:
+        body.append(f"- {plan.summary}")
+    for dropped in plan.dropped:
+        body.append(f"- Dropped `{dropped.range}`: {dropped.reason}")
+    low = [stage.id for stage in plan.stages if stage.needs_review_marker]
+    if low:
+        body.append(
+            f"- Translated at low or unstated confidence, and marked in the cells themselves: "
+            f"{', '.join(low)}."
+        )
+
+    lines = [
+        "# What this process is, and what the conversion of it left open. Read once; it is",
+        "# collapsed because it is orientation rather than instruction.",
+        "#",
+        "# The prose comes from the workbook's own documentation and carries its citations. The",
+        "# provenance below it is derived from the approved plan, so it cannot drift from what",
+        "# was actually agreed.",
+    ]
+    if unanswered:
+        # Not in the accordion. An unanswered question is a caveat on every number below it, and
+        # a caveat nobody opens is a caveat nobody has.
+        lines.extend(
+            [
+                "_open = [",
+                *(f"    {question.question!r}," for question in unanswered),
+                "]",
+            ]
+        )
+    lines.extend(
+        [
+            f"kedge_briefing = mo.accordion({{{f'About this process: {plan.workbook}'!r}: mo.md(",
+            f"    {chr(10).join(body)!r}",
+            ")})",
+        ]
+    )
+    if unanswered:
+        lines.extend(
+            [
+                "mo.vstack(",
+                "    [",
+                "        mo.md(",
+                '            "**Questions this conversion raised and nobody has answered.** They '
+                'apply to "',
+                '            "every number below."',
+                "        ),",
+                '        mo.md("\\n".join(f"- {_q}" for _q in _open)),',
+                "        kedge_briefing,",
+                "    ]",
+                ")",
+            ]
+        )
+    else:
+        lines.append("kedge_briefing")
+    return ScaffoldCell(name="kedge_briefing", code="\n".join(lines), role="setup")
 
 
 def _head_cells(
@@ -940,6 +1250,9 @@ def _head_cells(
             role="setup",
             code=_SETUP_TEMPLATE.format(version=plan.version, workbook=plan.workbook, **paths),
         ),
+        _briefing_cell(plan),
+        ScaffoldCell(name="kedge_run_mode", role="setup", code=_RUN_MODE_CELL),
+        ScaffoldCell(name="kedge_run", role="setup", code=_RUN_CELL),
         ScaffoldCell(name="handin_source", role="handin", code=_SOURCE_CELL),
         ScaffoldCell(name="handin", role="handin", code=_HANDIN_CELL),
         ScaffoldCell(name="handin_contract", role="handin", code=_CONTRACT_CELL),
@@ -1022,7 +1335,11 @@ def _stage_cell(
 
 
 def _checkpoint_cells(
-    stage: Stage, index: int, total: int, names: dict[str, str]
+    stage: Stage,
+    index: int,
+    total: int,
+    names: dict[str, str],
+    gated: Mapping[str, str] | None = None,
 ) -> list[ScaffoldCell]:
     """A checkpoint: the approval UI, then the gate that blocks everything downstream.
 
@@ -1037,11 +1354,24 @@ def _checkpoint_cells(
     decision = f"{name}_decision"
     note = f"{name}_note"
     heading = f"### Checkpoint: {stage.id}"
-    blocked = f"**Blocked at checkpoint `{stage.id}`.** Record a decision above to continue."
-    needs_note = f"**Blocked at checkpoint `{stage.id}`.** A reason is required, not optional."
+    blocked = _waiting(
+        index,
+        total,
+        stage.id,
+        "Record a decision above to continue. Nothing below runs until you do.",
+    )
+    needs_note = _waiting(
+        index,
+        total,
+        stage.id,
+        "A reason is required, not optional -- it is the whole "
+        "improvement over somebody typing a number into Excel with no record of why.",
+    )
 
+    gates = _gate_tokens(stage, names, gated or {})
     ui_lines = [
         f"# Checkpoint {index} of {total}: {stage.id}",
+        *(f"_after_{name} = {gate}" for gate in gates),
         "# Deliberately NOT automated. Forcing a judgement call into code either fabricates",
         "# logic that was never there or silently drops a control (PLAN 2.2). Recording the",
         "# decision and the reason here is better than the Excel original, where the same step",
@@ -1075,8 +1405,15 @@ def _checkpoint_cells(
     gate_lines = [
         f"# Gate for checkpoint '{stage.id}'. mo.stop halts this cell and every cell downstream",
         "# of it, so nothing proceeds on an unapproved checkpoint.",
+        "#",
+        "# A decision already recorded against this run stands: reopening the notebook must not",
+        "# ask again for something somebody already signed, and the dropdown above comes back",
+        "# empty because marimo's state died with the kernel, not because nobody decided.",
+        f"_recorded = kedge_run.decision_for({stage.id!r})",
+        f"_decision = {decision}.value or (_recorded.decision if _recorded else None)",
+        f'_note = ({note}.value or "").strip() or (_recorded.note if _recorded else "")',
         "mo.stop(",
-        f"    {decision}.value != {unblocking!r},",
+        f"    _decision != {unblocking!r},",
         f"    mo.md({blocked!r}),",
         ")",
     ]
@@ -1084,17 +1421,23 @@ def _checkpoint_cells(
         gate_lines.extend(
             [
                 "mo.stop(",
-                f'    not ({note}.value or "").strip(),',
+                "    not _note,",
                 f"    mo.md({needs_note!r}),",
                 ")",
             ]
         )
     gate_lines.extend(
         [
+            "# Recorded only when it is new, so re-running the cell does not append the same",
+            "# decision again on every keystroke upstream.",
+            "if _recorded is None or (_recorded.decision, _recorded.note) != (_decision, _note):",
+            "    kedge.runs.record_decision(",
+            f"        KEDGE_RUNS, KEDGE_RUN_ID, {stage.id!r}, _decision, _note",
+            "    )",
             f"{name} = {{",
             f'    "stage": {stage.id!r},',
-            f'    "decision": {decision}.value,',
-            f'    "note": {note}.value,',
+            '    "decision": _decision,',
+            '    "note": _note,',
             '    "decided_at": datetime.datetime.now(datetime.UTC),',
             "}",
             name,
@@ -1109,12 +1452,439 @@ def _checkpoint_cells(
     ]
 
 
+def _handin_satellites(name: str) -> tuple[str, ...]:
+    """The names a stage with its own named hand-in claims beyond the stage name.
+
+    Three cells and six names: the selector cell defines the three widgets and the tab strip,
+    the receipt cell defines the record, the frame cell defines the LazyFrame. All six have to
+    be unique across the notebook for the same reason a checkpoint's three do -- marimo rejects
+    a notebook that defines one name in two cells, and the user meets that as a file that will
+    not open rather than as a scaffolding error.
+    """
+    return (
+        f"{name}_input",
+        f"{name}_drop",
+        f"{name}_pick",
+        f"{name}_paste",
+        f"{name}_handin",
+        f"{name}_frame",
+    )
+
+
+def _named_handin(stage: Stage) -> str | None:
+    """The label of this stage's own hand-in, or ``None`` if it reads the notebook's.
+
+    The distinction is carried by :attr:`~kedge.plan.model.StageSource.ref`, and it is the
+    difference between a process with one input and a process with several.
+    ``{origin: handin}`` means the hand-in at the top of the notebook -- one file, the ordinary
+    case, and what every plan written before hand-offs existed meant.
+    ``{origin: handin, ref: 'post-adjustment extract'}`` means *another* one, arriving later, at
+    a point in the runbook the user has not reached yet.
+
+    That second shape is what a workbook whose process is "extract, adjust, re-extract, check"
+    needs, and the head hand-in cannot express it: the re-extract does not exist when the
+    notebook is opened, and the cell asking for it has to sit below the cell that told the user
+    how to produce it.
+    """
+    for source in stage.sources:
+        if source.origin is SourceOrigin.HANDIN and source.ref:
+            return source.ref
+    return None
+
+
+def _handin_cells(
+    stage: Stage,
+    index: int,
+    total: int,
+    name: str,
+    label: str,
+    gated: Mapping[str, str] | None = None,
+) -> list[ScaffoldCell]:
+    """A stage's own hand-in: selector, receipt, frame.
+
+    The same three steps the notebook head performs for its primary input, emitted again under
+    this stage's name because a runbook asks for evidence more than once. It deliberately does
+    *not* repeat the drift and contract cells: those describe the notebook's declared input, and
+    a mid-process re-extract is a different shape under a different agreement. What it does keep
+    is the managed store, so the second hand-in is hashed and receipted exactly like the first
+    and "this run consumed these files" stays a defensible claim about all of them.
+    """
+    heading = f"### {label}"
+    waiting = _waiting(
+        index,
+        total,
+        label,
+        "Drop a file, select one, or paste the result grid -- header row included.",
+    )
+    gates = _gate_tokens(stage, {}, gated or {})
+    selector_lines = [
+        f"# Stage {index} of {total}: {stage.id} -- the hand-in this stage reads.",
+        *_comment("Intent", stage.intent),
+        "#",
+        "# A second hand-in, arriving later than the notebook's own. Everything below this cell",
+        "# stays dark until it does, which is what makes this a runbook rather than a report:",
+        "# the next instruction appears once the previous one has been carried out, not before.",
+        *(
+            [
+                "#",
+                "# And this cell is itself hidden until the step above it is confirmed. Reading",
+                "# that token is what creates the edge marimo hides the cell on -- a selector",
+                "# that constructed widgets and read nothing would render from the moment the",
+                "# notebook opened, inviting a re-extract taken before the statement ever ran.",
+            ]
+            if gates
+            else []
+        ),
+        *(f"_after_{name} = {gate}" for gate in gates),
+        f'{name}_drop = mo.ui.file(kind="area", label="Drop {label} here")',
+        f"{name}_pick = mo.ui.file_browser(",
+        '    multiple=False, label="...or select it on this machine"',
+        ")",
+        f"{name}_paste = mo.ui.text_area(",
+        '    label="...or paste the result grid, header row included",',
+        '    placeholder="Paste straight from the query client. Tab, comma, semicolon or pipe.",',
+        "    full_width=True,",
+        "    rows=8,",
+        ")",
+        f"{name}_input = mo.ui.tabs(",
+        f'    {{"Drop": {name}_drop, "Select": {name}_pick, "Paste": {name}_paste}}',
+        ")",
+        f"mo.vstack([mo.md({heading!r}), {name}_input])",
+    ]
+
+    receipt_lines = [
+        f"# The receipt for {label}. Same store, same hashing, same audit line as the hand-in",
+        "# at the top of the notebook -- a mid-process extract is evidence too.",
+        "#",
+        "# `previous_handin` is what makes resuming real: if this run already took a hand-in at",
+        "# this step, and the managed copy is still on disk and still hashes the same, it is",
+        "# used and the user is not asked again. A file that has changed underneath is not",
+        "# reused -- resuming onto different data silently is worse than asking twice.",
+        f"_resumed = kedge.runs.previous_handin(KEDGE_RUNS, KEDGE_RUN_ID, {stage.id!r})",
+        f'_pasted = ({name}_paste.value or "").strip()',
+        "mo.stop(",
+        "    _resumed is None",
+        f"    and not {name}_drop.value",
+        f"    and not {name}_pick.value",
+        "    and not _pasted,",
+        f"    mo.md({waiting!r}),",
+        ")",
+        "",
+        "# Precedence by reproducibility, most reproducible first -- see the head hand-in cell.",
+        "# A fresh selection outranks the resumed one: supplying a file again is how a user",
+        "# corrects an extract they got wrong.",
+        f"{name}_handin = kedge.ingest.receive(",
+        f"    {name}_pick.value",
+        f"    or {name}_drop.value",
+        "    or (kedge.ingest.Paste(text=_pasted) if _pasted else None)",
+        "    or _resumed,",
+        "    store_dir=HANDIN_DIR,",
+        ")",
+        "kedge.runs.record_handin(",
+        f"    KEDGE_RUNS, KEDGE_RUN_ID, {stage.id!r}, {name}_handin",
+        ")",
+        f'mo.md(f"**{label}** `{{{name}_handin.audit_line()}}`")',
+    ]
+
+    frame_lines = [
+        f"# {label} as a frame. read_data is the reader the contract check uses, so a layout",
+        "# note here means what it means at the top of the notebook.",
+        f"_data, _layout = kedge.ingest.read_data({name}_handin.path)",
+        f"{name}_frame = _data.lazy()",
+        "_notes = _layout.notes()",
+        "mo.vstack(",
+        f'    [mo.md("_Layout: " + "; ".join(_notes) + "._"), {name}_frame]',
+        "    if _notes",
+        f"    else [{name}_frame]",
+        ")",
+    ]
+
+    return [
+        ScaffoldCell(
+            name=f"{name}_input",
+            code="\n".join(selector_lines),
+            role="handin",
+            stage_id=stage.id,
+        ),
+        ScaffoldCell(
+            name=f"{name}_handin",
+            code="\n".join(receipt_lines),
+            role="handin",
+            stage_id=stage.id,
+        ),
+        ScaffoldCell(
+            name=f"{name}_frame",
+            code="\n".join(frame_lines),
+            role="handin",
+            stage_id=stage.id,
+        ),
+    ]
+
+
+def _handoff_satellites(name: str) -> tuple[str, ...]:
+    """Every name a hand-off may claim beyond the statement itself.
+
+    Reserved as one set whether or not this particular hand-off uses all of them. The
+    alternative -- reserving exactly what each shape needs -- means a plan that later gains a
+    confirmation quietly collides with a stage named after one of these, and marimo reports
+    that as a notebook which will not open.
+    """
+    return (
+        f"{name}_inputs",
+        f"{name}_parameters",
+        f"{name}_ran",
+        f"{name}_ran_note",
+        f"{name}_confirmed",
+    )
+
+
+def _gate_tokens(stage: Stage, names: dict[str, str], gated: Mapping[str, str]) -> list[str]:
+    """The tokens this stage must read before it may render.
+
+    Reading a token is what creates the dataflow edge, and the edge is the only thing that
+    hides a cell in marimo. This was the bug the eval missed entirely: the post-adjustment
+    selector *constructed widgets and read nothing*, so there was no edge, so nothing could gate
+    it -- and it rendered from the moment the notebook opened, inviting the user to paste a
+    re-extract taken before the update had been run.
+    """
+    return [gated[item] for item in stage.depends_on if item in gated]
+
+
+def _waiting(index: int, total: int, title: str, instruction: str) -> str:
+    """The text a blocked cell renders.
+
+    In app mode a stopped cell is the *only* thing the user sees at that point -- everything
+    below it is gone, with no indication whether it is waiting, broken or finished. So the stop
+    message carries the position as well as the instruction: "Step 4 of 8" is the difference
+    between a page that has stalled and a page that is waiting for you.
+    """
+    return f"**Step {index} of {total}: {title}.** {instruction}"
+
+
+def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list[ScaffoldCell]:
+    """The two cells that record a mutating statement as having been run.
+
+    A read-only query needs none of this: the hand-in that follows *is* the evidence it was run,
+    and asking as well is friction with nothing behind it. A statement that changes data is
+    different in both directions. Nothing downstream is evidence it ran -- a re-extract taken
+    beforehand looks exactly like one taken after -- and there is no way to detect that
+    afterwards. So the user says so, the assertion goes in the run record with a time against
+    it, and everything downstream hangs off that.
+    """
+    ran = f"{name}_ran"
+    note = f"{name}_ran_note"
+    confirmed = f"{name}_confirmed"
+
+    ui_lines = [
+        f"# Confirmation for '{stage.id}'. The statement above changes data, so nothing below",
+        "# this appears until somebody says it has been run -- and what they say is recorded.",
+        "#",
+        "# Reads the statement so this cell is itself hidden until there is something to",
+        "# confirm. A tick-box offering 'I have run it' above a statement that has not",
+        "# been generated yet is not useless -- it is a way to record a lie.",
+        f"_awaiting_{name} = {name}",
+        f'{ran} = mo.ui.checkbox(label="I have run the statement above")',
+        f"{note} = mo.ui.text_area(",
+        '    label="Anything worth recording about the run (rows affected, ticket, who ran it)",',
+        '    placeholder="e.g. 76 rows affected, ticket FC-2291, run by R. Advani at 09:14",',
+        "    full_width=True,",
+        ")",
+        "mo.vstack(",
+        "    [",
+        f"        mo.md({f'#### Confirm: {stage.id}'!r}),",
+        f"        {ran},",
+        f"        {note},",
+        "    ]",
+        ")",
+    ]
+
+    waiting = _waiting(
+        index,
+        total,
+        stage.id,
+        "Run the statement above, then tick the box to confirm it. Nothing below this point "
+        "is shown until you do -- a re-extract taken before the statement ran looks exactly "
+        "like one taken after.",
+    )
+    gate_lines = [
+        "# The gate. Recorded into the run before anything downstream sees it, so closing the",
+        "# notebook here and reopening it tomorrow resumes past this point rather than asking",
+        "# again.",
+        "mo.stop(",
+        f"    not {ran}.value,",
+        f"    mo.md({waiting!r}),",
+        ")",
+        f"{confirmed} = kedge.runs.record_decision(",
+        "    KEDGE_RUNS,",
+        "    KEDGE_RUN_ID,",
+        f"    {stage.id!r},",
+        '    "ran",',
+        f'    ({note}.value or "").strip(),',
+        ")",
+        f'mo.md(f"Confirmed: `{{{confirmed}.audit_line()}}`")',
+    ]
+
+    return [
+        ScaffoldCell(
+            name=f"{name}_ran", code="\n".join(ui_lines), role="handoff", stage_id=stage.id
+        ),
+        ScaffoldCell(name=confirmed, code="\n".join(gate_lines), role="handoff", stage_id=stage.id),
+    ]
+
+
+def _identifier(text: str) -> str:
+    """A parameter name reduced to something that can be a Python variable."""
+    cleaned = _IDENTIFIER_UNSAFE.sub("_", text.strip()).strip("_").lower()
+    return cleaned or "parameter"
+
+
+def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
+    """The inputs a parameterised statement is built from.
+
+    A separate cell because marimo's single-definition rule forbids one cell from both creating
+    a UI element and reading it -- and because these belong at the *top* of the process. "Which
+    period are you running this for" is the first thing anybody is asked when they do this by
+    hand, and it is the thing that must not be a constant somebody edits inside a SQL string
+    every month.
+
+    Every input is a text box unless its name suggests otherwise, because the plan says what a
+    parameter is called and not what shape it is. A date is worth detecting: it is the parameter
+    almost every periodic process has, and `mo.ui.date` yields a `datetime.date` that
+    `kedge.sql.literal` renders as a proper `DATE` literal.
+    """
+    lines = [
+        f"# Inputs for '{stage.id}'. Fill these in first -- the statement below is built from",
+        "# them, and the run records what they were.",
+    ]
+    for parameter in handoff.parameters:
+        variable = f"{name}_{_identifier(parameter)}"
+        label = parameter.replace("_", " ")
+        if _DATE_PARAMETER.search(parameter):
+            lines.append(f"{variable} = mo.ui.date(label={label!r})")
+        else:
+            lines.append(f"{variable} = mo.ui.text(label={label!r}, full_width=True)")
+    shown = ", ".join(f"{name}_{_identifier(parameter)}" for parameter in handoff.parameters)
+    lines.append(f"mo.vstack([mo.md({f'#### Inputs: {stage.id}'!r}), {shown}])")
+    return ScaffoldCell(
+        name=f"{name}_inputs", code="\n".join(lines), role="handoff", stage_id=stage.id
+    )
+
+
+def _handoff_cells(
+    stage: Stage,
+    index: int,
+    total: int,
+    names: dict[str, str],
+    gated: Mapping[str, str],
+) -> list[ScaffoldCell]:
+    """A hand-off: the statement the user takes away, and nothing else.
+
+    The one stage kind that computes nothing. What it emits is text plus an instruction, and it
+    binds that text to the stage's name -- so the rest of the notebook, and anything reading the
+    notebook's definitions, can get at exactly what the user was told to run.
+
+    Two shapes. A fixed statement is a string literal, optionally with ``{placeholders}`` filled
+    from a parameters dict the user edits in place. A generated one is rendered row by row out
+    of an upstream frame through :mod:`kedge.sql`, which is the reviewable form of the
+    ``="UPDATE ... "&F2&"..."`` column real workbooks do this with: the arithmetic happens in
+    polars where it can be checked, and the SQL becomes a rendering of the result rather than
+    the place the result lives.
+    """
+    name = names[stage.id]
+    handoff = stage.effective_handoff()
+    gates = _gate_tokens(stage, names, gated)
+
+    lines = [
+        f"# Stage {index} of {total}: {stage.id}  [handoff]",
+        "# kedge does not run this. It holds no connection and issues no statement -- what it",
+        "# does is work out exactly what needs running, say where, and wait for what comes back.",
+        *_comment("Intent", stage.intent),
+        *_comment("Do this", handoff.instruction),
+    ]
+    if handoff.connection:
+        lines.extend(_comment("Against", handoff.connection))
+    if stage.notes:
+        lines.extend(_comment("Note", stage.notes))
+    for gate in gates:
+        lines.append(f"_gate_{name} = {gate}  # this cell stays hidden until that step is recorded")
+
+    if handoff.is_generated:
+        upstream = names.get(handoff.built_from or "", "handin_frame")
+        header = f"Generated by kedge from stage '{handoff.built_from}'. Read it before running it."
+        if handoff.connection:
+            header = f"{header}\nRun against: {handoff.connection}"
+        lines.extend(
+            [
+                "#",
+                "# One statement per row of the frame above. kedge.sql renders the literals: a",
+                "# name with an apostrophe in it, a null, a date and a money value all have forms",
+                "# that string concatenation gets wrong -- quietly, at the moment somebody is",
+                "# about to run it against production.",
+                "_rows = (",
+                f"    {upstream}.collect() if isinstance({upstream}, pl.LazyFrame) else {upstream}",
+                ")",
+                f"{name} = kedge.sql.script(",
+                f"    kedge.sql.render_all(_rows.iter_rows(named=True), {handoff.template!r}),",
+                f"    header={header!r},",
+                ")",
+            ]
+        )
+    elif handoff.parameters:
+        lines.extend(
+            [
+                "#",
+                "# The statement's parameters, read off the inputs above and substituted as",
+                "# properly quoted literals. Nobody edits the SQL: a period end typed into a box",
+                "# once reaches every statement that needs it, and the run records what it was.",
+                f"{name}_parameters = {{",
+                *(
+                    f"    {parameter!r}: {name}_{_identifier(parameter)}.value,"
+                    for parameter in handoff.parameters
+                ),
+                "}",
+                "mo.stop(",
+                f'    any(value in (None, "") for value in {name}_parameters.values()),',
+                f"    mo.md({_waiting(index, total, stage.id, 'Fill in the inputs above before this statement can be built.')!r}),",
+                ")",
+                f"kedge.runs.record_parameters(KEDGE_RUNS, KEDGE_RUN_ID, **{name}_parameters)",
+                f"{name} = kedge.sql.render({handoff.statement!r}, {name}_parameters)",
+            ]
+        )
+    else:
+        lines.append(f"{name} = {handoff.statement!r}")
+
+    fence = handoff.medium.value
+    body = 'f"```' + fence + "\\n{" + name + '}\\n```"'
+    lines.extend(
+        [
+            "mo.vstack(",
+            "    [",
+            f"        mo.md({f'### Run this: {stage.id}'!r}),",
+            f"        mo.md({handoff.instruction!r}),",
+            f"        mo.md({body}),",
+            "    ]",
+            ")",
+        ]
+    )
+    cells: list[ScaffoldCell] = []
+    if handoff.parameters and not handoff.is_generated:
+        cells.append(_parameter_cell(stage, name, handoff))
+    cells.append(ScaffoldCell(name=name, code="\n".join(lines), role="handoff", stage_id=stage.id))
+    if handoff.needs_confirmation:
+        cells.extend(_confirmation_cells(stage, index, total, name))
+    return cells
+
+
 def _upstream_name(stage: Stage, names: dict[str, str], checkpoints: set[str]) -> str:
     """The frame a stage builds on: its first non-checkpoint dependency, else the hand-in.
 
     A checkpoint's output is a decision record, not a frame, so it gates a stage without feeding
     it. The reference that does the gating is emitted separately.
     """
+    # A stage's own hand-in outranks its dependencies: it is the thing this stage was written
+    # to read, and the dependency is usually the hand-off cell that told the user to produce it.
+    if _named_handin(stage) is not None:
+        return f"{names[stage.id]}_frame"
     for dependency in stage.depends_on:
         if dependency in names and dependency not in checkpoints:
             return names[dependency]
@@ -1148,34 +1918,31 @@ def _comment_items(label: str, items: list[str], *, width: int = 92) -> list[str
 
 
 _RECONCILE_BODY = """
-# There is exactly one way this cell can say "passed", and it runs through kedge.reconcile,
-# which refuses to construct a pass without compared rows. Every other path -- no workbook on
-# this machine, no cached values in it, no region matching a notebook column, an error part
-# way through -- lands on NOT RECONCILED with a reason attached. A signed-off claim that
-# nothing was checked is the most dangerous artifact this project could produce (PLAN 6.2),
-# so the fallback is built from the same report type as the real thing rather than from a
-# hopeful string.
-_reason = None
-reconciliation = None
-if not WORKBOOK.is_file():
-    _reason = (
-        f"The workbook {WORKBOOK} is not on this machine, so nothing was compared. That is "
-        f"not a pass: correct WORKBOOK in the setup cell and re-run."
-    )
-else:
-    try:
-        reconciliation = kedge.reconcile.reconcile_panel(WORKBOOK, reconciliation_values)
-    except kedge.KedgeError as _error:
-        _reason = f"Reconciliation could not run, so nothing was compared: {_error}"
-
-if reconciliation is None:
-    reconciliation = kedge.reconcile.ReconciliationPanel(
-        kedge.reconcile.ReconciliationReport(
-            workbook=str(WORKBOOK),
-            tolerance=kedge.reconcile.Tolerance(),
-            notes=[_reason],
-        )
-    )
+# Reconciliation asks whether the *translation* is faithful: does this Python reproduce the
+# numbers the workbook itself holds? That is a question about the **conversion**, and it has one
+# answer, measured once, against the data the spreadsheet contains.
+#
+# It is not a question about this month's run. The workbook was one period; a run is another,
+# and the numbers are supposed to differ. Comparing anyway fails on every run after the first --
+# a red panel saying the figures do not match, on a run where nothing is wrong -- and a few
+# months later it is pointing at a spreadsheet nobody has opened since the process changed.
+#
+# So the outcome is recorded once and cited afterwards, and the live comparison re-runs only
+# when this run is working on the same data the acceptance was measured on. A failure *there*
+# means somebody edited the notebook into disagreeing with the workbook, which is worth knowing.
+# There is still exactly one way to say "passed", and it runs through kedge.reconcile, which
+# refuses to construct a pass without compared rows (PLAN 6.2).
+reconciliation = kedge.reconcile.check_translation(
+    kedge.reconcile.AcceptanceStore(ACCEPTANCE_PATH),
+    WORKBOOK,
+    reconciliation_values,
+    handin_sha256=handin.sha256,
+    notebook=__file__,
+    watching_this_run=[
+        "the hand-in contract and the drift report, at the top of this notebook",
+        "the checkpoints, which record who decided what and why",
+    ],
+)
 reconciliation"""
 
 
