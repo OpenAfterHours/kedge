@@ -44,3 +44,28 @@ fix a cycle. Restructure so the dependency runs one way.
 kedge checks your code against the live graph *before* it reaches the kernel, and returns any
 collisions or cycles to you as violations. That is cheaper than a round trip, but it is not a
 substitute for reading the registry: a rejected proposal is a wasted turn either way.
+
+
+## A cell that builds UI and reads nothing cannot be hidden
+
+marimo decides what to show from the dataflow graph, and the graph is built from *references*. A
+cell that only constructs `mo.ui` elements references nothing, so it has no incoming edge and
+renders the moment the notebook opens — whatever is supposed to happen first.
+
+In a runbook that is not cosmetic. A cell offering "paste the re-extract here", visible before
+the statement it is meant to follow has even been generated, invites somebody to paste an
+extract taken *before* the update ran. Nothing downstream can tell the difference, and neither
+can anyone afterwards.
+
+So a cell that should wait its turn must read the token of the step before it, even if it does
+nothing with the value:
+
+```python
+_after_post_adjustment = update_statement_confirmed  # the edge is the gate
+post_adjustment_drop = mo.ui.file(kind="area", label="Drop the re-extract here")
+```
+
+The other half of the same rule: `mo.stop` halts the cell **and everything downstream**, and in
+app mode a stopped cell's message is the only thing left on the page. Every one of them names
+its step and says what to do — `**Step 3 of 8: the extract.** Run the query above, then paste
+what it returned.` A blocked page that explains nothing is indistinguishable from a broken one.

@@ -14,6 +14,7 @@ Read this first, then the document you actually need:
 | `RELEASING.md` | How a version tag becomes a PyPI release, and how to recover when one fails. |
 | `CONTRIBUTING.md` | The short version for a human arriving from GitHub. Points back at this file and `CONVENTIONS.md`. |
 | `docs/analyser-worked-example.md` | Real `kedge inspect` output over two fixture workbooks, annotated. The fastest way to see what the analyser actually produces. |
+| `evals/README.md` | The evals: a workbook plus a rubric, declaring what kedge should *do* rather than what the analyser should *find*. Read it before confusing one with `tests/fixtures`. |
 | `docs/ty-diagnostics.md` | Every outstanding `ty` diagnostic, why it is there, and what would clear it. |
 | `SECURITY.md` | The actual trust boundary: loopback, no auth, machine-level. Read before changing anything that binds a socket or logs a payload. |
 
@@ -30,6 +31,12 @@ Read this first, then the document you actually need:
    do *not* import it.
 3. **Excel semantics go through `kedge.xl`.** Never open-code half-away-from-zero rounding or
    null-as-zero arithmetic. If `kedge.xl` lacks something, add it there with tests.
+   **SQL literals go through `kedge.sql` for the same reason**, and it is the same class of bug:
+   an apostrophe in a counterparty name, a null, a date, a money value at the edge of exponent
+   notation. Every one is ordinary in a finance extract and every one breaks a statement built
+   by concatenation -- at the moment somebody pastes it into a production client. Unlike 1, 2, 7
+   and 8 this is *not* machine-enforced: no AST pass can tell SQL-shaped string concatenation
+   from any other, so it holds only as long as reviewers hold it.
 4. **Every analyser extractor degrades gracefully.** Absent and unparseable are first-class
    results. A malformed workbook produces a `Finding`, never a traceback. `analyse()` always
    returns a complete `WorkbookAnalysis`.
@@ -76,6 +83,8 @@ uv run python scripts/version.py v0.2.0    # does that tag match __version__?
 uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole release
 
 uv run python tests/fixtures/generate.py   # regenerate the fixture corpus
+uv run python evals/adjustment_signoff/build_workbook.py   # regenerate the eval workbook
+uv run python evals/run.py adjustment_signoff              # grade the reference conversion
 uv run kedge --help
 ```
 
@@ -156,6 +165,101 @@ including the contract tests. `ty` is advisory there until its three known diagn
   dropped from the ladder in `_recover` if the endpoint refuses it); responses reports it
   unprompted on `response.completed`. Prefer it over `TokenCounter`, which is an estimate over a
   fixed `cl100k_base` and cannot see `cached_tokens` at all.
+- **Presence is not the absence of a null.** `reconcile.verify` compares a prediction against a
+  re-extract with a full outer join, and the obvious way to tell "this row is missing" from "this
+  row differs" is to look at whether a value column came back null. That is wrong on precisely
+  the row the module exists for: a re-extract holding a legitimate `NULL` is *present and
+  different*, and reading it as missing loses the break. Two explicit boolean marker columns are
+  added before the join, named so they cannot collide with a hand-in's own columns. The eval's
+  central case (`ACC-00001`, Excel's blank-as-zero against the warehouse's `NULL`) is a
+  regression test for exactly this.
+- **A paste is the one hand-in whose stored bytes are not the bytes that arrived.** Everywhere
+  else the SHA-256 is a claim about a file the user still holds, so rewriting the payload would
+  falsify it. A paste has no original, so `kedge.ingest.paste` normalises it to RFC 4180 CSV and
+  the managed file becomes the artifact of record. It has to: `read_frame` picks its separator
+  off the **extension**, so a tab-delimited paste stored under `.csv` reads as one column, and
+  under `.tsv` every comma-delimited paste is stranded. Two consequences worth knowing — the same
+  grid pasted as TSV and as CSV dedupes to one stored file, and the delimiter has to be resolved
+  before the file is named.
+- **A cell that only builds `mo.ui` elements reads nothing, so nothing can hide it.** marimo
+  gates a cell on its dataflow edges; a selector that constructs widgets and references no
+  upstream name has none, so it renders from the moment the notebook opens. In a runbook that
+  means the re-extract box sits on screen before the UPDATE it is meant to follow — and a
+  re-extract taken *before* the statement ran looks exactly like one taken after, with no way to
+  tell afterwards. Such a cell must read the previous step's token (`_after_x = <token>`), and
+  `_gate_map` in `scaffold.py` is what supplies it. The eval scored 38/38 while this was broken,
+  because the harness executed cells linearly and had no way to express "should not have been
+  visible"; `harness/drive.py:visible_cells` exists for that now.
+- **In app mode an error renders as nothing at all.** Everything below a stopped or failed cell
+  disappears, and `marimo run` hides the traceback, so a broken conversion and a conversion
+  waiting patiently look identical: a page that just ends. Every `mo.stop` message therefore
+  names its step (`Step 3 of 8`) and what to do — at that moment it is the entire user
+  interface. This is why the first report of the typing bug below was "I was expecting the SQL
+  to appear and I can't see it".
+- **Excel copies what a cell *looks like*, not what it holds.** A column formatted `#,##0.00`
+  reaches the clipboard as `364,422.95`, so a pasted grid arrives with `accrual_gbp` as `String`
+  — and `empty_as_zero` was a *silent no-op* on it, because a paste has no nulls, it has empty
+  strings. The failure surfaced four operations later as `arithmetic on dtypes str and dyn
+  float`, inside a query plan, in a cell app mode drew as blank. Two fixes, and both matter:
+  `read_data` now types unambiguously numeric text columns and reports each one on the `Layout`,
+  and `empty_as_zero` casts strictly so a text column fails at *that* expression instead of
+  three later. It refuses to coerce a leading zero or more than 15 significant digits — those
+  are identifiers, and `00123` becoming `123.0` breaks every join it takes part in. Note polars'
+  own CSV inference does that to `00123` before kedge sees it; that one is still open.
+- **marimo's state dies with the kernel, and a runbook outlives it.** A process that says "run
+  this update, then re-extract tomorrow" cannot keep its progress in widget values. `kedge.runs`
+  writes one JSON file per run — hand-ins by hash, decisions with notes and times — so reopening
+  resumes and the sign-off's audit line is derived rather than asserted. Starting fresh writes a
+  *new* file beside the old one: a run record is evidence, and "start again" must never erase
+  what was signed off last month.
+- **A prompt is a hand-written copy of an enum, and prose does not go red.** `StageKind.HANDOFF`
+  was added while `propose_system.md` went on listing four kinds, so the model could not propose
+  a hand-off — it had never been given the word. `tests/unit/test_agent_prompts.py` now asserts
+  every `StageKind`, `SourceOrigin` and `ExcelPattern` member appears in the prompt that offers
+  it, the same way `test_every_tool_the_model_is_offered_is_described_in_the_prompt` already did
+  for the tool list. It found a missing `aggregate` row on the first run.
+- **A signal that is permanently amber is one people stop reading.** A conversion that
+  deliberately improves on a workbook column -- rendering the UPDATEs through `kedge.sql`
+  instead of copying the workbook's broken concatenated ones -- reproduces nothing for that
+  region, so the report sat at `NOT RECONCILED` on every correct run, with the default message
+  telling the reader to go and check that a cell ran. `reconcile_workbook(..., not_reproduced=
+  {region_id: why})` is the fix: still `NOT_RECONCILED`, because nothing can make an unchecked
+  region a pass, but reported as a decision with its reason, and the headline becomes `CHECKED
+  WITH EXCEPTIONS` rather than the same amber as a genuine gap.
+- **Reconciliation is evidence for a decision, so it goes before the decision.** It used to be
+  the last cell in the file. In a runbook that is wrong twice: it depends only on the computing
+  stages, so marimo renders it as soon as those finish -- which put a wall of reconciliation
+  output directly beneath the sentence telling a blocked user what to type -- and it put the
+  proof that the arithmetic matches the workbook *after* the approval it is proof for.
+  `_with_reconciliation` now emits it straight after the last stage declaring any operations.
+- **A blocking message must lead with the instruction.** "A reason is required, not optional --
+  it is the whole improvement over somebody typing a number into Excel" tells a stuck user why
+  the rule exists and never where to type. Instruction first, justification after; the eval
+  asserts the message contains an actual verb.
+- **Reconciliation is an acceptance test on the conversion, not a control on every run.** It
+  asks whether the *translation* reproduces the workbook's own numbers, which is one question
+  with one answer, measured against the data the spreadsheet holds. A converted notebook is then
+  run monthly on *new* data, where the workbook is no baseline at all — so leaving the live
+  comparison in the notebook reported FAILED on every run after the first, on runs where nothing
+  was wrong, pointing at a spreadsheet nobody had opened since the process changed. The outcome
+  is now recorded once (`kedge.reconcile.AcceptanceStore`, `<project>/reconciliation.json`) and
+  cited afterwards, and the live check re-runs only when the hand-in digest matches the one the
+  acceptance was measured on — the only case where a failure means somebody edited the notebook
+  into disagreeing with the workbook. The panel names what *is* watching the run (the contract,
+  the drift report, the checkpoints, the verification), because a bare citation reads as
+  "nothing is being checked". `TranslationCheck.status` stays falsy for a citation; the question
+  "is the translation accepted?" is `translation_accepted`, spelled differently on purpose.
+- **The conversion used to throw away the only part nobody can reconstruct.** A workbook's
+  Process Notes or Sign-off sheet — Purpose, Background, Known issues, written by somebody for
+  exactly the person who opens the notebook eight months later — was extracted by the analyser
+  into `WorkbookAnalysis.notes`, with the sheet and cells each note came from, and then dropped
+  on the floor. `Briefing` on the plan is where it goes, and `_briefing_cell` renders it first,
+  collapsed. Two halves with different reliability: the prose is model-extracted and **must cite
+  its sources** (the validator refuses prose without them — invented background in a finance
+  notebook is confident, plausible and unattributable, and an honest blank is a correct answer);
+  the provenance below it is derived from the approved plan with no model involved. Unanswered
+  open questions sit *outside* the accordion, because they qualify every number below them on
+  every run and a caveat nobody opens is a caveat nobody has.
 - Excel's `ROUND` collapses the operand to **15 significant decimal digits** before rounding
   half-away-from-zero. Missing this is a one-penny error that propagates.
 - marimo's two file inputs return different things: `mo.ui.file` gives bytes with no path,

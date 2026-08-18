@@ -22,6 +22,7 @@ Where a workbook does something this table does not cover, that is a signal for 
 | `=VLOOKUP(k, t, n, TRUE)` | `vlookup_approx` | `.join_asof(t, on=k, strategy="backward")` |
 | `=INDEX(r, MATCH(k, m, 0))` | `index_match` | same as exact `VLOOKUP` — a join |
 | `=SUMPRODUCT(a, b)` | `sumproduct` | `(col("a") * col("b")).sum()` |
+| `SUM`/`COUNT`/`AVERAGE` over a range | `aggregate` | `.select(...)`, or `.group_by(...).agg(...)` where the total is per key |
 | running total down a column | `running_total` | `col("x").cum_sum()` |
 | `=A2` referencing the row above | `prior_row` | `col("x").shift(1)` — a window, not a loop |
 | absolute ref `$B$1` to a parameter | `parameter_ref` | a Python constant, or a value from the parameters frame |
@@ -46,7 +47,7 @@ generated code reaches for `kedge.xl` rather than the naive equivalent.
 | Row-wise addition | `=A1+B1+C1` ignores empties | `col("a")+col("b")` propagates null | `pl.sum_horizontal(...)` matches Excel |
 | Column aggregate | `SUM()` ignores empties | `.sum()` ignores nulls | Matches. Safe |
 | Divide by zero | `#DIV/0!`, propagates visibly | `inf` / `-inf` / `nan` | `inf` poisons downstream aggregates quietly. Every division gets wrapped |
-| Text-formatted numbers | coerced on the fly | stays `String` | Silent type mismatch on join keys. Dtypes are profiled at load |
+| Text-formatted numbers | coerced on the fly | stays `String` | `kedge.ingest.read_data` converts an unambiguously numeric text column on the way in and reports each one. It refuses where converting would lose something -- a leading zero, more than 15 significant digits -- and those reach the notebook as text, where `col(x).xl.to_number()` is a decision with a person behind it |
 | Dates | 1900 serial system, with the leap-year bug | proper temporal types | Off-by-one on pre-1901 dates |
 | `VLOOKUP` exact | first hit wins | a join multiplies rows on a duplicate key | Key uniqueness is checked before the join, not after |
 
@@ -54,3 +55,31 @@ generated code reaches for `kedge.xl` rather than the naive equivalent.
 `col("amount").xl.round(2)`, `col("a").xl.add(col("b"))`, `col("n").xl.div(col("d"))`,
 `col("x").xl.serial_to_date()`. Mention it in a stage's notes where the region depends on one of
 these behaviours; it makes the assumption greppable for a reviewer.
+
+
+# A process the user carries out, not a pipeline that replaces one
+
+Many workbooks are not a calculation. They are the *record* of a process: run an extract, work
+out an adjustment, run an update, re-extract to prove it took, write a memo somebody signs. The
+conversion of one is a **runbook** — a notebook that hands the user each statement in turn, takes
+the results back, does the arithmetic in the middle where it can be checked, and refuses to claim
+the change worked until it has seen evidence that it did.
+
+Four things follow, and each has somewhere to go in the plan:
+
+| In the workbook | In the plan |
+|---|---|
+| SQL sitting in a cell, or in `xl/connections.xml` | `kind: handoff` with a fixed `statement` |
+| A column of `="UPDATE ... "&F17&"..."` | `kind: handoff` with `template` + `built_from` and `mutates: true` |
+| A tab holding data somebody pasted | a `handin` source; give it a `ref` if it is not the first |
+| A sign-off tab, an approval, an override | `kind: checkpoint` |
+
+Two failures are worth naming because both look reasonable.
+
+**Dropping a column of generated SQL.** The analyser reports it as a dead region, correctly:
+nothing in the workbook reads it. Its consumer is a person with a clipboard, which no static
+analysis can see. Dropping it deletes the step that changes the data.
+
+**Trusting a summary figure.** A sign-off tab's impact numbers are typed, which means they can be
+— and often are — left over from an earlier run. Recompute them; never carry them forward as
+inputs, and never reconcile against them.

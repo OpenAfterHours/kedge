@@ -14,6 +14,7 @@ import re
 
 from kedge.agent.prompts import PROMPTS_DIR, SYSTEM_PARTS, build_system_prompt, load_prompt
 from kedge.agent.tools import tool_names
+from kedge.plan.propose import load_prompt as plan_prompt
 
 _EMOJI = re.compile("[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f000-\U0001f0ff⬀-⯿]")
 _SEPARATOR = re.compile(r"^:?-{3,}:?$")
@@ -173,3 +174,84 @@ def test_extra_blocks_are_appended_after_the_files() -> None:
     prompt = build_system_prompt(parts=("role.md",), extra=("## This workspace\n\nOne sheet.",))
     assert prompt.endswith("One sheet.")
     assert "kedge's conversion copilot" in prompt
+
+
+# ── the vocabularies the model is given must be the vocabularies the code has ────────────────
+#
+# Every one of these tables is hand-written prose duplicating an enum, and prose does not go red
+# when an enum gains a member. `StageKind.HANDOFF` was added and `propose_system.md` went on
+# listing four kinds for the whole of one release, which meant the model could not propose a
+# hand-off because it had never been told the word existed -- and no test noticed. These are the
+# same idea as `test_every_tool_the_model_is_offered_is_described_in_the_prompt`, applied to the
+# enums instead of the tool list.
+
+
+def test_every_stage_kind_is_offered_to_the_planner() -> None:
+    from kedge.plan.model import StageKind
+
+    prompt = plan_prompt("propose_system.md")
+
+    missing = [kind.value for kind in StageKind if f"`{kind.value}`" not in prompt]
+    assert not missing, (
+        f"stage kinds the model is never told about: {missing}. It cannot propose what it has "
+        f"not been given a word for."
+    )
+
+
+def test_every_source_origin_is_offered_to_the_planner() -> None:
+    from kedge.plan.model import SourceOrigin
+
+    prompt = plan_prompt("propose_system.md")
+
+    missing = [origin.value for origin in SourceOrigin if f"`{origin.value}`" not in prompt]
+    assert not missing, f"source origins the model is never told about: {missing}"
+
+
+def test_every_excel_pattern_is_in_the_translation_vocabulary() -> None:
+    from kedge.analysis.model import ExcelPattern
+
+    prompt = plan_prompt("propose_vocabulary.md")
+
+    missing = [pattern.value for pattern in ExcelPattern if f"`{pattern.value}`" not in prompt]
+    assert not missing, (
+        f"Excel patterns with no entry in the vocabulary: {missing}. A pattern the model cannot "
+        f"name is one it will improvise around instead of raising an open question."
+    )
+
+
+def test_the_planner_is_told_a_mutating_handoff_needs_confirming() -> None:
+    """The field that decides whether a re-extract box can appear before the update ran."""
+    prompt = plan_prompt("propose_system.md")
+
+    assert "mutates" in prompt
+    assert "UPDATE" in prompt
+
+
+def test_the_prompts_do_not_still_claim_text_columns_are_handled_at_load() -> None:
+    """The line that made the typing bug invisible for a whole release.
+
+    Both vocabularies said text-formatted numbers were dealt with because "dtypes are profiled at
+    load". Profiling is not converting, and a grid pasted out of Excel arrives as text every
+    time. The reader now converts and reports; the prompts have to say what actually happens.
+    """
+    for name, read in (("propose_vocabulary.md", plan_prompt), ("excel.md", load_prompt)):
+        prompt = read(name)
+        assert "profiled at load" not in prompt.lower(), name
+        assert "read_data" in prompt, name
+
+
+def test_the_agent_is_told_to_render_sql_rather_than_concatenate_it() -> None:
+    prompt = load_prompt("role.md")
+
+    assert "kedge.sql" in prompt
+    assert "kedge.reconcile.verify" in prompt
+    assert "kedge.runs" in prompt
+
+
+def test_the_planner_is_told_to_capture_the_workbook_s_own_documentation() -> None:
+    """And told not to invent it, which is the half that matters in a finance notebook."""
+    prompt = plan_prompt("propose_system.md")
+
+    assert "briefing" in prompt
+    assert "sources" in prompt
+    assert "leave the fields empty" in prompt

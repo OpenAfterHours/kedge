@@ -13,7 +13,7 @@ a small unexplained delta; in practice the overwhelming majority of them are on 
 | Divide by zero | `#DIV/0!` error, propagates visibly | `inf` / `-inf` / `nan` | `inf` poisons downstream aggregates quietly. Wrap every division |
 | `VLOOKUP(..., FALSE)` | exact match, first hit | — | `join(..., how="left")`; check key uniqueness first or rows multiply |
 | `VLOOKUP(..., TRUE)` | approximate, assumes sorted, takes largest <= key | — | `join_asof(strategy="backward")` — verified default |
-| Text-formatted numbers | coerced on the fly | stays `String` | Silent type mismatch on join keys. Profile dtypes at load |
+| Text-formatted numbers | coerced on the fly | stays `String` | `kedge.ingest.read_data` converts an unambiguously numeric text column on the way in and reports each one. It refuses where converting would lose something -- a leading zero, more than 15 significant digits -- and those reach the notebook as text, where `col(x).xl.to_number()` is a decision with a person behind it |
 | Dates | 1900 serial system, including the 1900 leap-year bug | proper temporal types | Off-by-one on pre-1901 dates; rare but real |
 
 ## The rounding rule in full — this is not in most people's mental model
