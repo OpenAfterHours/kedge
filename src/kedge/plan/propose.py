@@ -32,7 +32,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -61,6 +62,7 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "Completer",
     "CompletionRequest",
+    "CompletionUsage",
     "OpenAICompleter",
     "ProposalError",
     "ProposalRefusedError",
@@ -157,6 +159,119 @@ def _rejects_temperature(exc: Exception) -> bool:
     return "temperature" in str(exc).lower()
 
 
+@dataclass(frozen=True, slots=True)
+class CompletionUsage:
+    """What one logical :meth:`Completer.complete` call cost, as the endpoint counted it.
+
+    One ``complete()`` is **not** one HTTP request. The temperature negotiation and the
+    ``json_schema -> json_object -> text`` ladder both retry inside the same call, so a single
+    logical completion can be three round trips against three different payloads -- and a model
+    that quietly burned two of them degrading a response format is a materially different result
+    from one that answered first time. Both figures are therefore kept: :attr:`requests` counts
+    what went over the wire, and the caller counts the completions.
+
+    ``reported`` is the field that keeps an honest sweep honest. Plenty of OpenAI-compatible
+    servers -- llama.cpp, a thin proxy, an internal gateway -- answer perfectly and volunteer no
+    ``usage`` block at all, and a zero token count from one of those is *not* a cheap model. So
+    "the endpoint reported nothing" (``reported == 0``) is expressed distinctly from "the endpoint
+    reported zero", and a report that renders the two the same way will get a model credited with
+    a cost nobody measured. It counts blocks that yielded a **number**, not blocks that merely
+    existed: a proxy answering with ``usage`` as a bare ``dict``, or with ``prompt_tokens: null``,
+    has told nobody anything, and counting it as a report is how the least informative endpoint in
+    a sweep becomes the cheapest model in it.
+
+    ``answered`` is the denominator ``reported`` belongs over, and it is not ``requests``. A 400
+    that starts a negotiation is a request that *cannot* carry a usage block, so measuring
+    completeness against the request count declares every recovered negotiation a flaky endpoint.
+
+    Deliberately a plain frozen dataclass rather than a reuse of
+    :class:`kedge.agent.loop.Usage`: ``plan/`` sits below ``agent/`` in the layering, and a
+    planning module importing the chat loop to borrow five integers would invert it. The
+    vocabulary is shared on purpose even though the type is not -- with one deliberate exception,
+    :attr:`any_reported`, which is spelled differently from :attr:`kedge.agent.loop._Meter.measured`
+    because it means something different: ``_Meter.measured`` is "every step reported", this is
+    "at least one request did". Both were called ``measured`` once, and
+    ``if usage.measured: print(usage.total)`` printed a partial total as though it were the bill.
+
+    Example:
+        >>> CompletionUsage(prompt=8_000, completion=120, requests=1, reported=1).total
+        8120
+        >>> CompletionUsage(requests=3).any_reported
+        False
+    """
+
+    prompt: int = 0
+    completion: int = 0
+    cached: int = 0
+    """Prompt tokens the endpoint served from cache. Part of ``prompt``, not additional to it."""
+    requests: int = 0
+    """HTTP requests issued, including the ones a negotiation threw away."""
+    answered: int = 0
+    """How many of those requests came back with a response at all, rather than raising."""
+    reported: int = 0
+    """How many answered requests carried usable numbers in the endpoint's own usage block."""
+
+    @property
+    def total(self) -> int:
+        """Prompt plus completion, cache or no cache."""
+        return self.prompt + self.completion
+
+    @property
+    def any_reported(self) -> bool:
+        """Whether any of it is the endpoint's own arithmetic rather than an assumed zero."""
+        return self.reported > 0
+
+    @property
+    def fully_reported(self) -> bool:
+        """Whether every request that could have carried numbers did.
+
+        Measured against :attr:`answered` rather than :attr:`requests`, because a request refused
+        with a 400 never had a usage block to volunteer.
+        """
+        return self.reported > 0 and self.reported >= self.answered
+
+
+def _read(source: Any, name: str) -> Any:
+    """One field off a usage block, whichever shape the endpoint chose to send it in.
+
+    The SDK hands back a pydantic object; a proxy that assembles its own JSON hands back a plain
+    ``dict``, and ``getattr`` finds nothing at all on one of those -- which is how a complete
+    usage block comes to read as "this endpoint reported nothing". Both shapes are read here, and
+    anything that raises on access is treated as absent: metering is bookkeeping, and bookkeeping
+    must never be the thing that turns a working plan into a traceback.
+    """
+    if source is None:
+        return None
+    try:
+        if isinstance(source, Mapping):
+            return source.get(name)
+        return getattr(source, name, None)
+    except Exception:
+        logger.debug("a usage block raised while reading %s; treating it as absent", name)
+        return None
+
+
+def _count(source: Any, name: str) -> int | None:
+    """One token count off a usage block, or ``None`` when the endpoint did not really give one.
+
+    ``None`` and ``0`` are different answers and the difference is the whole honesty of the cost
+    column: ``None`` is "nobody counted", ``0`` is "the endpoint counted zero". So a null, a
+    missing key, a nested ``dict`` where a number belongs and a string that will not parse --
+    ``prompt_tokens="8,000"``, which an ``int()`` would raise on -- all come back as ``None``
+    rather than as a zero somebody will later average, or as a ``ValueError`` in the middle of a
+    successful plan. ``bool`` is excluded on purpose: ``True`` is an ``int`` in Python and one
+    prompt token is not what an endpoint sending it meant.
+    """
+    value = _read(source, name)
+    try:
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            return None
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        logger.debug("usage field %s was not a number; treating it as unreported", name)
+        return None
+
+
 class OpenAICompleter:
     """A :class:`Completer` backed by the OpenAI SDK against the configured endpoint.
 
@@ -170,10 +285,17 @@ class OpenAICompleter:
     parameter drops it for the rest of the session rather than being misread as one more piece of
     evidence that structured output is unsupported.
 
+    Both negotiations leave a trace worth reading, and so does what they cost: :attr:`mode`,
+    :attr:`omit_temperature` and :attr:`usage` are the three pieces of observable state a caller
+    needs to tell "answered first time" from "answered on the third attempt after giving up on
+    structured output", which is a real difference between two models that both returned a plan.
+
     Example:
         >>> completer = OpenAICompleter(base_url="https://api.example/v1", api_key="k", model="m")
         >>> completer.mode
         'json_schema'
+        >>> completer.usage.any_reported
+        False
     """
 
     def __init__(
@@ -204,11 +326,31 @@ class OpenAICompleter:
         """Current structured-output mode: ``json_schema``, ``json_object`` or ``text``."""
         self.omit_temperature = False
         """Whether the endpoint refused an explicit ``temperature`` and it is no longer sent."""
+        self.usage = CompletionUsage()
+        """What the **most recent** :meth:`complete` cost, accumulated across its retries.
+
+        Public for the same reason :attr:`mode` and :attr:`omit_temperature` are: it is observable
+        state about the negotiation that just happened, and a caller that wants to know what a
+        plan cost has nowhere else to read it. A decorator around :class:`Completer` can time a
+        call and count calls, but the protocol returns a bare string, so tokens are structurally
+        invisible from outside -- an eval sweep comparing models on cost would have to guess.
+
+        Reset at the top of every call, so it describes one completion rather than a session, and
+        written *as the requests happen* rather than at the end -- a call that raises still burned
+        whatever it burned, and a failed leg of a sweep that reports zero tokens is a lie about
+        the bill.
+
+        That reset is also why **one completer must not be called from two threads at once**: the
+        second call's reset lands between the first call's requests and the caller's read of them,
+        so both callers read one call's arithmetic and the sweep bills a model for tokens nobody
+        spent. A parallel sweep gives each worker its own completer.
+        """
 
     def complete(self, request: CompletionRequest) -> str:
         """Send the request, degrading the structured-output mode on rejection."""
         from openai import BadRequestError, OpenAIError
 
+        self.usage = CompletionUsage()
         while True:
             payload: dict[str, Any] = {
                 "model": request.model or self._model,
@@ -220,6 +362,7 @@ class OpenAICompleter:
             try:
                 response = self._client.chat.completions.create(**payload)
             except BadRequestError as exc:
+                self._meter(None)
                 # Tested before the structured-output ladder, because it is the same exception
                 # type: without this, an endpoint that only accepts its default temperature burns
                 # three requests degrading a `response_format` it was perfectly happy with, and
@@ -243,14 +386,59 @@ class OpenAICompleter:
                 )
                 continue
             except OpenAIError as exc:
+                self._meter(None)
                 msg = f"the model endpoint could not be reached or refused the request: {exc}"
                 raise ProposalError(msg) from exc
+            except Exception:
+                # Not every failure arrives translated. The SDK maps transport errors around the
+                # request, but a raw `httpx.ReadTimeout` -- or the bare `TimeoutError` httpx maps
+                # one from -- has already escaped it on this project once (CLAUDE.md). Metered and
+                # re-raised untouched: the request was still made and still billed, and a leg that
+                # reports zero requests for it is a lie about the bill in the one direction that
+                # flatters the endpoint.
+                self._meter(None)
+                raise
 
+            self._meter(response)
             content = response.choices[0].message.content if response.choices else None
             if not content:
                 msg = "the model endpoint returned an empty response"
                 raise ProposalError(msg)
             return content
+
+    def _meter(self, response: Any | None) -> None:
+        """Fold one HTTP request into :attr:`usage`, whether or not it returned anything.
+
+        Called on every outcome of ``chat.completions.create`` -- the answer, the 400 that starts
+        a negotiation, the transport failure that ends the call -- because the request count has
+        to include the ones that were thrown away. That is the whole point of keeping it apart
+        from the completion count.
+
+        Every field is optional and every read is defended (:func:`_count`), because the endpoint
+        is whatever the user configured. A partial usage block is commonplace on
+        OpenAI-compatible servers and is still worth more than nothing; a missing or malformed one
+        must never turn a working plan into a traceback. ``reported`` advances only when a block
+        yielded an actual number, so an endpoint that answers with an empty ``usage`` dict stays
+        visibly unmeasured rather than being credited with zero tokens it never claimed.
+        """
+        current = self.usage
+        if response is None:
+            self.usage = replace(current, requests=current.requests + 1)
+            return
+        block = _read(response, "usage")
+        prompt = _count(block, "prompt_tokens")
+        completion = _count(block, "completion_tokens")
+        cached = _count(_read(block, "prompt_tokens_details"), "cached_tokens")
+        self.usage = CompletionUsage(
+            prompt=current.prompt + (prompt or 0),
+            completion=current.completion + (completion or 0),
+            cached=current.cached + (cached or 0),
+            requests=current.requests + 1,
+            answered=current.answered + 1,
+            # A block is a report when it carried a token count, not when it was present. The two
+            # are different for exactly the servers this negotiation exists for.
+            reported=current.reported + (1 if prompt is not None or completion is not None else 0),
+        )
 
     def _response_format(self, request: CompletionRequest) -> dict[str, Any] | None:
         if self.mode == "json_schema" and request.json_schema is not None:

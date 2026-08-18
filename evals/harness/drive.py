@@ -58,7 +58,31 @@ __all__ = [
     "Widget",
     "run_notebook",
     "visible_cells",
+    "workspace_overrides",
 ]
+
+
+def workspace_overrides(root: Path, workbook: Path) -> dict[str, Path]:
+    """The four paths a driven notebook must be pointed at, so a run stays inside ``root``.
+
+    One helper rather than a dict literal at each call site, because there are four of them --
+    ``grade``, ``convert.driven_run``, and two in the case's own re-driving graders -- and the
+    fourth key was missing from all of them. A *scaffolded* notebook bakes ``ACCEPTANCE_PATH`` from
+    the plan's project directory, and with no ``handins_dir`` to derive one from it comes out
+    **relative**: driving a generated conversion wrote its acceptance record into whatever
+    directory pytest was run from, which was the repository root. The committed reference
+    conversion hid it, because that one computes its own path from ``__file__``.
+
+    An acceptance record is the evidence that a translation was ever checked against the workbook
+    (PLAN 6.2). Somewhere unpredictable is the one place it must not be, and a harness that leaks
+    one into the working tree would eventually have a stale one read back.
+    """
+    return {
+        "HANDIN_DIR": root / "store",
+        "RUNS_DIR": root / "runs",
+        "ACCEPTANCE_PATH": root / "reconciliation.json",
+        "WORKBOOK": workbook,
+    }
 
 
 class Stopped(Exception):  # noqa: N818 - it is a control signal, not a failure

@@ -513,22 +513,18 @@ is no way to detect that afterwards, which is what makes it worth a grader of it
 
 def _drive(ctx: Context, inputs: dict[str, Any], root: Path) -> Any:
     """Drive the notebook again, in a workspace of this grader's own."""
-    from harness.drive import run_notebook
+    from harness.drive import run_notebook, workspace_overrides
 
     return run_notebook(
         ctx.notebook,
         inputs=inputs,
-        overrides={
-            "HANDIN_DIR": root / "store",
-            "RUNS_DIR": root / "runs",
-            "WORKBOOK": WORKBOOK,
-        },
+        overrides=workspace_overrides(root, WORKBOOK),
     )
 
 
 def progressive_disclosure(ctx: Context) -> ItemResult:
     """Nothing is on screen before its turn, and the first step is."""
-    from harness.drive import visible_cells
+    from harness.drive import visible_cells, workspace_overrides
 
     with tempfile.TemporaryDirectory(prefix="kedge-eval-visible-") as workspace:
         root = Path(workspace)
@@ -536,11 +532,7 @@ def progressive_disclosure(ctx: Context) -> ItemResult:
             visible_cells(
                 ctx.notebook,
                 inputs={},
-                overrides={
-                    "HANDIN_DIR": root / "store",
-                    "RUNS_DIR": root / "runs",
-                    "WORKBOOK": WORKBOOK,
-                },
+                overrides=workspace_overrides(root, WORKBOOK),
             )
         )
 

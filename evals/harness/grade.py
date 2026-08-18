@@ -18,7 +18,7 @@ from typing import Any
 
 import yaml
 
-from harness.drive import run_notebook, unused_inputs
+from harness.drive import run_notebook, unused_inputs, workspace_overrides
 from harness.model import EvalReport, ItemResult, Outcome, TierResult
 
 logger = logging.getLogger(__name__)
@@ -63,11 +63,7 @@ def grade(
         run = run_notebook(
             notebook,
             inputs=script,
-            overrides={
-                "HANDIN_DIR": root / "store",
-                "RUNS_DIR": root / "runs",
-                "WORKBOOK": case.WORKBOOK,
-            },
+            overrides=workspace_overrides(root, case.WORKBOOK),
         )
         context = case.Context(
             run=run,
