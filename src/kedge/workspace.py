@@ -328,6 +328,28 @@ class Workspace:
         return self.project_dir / "handins"
 
     @property
+    def acceptance_path(self) -> Path:
+        """Whether this translation was ever reconciled against the workbook it came from.
+
+        One record, not a history, and beside the notebook rather than under `runs/`: it is a
+        fact about the *conversion*. The workbook it names will be superseded, moved or deleted
+        within a few months of a conversion, and the record has to outlive it — which is the
+        whole reason it is written down rather than re-derived on every run.
+        """
+        return self.project_dir / "reconciliation.json"
+
+    @property
+    def runs_dir(self) -> Path:
+        """One JSON file per pass through the runbook (:mod:`kedge.runs`).
+
+        Beside the plans and the hand-ins rather than under them: a run is neither. It is the
+        record of a person carrying the process out -- which hand-ins they supplied, what they
+        approved, when -- and it is the thing that lets somebody close the notebook halfway
+        through and come back to it.
+        """
+        return self.project_dir / "runs"
+
+    @property
     def contract_path(self) -> Path:
         """The hand-in contract this workbook's notebook enforces (PLAN 2.8).
 
