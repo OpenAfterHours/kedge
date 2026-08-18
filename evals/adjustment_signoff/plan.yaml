@@ -1,0 +1,213 @@
+# kedge process plan. Edit freely: this file is a review artifact, not generated code.
+# Nothing reaches the notebook until approval.state is 'approved' (PLAN 2.2).
+plan_schema_version: '1.1'
+version: 2
+created_at: '2026-08-18T12:30:16.148384Z'
+workbook: q2_accrual_adjustment.xlsx
+workbook_sha256: 8f3cee46fd4774314e2220026106eaa5a72e4bfc5e4fe00e2bc9ab52014eeccc
+analysis_schema_version: '1.0'
+kedge_version: ''
+generated_by: human
+based_on_version: 1
+assessment:
+  convertible: 0.85
+  blockers: []
+  rationale: Every calculation is a fill-down of two ROUNDs over a lookup, which translates cleanly. What
+    is not code is the three steps a person carries out elsewhere, and those become hand-offs rather than
+    blockers.
+stages:
+- id: extract_query
+  intent: Hand the user the query that produces the pre-adjustment position
+  kind: handoff
+  sources:
+  - origin: query
+    ref: AccrualExtract
+  depends_on: []
+  confidence: n/a
+  assumptions: []
+  operations: []
+  handoff:
+    instruction: Run this against FinanceWarehouse and bring the whole grid back, header row included.
+    medium: sql
+    statement: "SELECT\n    a.trade_id,\n    a.entity_id,\n    e.entity_name,\n    a.cost_centre,\n  \
+      \  a.accrual_gbp,\n    a.period_end,\n    a.status\nFROM fin.accruals AS a\nINNER JOIN fin.entities\
+      \ AS e\n    ON e.entity_id = a.entity_id\nWHERE a.period_end = {period_end}\n  AND a.ledger = {ledger}\n\
+      ORDER BY a.entity_id, a.trade_id"
+    connection: FinanceWarehouse
+    parameters:
+    - period_end
+    - ledger
+    mutates: false
+  notes: Recovered from xl/connections.xml and reproduced on the Pre-Adjustment tab above the data it
+    returned.
+- id: pre_adjustment
+  intent: The statutory accrual position as it stands before any adjustment
+  kind: load
+  sources:
+  - origin: handin
+    ref: pre-adjustment extract
+  depends_on:
+  - extract_query
+  confidence: high
+  assumptions:
+  - One row per trade per period end; trade_id is unique within the extract.
+  operations: []
+- id: adjust
+  intent: Apply the agreed 4.5% Q2 uplift to in-scope statutory accruals
+  kind: transform
+  sources:
+  - origin: stage
+    ref: pre_adjustment
+  depends_on:
+  - pre_adjustment
+  confidence: high
+  assumptions:
+  - 'Scope is the UPDATE''s own WHERE clause: four entities (E-04, E-07, E-09, E-12), statutory ledger,
+    period end 2026-06-30, excluding CANCELLED trades.'
+  - A blank accrual is zero, because Excel's ROUND reads the empty cell as zero and the workbook's cached
+    value for that row is 0.00. Whether that is right for the process is a separate question; the translation
+    has to reproduce it.
+  - 'ROUND is Excel''s: half away from zero over the 15-significant-digit value. Four of the 76 rows are
+    a penny out without it.'
+  operations:
+  - adjustment_c17_c92
+  - adjustment_d17_d92
+  - adjustment_e17_e92
+  - adjustment_f17_f92
+  - adjustment_d94_f94
+  notes: The Sign-off tab says 'the three affected entities' where the scope row and the UPDATE both name
+    four. Four is what ran, so four is what this reproduces -- see the open question.
+- id: approve_adjustment
+  intent: Record the decision to apply the adjustment before it is applied
+  kind: checkpoint
+  sources: []
+  depends_on:
+  - adjust
+  confidence: n/a
+  assumptions: []
+  operations: []
+  checkpoint:
+    question: Approve this adjustment and generate the UPDATE?
+    options:
+    - approve
+    - reject
+    guidance: Check the row count and the movement against what the finance committee agreed. Note that
+      the Sign-off tab's own figures are stale.
+    require_note: true
+- id: update_statement
+  intent: Hand the user the UPDATE that applies the approved adjustment
+  kind: handoff
+  sources: []
+  depends_on:
+  - approve_adjustment
+  - adjust
+  confidence: n/a
+  assumptions: []
+  operations:
+  - adjustment_g17_g92
+  handoff:
+    instruction: Run this against FinanceWarehouse in one transaction, then run the extract query again
+      and bring the new grid back.
+    medium: sql
+    built_from: adjust
+    template: UPDATE fin.accruals SET accrual_gbp = {accrual_gbp_after}, adjustment_note = {adjustment_note}
+      WHERE trade_id = {trade_id}
+    connection: FinanceWarehouse
+    parameters: []
+    mutates: false
+  notes: 'Adjustment!G is a column of =''UPDATE ... ''&F17&''...'' filled down 76 rows. The analyser reports
+    it as a dead region because nothing in the workbook reads it -- its consumer is a person with a clipboard.
+    Rendered through kedge.sql rather than reproduced: the workbook''s own statement is invalid SQL for
+    the entity whose name contains an apostrophe.'
+- id: post_adjustment
+  intent: The re-extract, as evidence the update did what was intended
+  kind: load
+  sources:
+  - origin: handin
+    ref: post-adjustment extract
+  depends_on:
+  - update_statement
+  confidence: high
+  assumptions: []
+  operations: []
+- id: verification
+  intent: Compare the re-extract against what the notebook predicted, row by row
+  kind: transform
+  sources:
+  - origin: stage
+    ref: adjust
+  - origin: stage
+    ref: post_adjustment
+  depends_on:
+  - adjust
+  - post_adjustment
+  confidence: high
+  assumptions:
+  - Compared per row on trade_id, not on a total. A total agrees whether the update hit 76 rows or 74.
+  operations: []
+- id: signoff
+  intent: The impact statement, recomputed, saying what was verified as well as computed
+  kind: output
+  sources:
+  - origin: stage
+    ref: verification
+  depends_on:
+  - verification
+  confidence: high
+  assumptions: []
+  operations: []
+  notes: The Sign-off tab's own impact figures are not inputs. They are stale -- they predate two trades
+    joining the scope -- and were signed anyway.
+open_questions:
+- question: 'The Sign-off tab says the uplift was applied to ''the three affected entities'', but the
+    scope row and the UPDATE statement both name four: E-04, E-07, E-09 and E-12. The statement is what
+    ran. Which is right?'
+  context: If the memo is right, one entity was adjusted that should not have been, and the movement is
+    overstated. If the statement is right, the memo understates what was changed and was signed on that
+    basis.
+- question: One in-scope trade has no accrual value. Excel read the blank as zero and the workbook predicts
+    0.00 for it; the warehouse left it NULL. Should the adjustment skip rows with no accrual rather than
+    writing zero to them?
+  context: The re-extract disagrees with the workbook on exactly this row, so whatever the answer, the
+    workbook's own sign-off claimed a position it did not have.
+dropped:
+- range: Sign-off!B20:D20
+  reason: 'The typed impact summary. Recomputed downstream rather than read: the figures are stale, and
+    carrying them forward would carry the staleness.'
+  acknowledged: true
+  accepted: true
+  note: Impact summary confirmed stale; recomputing.
+  acknowledged_at: '2026-08-18T12:30:16.148212Z'
+summary: 'A quarterly statutory accrual uplift: extract, compute, approve, apply by statement, re-extract,
+  verify, sign off. Four of the seven steps are a person doing something kedge cannot do, so the notebook
+  is a runbook rather than a pipeline.'
+briefing:
+  purpose: Records the quarterly uplift applied to statutory accruals following the reforecast, and evidences
+    that the adjustment was applied as approved. The output is the sign-off that Financial Control keeps
+    as the control record for the period.
+  background: The June reforecast moved the accrual basis for the affected entities from the 2025 rate
+    card to the 2026 one. Finance agreed a flat 4.5% uplift as the practical equivalent, to be applied
+    to statutory-ledger accruals at the period end only. Management accounts are unaffected.
+  cadence: Quarterly, once the reforecast has been agreed at the finance committee.
+  audience: Prepared by Financial Control, reviewed by the Head of Statutory Reporting. Control reference
+    FC-Q2-2026-014.
+  watch_for:
+  - One trade carries no accrual value in the source system pending a cost-centre reallocation. Excel
+    read the blank as zero and the workbook predicted 0.00 for it; the warehouse left it NULL, so the
+    verification step reports it as a break every run until the reallocation happens.
+  - Cancelled trades are excluded by the statement, so they must be excluded here too. Four of them sit
+    inside the adjusted entities.
+  - The workbook's own generated SQL was invalid for the entity whose name contains an apostrophe. This
+    notebook renders statements through kedge.sql instead, so its output deliberately differs from the
+    spreadsheet's.
+  sources:
+  - Sign-off!A3:A4 (Purpose)
+  - Sign-off!A6:A7 (Background)
+  - Sign-off!A12:A13 (Scope)
+  - Sign-off!A15:A16 (Known issues)
+  - Sign-off!A24:B28 (Sign-off block)
+  - Adjustment!G17:G92, read during conversion
+approval:
+  state: approved
+  by: evals/adjustment_signoff/build_plan.py
+  at: '2026-08-18T12:30:16.148638Z'

@@ -1,0 +1,362 @@
+# What a good conversion of q2_accrual_adjustment.xlsx looks like.
+#
+# This is a rubric, not a fixture manifest. `tests/fixtures/manifest.py` declares what the
+# analyser should *find*; this declares what kedge should *do*. Nothing here asserts on
+# phrasing -- the same workbook planned twice will not produce the same words, and a check that
+# demanded it would go red on a model upgrade rather than on a regression.
+#
+# Three tiers, and they are kept apart because they cost different amounts and fail for
+# different reasons:
+#
+#   deterministic  - no model needed. Run the notebook, compare numbers. A failure here is a
+#                    bug in kedge or in the generated code, never a matter of judgement.
+#   structural     - assertions about the shape of the plan, in the style of
+#                    tests/llm/test_plan_judgement.py. Needs a model; survives nondeterminism.
+#   judgement      - things only a reader can settle. Recorded so they are read, not scored.
+#
+# The scoring weight is deliberately lopsided toward `deterministic`. A plan that reads well and
+# produces the wrong pennies has failed.
+
+workbook: q2_accrual_adjustment.xlsx
+generated_by: build_workbook.py
+sha256_note: >
+  The generator is byte-deterministic. If the workbook's hash changes without
+  build_workbook.py changing, something is wrong with the toolchain, not with the eval.
+
+# =============================================================================
+# THE PROCESS THE WORKBOOK RECORDS
+# =============================================================================
+#
+# Stated once here so every expectation below can refer to it, and so a reader can check the
+# rubric against the workbook without reverse-engineering the generator.
+
+process:
+  - step: extract
+    human_action: Run the AccrualExtract query against FinanceWarehouse; bring back the grid.
+    evidence_in_workbook: Pre-Adjustment rows 4-16 (the SQL) and xl/connections.xml
+  - step: compute
+    human_action: none - this is the arithmetic that should move into the notebook
+    evidence_in_workbook: Adjustment!E and Adjustment!F, over the uplift_rate named range
+  - step: approve
+    human_action: Someone signs off the adjustment before it is applied.
+    evidence_in_workbook: the Sign-off tab exists at all
+  - step: apply
+    human_action: Run the UPDATE against FinanceWarehouse.
+    evidence_in_workbook: Adjustment rows 10-15 (set-based) and Adjustment!G (per row)
+  - step: verify
+    human_action: Re-run the extract; bring back the grid.
+    evidence_in_workbook: Post-Adjustment, same shape as Pre-Adjustment
+
+facts:
+  trades_extracted: 120
+  entities_in_scope: 4          # E-04, E-07, E-09, E-12
+  rows_the_update_reaches: 76   # 80 in-scope, less 4 CANCELLED
+  uplift_rate: 0.045
+  period_end: 2026-06-30
+  # Computed by the generator, and the figures a correct notebook must reproduce to the penny.
+  accrual_total_before: 19649058.01
+  uplift_total: 884207.62
+  accrual_total_after: 20533265.63
+  # What the Sign-off tab claims. Both predate two trades joining the scope, and both were
+  # signed anyway, because nothing in the workbook could tell anyone.
+  stale_movement: 873369.92
+  stale_rows_adjusted: 74
+
+# =============================================================================
+# TIER 1 - DETERMINISTIC
+# =============================================================================
+#
+# Gradeable with no model in the loop. `App.run()` executes a marimo notebook in-process
+# (kedge.reconcile.compare.notebook_definitions), so the harness can drive the whole runbook
+# headlessly: feed the pre-adjustment grid as hand-in 1, approve the checkpoint, read the
+# generated SQL out of the definitions, feed the post-adjustment grid as hand-in 2, and check
+# what the verification cell concluded.
+
+deterministic:
+  - id: ran_to_completion
+    weight: 2
+    check: >
+      The runbook can be driven end to end: every hand-in the script supplies lands on a widget
+      the notebook actually has, no cell raises, and no mo.stop is still waiting at the end.
+    fails_if: >
+      A cell stopped, a cell raised, or the script named a widget the notebook does not have.
+      The last is not the notebook's fault -- it means this harness could not play the human
+      part -- and it is reported as such rather than blamed on the conversion.
+    note: >
+      Graded first and separately because everything below it is a statement about a cell that
+      ran. Marking those FAIL when the notebook stopped at cell three would report one problem
+      eight times and bury it; they SKIP instead.
+
+  - id: totals_to_the_penny
+    weight: 3
+    check: >
+      The notebook's computed uplift total equals 884207.62 exactly, and the after total
+      20533265.63. Both require Excel's 15-significant-digit collapse before rounding: four of
+      the 76 in-scope rows land on the wrong side of it otherwise, and each is a penny.
+    fails_if: A .round(2) was used anywhere instead of kedge.xl's Excel rounding.
+
+  - id: reconciles_against_the_workbook
+    weight: 3
+    check: >
+      kedge.reconcile reports PASSED against the Adjustment tab's cached values.
+    fails_if: >
+      NOT_RECONCILED. The workbook has a full cache (384 injected values), so there is no
+      honest route to "no baseline" here -- that status means the notebook did not find it.
+
+  - id: generated_sql_is_valid
+    weight: 3
+    check: >
+      Every statement the notebook generates parses and executes. The harness seeds a DuckDB
+      table from the Pre-Adjustment grid, runs the statements, and compares the resulting table
+      against Post-Adjustment.
+    fails_if: >
+      The statement for ACC-00041 breaks. Its entity is `O'Brien & Partners`, and the workbook's
+      own concatenated SQL for that row is not valid SQL -- see Adjustment!G55. Reproducing the
+      workbook's string faithfully is the wrong answer; kedge.sql.literal is the right one.
+    note: >
+      This is the one place the eval rewards *departing* from the workbook. Everywhere else,
+      matching Excel is the goal.
+
+  - id: null_is_not_zero
+    weight: 3
+    check: >
+      ACC-00001 has no accrual. Excel's =ROUND(D17*1.045,2) over the blank cell gives 0.00, and
+      that is what the workbook's cache holds. The warehouse propagates the NULL, which is what
+      Post-Adjustment holds. The notebook must reproduce the workbook (0.00) *and* report the
+      row as a break when the re-extract comes back NULL.
+    fails_if: >
+      The break is not reported, or the row is silently dropped, or the notebook "fixes" the
+      workbook by predicting NULL and thereby fails to reconcile.
+
+  - id: verification_finds_exactly_one_break
+    weight: 3
+    check: >
+      kedge.reconcile.verify(predicted, post_adjustment, keys=["trade_id"]) reports FAILED with
+      exactly one break, on ACC-00001.
+    fails_if: >
+      PASSED. That is the dangerous direction: it is a signed claim that production holds what
+      the notebook says it holds, and here it does not.
+
+  - id: cancelled_rows_excluded
+    weight: 2
+    check: The four CANCELLED trades inside adjusted entities are not adjusted.
+    fails_if: 80 rows are adjusted rather than 76.
+
+  - id: progressive_disclosure
+    weight: 3
+    check: >
+      On a fresh open only the first step and its reply box are on screen. The post-adjustment
+      input, the generated UPDATE and the confirmation box are not.
+    fails_if: >
+      A selector renders before its turn. The usual cause is a cell that constructs widgets and
+      reads nothing -- marimo has no dataflow edge to hide it on, so it appears immediately and
+      invites a re-extract taken before the update was ever run. There is no way to detect that
+      afterwards, which is why it is weighted like a correctness item.
+
+  - id: a_blocked_step_says_which_step_it_is
+    weight: 2
+    check: >
+      A waiting cell renders a message naming the step ("Step 3 of 8") *and* an instruction --
+      an actual verb the user can act on, not only a justification for the rule.
+    fails_if: >
+      The message is empty or positionless. In app mode everything below a stop disappears, so
+      the stop message is the whole user interface at that moment -- a page that says nothing is
+      indistinguishable from one that has died.
+
+  - id: the_period_is_an_input
+    weight: 2
+    check: >
+      Setting the period to a different date changes the extract query, and the original date no
+      longer appears in it.
+    fails_if: >
+      The period is hardcoded in the SQL. In the workbook it was typed into a cell and then typed
+      again into the WHERE clause of both statements, which is right three times and wrong the
+      fourth.
+
+  - id: a_paste_out_of_excel_works
+    weight: 3
+    check: >
+      A grid pasted the way Excel puts it on the clipboard -- tab-delimited, thousands
+      separators, dd/mm/yyyy dates -- gets through and produces the same uplift as a file.
+    fails_if: >
+      Anything raises, or the totals differ. Excel copies *displayed* values, so a column
+      formatted #,##0.00 arrives as "364,422.95" and polars types it String; the failure then
+      surfaces several operations later as an arithmetic-on-str error, from inside a query plan,
+      in a cell app mode renders as nothing at all.
+    note: >
+      This is the defect a real user hit while every other deterministic item was passing. The
+      eval drove the file path and never the paste path, so it saw none of it.
+
+  - id: the_run_resumes_after_the_kernel_dies
+    weight: 3
+    check: >
+      Driven once to the end, then driven again against the same run directory with nothing
+      supplied, the runbook reaches the end with the same numbers.
+    fails_if: >
+      The second pass stops asking for something the first pass already provided. marimo's state
+      dies with the kernel, so a process that takes two days is one nobody can leave unless the
+      hand-ins and decisions come back off disk.
+
+  - id: starting_fresh_keeps_the_old_run
+    weight: 2
+    check: >
+      Choosing "start a new run" begins a new one and leaves the previous run file on disk.
+    fails_if: >
+      The same run continues, or the old record is gone. A run record is evidence; a tool where
+      "start again" erases it is one nobody should put a control through.
+
+  - id: the_notebook_says_why_this_process_exists
+    weight: 3
+    check: >
+      The notebook opens with a briefing covering what the process is for, why it exists and
+      what to watch for, and cites the workbook cells each part came from.
+    fails_if: >
+      There is no briefing, it omits the background, or it states a rationale without saying
+      where it came from. Invented background in a finance notebook is worse than none: it is
+      confident, plausible, and the next reader cannot tell it from the real thing.
+    note: >
+      All of it is in the workbook's Sign-off tab and reaches the plan through the analyser's
+      notes. The conversion used to discard every word.
+
+  - id: unanswered_questions_are_not_buried
+    weight: 2
+    check: >
+      Questions the conversion raised and nobody answered are visible in what the notebook
+      renders, not only in the plan file beside it.
+    fails_if: >
+      They are absent from the notebook. They qualify every number it produces, every run -- a
+      caveat nobody opens is a caveat nobody has.
+
+  - id: reconciliation_does_not_rot_on_a_later_period
+    weight: 3
+    check: >
+      Driven once as the conversion and then again for a different period on different data, the
+      translation check cites the recorded acceptance rather than comparing against the workbook
+      again -- and names what is checking the later run instead.
+    fails_if: >
+      It reports FAILED, or compares against the workbook a second time. Reconciliation asks
+      whether the *translation* is faithful, which is a question about the conversion and has one
+      answer. Asking it of every run means a red panel on every run after the first, on runs
+      where nothing is wrong, pointing at a spreadsheet that within months describes nothing.
+    note: >
+      Found by a user asking the obvious question of the panel: why is a notebook I run monthly
+      still comparing itself to an Excel file from Q2?
+
+  - id: a_declared_exception_does_not_read_as_a_defect
+    weight: 2
+    check: >
+      Adjustment!G -- which a good conversion deliberately does not reproduce -- is reported as
+      a declared exception with a reason, not as a cell that failed to run, and the panel does
+      not lead with NOT RECONCILED.
+    fails_if: >
+      It is reported as passed (an unchecked region never is), or the default "the notebook
+      produced no values for this region, check that the cell ran" message is shown, or the
+      headline is permanently amber. The last matters most: a signal every correct run trips is
+      a signal people stop reading, and this one exists to be believed.
+
+  - id: no_pandas
+    weight: 1
+    check: kedge.agent.validate passes on every generated cell.
+
+# =============================================================================
+# TIER 2 - STRUCTURAL
+# =============================================================================
+#
+# About the plan, not the prose. Each is a property that survives the model saying it
+# differently on a second run.
+
+structural:
+  - id: hands_over_rather_than_pretends
+    weight: 3
+    check: >
+      The plan contains at least two `handoff` stages: the extract query and the update. Neither
+      is planned as something kedge executes.
+    fails_if: >
+      The plan proposes a database connection, or treats the UPDATE as a transformation of the
+      frame and never surfaces it to the user.
+
+  - id: takes_two_handins
+    weight: 3
+    check: >
+      At least one stage declares a hand-in with a `ref` -- a second input, arriving mid-process
+      -- for the re-extract. The head hand-in alone cannot express a re-extract, because the
+      re-extract does not exist when the notebook is opened.
+
+  - id: generates_the_update_from_the_frame
+    weight: 3
+    check: >
+      The update hand-off is generated (`template` + `built_from`), not a fixed statement.
+      Adjustment!G is one UPDATE per row built by concatenation; the equivalent is
+      kedge.sql.render_all over the computed frame.
+    accepts_alternative: >
+      A fixed statement carrying the set-based UPDATE from Adjustment rows 10-15 is a defensible
+      *second* hand-off, and a plan proposing both is better than one proposing either. What
+      fails is proposing neither.
+
+  - id: does_not_drop_the_sql_column
+    weight: 3
+    check: >
+      Adjustment!G does not appear in the plan's `dropped` ranges.
+    note: >
+      The analyser reports it as `dead_region`, correctly: nothing in the workbook reads it. Its
+      consumer is a person with a clipboard, which no static analysis can see. Dropping it
+      deletes the step that changes the data, and this is the sharpest single discrimination in
+      the eval -- a plausible, well-reasoned, catastrophic edit.
+
+  - id: raises_the_memo_discrepancy
+    weight: 2
+    check: >
+      An open question, an assumption, or a checkpoint names the disagreement between the
+      Sign-off narrative ("the three affected entities") and the scope and statement (four:
+      E-04, E-07, E-09, E-12).
+    fails_if: Either number is adopted silently.
+
+  - id: does_not_trust_the_impact_summary
+    weight: 2
+    check: >
+      The Sign-off impact figures are not used as an input to anything. They are stale --
+      873369.92 against a true movement of 884207.62, and 74 rows against 76 -- because they
+      were typed after an earlier run.
+    fails_if: >
+      The notebook reconciles against them, or reports agreement with them, or carries them
+      forward as constants.
+
+  - id: has_a_checkpoint_before_the_update
+    weight: 2
+    check: >
+      A `checkpoint` stage gates the update hand-off. The workbook had a sign-off tab; the
+      notebook should not hand somebody a production UPDATE with no recorded decision.
+
+  - id: consults_the_knowledge_pack
+    weight: 1
+    check: >
+      Where a knowledge pack describes fin.accruals, the plan's assumptions reflect its grain
+      rather than guessing.
+    note: context/databases/example.yaml describes a different schema; this needs a pack to test.
+
+# =============================================================================
+# TIER 3 - JUDGEMENT
+# =============================================================================
+#
+# Not scored. Read them, and if the answer is consistently poor, that is a finding about kedge
+# rather than about this workbook.
+
+judgement:
+  - Does the runbook read in the order a person would carry it out?
+  - Is the instruction on each hand-off something you could follow without the workbook open?
+  - Would a reviewer who had never seen the workbook understand what is being changed, and why?
+  - Does the sign-off output say what was verified, or only what was computed?
+
+# =============================================================================
+# KNOWN AMBIGUITIES
+# =============================================================================
+#
+# Recorded so nobody scores them as failures.
+
+ambiguities:
+  - The analyser types the Sign-off tab as `data` rather than `documentation`. Both are
+    defensible -- it holds a small impact table as well as prose -- and the plan is not marked
+    down for either reading.
+  - Whether the extract is one stage (hand-off plus hand-in) or two is a presentation choice.
+    Both scaffold to the same cells.
+  - The uplift may reasonably be modelled as one transform or as two (uplift, then total).

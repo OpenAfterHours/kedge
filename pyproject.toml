@@ -75,6 +75,12 @@ Issues = "https://github.com/OpenAfterHours/kedge/issues"
 Changelog = "https://github.com/OpenAfterHours/kedge/releases"
 
 [dependency-groups]
+# The eval harness. Separate from `dev` because it is not needed to run the test suite: the one
+# thing it adds is an engine to *execute* generated SQL against, which is how a statement gets
+# graded on being valid rather than on looking valid. Without it that single item skips, loudly.
+evals = [
+    "duckdb>=1.1",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -146,6 +152,14 @@ ignore = [
 "tests/**" = ["S101", "T20", "G"]
 "tests/fixtures/generate.py" = ["T20"]
 "scripts/**" = ["T20", "G"]
+# Eval workbook generators are scripts, not library code: they print what they built, and what
+# they built is the thing somebody is checking. Same reason tests/fixtures/generate.py is here.
+"evals/**" = ["T20"]
+# A marimo notebook is cells rendered as functions, so every one of these is the format rather
+# than the code: a cell-level constant is a function local and a parameter of every cell that
+# reads it (N806, N803), and a cell's trailing bare expression *is* its output (B018). Linting
+# them out would mean writing a notebook that is not a notebook.
+"evals/**/notebook.py" = ["T20", "N803", "N806", "B018"]
 # RUF001 flags ambiguous unicode to catch accidental homoglyphs. In the driver's escaping tests
 # those characters are the subject under test -- U+2028/U+2029 terminate a line for
 # str.splitlines() but not for a Python tokeniser, which is precisely the embedder bug the
@@ -164,7 +178,7 @@ known-first-party = ["kedge", "scripts", "utils"]
 python-version = "3.12"
 
 [tool.ty.src]
-exclude = ["tests/fixtures/"]
+exclude = ["tests/fixtures/", "evals/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

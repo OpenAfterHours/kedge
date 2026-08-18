@@ -19,3 +19,9 @@ htmlcov/
 handins/
 *.marker.json
 scratch/
+
+# Eval runbooks write these when driven; they are per-run artifacts, not sources.
+evals/*/handins/
+evals/*/runs/
+evals/*/*.kedge/
+evals/*/reconciliation.json
