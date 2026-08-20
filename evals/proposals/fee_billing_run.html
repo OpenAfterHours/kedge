@@ -1,0 +1,806 @@
+<title>A Harder Spreadsheet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,500;0,600;0,700;1,400&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root {
+  --ground:      #F3F4F5;
+  --surface:     #FFFFFF;
+  --surface-sunk:#EDEEF0;
+  --ink:         #16181C;
+  --ink-soft:    #3A3E45;
+  --muted:       #61666E;
+  --faint:       #8B9099;
+  --rule:        #DDE0E3;
+  --rule-strong: #C3C7CC;
+  --accent:      #A8571B;
+  --accent-ink:  #8C4715;
+  --accent-wash: #F7EDE2;
+  --positive:    #2F6B4F;
+  --positive-wash:#E7F0EB;
+
+  --measure: 67ch;
+  --gutter: 5.5rem;
+
+  --f-display: "Spectral", "Iowan Old Style", Georgia, serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #131518;
+    --surface:     #1A1D21;
+    --surface-sunk:#101215;
+    --ink:         #E6E8EA;
+    --ink-soft:    #C6CAD0;
+    --muted:       #969CA5;
+    --faint:       #6E747C;
+    --rule:        #2A2E34;
+    --rule-strong: #3C424A;
+    --accent:      #E0954A;
+    --accent-ink:  #EDAE69;
+    --accent-wash: #2A2018;
+    --positive:    #6FB08C;
+    --positive-wash:#182420;
+  }
+}
+
+:root[data-theme="dark"] {
+  --ground:      #131518;
+  --surface:     #1A1D21;
+  --surface-sunk:#101215;
+  --ink:         #E6E8EA;
+  --ink-soft:    #C6CAD0;
+  --muted:       #969CA5;
+  --faint:       #6E747C;
+  --rule:        #2A2E34;
+  --rule-strong: #3C424A;
+  --accent:      #E0954A;
+  --accent-ink:  #EDAE69;
+  --accent-wash: #2A2018;
+  --positive:    #6FB08C;
+  --positive-wash:#182420;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--f-body);
+  font-size: 16.5px;
+  line-height: 1.66;
+  margin: 0;
+  padding: 0 1.5rem 8rem;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: calc(var(--measure) + var(--gutter) + 12rem);
+  margin: 0 auto;
+}
+
+/* ── masthead ───────────────────────────────────────────── */
+
+.masthead {
+  padding: 5rem 0 2.25rem;
+  border-bottom: 2px solid var(--ink);
+  margin-bottom: 3rem;
+}
+
+.status {
+  font-family: var(--f-mono);
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  margin-bottom: 1.75rem;
+}
+.status span { display: inline-flex; align-items: center; gap: 0.5rem; }
+.status span::before {
+  content: "";
+  width: 5px; height: 5px;
+  background: var(--accent);
+  border-radius: 50%;
+  flex: none;
+}
+
+h1 {
+  font-family: var(--f-display);
+  font-weight: 700;
+  font-size: clamp(2.4rem, 6vw, 3.9rem);
+  line-height: 1.04;
+  letter-spacing: -0.022em;
+  margin: 0 0 1.1rem;
+  text-wrap: balance;
+  max-width: 17ch;
+}
+h1 .quiet {
+  display: block;
+  font-style: italic;
+  font-weight: 400;
+  font-size: 0.52em;
+  letter-spacing: -0.01em;
+  color: var(--muted);
+  margin-top: 0.6rem;
+  max-width: 26ch;
+}
+
+.standfirst {
+  font-family: var(--f-display);
+  font-size: 1.2rem;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  max-width: 58ch;
+  margin: 0;
+}
+
+.provenance {
+  margin-top: 2.25rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--rule);
+  font-family: var(--f-mono);
+  font-size: 0.775rem;
+  line-height: 1.7;
+  color: var(--muted);
+  max-width: 78ch;
+}
+.provenance strong { color: var(--ink-soft); font-weight: 500; }
+
+/* ── sections ───────────────────────────────────────────── */
+
+section { margin-bottom: 4.5rem; }
+
+.sec-head {
+  display: grid;
+  grid-template-columns: var(--gutter) minmax(0, 1fr);
+  align-items: baseline;
+  gap: 0 0;
+  margin-bottom: 1.75rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--rule-strong);
+}
+.sec-num {
+  font-family: var(--f-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+  padding-top: 0.45rem;
+}
+h2 {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: clamp(1.5rem, 3vw, 1.95rem);
+  line-height: 1.2;
+  letter-spacing: -0.014em;
+  margin: 0;
+  max-width: 30ch;
+  text-wrap: balance;
+}
+
+h3 {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: 1.16rem;
+  line-height: 1.35;
+  letter-spacing: -0.008em;
+  margin: 2.75rem 0 0.85rem var(--gutter);
+  max-width: 52ch;
+  text-wrap: balance;
+}
+h3 .h3num {
+  font-family: var(--f-mono);
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  margin-right: 0.6rem;
+}
+
+.body { margin-left: var(--gutter); max-width: var(--measure); }
+
+p { margin: 0 0 1.15rem; }
+.body > p:last-child { margin-bottom: 0; }
+
+strong { font-weight: 600; color: var(--ink); }
+em { font-style: italic; }
+
+code {
+  font-family: var(--f-mono);
+  font-size: 0.845em;
+  background: var(--surface-sunk);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 0.08em 0.34em;
+  color: var(--accent-ink);
+  word-break: break-word;
+}
+
+blockquote {
+  margin: 1.5rem 0 1.5rem var(--gutter);
+  max-width: var(--measure);
+  padding: 1.1rem 1.4rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  font-family: var(--f-display);
+  font-size: 1.02rem;
+  line-height: 1.62;
+  color: var(--ink-soft);
+}
+blockquote p { margin: 0 0 0.7rem; }
+blockquote p:last-child { margin: 0; }
+blockquote strong { color: var(--ink); }
+
+/* ── measured readout ───────────────────────────────────── */
+
+.readout {
+  margin: 1.75rem 0 1.75rem var(--gutter);
+  max-width: var(--measure);
+  background: var(--surface);
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.readout-label {
+  font-family: var(--f-mono);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--surface);
+  background: var(--accent);
+  padding: 0.4rem 0.9rem;
+}
+.readout pre {
+  margin: 0;
+  padding: 1rem 1.1rem;
+  font-family: var(--f-mono);
+  font-size: 0.82rem;
+  line-height: 1.75;
+  color: var(--ink-soft);
+  overflow-x: auto;
+  white-space: pre;
+}
+.readout pre b { color: var(--accent-ink); font-weight: 600; }
+
+/* ── tables ─────────────────────────────────────────────── */
+
+.tablewrap {
+  margin: 1.9rem 0 2rem;
+  overflow-x: auto;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  background: var(--surface);
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.855rem;
+  line-height: 1.5;
+}
+thead th {
+  font-family: var(--f-mono);
+  font-size: 0.66rem;
+  font-weight: 600;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--rule-strong);
+  background: var(--surface-sunk);
+  white-space: nowrap;
+}
+tbody td {
+  padding: 0.62rem 0.9rem;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+}
+tbody tr:last-child td { border-bottom: none; }
+.num { text-align: right; font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wide { min-width: 22rem; }
+td.mono, th.mono { font-family: var(--f-mono); font-size: 0.8rem; }
+tr.highlight td { background: var(--accent-wash); }
+tr.highlight td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+
+.bar {
+  display: inline-block;
+  vertical-align: middle;
+  height: 7px;
+  background: var(--rule-strong);
+  border-radius: 1px;
+  min-width: 2px;
+}
+tr.highlight .bar, .bar.hot { background: var(--accent); }
+.barcell { width: 9rem; }
+
+.verdict {
+  font-family: var(--f-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  padding: 0.14em 0.45em;
+  border-radius: 2px;
+  border: 1px solid var(--rule-strong);
+  color: var(--muted);
+  white-space: nowrap;
+}
+.verdict.stop { color: var(--accent-ink); border-color: var(--accent); background: var(--accent-wash); }
+.verdict.go { color: var(--positive); border-color: var(--positive); background: var(--positive-wash); }
+
+/* ── lists ──────────────────────────────────────────────── */
+
+ol.numbered, ul.plain {
+  margin: 0 0 1.15rem var(--gutter);
+  max-width: var(--measure);
+  padding-left: 1.35rem;
+}
+ol.numbered li, ul.plain li { margin-bottom: 0.85rem; padding-left: 0.25rem; }
+ol.numbered li::marker { font-family: var(--f-mono); font-size: 0.82rem; color: var(--accent); font-weight: 600; }
+ul.plain li::marker { color: var(--rule-strong); }
+
+.kicker {
+  font-family: var(--f-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 0.7rem var(--gutter);
+}
+
+footer {
+  margin-top: 5rem;
+  padding-top: 1.5rem;
+  border-top: 2px solid var(--ink);
+  font-family: var(--f-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.8;
+}
+
+@media (max-width: 760px) {
+  :root { --gutter: 0rem; }
+  body { padding: 0 1.1rem 5rem; font-size: 16px; }
+  .sec-head { grid-template-columns: 1fr; gap: 0.35rem; }
+  .sec-num { padding-top: 0; }
+  h3 { margin-left: 0; }
+  blockquote, .readout, ol.numbered, ul.plain, .kicker { margin-left: 0; }
+  ol.numbered, ul.plain { padding-left: 1.2rem; }
+}
+</style>
+
+<div class="page">
+
+<header class="masthead">
+  <div class="status">
+    <span>Proposal &mdash; nothing built</span>
+    <span>evals/proposals/fee_billing_run.md</span>
+    <span>measured at 305fe62</span>
+  </div>
+  <h1>A Harder Spreadsheet
+    <span class="quiet">Proposing <code style="font-size:0.9em">fee_billing_run</code>: the same process, a much harder workbook</span>
+  </h1>
+  <p class="standfirst">Nothing in this repository has ever been converted at a complexity above 0.368. Every claim kedge makes about handling real spreadsheets rests on one workbook that its own scorer calls one notch above simple.</p>
+  <p class="provenance"><strong>On the figures.</strong> Everything in sections 1 and 2 was measured against the tree at <code>305fe62</code>, by running the real analyser and the real <code>build_proposal_context</code> over the committed fixtures and over two probe workbooks built for this proposal. Where a claim is a prediction rather than a measurement, it says so.</p>
+</header>
+
+<!-- 0 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§0</div><h2>What this eval is for, and why it is not <code>rebate_payfile</code></h2></div>
+
+  <div class="body">
+    <p><code>adjustment_signoff</code> and the <code>rebate_payfile</code> proposal beside this one strike the same bargain, and <code>adjustment_signoff</code>'s README states it outright:</p>
+  </div>
+
+  <blockquote><p>This eval specifies target behaviour. It was written to lead the implementation, not to measure what was already there.</p></blockquote>
+
+  <div class="body">
+    <p>Both are specifications wearing an eval's clothes. Both require substantial new <code>src/</code> before they can be scored at all &mdash; <code>rebate_payfile</code> estimates 1,200&ndash;1,800 lines.</p>
+    <p>This one is the opposite instrument, and the difference is the whole point of proposing it.</p>
+    <p><strong>It is a diagnostic.</strong> It changes exactly one variable &mdash; the difficulty of the spreadsheet &mdash; and asks whether the pipeline that demonstrably works on a simple workbook still produces the desired output on a realistic one. Phase 1 requires <strong>no new <code>src/</code> capability whatsoever</strong>: build the workbook, build the rubric, run today's <code>analyse</code> &rarr; <code>triage</code> &rarr; <code>propose</code> &rarr; <code>scaffold</code> &rarr; <code>--convert</code>, and write down what happens. Everything it finds is a defect that exists right now, in committed code, that nothing in the repository is currently able to see.</p>
+    <p><strong>It deliberately keeps the process shape constant.</strong> Extract, compute, hand a statement over, take the evidence back, sign off &mdash; the same five beats as <code>adjustment_signoff</code>, for the same reason a controlled experiment changes one thing at a time. <code>rebate_payfile</code> varies the shape (two sources, one join, an outbound file) and therefore cannot distinguish <em>"kedge struggles with complex spreadsheets"</em> from <em>"kedge has never seen a second input"</em>. Holding the shape fixed makes the result attributable. The two proposals are complementary and neither substitutes for the other; if only one is built, this is the cheaper one, and it is the one that tells you where you actually are.</p>
+  </div>
+</section>
+
+<!-- 1 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§1</div><h2>How simple the current corpus actually is</h2></div>
+
+  <div class="body"><p>Every workbook in the repository, analysed:</p></div>
+
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Workbook</th>
+          <th class="num">Ops</th>
+          <th class="num">Sheets</th>
+          <th class="num">Findings</th>
+          <th class="num">Edges</th>
+          <th class="num">Complexity</th>
+          <th class="barcell"></th>
+          <th>Verdict</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td class="mono">powerquery.xlsx</td><td class="num">2</td><td class="num">3</td><td class="num">6</td><td class="num">1</td><td class="num">0.234</td><td><span class="bar" style="width:23%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr><td class="mono">legacy_sql.xlsx</td><td class="num">2</td><td class="num">2</td><td class="num">8</td><td class="num">0</td><td class="num">0.273</td><td><span class="bar" style="width:27%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr><td class="mono">documented.xlsx</td><td class="num">4</td><td class="num">4</td><td class="num">6</td><td class="num">2</td><td class="num">0.336</td><td><span class="bar" style="width:34%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr class="highlight"><td class="mono"><strong>q2_accrual_adjustment.xlsx</strong><br><span style="font-family:var(--f-body);font-size:0.9em;color:var(--muted)">the eval</span></td><td class="num"><strong>7</strong></td><td class="num">4</td><td class="num">6</td><td class="num">8</td><td class="num"><strong>0.368</strong></td><td><span class="bar" style="width:37%"></span></td><td><span class="verdict go">proceed</span></td></tr>
+        <tr><td class="mono">mostly_manual.xlsx</td><td class="num">8</td><td class="num">4</td><td class="num">11</td><td class="num">10</td><td class="num">0.408</td><td><span class="bar" style="width:41%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr><td class="mono">no_cached_values.xlsx</td><td class="num">9</td><td class="num">3</td><td class="num">12</td><td class="num">8</td><td class="num">0.432</td><td><span class="bar" style="width:43%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr><td class="mono">clean_pipeline.xlsx</td><td class="num">13</td><td class="num">5</td><td class="num">13</td><td class="num">13</td><td class="num">0.495</td><td><span class="bar" style="width:50%"></span></td><td><span class="verdict go">proceed</span></td></tr>
+        <tr><td class="mono">cross_sheet_chain.xlsx</td><td class="num">16</td><td class="num">5</td><td class="num">16</td><td class="num">19</td><td class="num">0.525</td><td><span class="bar" style="width:53%"></span></td><td><span class="verdict">proceed_with_care</span></td></tr>
+        <tr><td class="mono">hostile.xlsx</td><td class="num">21</td><td class="num">5</td><td class="num">44</td><td class="num">9</td><td class="num">0.527</td><td><span class="bar" style="width:53%"></span></td><td><span class="verdict stop">stop</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="body">
+    <p><code>kedge.plan.triage.complexity</code>'s own docstring reads: <em>"Roughly: under 0.35 is a simple workbook, over 0.7 is a big one."</em> The workbook that defines kedge's target behaviour scores <strong>0.368</strong>. The most complex artifact anywhere in the tree scores 0.527, is called <code>hostile</code>, and is a robustness fixture that triages to <code>stop</code> &mdash; so it has never been converted and never will be.</p>
+  </div>
+
+  <h3><span class="h3num">1.1</span>Size is not complexity, and this determines how the workbook must be built</h3>
+
+  <div class="body">
+    <p>The obvious way to write a harder generator &mdash; more sheets, more columns, more rows &mdash; produces a workbook that is not harder at all. R1C1 normalisation is doing its job: a formula filled down a column <em>and</em> across thirty columns still normalises to one string.</p>
+    <p>Measured, on a workbook built for this proposal:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Probe 1 &mdash; uniform grid</div>
+<pre>5 sheets, 3 of them 30 columns wide by 58 rows of chained arithmetic
+5,220 formula cells
+
+  operations   <b>7</b>
+  complexity   <b>0.369</b>      indistinguishable from q2_accrual_adjustment.xlsx</pre>
+  </div>
+
+  <div class="body">
+    <p>Replacing those uniform grids with <strong>heterogeneous</strong> columns &mdash; 25 different formula shapes, then 20 more reading the first sheet &mdash; on a workbook of comparable size:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Probe 2 &mdash; heterogeneous columns</div>
+<pre>  operations        <b>49</b>
+  distinct patterns <b>14</b>       arithmetic, iferror, index_match, running_total,
+                             subtotal, sumifs, sumproduct, vlookup_approx, ...
+  dependency edges  <b>73</b>
+  column profiles   <b>55</b>
+  findings          <b>28</b>
+  complexity        <b>0.665</b></pre>
+  </div>
+
+  <div class="body">
+    <p>That is the target. A <code>fee_billing_run</code> generator must emit <em>variety</em>, not volume: every column a different calculation, which is what a spreadsheet grown over four years by three people actually looks like. A generator that emits a big grid will produce a simple workbook, and the eval will measure nothing.</p>
+  </div>
+</section>
+
+<!-- 2 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§2</div><h2>Five things that are true today, and only a bigger workbook can show</h2></div>
+
+  <div class="body">
+    <p>Each is verifiable in the tree as it stands. Three are measurements from the probes above; two are present-tense defects reachable on a <strong>committed fixture</strong> right now.</p>
+  </div>
+
+  <h3><span class="h3num">2.1</span>The one operation that must never be dropped sorts dead last in the planner's context</h3>
+
+  <div class="body">
+    <p><code>_operation_digest</code> ranks by fan-out, and the comment says why: <em>"a region twenty other regions depend on is structurally more important than one nothing reads, and if anything has to be dropped it should be the latter."</em> Sound reasoning, and on a simple workbook harmless.</p>
+    <p>But a <strong>manual carry</strong> &mdash; a column of <code>="UPDATE ... "&amp;F17&amp;"..."</code> whose consumer is a person with a clipboard &mdash; has fan-out zero <em>by definition</em>. Nothing in the workbook reads it. That is precisely what makes it a <code>dead_region</code>, and <code>adjustment_signoff</code>'s README calls dropping it <strong>the sharpest failure the eval has</strong>: <em>"plausible, well-reasoned, and it deletes the step that changes the data."</em></p>
+    <p>On the 49-operation probe, with one such column present:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Measured &mdash; rank of the manual carry</div>
+<pre>manual carry ranks <b>49 of 49</b>  (fan-out ordering)
+all 18 dead regions sit in the final <b>18</b> positions
+
+last 8 in rank order:
+  calc2_q2_q199   0
+  calc2_r2_r199   0
+  calc2_s2_s199   0
+  calc2_t2_t199   0
+  calc_a201_y201  0
+  <b>update_a2_a199  0   &lt;- the column that posts the data</b></pre>
+  </div>
+
+  <div class="body">
+    <p><code>_MAX_OPERATIONS</code> is 80. At 7 operations the ranking is invisible. At 49 it is a latent hazard. Past 80 the manual carry is simply <strong>not in the context the model reasons over</strong>, and the model is told only <code>operations_omitted: N</code> &mdash; a count, with no way to know that the omitted tail is where every manually-carried step in the workbook lives, because zero fan-out is exactly what a manual carry and an abandoned column have in common.</p>
+    <p>The fix is probably not "raise the cap". It is that fan-out is the wrong sole key: a region carrying generated SQL, or one the analyser flagged <code>dead_region</code>, is <em>more</em> interesting for having no consumer, not less. But the eval has to exist before that argument can be settled with evidence.</p>
+  </div>
+
+  <h3><span class="h3num">2.2</span>Eighteen decisions, one button</h3>
+
+  <div class="body">
+    <p><code>plan.dropped</code> requires per-drop acknowledgement, and <code>DroppedRange</code> insists a reason is given &mdash; <em>"'Unused' alone is not a reason."</em> At one dead region that is a genuine decision, and <code>adjustment_signoff</code> grades it as one.</p>
+    <p>The probe produced <strong>18 dead regions out of 49 operations</strong>. <code>kedge.plan.review.acknowledge_all_drops</code> clears all of them in one call with one shared note, and its docstring is careful and correct about what it does: <em>"It still records an explicit acknowledgement per drop, so the audit trail is identical to acknowledging them one at a time."</em> The audit trail is identical. The <strong>decision</strong> is not: eighteen ranges dismissed with one sentence that cannot be true of all of them, and the manual carry is one of the eighteen.</p>
+    <p>This is the same shape as CLAUDE.md's own note that <em>"a signal that is permanently amber is one people stop reading"</em>, arriving from the other direction: a signal that can be cleared in bulk is one people clear in bulk.</p>
+  </div>
+
+  <h3><span class="h3num">2.3</span>The reconciliation map is the hole that scales worst</h3>
+
+  <div class="body">
+    <p><code>_values_cell</code> emits <code>reconciliation_values</code> with a <code>TODO(kedge)</code> marker and one entry per operation, defaulting each to the stage's whole frame. Its docstring is honest that the default is <em>"a starting point rather than an answer"</em>: it resolves only where the workbook's own header for the region names a column of that frame, because <code>infer_regions</code> sets <code>column=_normalise_name(header)</code> and <code>compare.to_vector</code> needs that exact name.</p>
+    <p><strong>Today:</strong> 6 operations across 8 stages, and the reference conversion fills 5 entries by hand.</p>
+    <p><strong>Predicted for <code>fee_billing_run</code>:</strong> 40-plus entries, of which the default resolves for almost none &mdash; because a conversion that is doing its job renames <code>"Fee @ tier bps"</code> to <code>fee_gbp</code>, and because a totals row has no column to name at all. Every unresolved entry renders as <em>"the notebook produced no values for this region, check that the cell ran and that the variable names match"</em> &mdash; the exact message the module's own docstring says <em>"sends a reader hunting a bug that is not there, on every run, for ever."</em></p>
+    <p>So the largest single translation burden in a complex conversion is a hole nothing has ever measured at scale, whose failure mode is a wall of text telling the reader to go and look for bugs that do not exist. That is worth knowing before a user finds it.</p>
+  </div>
+
+  <h3><span class="h3num">2.4</span><code>ExcelPattern.PIVOT</code> is never assigned by any code path in <code>src/</code></h3>
+
+  <div class="body">
+    <p>Grep the whole tree. <code>ExcelPattern.PIVOT</code> appears in exactly three places &mdash; two translation-hint tables in <code>analysis/regions.py</code> and one in <code>notebook/scaffold.py</code> &mdash; and in <strong>no</strong> assignment. <code>classify_pattern</code> cannot return it; nothing else sets <code>excel_pattern</code>. Nothing anywhere in <code>src/</code> reads a <code>pivotCache</code> or a <code>pivotTable</code> part.</p>
+    <p>A pivot table is therefore invisible: no operation, no finding, no blocker, no open question. The summary tab a manager actually reads is, to kedge, an empty sheet. And because <code>tests/unit/test_agent_prompts.py</code> asserts every <code>ExcelPattern</code> member appears in the prompt that offers it, the model is told about a vocabulary word the analyser can never hand it &mdash; the mirror image of the <code>StageKind.HANDOFF</code> bug already recorded in CLAUDE.md, where the enum grew and the prose did not.</p>
+    <p>Whether the right answer is "parse pivot caches" or "raise a blocker saying a pivot table was found and cannot be read" is a design question. Silence is not one of the options, and silence is what happens now.</p>
+  </div>
+
+  <h3><span class="h3num">2.5</span>Truncation is already silent, and it is already happening</h3>
+
+  <div class="body">
+    <p><code>build_proposal_context</code>'s docstring promises:</p>
+  </div>
+
+  <blockquote><p>Everything that is truncated says so explicitly, so the model never reasons as though it saw the whole workbook.</p></blockquote>
+
+  <div class="body">
+    <p>It sets <code>operations_omitted</code> and <code>column_profiles_omitted</code>. It sets nothing for <strong>findings</strong> (capped at 40), <strong>process notes</strong> (20), <strong>named ranges</strong> (40), <strong>dependency edges</strong> (200), <strong>cycles</strong> (10) or <strong>roots/leaves</strong> (40 each). Those six truncate in silence.</p>
+    <p>This is not hypothetical and does not need a new workbook to demonstrate. On <code>tests/fixtures/hostile.xlsx</code>, today:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Measured &mdash; hostile.xlsx, current tree</div>
+<pre>analysis findings: <b>44</b>  ->  digest findings: <b>40</b>
+process notes:     <b>21</b>  ->  cap: <b>20</b>
+keys announcing truncation: <b>[]</b>
+
+the four dropped, ranked last because they are severity=info:
+  info  dead_region                   Broken!A5
+  info  document_attached_by_filename documented_procedure.docx
+  info  document_attached_by_filename procedure_legacy.doc
+  info  document_attached_by_filename README.md</pre>
+  </div>
+
+  <div class="body">
+    <p>Four findings and one process note are dropped from the planner's view with no announcement. The findings are ranked errors-first, so what goes is the <code>info</code> tail &mdash; and three of the four dropped are <code>document_attached_by_filename</code>, the one member of <code>FindingKind</code> whose entire purpose the model docstring spells out:</p>
+  </div>
+
+  <blockquote><p>a sidecar document was attached because its filename looked like a process document&hellip; the user is the only one who can tell whether the guess was right, and <strong>a note silently attributed to the wrong workbook is worse than no note</strong>.</p></blockquote>
+
+  <div class="body">
+    <p>So the finding that exists to say <em>"I guessed at this attribution, please check me"</em> is <code>info</code>, sorts last, and is silently discarded &mdash; while the notes it is warning about are in the context, unlabelled, feeding a <code>Briefing</code> that is required to cite its sources. The citation requirement holds; what it cites may be attributed to the wrong workbook, and the warning that said so did not survive the trip.</p>
+    <p>To be precise about the blast radius: this affects the <strong>planner's digest</strong> only. The analysis JSON <code>kedge inspect</code> writes holds all 44, and <code>report.py</code> renders all 44 uncapped, so a human who looks sees everything. The defect is that the <em>model</em> reasons over a truncated view while the context it was handed says it is complete &mdash; and a complex workbook turns each of those six caps from a theoretical limit into a live one.</p>
+  </div>
+</section>
+
+<!-- 3 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§3</div><h2>The process the workbook records</h2></div>
+
+  <div class="body">
+    <p><strong><code>m11_management_fee_run.xlsx</code>.</strong> The monthly management-fee billing run: work out what each client owes, get it approved, post it to the ledger, sign it off. Ten tabs, laid out in the order somebody built them over four years &mdash; which is deliberately <strong>not</strong> dependency order.</p>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Tab</th><th class="wide">What it is</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">Positions</td><td>The warehouse extract. SQL in rows 3&ndash;18, the same query in <code>xl/connections.xml</code> as a real ODBC connection, then ~900 rows: one per client per day-end, two months (the prior month is needed for opening balances).</td></tr>
+        <tr><td class="mono">Fee Schedule</td><td>Pasted from the onboarding team's file. Two preamble rows, header on row 4, tiered bps by AUM band, effective-dated. Numbers arrive as text because Excel copied what the cells <em>looked like</em>. Client codes carry leading zeros.</td></tr>
+        <tr><td class="mono">Entity Map</td><td>Client to legal entity to cost centre. Added in year three, which is why it is the eighth tab and everything above it depends on it.</td></tr>
+        <tr><td class="mono">Working</td><td>The wide one. ~28 heterogeneous columns: average AUM, tier lookup, floors and caps, pro-rating, the composite key. Four abandoned columns from a method changed in 2024 sit between the live ones.</td></tr>
+        <tr><td class="mono">Overrides</td><td>Three clients whose computed fee was typed over by the billing manager, each with a reason and a date.</td></tr>
+        <tr><td class="mono">Allocation</td><td>Fees aggregated to invoice grain and allocated to cost centres, with an embedded subtotal row per legal entity <em>inside</em> the grid.</td></tr>
+        <tr><td class="mono">Summary</td><td>A pivot table over <code>Allocation</code>. The tab the manager actually reads.</td></tr>
+        <tr><td class="mono">Post</td><td>One <code>INSERT ...</code> per invoice, built by <code>&amp;</code>. The manual carry. Nothing reads it.</td></tr>
+        <tr><td class="mono">Recon</td><td>Last month's figures beside this month's, with a variance column and a hand-typed commentary.</td></tr>
+        <tr><td class="mono">Sign-off</td><td>Purpose, background, known issues, who signs. Feeds <code>Briefing</code> through the analyser's notes.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="body">
+    <p>Target shape: roughly <strong>45&ndash;60 logical operations, 12&ndash;15 distinct patterns, complexity 0.68&ndash;0.75</strong> &mdash; past the docstring's "over 0.7 is a big one" line, and past nothing else in the tree by a factor of three.</p>
+    <p>Note what is <em>not</em> in that list: no macros, no external links, no circular references, no <code>.xlsb</code>. Those are <code>hostile.xlsx</code>'s job, and they triage to <code>stop</code>. This workbook must triage to <code>proceed</code> or <code>proceed_with_care</code>, because an eval about conversion quality that refuses to convert measures nothing.</p>
+  </div>
+</section>
+
+<!-- 4 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§4</div><h2>What it discriminates</h2></div>
+
+  <div class="body">
+    <p>Ten, each planted so it fails independently, and each carrying process meaning rather than being a parsing quirk. The README's own warning applies and is respected: <em>"a case that fails on ten parsing quirks measures the reader, not the conversion."</em></p>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th class="num">#</th><th class="wide">Discrimination</th><th>Where</th></tr></thead>
+      <tbody>
+        <tr><td class="num">1</td><td>An approximate-match <code>VLOOKUP</code> is a banded join, not a lookup</td><td class="mono">Working, tier column</td></tr>
+        <tr><td class="num">2</td><td>A prior-row reference needs an explicit sort</td><td class="mono">Working, opening balance</td></tr>
+        <tr><td class="num">3</td><td>Pro-rating is date arithmetic with an Excel serial boundary</td><td class="mono">Working, part-period</td></tr>
+        <tr><td class="num">4</td><td>A manual override is a decision to re-ask, not a number to bake in</td><td class="mono">Overrides</td></tr>
+        <tr><td class="num">5</td><td>Seventeen dead regions are dead; the eighteenth posts the fees</td><td class="mono">Working, and Post</td></tr>
+        <tr><td class="num">6</td><td>An embedded subtotal row is not data</td><td class="mono">Allocation</td></tr>
+        <tr><td class="num">7</td><td>A pivot table is a tab the conversion cannot see into</td><td class="mono">Summary</td></tr>
+        <tr><td class="num">8</td><td>Text-formatted numbers, and a leading zero that must survive</td><td class="mono">Fee Schedule</td></tr>
+        <tr><td class="num">9</td><td>Stale cached values on one sheet must not reconcile as passed</td><td class="mono">Allocation</td></tr>
+        <tr><td class="num">10</td><td>Tab order is not dependency order</td><td class="mono">Entity Map</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="body"><p>Five are worth expanding.</p>
+
+    <p><strong>Number 1 is the highest-value translation risk in the whole proposal.</strong> <code>=VLOOKUP(AUM, tiers, 3, TRUE)</code> over a banded rate table is the single most common construct in finance spreadsheets and the one whose polars translation is least forgiving. The analyser already classifies it (<code>vlookup_approx</code>) and already hints the answer (<code>.join_asof(lookup, on=..., strategy="backward")</code>). So this tests something sharper than recognition: <strong>is the hint enough?</strong> <code>join_asof</code> requires both frames sorted on the join key and silently produces wrong answers if they are not; the band boundary is <code>&gt;=</code> on the floor, and an off-by-one moves an entire tier of clients onto the wrong rate. Note also that non-negotiable 3 says Excel semantics belong in <code>kedge.xl</code> &mdash; and approximate-match lookup <em>is</em> Excel semantics that <code>kedge.xl</code> does not have. Whether that is a gap or correctly out of scope is a question this eval is built to force.</p>
+
+    <p><strong>Number 4 is the sharpest judgement discrimination, and it is new.</strong> Three clients' fees were typed over by a person, each with a written reason. There are three wrong answers and they fail in different directions. Reproducing the typed numbers bakes last quarter's judgement into every future month. Dropping them silently loses three real decisions. Reconciling against them reports a pass for a figure nobody calculated. The desired output is a <strong>checkpoint</strong> that surfaces all three with their reasons and asks whether they still apply <em>this</em> month &mdash; which is the runbook argument in miniature, and which no existing eval asks for. <code>adjustment_signoff</code> has one checkpoint gating one approval; this asks whether the planner can recognise that a block of typed-over cells <em>is</em> a checkpoint.</p>
+
+    <p><strong>Number 5 is <code>adjustment_signoff</code>'s sharpest discrimination, re-run at realistic scale.</strong> There, one dead region, and the eval asks "did you keep it?" &mdash; a one-in-one choice a coin could win. Here, eighteen, seventeen of which genuinely should go, and the one that must stay sorts last in the planner's context (&sect;2.1) and can be dismissed along with the rest by a single <code>acknowledge_all_drops</code> (&sect;2.2). Same question, and the first time it has been asked in a way that can distinguish understanding from luck.</p>
+
+    <p><strong>Number 9 is non-negotiable 6 under pressure.</strong> <code>Allocation</code> was last saved with calculation set to manual, so its cached values are real but stale &mdash; <code>PARTIAL_CACHED_VALUES</code> fires. A conversion that reconciles against them reports a pass against numbers Excel itself would disown. The correct outcome is that region declared not reconciled, with a reason, and the headline reading <code>CHECKED WITH EXCEPTIONS</code> &mdash; the mechanism CLAUDE.md records as <code>not_reproduced</code>, exercised for the second time and for a completely different cause than the first.</p>
+
+    <p><strong>Number 10 is where the harness's own limits show, and that is worth grading too.</strong> <code>harness/drive.py</code> executes cells in file order; marimo does not. A plan that follows tab order emits a notebook whose <code>Working</code> cells reference <code>Entity Map</code> names defined below them &mdash; which marimo resolves by dataflow and the harness reports as a <code>NameError</code>. The scaffolder emits in topological order regardless (<code>ordering_warnings</code> is explicitly <em>"not an error"</em>), so this should pass. If it does not, the eval has found either a scaffolder bug or a harness limit, and the two are told apart by opening the file. Either is worth a day.</p>
+  </div>
+</section>
+
+<!-- 5 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§5</div><h2>Predictions</h2></div>
+
+  <div class="body">
+    <p>A diagnostic that predicts nothing is just a bigger test. These are falsifiable and should be recorded before the first run, so the eval can be <strong>wrong</strong>.</p>
+  </div>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th class="num">#</th><th class="wide">Prediction</th><th>Confidence</th><th class="wide">Basis</th></tr></thead>
+      <tbody>
+        <tr><td class="num mono">P1</td><td>Triage returns <code>proceed_with_care</code>, complexity 0.68&ndash;0.75</td><td>High</td><td>Measured on the probe: 49 ops gave 0.665</td></tr>
+        <tr><td class="num mono">P2</td><td>The plan's <code>dropped</code> list arrives with 15+ entries and is cleared in one action</td><td>High</td><td><code>acknowledge_all_drops</code> exists and is the path of least resistance</td></tr>
+        <tr><td class="num mono">P3</td><td>The <code>Post</code> column is dropped, or kept with a reason that does not mention that a person runs it</td><td>Medium&ndash;high</td><td>It ranks last, it is an <code>info</code> <code>dead_region</code>, and there are seventeen like it</td></tr>
+        <tr><td class="num mono">P4</td><td><code>Summary</code> produces nothing at all &mdash; not even an open question</td><td>Very high</td><td><code>ExcelPattern.PIVOT</code> has no assignment site</td></tr>
+        <tr><td class="num mono">P5</td><td>The plan carries 1&ndash;3 open questions, satisfying <code>open_questions_warning</code></td><td>High</td><td>The guard is <code>if self.open_questions: return None</code></td></tr>
+        <tr><td class="num mono">P6</td><td><code>reconciliation_values</code> comes back with under half its entries resolvable</td><td>Medium&ndash;high</td><td>The default is the whole frame; the key is the workbook's own header</td></tr>
+        <tr><td class="num mono">P7</td><td>The tier lookup is translated as an exact join or a <code>when/then</code> ladder rather than <code>join_asof</code></td><td>Medium</td><td>The hint is one line in a digest of 50 operations</td></tr>
+        <tr><td class="num mono">P8</td><td><code>--convert</code> cost rises 3&ndash;5&times; against <code>adjustment_signoff</code></td><td>High</td><td>~14 <code>TODO(kedge)</code> holes against 6, over a larger context</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="body">
+    <p>P5 deserves its own line, because it is a small fix with a real consequence. <code>open_questions_warning</code> returns <code>None</code> the moment the list is non-empty, whatever the complexity. One question on a 0.37 workbook is proportionate; one question on a 0.75 workbook is a model that has understood a tenth of it and said so once. The quantity is continuous and the guard is a boolean.</p>
+    <p>If P1, P4 and P5 hold and everything else fails to reproduce, the eval has still paid for itself: those three are defects in committed code that no existing test can reach.</p>
+  </div>
+</section>
+
+<!-- 6 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§6</div><h2>The rubric, in outline</h2></div>
+
+  <div class="body">
+    <p>Ids are the contract between <code>expected.yaml</code> and <code>case.py</code>; <code>tests/unit/test_evals_harness.py</code> asserts the two sets match in both directions. Three tiers, weighted as <code>adjustment_signoff</code> weights them.</p>
+  </div>
+
+  <p class="kicker">Deterministic &mdash; approximately 42 points</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>id</th><th class="num">w</th><th class="wide">What it checks</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">ran_to_completion</td><td class="num">2</td><td>every scripted input lands, nothing raises, nothing is still waiting</td></tr>
+        <tr><td class="mono">tier_lookup_is_banded</td><td class="num">4</td><td>the band boundary is right at every tier edge, including the lowest and highest bands</td></tr>
+        <tr><td class="mono">opening_balance_is_ordered</td><td class="num">3</td><td>the prior-row column survives an input frame in a shuffled order</td></tr>
+        <tr><td class="mono">proration_matches_excel</td><td class="num">3</td><td>part-period day counts, on the month boundary and on the serial boundary</td></tr>
+        <tr><td class="mono">overrides_are_surfaced_not_applied</td><td class="num">4</td><td>all three appear with their reasons; none is silently reproduced</td></tr>
+        <tr><td class="mono">does_not_drop_the_posting_column</td><td class="num">4</td><td>the eighteenth dead region survives; the other seventeen may go</td></tr>
+        <tr><td class="mono">dead_regions_are_individually_reasoned</td><td class="num">2</td><td>no two drops share a reason verbatim</td></tr>
+        <tr><td class="mono">subtotal_rows_are_excluded</td><td class="num">3</td><td>the embedded subtotals do not reach the aggregation</td></tr>
+        <tr><td class="mono">leading_zero_client_codes_survive</td><td class="num">3</td><td><code>00417</code> is still <code>00417</code> after ingestion and after the join</td></tr>
+        <tr><td class="mono">text_formatted_fees_are_typed</td><td class="num">2</td><td>the pasted bps column is numeric before arithmetic touches it</td></tr>
+        <tr><td class="mono">stale_region_is_not_reconciled</td><td class="num">4</td><td><code>Allocation</code> declared <code>not_reproduced</code>; headline reads <code>CHECKED WITH EXCEPTIONS</code></td></tr>
+        <tr><td class="mono">reconciliation_map_resolves</td><td class="num">3</td><td>every entry in <code>reconciliation_values</code> yields a vector, or says why not</td></tr>
+        <tr><td class="mono">generated_sql_is_valid</td><td class="num">3</td><td>executed against DuckDB, as <code>adjustment_signoff</code> does it</td></tr>
+        <tr><td class="mono">no_posting_before_approval</td><td class="num">3</td><td>via <code>visible_cells</code>: the posting panel does not render until the checkpoint is recorded</td></tr>
+        <tr><td class="mono">the_notebook_says_why_this_process_exists</td><td class="num">3</td><td>briefing present, prose cites the <code>Sign-off</code> tab</td></tr>
+        <tr><td class="mono">a_blocked_step_says_which_step_it_is</td><td class="num">2</td><td>reused verbatim</td></tr>
+        <tr><td class="mono">no_pandas</td><td class="num">1</td><td>reused verbatim</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p class="kicker">Structural &mdash; approximately 20 points</p>
+
+  <div class="body">
+    <p><code>recognises_the_pivot_tab</code> (3) &mdash; does the plan mention <code>Summary</code> at all, in any form, including an open question saying it cannot be read? Currently expected to fail, and recorded as the measurement of &sect;2.4.</p>
+    <p><code>overrides_are_a_checkpoint</code> (4) &mdash; <code>names_the_tier_table_as_a_lookup_source</code> (3) &mdash; <code>has_a_checkpoint_before_posting</code> (2) &mdash; <code>stage_count_is_proportionate</code> (2), 8&ndash;16, because a 50-operation workbook in four stages has not been decomposed and in forty has not been understood &mdash; <code>open_questions_scale_with_complexity</code> (3), at least three on a 0.7 workbook &mdash; <code>consults_the_knowledge_pack</code> (3), gradeable at last if a pack for the billing schema is added.</p>
+  </div>
+
+  <p class="kicker">Judgement &mdash; not scored, recorded to be read</p>
+
+  <div class="body">
+    <p>Would somebody who has never seen the workbook know, from the notebook alone, why three clients' fees differ from the formula? Does the conversion say what it did about the pivot tab, or only omit it? Is the tier table presented as a thing that changes, or baked in as constants?</p>
+  </div>
+</section>
+
+<!-- 7 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§7</div><h2>What has to change to run it</h2></div>
+
+  <div class="body">
+    <p>Phase 1 needs <strong>no <code>src/</code> change at all</strong> &mdash; that is the proposal's main claim and its main attraction. It needs three small harness changes, all of which are limits <code>adjustment_signoff</code> happened not to hit:</p>
+  </div>
+
+  <ol class="numbered">
+    <li><strong>The two-hand-in tuple.</strong> <code>harness/grade.py:61</code> and <code>harness/convert.py:377</code> both do <code>pre, post = case.write_handins(...)</code>. This workbook has three inbound artifacts (positions extract, fee schedule paste, prior-month positions). A mapping, not a tuple. The <code>rebate_payfile</code> proposal identifies the same line, which is a good sign that it is genuinely the seam and not a quirk of either case.</li>
+    <li><strong><code>drive.py</code>'s stand-in <code>mo</code>.</strong> It raises on anything outside its surface, by design and rightly. A wider workbook plausibly wants <code>mo.ui.multiselect</code> for the override review; add it when the scaffolder actually emits it, not before.</li>
+    <li><strong>A rot guard proportionate to the workbook.</strong> <code>tests/unit/test_evals_adjustment_signoff.py</code> checks every figure <code>expected.yaml</code> quotes against what the generator produces, and the README notes it has already caught the rubric going stale once. With ten discriminations and forty graded figures that test is not optional, and it should assert the <em>structural</em> targets too &mdash; operation count, pattern count, complexity band &mdash; because a generator refactor that quietly collapses the workbook back to seven operations (&sect;1.1) would otherwise pass everything while measuring nothing.</li>
+  </ol>
+
+  <div class="body">
+    <p>What phase 2 might need is exactly what phase 1 finds, and writing that list now would be guessing. The candidates visible from here are: a second ranking key in <code>_operation_digest</code>, an <code>*_omitted</code> key for the six silent caps, a <code>PIVOT</code> assignment site or a blocker, a complexity-scaled <code>open_questions_warning</code>, and possibly a <code>kedge.xl</code> banded-lookup helper. Every one is small. None should be built before the eval says it is needed.</p>
+  </div>
+</section>
+
+<!-- 8 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§8</div><h2>Phasing</h2></div>
+
+  <div class="body">
+    <p>The order matters, and it is not the order <code>adjustment_signoff</code> was built in. That case hand-wrote its gold answer first and, in its own words, <em>"the reference conversion is a worked example of the destination; it was never evidence that kedge can get there"</em> &mdash; five real defects hid behind it until <code>--convert</code> was built.</p>
+  </div>
+
+  <ol class="numbered">
+    <li><strong>Generator and rot guard only.</strong> Build <code>m11_management_fee_run.xlsx</code>; assert the structural targets (45&ndash;60 operations, 12+ patterns, complexity &gt; 0.65, triage not <code>stop</code>). Cheap, and it is the step that proves the workbook is actually hard rather than merely large.</li>
+    <li><strong>Run today's pipeline and write down what happened.</strong> <code>kedge inspect</code>, <code>triage</code>, a real plan proposal, <code>scaffold</code>. Score the eight predictions in &sect;5. <strong>This is where the value is</strong>, and it arrives before a single grader is written.</li>
+    <li><strong><code>expected.yaml</code> and <code>case.py</code></strong>, informed by step 2 rather than by guesswork about what will be hard.</li>
+    <li><strong><code>--convert</code> a model through it</strong>, from the beginning and not at the end.</li>
+    <li><strong>The reference conversion last, not first</strong> &mdash; deliberately inverting the first eval's order. Its only jobs are to prove the graders can pass and to serve as the worked example; writing it first is what let the graders be shaped around a hand-written answer that hid the defects.</li>
+  </ol>
+
+  <div class="body">
+    <p>Sizing: the generator is the bulk of it, perhaps 900&ndash;1,200 lines because heterogeneity cannot be looped. The rubric and graders scale with the ten discriminations, call it 1,200. Steps 1 and 2 together are maybe a third of the work and return most of the diagnostic value &mdash; the same argument <code>rebate_payfile</code> makes for its own phase 1, and the right way round for both.</p>
+  </div>
+</section>
+
+<!-- 9 ─────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§9</div><h2>Deliberately out of scope</h2></div>
+
+  <ul class="plain">
+    <li><strong>Not a robustness fixture.</strong> No macros, no <code>.xlsb</code>, no circular references, no unresolvable external links. <code>hostile.xlsx</code> owns those and triages to <code>stop</code>; a workbook that refuses to convert cannot be graded on the quality of its conversion.</li>
+    <li><strong>Not a second process shape.</strong> One input arriving in two forms plus a schedule, one hand-off, one sign-off. Two sources joined and an outbound file are <code>rebate_payfile</code>'s subject, and the two proposals should stay separable, or neither result is attributable.</li>
+    <li><strong>Not a parsing gauntlet.</strong> Two format nasties only &mdash; text-formatted numbers and the leading-zero code &mdash; and both carry process meaning.</li>
+    <li><strong>Still nothing about the chat loop.</strong> Workbook in, notebook out.</li>
+    <li><strong>No new <code>src/</code> capability in phase 1.</strong> If a discrimination cannot be graded without new product code, it belongs in <code>rebate_payfile</code> instead. That constraint is what keeps this eval a measurement rather than a second specification.</li>
+  </ul>
+</section>
+
+<!-- 10 ────────────────────────────────────────────────── -->
+<section>
+  <div class="sec-head"><div class="sec-num">§10</div><h2>Open questions for the author</h2></div>
+
+  <ol class="numbered">
+    <li><strong>Is the manual override block a checkpoint or a hand-in?</strong> It is a person's judgement recorded in cells, which is <code>checkpoint</code>. But next month's overrides are different cells, so arguably it is an input that should arrive as a hand-in each run. <code>StageKind</code>'s membership test &mdash; <em>does the scaffolder emit something different for it?</em> &mdash; says checkpoint. The workbook's own habit says hand-in. I think checkpoint, and I am not confident.</li>
+    <li><strong>Should the pivot tab be a blocker or an open question?</strong> A blocker is honest and stops a conversion that might otherwise be fine, since the pivot is usually derivable from the tab beneath it. An open question is proportionate and easy to ignore. The answer probably depends on whether anything downstream <em>reads</em> the pivot, which is knowable: a <code>GETPIVOTDATA</code> reference is a formula and the analyser would see it.</li>
+    <li><strong>How hard is too hard?</strong> If this workbook triages to <code>stop</code>, the eval is unrunnable and has to be softened. If it triages to <code>proceed</code>, it may not be stressing triage at all. <code>proceed_with_care</code> is the target, and it is a narrow band to hit deliberately &mdash; which is itself worth knowing about the triage scorer.</li>
+    <li><strong>Should <code>expected.yaml</code> pin the predictions in &sect;5?</strong> Recording them as gradeable items makes the eval self-documenting about what it expected to fail, and turns each fix into a visible score movement &mdash; the same thing <code>EXPECTED_DEFECTS</code> does in <code>tests/unit/test_evals_convert.py</code>, which went from five entries to an exact empty set. The risk is a rubric that scores kedge against yesterday's opinion of itself.</li>
+    <li><strong>Does a second eval mean a second reference conversion is affordable?</strong> <code>adjustment_signoff</code>'s is 817 lines and is the single most expensive artifact in <code>evals/</code>. Phasing it last (&sect;8) is partly an argument that it might not be needed at all until the graders have been proven some other way.</li>
+  </ol>
+</section>
+
+<footer>
+  <div>Proposal only. Nothing here is built.</div>
+  <div>Companion proposal: <code>evals/proposals/rebate_payfile.md</code> &mdash; two sources, one join, and a file that goes back out.</div>
+</footer>
+
+</div>
