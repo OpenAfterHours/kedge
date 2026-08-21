@@ -380,7 +380,7 @@ footer {
 
 <header class="masthead">
   <div class="status">
-    <span>Proposal &mdash; nothing built</span>
+    <span>Phase 1 step 1 built &mdash; rest proposal</span>
     <span>evals/proposals/fee_billing_run.md</span>
     <span>measured at 305fe62</span>
   </div>
@@ -653,7 +653,35 @@ the four dropped, ranked last because they are severity=info:
   </div>
 
   <div class="body">
-    <p>Target shape: roughly <strong>45&ndash;60 logical operations, 12&ndash;15 distinct patterns, complexity 0.68&ndash;0.75</strong> &mdash; past the docstring's "over 0.7 is a big one" line, and past nothing else in the tree by a factor of three.</p>
+    <p>Target shape was <strong>45&ndash;60 logical operations, 12&ndash;15 distinct patterns, complexity 0.68&ndash;0.75</strong>, and that band is no longer an estimate. A calibration spike &mdash; <code>evals/fee_billing_run/build_workbook.py</code>, the first cut of this generator &mdash; was built to answer whether the tab design above actually lands in it, because a design that scores 0.55 stresses nothing new and one that triages <code>stop</code> cannot be graded at all. Measured:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Calibration &mdash; m11_management_fee_run.xlsx</div>
+<pre>operations              <b>49</b>     target (45, 60)
+distinct patterns       <b>16</b>     target &gt;= 12
+complexity           <b>0.699</b>     target (0.68, 0.75)
+verdict     <b>proceed_with_care</b>  must not be 'stop'
+convertible           1.00
+sheets                  10
+cross-sheet ops         19
+findings                45
+dead regions            <b>25</b>
+dependency edges        51
+column profiles         75
+manual carry     ranks <b>25 of 49</b>  (fan-out 0)
+digest truncation     none
+
+<b>IN BAND</b></pre>
+  </div>
+
+  <div class="body">
+    <p><strong>1.9 times the complexity of anything kedge has ever converted.</strong> Three things the spike settled that the design could not:</p>
+    <ul class="plain" style="margin-left:0">
+      <li><strong>Two columns had to be rewritten before the workbook was hard at all.</strong> A reference whose target moves per row &mdash; <code>=Positions!$A{n}</code> filled down, and <code>=Working!$S{n}</code> on <code>Allocation</code> &mdash; normalises to a <em>different</em> R1C1 string on every row, so one column became eighty-four operations and the first measurement came back at <strong>208 operations, complexity 0.855</strong>. Both are now written the way the process would really do it (a pasted code column, and a <code>SUMIFS</code> by key). &sect;1.1 warned that uniformity hides complexity; the opposite error is just as easy and it inflates rather than collapses.</li>
+      <li><strong>25 dead regions, not the 15-plus predicted</strong> &mdash; so P2's haystack is bigger than expected and discrimination 5 is correspondingly sharper.</li>
+      <li><strong>The workbook sits deliberately under <code>_MAX_OPERATIONS</code>.</strong> At 49 the planner sees every operation, so the eval measures conversion quality rather than truncation. Truncation is a different question and the cheap way to ask it is a <em>variant</em> of this workbook past 80, not a second eval.</li>
+    </ul>
     <p>Note what is <em>not</em> in that list: no macros, no external links, no circular references, no <code>.xlsb</code>. Those are <code>hostile.xlsx</code>'s job, and they triage to <code>stop</code>. This workbook must triage to <code>proceed</code> or <code>proceed_with_care</code>, because an eval about conversion quality that refuses to convert measures nothing.</p>
   </div>
 </section>
@@ -874,7 +902,7 @@ class PivotExtraction(_Frozen):
   </div>
 
   <ol class="numbered">
-    <li><strong>Generator and rot guard only.</strong> Build <code>m11_management_fee_run.xlsx</code>; assert the structural targets (45&ndash;60 operations, 12+ patterns, complexity &gt; 0.65, triage not <code>stop</code>). Cheap, and it is the step that proves the workbook is actually hard rather than merely large.</li>
+    <li><strong>Generator and rot guard only. &mdash; DONE.</strong> <code>m11_management_fee_run.xlsx</code> lands at 49 operations and complexity 0.699, and <code>tests/unit/test_evals_fee_billing_run.py</code> asserts the band in both directions &mdash; verified by injecting the collapse it exists to catch (chain the columns and the workbook falls to 13 operations at 0.503; both assertions fire). Still to finish before the spike is the real generator: cached values via the corpus's <code>inject_cached_values</code>, the <code>Summary</code> pivot built by Excel over COM, and the written narrative.</li>
     <li><strong>Run today's pipeline and write down what happened.</strong> <code>kedge inspect</code>, <code>triage</code>, a real plan proposal, <code>scaffold</code>. Score the eight predictions in &sect;5. <strong>This is where the value is</strong>, and it arrives before a single grader is written.</li>
     <li><strong><code>expected.yaml</code> and <code>case.py</code></strong>, informed by step 2 rather than by guesswork about what will be hard.</li>
     <li><strong>The pivot extractor (&sect;7.1)</strong>, with its own unit tests over an Excel-built fixture. It sits here rather than first only so that step 2 records the <code>role=data</code> misclassification once, as the before; it does not depend on anything in steps 1&ndash;3 and could equally land ahead of them.</li>

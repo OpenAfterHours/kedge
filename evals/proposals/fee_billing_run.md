@@ -1,6 +1,8 @@
 # Proposal: `fee_billing_run` -- the same process, a much harder spreadsheet
 
-Status: proposal. Nothing here is built.
+Status: proposal. **Phase 1 step 1 is built** -- `evals/fee_billing_run/build_workbook.py` and
+`tests/unit/test_evals_fee_billing_run.py`, a calibration spike and its rot guard, measured in
+section 3. Everything else here is still a proposal.
 
 Every figure in section 1 and section 2 was measured against the tree at `305fe62`, by running the
 real analyser and the real `build_proposal_context` over the committed fixtures and over three probe
@@ -278,9 +280,44 @@ built them over four years -- which is deliberately **not** dependency order.
 | `Recon` | Last month's figures beside this month's, with a variance column and a hand-typed commentary. |
 | `Sign-off` | Purpose, background, known issues, who signs. Feeds `Briefing` through the analyser's notes. |
 
-Target shape: roughly **45-60 logical operations, 12-15 distinct patterns, complexity 0.68-0.75** --
-past the docstring's "over 0.7 is a big one" line, and past nothing else in the tree by a factor of
-three.
+Target shape was **45-60 logical operations, 12-15 distinct patterns, complexity 0.68-0.75**, and
+that band is no longer an estimate. A calibration spike -- `evals/fee_billing_run/build_workbook.py`,
+the first cut of this generator -- was built to answer whether the tab design above actually lands in
+it, because a design that scores 0.55 stresses nothing new and one that triages `stop` cannot be
+graded at all. Measured:
+
+```
+operations              49     target (45, 60)
+distinct patterns       16     target >= 12
+complexity           0.699     target (0.68, 0.75)
+verdict     proceed_with_care  must not be 'stop'
+convertible           1.00
+sheets                  10
+cross-sheet ops         19
+findings                45
+dead regions            25
+dependency edges        51
+column profiles         75
+manual carry        ranks 25 of 49  (fan-out 0)
+digest truncation     none
+```
+
+**In band, and 1.9 times the complexity of anything kedge has ever converted.** Three things the
+spike settled that the design could not:
+
+- **Two columns had to be rewritten before the workbook was hard at all.** A reference whose target
+  moves per row -- `=Positions!$A{n}` filled down, and `=Working!$S{n}` on `Allocation` -- normalises
+  to a *different* R1C1 string on every row, so one column became eighty-four operations and the
+  first measurement came back at **208 operations, complexity 0.855**. Both are now written the way
+  the process would really do it (a pasted code column, and a `SUMIFS` by key). Section 1.1 warned
+  that uniformity hides complexity; the opposite error is just as easy and it inflates rather than
+  collapses.
+- **25 dead regions, not the 15-plus predicted** -- so P2's haystack is bigger than expected and
+  discrimination 5 is correspondingly sharper.
+- **The workbook sits deliberately under `_MAX_OPERATIONS`.** At 49 the planner sees every
+  operation, so the eval measures conversion quality rather than truncation. Truncation is a
+  different question and the cheap way to ask it is a *variant* of this workbook past 80, not a
+  second eval.
 
 Note what is *not* in that list: no macros, no external links, no circular references, no `.xlsb`. Those
 are `hostile.xlsx`'s job and they triage to `stop`. This workbook must triage to `proceed` or
@@ -549,9 +586,12 @@ hand-wrote its gold answer first and, in its own words, *"the reference conversi
 of the destination; it was never evidence that kedge can get there"* -- five real defects hid behind
 it until `--convert` was built.
 
-1. **Generator and rot guard only.** Build `m11_management_fee_run.xlsx`; assert the structural
-   targets (45-60 operations, 12+ patterns, complexity > 0.65, triage not `stop`). Cheap, and it is
-   the step that proves the workbook is actually hard rather than merely large.
+1. ~~**Generator and rot guard only.**~~ **Done.** `m11_management_fee_run.xlsx` lands at 49
+   operations and complexity 0.699, and `tests/unit/test_evals_fee_billing_run.py` asserts the band
+   in both directions -- verified by injecting the collapse it exists to catch (chain the columns and
+   the workbook falls to 13 operations at 0.503; both assertions fire). Still to finish before the
+   spike is the real generator: cached values via the corpus's `inject_cached_values`, the `Summary`
+   pivot built by Excel over COM, and the written narrative.
 2. **Run today's pipeline and write down what happened.** `kedge inspect`, `triage`, a real plan
    proposal, `scaffold`. Score the eight predictions in section 5. **This is where the value is**, and
    it arrives before a single grader is written.
