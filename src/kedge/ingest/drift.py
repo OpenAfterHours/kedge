@@ -293,6 +293,33 @@ def _filled_width(row: tuple[Any, ...]) -> int:
     return sum(1 for cell in row if cell is not None and str(cell).strip())
 
 
+def _blocks(row: tuple[Any, ...]) -> list[list[str]]:
+    """The row split into runs of populated cells, separated by empty ones.
+
+    A spreadsheet is not a table; it is a sheet with tables drawn on it. A grid with a small
+    block of scalars parked to its right -- ``Minimum fee | 750``, ``Maximum fee | 250000`` --
+    is completely ordinary, and the blank column between them is what a reader uses to tell the
+    two apart. So does this.
+    """
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for cell in row:
+        text = "" if cell is None else str(cell).strip()
+        if text:
+            current.append(text)
+        elif current:
+            blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    return blocks
+
+
+def _principal_block(row: tuple[Any, ...]) -> list[str]:
+    """The run of populated cells most likely to be the grid: the widest, leftmost on a tie."""
+    return max(_blocks(row), key=len, default=[])
+
+
 def _usual_field_count(rows: list[tuple[Any, ...]]) -> int:
     """How many fields the scanned rows mostly agree on.
 
@@ -314,13 +341,25 @@ def detect_layout(path: Path, *, sheet: str | None = None) -> tuple[int, int]:
     anything a schema check would notice.
 
     The header is taken to be the first row that is as wide as the widest row scanned, whose
-    cells are all distinct, and none of which parses as a number. That last condition is what
-    stops an all-text data row being mistaken for a header. Rows carrying more fields than the
-    file otherwise agrees on are ruled out before any of that: an unquoted delimiter inside a
-    text value ("Acme, Inc") makes one data row wider than every other, and the widest row is
-    then the *malformed* one. Promoting it would discard the real header as preamble and lose
-    a row from the frame -- where the honest outcome is the loud read failure a ragged file
-    deserves.
+    cells are all distinct, and none of whose *principal block* parses as a number. That last
+    condition is what stops an all-text data row being mistaken for a header. Rows carrying
+    more fields than the file otherwise agrees on are ruled out before any of that: an
+    unquoted delimiter inside a text value ("Acme, Inc") makes one data row wider than every
+    other, and the widest row is then the *malformed* one. Promoting it would discard the real
+    header as preamble and lose a row from the frame -- where the honest outcome is the loud
+    read failure a ragged file deserves.
+
+    **Why the principal block rather than the whole row.** A worksheet is a sheet with tables
+    drawn on it, not a table, and a small block of scalars parked beside the grid -- ``Minimum
+    fee | 750``, ``Maximum fee | 250000``, in the two columns to the right of a rate card -- is
+    completely ordinary. Testing every populated cell for numerality rejected the header row
+    for carrying ``250000`` three columns away from it, and the fallback then read the sheet's
+    *title* as the header, so a real hand-in parsed as one unusable column. The blank column
+    between the two blocks is what a person uses to tell them apart, and :func:`_blocks` is
+    that reading: the numeric test applies to the widest run of adjacent cells, which is the
+    grid, and a detached caption-and-scalar block beside it no longer disqualifies the row.
+    Distinctness is still checked across the whole row, because two identical labels anywhere
+    in it break the read whichever block they sit in.
 
     Args:
         path: The file to inspect.
@@ -346,7 +385,7 @@ def detect_layout(path: Path, *, sheet: str | None = None) -> tuple[int, int]:
         if widths[index] < widest:
             continue
         values = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
-        if any(_looks_numeric(value) for value in values):
+        if any(_looks_numeric(value) for value in _principal_block(row)):
             continue
         if len({value.lower() for value in values}) != len(values):
             continue

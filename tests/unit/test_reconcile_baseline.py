@@ -13,12 +13,16 @@ from typing import Any
 import pytest
 
 from conftest import make_analysis, make_operation
+from kedge.analysis.model import LogicalOperation
+from kedge.analysis.workbook import parse_a1_range
 from kedge.reconcile.baseline import (
     BaselineVector,
     infer_regions,
+    operation_ranges,
     operation_reference,
     read_baseline,
     read_baselines,
+    region_cell_count,
     specs_from_mapping,
     split_reference,
 )
@@ -39,6 +43,79 @@ class _StubHandle:
     def read_range(self, sheet: str, a1: str, **_: Any) -> list[list[Any]]:
         self.calls.append((sheet, a1))
         return self._sheets.get(sheet, [])
+
+
+class _GridHandle:
+    """A handle that answers the range it was asked for, the way the real one does.
+
+    `_StubHandle` returns the whole sheet whatever it is asked for, which is enough for a
+    region that is one rectangle and actively misleading for one that is several: every
+    piece would come back holding the same values, and a baseline that read the wrong cells
+    would still look right. This one holds cells by reference and slices them, clamping to
+    the sheet's last row and to `max_rows` exactly as `WorkbookHandle.read_range` does.
+    """
+
+    def __init__(self, sheets: dict[str, dict[str, Any]], *, last_row: int | None = None) -> None:
+        self._cells: dict[str, dict[tuple[int, int], Any]] = {}
+        for sheet, cells in sheets.items():
+            grid: dict[tuple[int, int], Any] = {}
+            for reference, value in cells.items():
+                bounds = parse_a1_range(reference)
+                assert bounds is not None, reference
+                grid[(bounds[0], bounds[1])] = value
+            self._cells[sheet] = grid
+        self._last_row = last_row
+        self.calls: list[tuple[str, str]] = []
+
+    @property
+    def sheet_names(self) -> list[str]:
+        return list(self._cells)
+
+    def read_range(self, sheet: str, a1: str, *, max_rows: int = 500, **_: Any) -> list[list[Any]]:
+        self.calls.append((sheet, a1))
+        grid = self._cells[sheet]
+        bounds = parse_a1_range(a1)
+        assert bounds is not None, a1
+        min_row, min_col, max_row, max_col = bounds
+        last = self._last_row if self._last_row is not None else max(row for row, _ in grid)
+        max_row = min(max_row, last, min_row + max_rows - 1)
+        if max_row < min_row:
+            return []
+        return [
+            [grid.get((row, col)) for col in range(min_col, max_col + 1)]
+            for row in range(min_row, max_row + 1)
+        ]
+
+
+#: A fee column broken by a subtotal row: E2:E5 and E7:E9 are client fees, E6 is their total.
+#: The shape the bug was found on, in eight cells rather than eighty-four.
+_BROKEN_COLUMN = {
+    "Calc": {
+        "E1": "fee",
+        "E2": 10.0,
+        "E3": 20.0,
+        "E4": 30.0,
+        "E5": 40.0,
+        "E6": 100.0,  # the SUBTOTAL: in the rectangle, not in the operation
+        "E7": 50.0,
+        "E8": 60.0,
+        "E9": 70.0,
+    }
+}
+
+
+def _broken_operation(**overrides: Any) -> LogicalOperation:
+    """The discontiguous fee column as the analyser records it."""
+    fields: dict[str, Any] = {
+        "sheet": "Calc",
+        "anchor": "E2",
+        "ranges": ["Calc!E2:E5", "Calc!E7:E9"],
+        "cell_count": 7,
+        "orientation": "column",
+        "cached_values_present": True,
+    }
+    fields.update(overrides)
+    return make_operation("calc_e2_e9", **fields)
 
 
 # ── references ──────────────────────────────────────────────────────────────
@@ -257,6 +334,169 @@ def test_single_cell_regions_are_left_out_of_inference() -> None:
     )
 
     assert infer_regions(handle, analysis) == []
+
+
+# ── regions that are not one rectangle ──────────────────────────────────────
+
+
+def test_a_contiguous_column_reads_its_own_cells_and_nothing_else() -> None:
+    """The unchanged case, asserted against a handle that answers the range it was given."""
+    handle = _GridHandle(_BROKEN_COLUMN)
+
+    vector = read_baseline(handle, RegionSpec(id="fee", reference="Calc!E2:E5", cell_count=4))
+
+    assert vector.cells == ("E2", "E3", "E4", "E5")
+    assert vector.values == (10.0, 20.0, 30.0, 40.0)
+    assert vector.status == "present"
+
+
+def test_a_discontiguous_operation_is_labelled_by_the_rectangle_that_encloses_it() -> None:
+    """There is no single range that is the operation and nothing else, and it says so."""
+    assert operation_reference(_broken_operation()) == "Calc!E2:E9"
+    assert operation_ranges(_broken_operation()) == ["Calc!E2:E5", "Calc!E7:E9"]
+
+
+def test_a_contiguous_operation_keeps_its_reconstructed_rectangle_and_declares_no_ranges() -> None:
+    operation = make_operation(
+        "calc_g2_g501", sheet="Calc", anchor="G2", cell_count=500, orientation="column"
+    )
+
+    assert operation_reference(operation) == "Calc!G2:G501"
+    assert operation_ranges(operation) == []
+
+
+def test_a_discontiguous_region_reads_its_own_cells_and_not_the_rows_between_them() -> None:
+    """The bug: the enclosing rectangle holds the subtotal and stops two rows short.
+
+    Reading `Calc!E2:E8` would put the subtotal at the fifth position and shunt every later
+    fee up one, so a correct conversion fails and an incorrect one can pass. Every value
+    below is asserted, because a vector of the right length is exactly what the bug produced.
+    """
+    handle = _GridHandle(_BROKEN_COLUMN)
+    spec = RegionSpec(
+        id="fee",
+        reference="Calc!E2:E9",
+        ranges=["Calc!E2:E5", "Calc!E7:E9"],
+        cell_count=7,
+    )
+
+    vector = read_baseline(handle, spec)
+
+    assert vector.cells == ("E2", "E3", "E4", "E5", "E7", "E8", "E9")
+    assert vector.values == (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0)
+    assert 100.0 not in vector.values  # the SUBTOTAL is not a client fee
+    assert vector.status == "present"
+    assert vector.cell_at(4) == "Calc!E7"
+
+
+def test_an_inferred_region_carries_the_operations_ranges_and_its_cell_count() -> None:
+    handle = _GridHandle(_BROKEN_COLUMN)
+    analysis = make_analysis(operations=[_broken_operation()])
+
+    specs = infer_regions(handle, analysis)
+
+    assert len(specs) == 1
+    assert specs[0].reference == "Calc!E2:E9"
+    assert specs[0].ranges == ["Calc!E2:E5", "Calc!E7:E9"]
+    assert specs[0].cell_count == 7
+    assert specs[0].column == "fee"
+    assert read_baseline(handle, specs[0]).values == (10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0)
+
+
+def test_a_region_read_over_several_ranges_counts_its_cells_not_its_rectangle() -> None:
+    spec = RegionSpec(
+        id="fee", reference="Calc!E2:E9", ranges=["Calc!E2:E5", "Calc!E7:E9"], cell_count=7
+    )
+
+    assert region_cell_count(spec) == 7  # not the 8 cells of E2:E9
+    assert region_cell_count(RegionSpec(id="x", reference="Calc!B2:C3")) == 4
+    assert region_cell_count(RegionSpec(id="x", reference="Calc!not-a-range")) is None
+
+
+# ── where no baseline can be built at all ───────────────────────────────────
+
+
+def test_ranges_that_do_not_account_for_every_cell_degrade_rather_than_shorten() -> None:
+    """The analyser renders at most twenty ranges; a region with more loses the rest.
+
+    A short vector is not a smaller version of the right answer. It would be compared row
+    against row from the top, so everything after the first missing piece lines up with the
+    wrong cell -- which is the failure this whole module exists to refuse.
+    """
+    handle = _GridHandle(_BROKEN_COLUMN)
+    spec = RegionSpec(
+        id="fee",
+        reference="Calc!E2:E9",
+        ranges=["Calc!E2:E5"],  # the second piece never made it into the list
+        cell_count=7,
+    )
+
+    vector = read_baseline(handle, spec)
+
+    assert vector.status == "incomplete"
+    assert vector.reason is NotReconciledReason.BASELINE_RANGE_INCOMPLETE
+    assert vector.values == ()  # nothing is read, so nothing can be compared by accident
+    assert "NOT a pass" in NotReconciledReason.BASELINE_RANGE_INCOMPLETE.explanation
+
+
+def test_an_operation_with_more_pieces_than_the_analyser_records_is_never_read_as_a_rectangle() -> (
+    None
+):
+    """End to end from the analysis: the ranges are short of the count, so the region stops."""
+    handle = _GridHandle(_BROKEN_COLUMN)
+    analysis = make_analysis(operations=[_broken_operation(cell_count=9)])
+
+    spec = infer_regions(handle, analysis)[0]
+
+    assert read_baseline(handle, spec).reason is NotReconciledReason.BASELINE_RANGE_INCOMPLETE
+
+
+def test_ranges_that_overlap_are_unreadable_because_their_cells_have_no_order() -> None:
+    handle = _GridHandle(_BROKEN_COLUMN)
+    spec = RegionSpec(id="fee", reference="Calc!E2:E9", ranges=["Calc!E2:E5", "Calc!E4:E9"])
+
+    assert read_baseline(handle, spec).reason is NotReconciledReason.BASELINE_RANGE_UNREADABLE
+
+
+def test_a_region_spread_over_two_sheets_is_unreadable_because_a_baseline_is_one_vector() -> None:
+    handle = _GridHandle({**_BROKEN_COLUMN, "Other": {"E2": 1.0}})
+    spec = RegionSpec(id="fee", reference="Calc!E2:E9", ranges=["Calc!E2:E5", "Other!E2"])
+
+    assert read_baseline(handle, spec).unreadable
+
+
+def test_a_piece_that_reads_back_short_is_padded_so_the_pieces_after_it_stay_in_place() -> None:
+    """A hole is a missing baseline, never a reason to slide the next piece up one row."""
+
+    class _ShortHandle(_GridHandle):
+        def read_range(self, sheet: str, a1: str, **kwargs: Any) -> list[list[Any]]:
+            rows = super().read_range(sheet, a1, **kwargs)
+            return rows[:-1] if a1 == "E2:E5" else rows
+
+    handle = _ShortHandle(_BROKEN_COLUMN)
+    spec = RegionSpec(
+        id="fee", reference="Calc!E2:E9", ranges=["Calc!E2:E5", "Calc!E7:E9"], cell_count=7
+    )
+
+    vector = read_baseline(handle, spec)
+
+    assert vector.cells == ("E2", "E3", "E4", "E5", "E7", "E8", "E9")
+    assert vector.values == (10.0, 20.0, 30.0, None, 50.0, 60.0, 70.0)
+    assert vector.status == "partial"
+    assert vector.reason is NotReconciledReason.PARTIAL_CACHED_VALUES
+
+
+def test_the_read_ceiling_bounds_the_region_rather_than_each_of_its_ranges() -> None:
+    handle = _GridHandle(_BROKEN_COLUMN)
+    spec = RegionSpec(
+        id="fee", reference="Calc!E2:E9", ranges=["Calc!E2:E5", "Calc!E7:E9"], cell_count=7
+    )
+
+    vector = read_baseline(handle, spec, max_rows=5)
+
+    assert vector.truncated
+    assert vector.values == (10.0, 20.0, 30.0, 40.0, 50.0)
+    assert vector.cells == ("E2", "E3", "E4", "E5", "E7")
 
 
 # ── declared specs ──────────────────────────────────────────────────────────

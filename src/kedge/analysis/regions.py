@@ -167,6 +167,9 @@ _RUNNING_TOTAL_RE = re.compile(
 _PRIOR_ROW_REF_RE = re.compile(r"R\[-1\]C(?![\[\d])")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+_COMPARISON_OPERATORS = frozenset({"=", "<>", "<", ">", "<=", ">="})
+"""Excel's only infix operators that bind looser than ``&``."""
+
 
 # =============================================================================
 # RESULT TYPE
@@ -412,6 +415,68 @@ def _is_falsey(argument: list[Token]) -> bool:
     return value in ("FALSE", "0")
 
 
+def _matching_close(tokens: list[Token]) -> int:
+    """Index of the bracket closing the one at position zero, or -1 if it never closes."""
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token.subtype == Token.OPEN:
+            depth += 1
+        elif token.subtype == Token.CLOSE:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _unwrap(tokens: list[Token]) -> list[Token]:
+    """Strip brackets that enclose the whole expression, so ``=(A2&B2)`` has a top level.
+
+    Only a bare ``PAREN`` group qualifies. A ``FUNC`` open bracket carries its function name
+    and is a call, not grouping, and a bracket that closes before the end -- ``=(A2&B2)*C2``
+    -- is grouping that genuinely changes what the formula evaluates to.
+    """
+    while (
+        len(tokens) >= 2
+        and tokens[0].type == Token.PAREN
+        and tokens[0].subtype == Token.OPEN
+        and _matching_close(tokens) == len(tokens) - 1
+    ):
+        tokens = tokens[1:-1]
+    return tokens
+
+
+def _top_level_operators(formula: str) -> list[str]:
+    """The infix operators sitting at bracket depth zero, in the order they are written.
+
+    Anything inside a function call, a plain bracket or an array literal is a sub-expression
+    and is deliberately invisible here: what a formula *evaluates to* is decided by the
+    operator at the top. Brackets wrapping the entire formula are redundant and are removed
+    first, or the top level would be empty.
+    """
+    operators: list[str] = []
+    depth = 0
+    for token in _unwrap(tokenise(formula)):
+        if token.subtype == Token.OPEN:
+            depth += 1
+        elif token.subtype == Token.CLOSE:
+            depth = max(depth - 1, 0)
+        elif depth == 0 and token.type == Token.OP_IN:
+            operators.append(token.value)
+    return operators
+
+
+def _concatenates(formula: str) -> bool:
+    """Whether the formula's loosest-binding top-level operator is ``&``.
+
+    ``&`` binds looser than every arithmetic operator in Excel and tighter than every
+    comparison one, so it is the loosest exactly when it is present at the top level and no
+    comparison is. That is the whole test, and it is what makes the mixed case decidable
+    rather than a coin toss -- see :func:`classify_pattern`.
+    """
+    operators = _top_level_operators(formula)
+    return "&" in operators and not _COMPARISON_OPERATORS.intersection(operators)
+
+
 def _resolve_component(component: str, current: int) -> int:
     """Resolve an R1C1 coordinate component (``C``, ``C[-2]``, ``C3``) to an index."""
     body = component[1:]
@@ -445,6 +510,23 @@ def classify_pattern(parsed: ParsedFormula, *, col: int = 1) -> ExcelPattern:
     :attr:`~kedge.analysis.model.ExcelPattern.UNKNOWN`, which is a useful answer: it tells
     the planner to raise an open question rather than improvise.
 
+    A formula that calls no function is classified by its **top-level operator** instead,
+    for the same reason. That matters most for ``&``: a column of
+    ``="INSERT INTO t VALUES ('"&A2&"');"`` is one generated statement per row -- the step a
+    person copies out and runs -- and calling it arithmetic loses the single most consequential
+    thing about it, and hands the translator ``col("a") * col("b")`` for a string.
+
+    **The mixed case is decided by precedence, not by counting.** ``&`` binds looser than
+    every arithmetic operator, so ``="Total "&A2*B2`` is a string with a product inside it,
+    never a product: one ``&`` at the top level makes the whole formula
+    :attr:`~kedge.analysis.model.ExcelPattern.TEXT_MANIPULATION` however much arithmetic sits
+    under it. Comparison operators bind looser still and make the result a boolean, so a
+    formula carrying one at the top level is left alone. The test is ordered after
+    :attr:`~kedge.analysis.model.ExcelPattern.PRIOR_ROW`, because which *row* a formula reads
+    is geometry no other field recovers, and before
+    :attr:`~kedge.analysis.model.ExcelPattern.PARAMETER_REF`, which only says where the
+    operands came from and is still legible in ``references``.
+
     Args:
         parsed: The parsed anchor formula of a region.
         col: 1-based column of the anchor cell, needed to resolve relative column offsets
@@ -461,6 +543,8 @@ def classify_pattern(parsed: ParsedFormula, *, col: int = 1) -> ExcelPattern:
             return ExcelPattern.LITERAL
         if _PRIOR_ROW_REF_RE.search(parsed.r1c1):
             return ExcelPattern.PRIOR_ROW
+        if _concatenates(parsed.a1):
+            return ExcelPattern.TEXT_MANIPULATION
         if parsed.references and all(
             reference.absolute_row and reference.absolute_col for reference in parsed.references
         ):
@@ -513,6 +597,58 @@ def classify_pattern(parsed: ParsedFormula, *, col: int = 1) -> ExcelPattern:
     return ExcelPattern.UNKNOWN
 
 
+def _lookup_table_sheet(parsed: ParsedFormula, sheet: str) -> str | None:
+    """Which sheet holds the table a ``VLOOKUP``/``HLOOKUP`` searches, if it can be told.
+
+    The table is the call's second argument, which is not necessarily the formula's only
+    range and is very often not on the sheet holding the formula. Resolution is deliberately
+    all-or-nothing: a defined name, a structured reference, a reference into another workbook
+    and one naming a sheet the workbook does not have all come back as None, because the
+    advice this feeds is *sort that table* and naming the wrong sheet is worse than naming
+    none.
+    """
+    outer = parsed.outermost_function
+    if outer not in ("VLOOKUP", "HLOOKUP"):
+        return None
+    arguments = _function_arguments(parsed.a1, outer)
+    if arguments is None or len(arguments) < 2:
+        return None
+    by_raw = {reference.raw: reference for reference in parsed.references}
+    for token in arguments[1]:
+        if token.type != Token.OPERAND or token.subtype != Token.RANGE:
+            continue
+        reference = by_raw.get(token.value)
+        if reference is None or reference.is_external or not reference.resolves:
+            return None
+        return reference.sheet or sheet
+    return None
+
+
+def _sorted_table_caveat(parsed: ParsedFormula, sheet: str) -> str:
+    """The sentence telling a reader *which* table an approximate match assumes is sorted.
+
+    This used to be a relative clause hanging off the headline -- "...which assumes the table
+    is sorted" -- immediately in front of the generic ``on {sheet}`` suffix, so it read as
+    "sorted on Working" while the table sat on Fee Schedule. On an approximate-match lookup
+    that is not merely untidy: the translation is a ``join_asof``, sorting the wrong frame is
+    silently wrong rather than loudly wrong, and the description was pointing at the frame
+    that must *not* be sorted. It is a sentence of its own now, and it names the sheet it
+    resolved or names none at all.
+    """
+    axis = "row" if parsed.outermost_function == "HLOOKUP" else "column"
+    table_sheet = _lookup_table_sheet(parsed, sheet)
+    if table_sheet is None:
+        return (
+            " Approximate matching assumes the lookup table is sorted ascending by its first "
+            f"{axis}; this formula does not resolve to a sheet, so find that table before "
+            "sorting anything."
+        )
+    return (
+        f" Approximate matching assumes the lookup table on {table_sheet} is sorted ascending "
+        f"by its first {axis} -- that table, not the sheet holding the formula."
+    )
+
+
 def _describe(
     parsed: ParsedFormula,
     pattern: ExcelPattern,
@@ -541,7 +677,7 @@ def _describe(
         ExcelPattern.SUMIFS: "A conditional sum over several criteria",
         ExcelPattern.COUNTIFS: "A conditional count",
         ExcelPattern.VLOOKUP_EXACT: "An exact-match lookup into a reference table",
-        ExcelPattern.VLOOKUP_APPROX: "An approximate-match lookup, which assumes the table is sorted",
+        ExcelPattern.VLOOKUP_APPROX: "An approximate-match lookup into a reference table",
         ExcelPattern.INDEX_MATCH: "An INDEX/MATCH lookup into a reference table",
         ExcelPattern.SUMPRODUCT: "A sum of pairwise products",
         ExcelPattern.RUNNING_TOTAL: "A running total accumulating down the column",
@@ -560,13 +696,14 @@ def _describe(
         ),
     }[pattern]
 
+    caveat = _sorted_table_caveat(parsed, sheet) if pattern is ExcelPattern.VLOOKUP_APPROX else ""
     volatile = (
         f" Uses the volatile function(s) {', '.join(parsed.volatile_functions)}, so it "
         "recalculates on every edit."
         if parsed.volatile_functions
         else ""
     )
-    return f"{headline} on {sheet}, {extent}{cross}{external}.{volatile}"
+    return f"{headline} on {sheet}, {extent}{cross}{external}.{caveat}{volatile}"
 
 
 # =============================================================================

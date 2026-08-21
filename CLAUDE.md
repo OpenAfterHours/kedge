@@ -167,6 +167,20 @@ including the contract tests. `ty` gates merges: its three long-standing diagnos
   dropped from the ladder in `_recover` if the endpoint refuses it); responses reports it
   unprompted on `response.completed`. Prefer it over `TokenCounter`, which is an estimate over a
   fixed `cl100k_base` and cannot see `cached_tokens` at all.
+- **A region is not always a rectangle, and the wrong cells are worse than no cells.** A column
+  of formulas broken by an embedded subtotal row, a blank row or a typed-over cell is one
+  logical operation with several ranges, and `reconcile.baseline.operation_reference` used to
+  collapse them into the rectangle from the anchor across `cell_count` cells. On
+  `evals/fee_billing_run`, `Allocation!E2:E29,E31:E58,E60:E87` became `Allocation!E2:E85`: two
+  `SUBTOTAL` figures read as client fees, the last two clients never read at all, and **56 of 84
+  baseline values compared against the wrong row**. Note what that is not — it is not an absent
+  baseline, so none of the three defences in `reconcile/model.py` fire: the vector is the right
+  length and full of real numbers, so a correct conversion fails and a wrong one can pass.
+  `RegionSpec` now carries `ranges` (read in order, concatenated) and `cell_count` (the
+  analyser's own, so ranges that do not add up degrade to `BASELINE_RANGE_INCOMPLETE` rather
+  than to a shorter vector — `regions._ranges` renders at most twenty). `reference` stays a
+  single A1 range and becomes the rectangle *enclosing* a discontiguous region: a label, never
+  something to read from.
 - **Presence is not the absence of a null.** `reconcile.verify` compares a prediction against a
   re-extract with a full outer join, and the obvious way to tell "this row is missing" from "this
   row differs" is to look at whether a value column came back null. That is wrong on precisely

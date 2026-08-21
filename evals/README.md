@@ -25,10 +25,13 @@ right: the corpus is *supposed* to have exactly one positive reconciliation path
 | `harness/cellprompt.py`, `cellgen.py`, `render.py`, `align.py`, `findings.py`, `convert.py` | Phase 2: scaffold a plan, have a model fill every hole, render, drive, grade. |
 | `run.py` | The CLI. |
 | `adjustment_signoff/` | A four-tab manual process — extract, adjust, re-extract, sign off — and whether kedge turns it back into the runbook it came from. |
+| `fee_billing_run/` | The same five beats over a ten-tab monthly billing run at 1.9 times the complexity. A diagnostic: it changes the difficulty of the spreadsheet and nothing else. |
+| `proposals/` | The case for an eval, argued before it is built -- and, once it is, the record of what building it measured. |
 
 ```bash
 uv sync --group evals                                 # duckdb, for executing generated SQL
 uv run python evals/run.py adjustment_signoff         # grade the reference conversion
+uv run python evals/run.py fee_billing_run            # the other one
 uv run python evals/run.py adjustment_signoff \
     --notebook path/to/converted.py --plan path/to/plan.yaml
 uv run python evals/run.py adjustment_signoff --json  # for a CI step
@@ -41,7 +44,7 @@ uv run python evals/run.py adjustment_signoff --model MODEL --dry-run     # reso
 Exit code is 0 when nothing gradeable failed — and non-zero when *nothing was graded at all*,
 because a sweep whose every leg skipped has not passed, it has not run.
 
-The first three call no model. The last three do, and they are the only things here that spend
+The first four call no model. The last three do, and they are the only things here that spend
 money or touch a network.
 
 ## `adjustment_signoff`
@@ -150,6 +153,222 @@ inside this one. Keep the rot guard in step: `expected.yaml` quotes figures, and
 `tests/unit/test_evals_adjustment_signoff.py` checks every one of them against what the
 generator actually produces. That test has already caught the rubric going stale once.
 
+## `fee_billing_run`
+
+```
+fee_billing_run/
+  build_workbook.py             generates the input; byte-deterministic
+  build_pivot.py                finishes the Summary tab by driving Excel over COM
+  m11_management_fee_run.xlsx   the committed input, 70KB
+  expected.yaml                 the rubric -- 24 items, 70 points
+  build_notebook.py             generates the reference conversion
+  notebook.py                   the reference conversion
+  case.py                       the graders, keyed to rubric ids
+```
+
+```bash
+uv run python evals/fee_billing_run/build_workbook.py                        # rebuild (refuses, see below)
+uv run python evals/fee_billing_run/build_workbook.py --calibrate            # measure; writes nothing
+uv run --with pywin32 python evals/fee_billing_run/build_workbook.py --with-pivot     # Windows + Excel
+uv run python evals/fee_billing_run/build_workbook.py --verify-with-excel             # Windows + Excel
+uv run python evals/fee_billing_run/build_notebook.py
+uv run pytest tests/unit/test_evals_fee_billing_run.py
+```
+
+**Building and measuring are separate operations.** `--calibrate` and `--verify-with-excel` read the
+workbook that is on disk and never rebuild it: the committed file is the artifact the eval grades, it
+carries a `Summary` pivot no pure-Python build can author -- openpyxl reads a pivot table and cannot
+write one -- and a rebuilt workbook is a different input. Both flags used to rebuild first, which
+destroyed discrimination 7 and then reported on the wrong file. For the same reason a plain rebuild
+over a workbook that already carries a pivot is *refused*: pass `--with-pivot` to put it back, or
+`--force` to accept losing it. `build_pivot.py` carries the warning that matters more: Excel
+recalculates on open, which silently repairs the deliberately stale `Allocation` figures
+discrimination 9 is made of, so it sets manual calculation on the application *before* the workbook is
+opened and re-reads every cached value afterwards. `--with-pivot` also restores `xl/connections.xml`
+afterwards, because Excel rewrites that part on save: the query's newlines come back as `_x000a_`
+rather than as the `&#10;` the fixtures are authored with, and `commandType="2"` is dropped because
+`2` is its schema default. Neither survived the reader until this case found it (see below), so the
+restore began as a workaround; now that both forms read back it is byte-stability against `build()`.
+
+The workbook is a monthly management-fee billing run -- work out what each client owes, get it
+approved, post it to the ledger, sign it off. Ten tabs, in the order somebody added them over four
+years, which is deliberately not dependency order:
+
+1. **`Positions`** -- the warehouse extract. The SQL in rows 3-18 *and* in `xl/connections.xml` as a
+   real ODBC connection, so "the extract is a step to hand over" is a claim the analyser can check
+   twice; then ~900 rows, one per client per day-end, over two months because the prior one carries
+   the opening balances.
+2. **`Fee Schedule`** -- pasted from the onboarding team's file. Two preamble rows, tiered bps by
+   AUM band, effective-dated. The numbers arrive as text and the client codes carry leading zeros.
+3. **`Entity Map`** -- client to legal entity to cost centre. Added in year three, which is why it
+   is the eighth tab and the fourth depends on it.
+4. **`Working`** -- the wide one. Some 28 heterogeneous columns: average AUM, the tier lookup,
+   floors, caps, pro-rating, the composite key, and four abandoned columns from a method changed in
+   2024 sitting between the live ones.
+5. **`Overrides`** -- three clients whose computed fee the billing manager typed over, each with a
+   written reason and a date.
+6. **`Allocation`** -- fees at invoice grain, allocated to cost centres, with a subtotal row per
+   legal entity embedded inside the grid. Last saved on manual calculation, so its cached values are
+   real and stale.
+7. **`Summary`** -- a pivot table over `Allocation`. The tab the manager actually reads.
+8. **`Post`** -- one `INSERT` per invoice, built by `&`. The manual carry. Nothing reads it, and one
+   of the eighty-four names it posts is `O'Hanlon & Reid Nominees`, so the workbook's own statement
+   for client `00041` is not valid SQL.
+9. **`Recon`** -- last month's figures beside this month's, a variance column, a hand-typed
+   commentary.
+10. **`Sign-off`** -- purpose, background, known issues, who signs. Feeds `Briefing` through the
+    analyser's notes.
+
+Measured: 50 logical operations, 15 distinct `ExcelPattern`s, 10 sheets, 60 dependency edges, 19
+dead regions, complexity **0.699**, triage `proceed_with_care`. That is 1.9 times
+`q2_accrual_adjustment.xlsx`'s 0.368, and the most complex thing anything in this repository has
+been asked to convert. `--calibrate` measures that band and
+`tests/unit/test_evals_fee_billing_run.py` pins it in both directions -- because complexity here
+comes from *variety* rather than size, and a generator refactor that quietly collapses 28 distinct
+column shapes back into one filled-down grid would leave a workbook that passes every assertion and
+measures nothing. Verified by injecting exactly that collapse: chained, the workbook falls to 13
+operations at 0.503 and both assertions fire.
+
+### Why it is a different instrument from `adjustment_signoff`
+
+`adjustment_signoff` is a **specification**. It was written to lead the implementation, and two of
+its steps needed capability that did not exist when it was written.
+
+This one is a **diagnostic**. It needed no new `src/` capability to be scored at all: build the
+workbook, build the rubric, run today's `analyse` to `triage` to `propose` to `scaffold` and write
+down what happens. It holds the process shape constant on purpose -- the same five beats, extract,
+compute, hand a statement over, take the evidence back, sign off -- and changes exactly one
+variable, the difficulty of the spreadsheet, so that a result is attributable. A case that also
+varied the shape could not distinguish "kedge struggles with complex spreadsheets" from "kedge has
+never seen a second input".
+
+Diagnostic does not mean tolerant. Where it shows the pipeline cannot cope with a construct, the
+pipeline changes: `evals/proposals/fee_billing_run.md` §7.1 specifies the pivot extractor rather
+than recording the limitation, because pivot tables are ubiquitous in finance and the analyser
+cannot see one.
+
+### What it discriminates
+
+Ten, of which eight carry points.
+
+| # | Discrimination | Where |
+|---|---|---|
+| 1 | An approximate-match `VLOOKUP` is a banded join, not a lookup | `Working` tier column |
+| 2 | A prior-row reference needs an explicit sort | `Working` opening balance |
+| 3 | Pro-rating is date arithmetic with an Excel serial boundary | `Working` part-period columns |
+| 4 | A manual override is a decision to re-ask, not a number to bake in | `Overrides` |
+| 5 | Eighteen dead regions are dead; the nineteenth posts the fees | `Working` abandoned columns, and `Post` |
+| 6 | An embedded subtotal row is not data | `Allocation` |
+| 7 | A pivot table is a derived aggregation, never a data source | `Summary` |
+| 8 | Text-formatted numbers, and a leading zero that must survive | `Fee Schedule` |
+| 9 | Stale cached values on one sheet must not reconcile as passed | `Allocation`, saved on manual calculation |
+| 10 | Tab order is not dependency order | `Entity Map` is the eighth tab and feeds the fourth |
+
+**Number 5 is `adjustment_signoff`'s sharpest discrimination re-run at realistic scale.** There, one
+dead region, and the eval asks "did you keep it?" -- a one-in-one choice a coin could win. Here,
+nineteen, eighteen of which genuinely should go, and the one that must stay is an `info`
+`dead_region` like the other eighteen, sits at the head of an undifferentiated nineteen-strong
+zero-fan-out tail in the planner's context, and can be dismissed along with the rest by a single
+`acknowledge_all_drops`.
+
+**Number 7 is a wrong answer rather than a missing one.** `Summary` is a real pivot over
+`Allocation`, and the analyser classifies its rendered grid as `role=data` -- an *input* -- at
+confidence 0.853, with no operations on the sheet and no dependency edge to the tab it aggregates.
+A plan that reads the summary as a source is believing well-evidenced analysis. `ExcelPattern.PIVOT`
+is assigned nowhere in `src/`, so `pivot_is_derived_not_read` is an unconditional skip today and
+that skip is the baseline the extractor will be measured against.
+
+**Number 8 grew a second half, and it is about a non-negotiable.** The leading zero is one hazard in
+a posted field; the other is client `00041`, `O'Hanlon & Reid Nominees`, whose name `Post!A`
+concatenates straight into the statement. `&` quotes nothing and escapes nothing, so the workbook's
+own line carries seven single quotes where a valid one has six -- a syntax error at the moment
+somebody pastes it into a production client. That is what makes `generated_sql_is_valid`'s failure
+text (*"render them through `kedge.sql`"*) name something it can detect: until the name was planted,
+naive concatenation produced valid SQL here and non-negotiable 3 was untested by this case. Two rot
+guards hold it, as `adjustment_signoff` holds `O'Brien & Partners`: one asserting the workbook's
+version is genuinely broken, one asserting `kedge.sql` renders it correctly.
+
+Number 7 carries no points until the extractor exists, and number 10 has no scored item at all --
+it appears only in the unscored judgement list -- which is why the ten discriminations are eight for
+scoring purposes. Nor do the eight fail perfectly independently: one measured coupling remains, and
+`evals/proposals/fee_billing_run.md` §4 records what it is and why it is correct rather than a
+defect.
+
+### Scoring
+
+The same three tiers, weighted the same way: **deterministic** 17 items over 49 points,
+**structural** 7 items over 21, **judgement** recorded to be read. Money is compared at half a penny
+here too.
+
+The reference conversion scores **47/47**, with eight honest skips. Six items want a plan and no
+reference plan is committed for this case yet -- five structural, plus
+`dead_regions_are_individually_reasoned`, which sits in the deterministic tier and reads
+`plan.dropped`; `pivot_is_derived_not_read` waits on the extractor; `consults_the_knowledge_pack`
+waits on a pack describing `fin.fee_invoice`. So the structural tier is currently `0/0` -- which the
+report renders as exactly that, rather than folding it into a total.
+
+What that run reconciles is worth quoting, because "declared with a reason" must not become a way to
+empty a denominator: **34 of the 45 regions are compared, over 2,609 rows**, and the other eleven are
+declared. Ten are `not_reproduced` -- the four 2024 columns the plan drops, the stale `Allocation`
+tab, the `Post` hand-off kedge renders through `kedge.sql` so there is no cached text to match, and
+the four `Recon` ranges that read the stale tab. One is `no_usable_baseline`, which is the different
+and more accurate claim: `Working!V` is the override flag, the notebook computes it, and eighty-one
+of its cells cache as calculated empty strings that read back as nothing at all, so it is the
+*workbook* that cannot check it. `reconciliation_map_resolves` counts both as resolved and enforces a
+floor (`case.RECONCILED_SHARE`) on how much was genuinely compared.
+
+The negative controls have a file of their own: `tests/unit/test_evals_fee_billing_run_controls.py`,
+46 scenarios grown out of the adversarial review that preceded the reference conversion. It differs
+from `test_evals_harness.py` in two ways, and both come from the workbook. Most scenarios are a
+**stub context** -- a hand-built frame, statement block or plan handed straight to one grader --
+rather than a textual mutation of the reference notebook, because at 1.9 times the complexity a
+mutation big enough to change what a grader sees is usually big enough to stop the run, and "the
+notebook stopped" is the one outcome that proves nothing. And every grader is controlled in **both
+directions**, enforced rather than trusted: a suite that only checks the failing direction is
+satisfied by a grader that fails everything, which has stopped measuring the conversion.
+
+### What building it found
+
+Running today's pipeline over the workbook -- offline, no model called, before a grader existed --
+found three defects in committed `src/`. A fourth arrived later, when the workbook grew a real ODBC
+connection. All four are fixed:
+
+| Defect | Consequence |
+|---|---|
+| `operation_reference` reconstructed a contiguous rectangle from an anchor and a cell count, ignoring `operation.ranges` | `Allocation`'s fee column is discontiguous *because* the subtotal rows sit inside it, so the baseline read two `SUBTOTAL` figures as client fees, lost two real clients off the end, and reported a **correct** notebook as differing on 56 of its 84 rows. Silently: `truncated=False`, no finding |
+| Any bare `&` concatenation classified as `arithmetic`, hint `col("a") * col("b")` | `classify_pattern` keyed off the outermost *function* and a bare `&` has none. The column that builds the INSERTs -- the one region that must never be dropped -- was described to the model as multiplication, with `functions: []` |
+| The approximate-`VLOOKUP` description named the sheet holding the formula as the one to sort | *"assumes the table is sorted on Working"*, where the table to sort is on `Fee Schedule`. `_describe` appended `" on {sheet}"` to every headline, and this is the only headline ending in a word that binds it as a prepositional object -- so the most load-bearing sentence in the digest, on the construct the case calls its highest-value translation risk, actively misdirected |
+| `analysis.connections` could not read a connection part **Excel itself** wrote | Excel escapes a newline inside `dbPr@command` as `_x000a_` -- `ST_Xstring`, not the `&#10;` this repository authors -- and drops `commandType` because `2` is its default. The reader decoded neither, so one round trip through Excel turned the extract query into a single line littered with `_x000a_`, with `command_type` `None`. `build_proposal_context` hands `connection.command` to the planner as the query to hand over, so that is what the model would have been shown. Neither form is malformed, so nothing complained. `_decode_xstring` now runs in `_attr`, once, for every `ST_Xstring` the module reads |
+
+That last one is why this case's connection part earns its keep twice. It is the first in the
+repository to make a round trip through Excel: `tests/fixtures/legacy_sql.xlsx` has one, but it is
+hand-authored and has never been re-saved, so its escaping was only ever read back by the convention
+that wrote it.
+
+A fifth is pinned rather than fixed. openpyxl's `data_only` view discards `t="str"`, so a
+calculated empty string reads as a cell nobody calculated: the 81 rows where the override flag
+returns `""` take cached-value coverage to 3,133 of 3,214, and the blocker tells the user to
+recalculate and re-save in Excel -- which cannot help, since Excel is what wrote the file.
+`test_an_empty_string_result_reads_as_an_uncalculated_cell` asserts the current behaviour exactly,
+so it inverts on the day it is fixed rather than quietly passing.
+
+Two more came out of driving Excel, which is the only oracle for cached values that are a parallel
+implementation of the sheet rather than a copy of it: an approximate `VLOOKUP` over a
+text-formatted column returns *text*, and Excel's `&` renders an integral number without its
+trailing `.0`. `--verify-with-excel` is now a mode rather than a one-off -- 5,309 cells compared, 11
+moved, all 11 on the two tabs that are stale on purpose -- and it fails both ways, because nothing
+moving would mean the deliberate staleness had gone.
+
+The first of those two propagated further than the tab it was planted on, and cost a `src/` change
+of its own. A conversion *must* type the tier column -- otherwise the arithmetic below it fails four
+operations later inside a query plan -- so the cached `'20.0'` meets a computed `20.0`, and reading
+that pair as a type difference makes the region unreconcilable by construction: doing the right
+thing is what breaks the check. `reconcile.model.as_numeric_pair` now compares them as the number
+both sides mean, and draws the line at **information loss rather than at type**
+(`kedge.xl.unambiguous_number`, non-negotiable 3), so `'00417'` against `417.0` stays the difference
+it is -- a client code is not the number 417, and blessing that agreement would pass a join key that
+has already broken every join it takes part in.
+
 ## The harness
 
 ### Driving a runbook headlessly
@@ -226,10 +445,12 @@ rubric of sixteen items is not a pass, and the headline will not render it as on
 
 ## Measuring a model
 
-Everything above grades committed artifacts, and scores 63/63 with no model anywhere in the loop.
-That proves the graders work. It says nothing about whether the model a user has configured can
-do the job — which matters, because this workbook is one of the *simplest* processes a user will
-bring. Two modes answer that, at two different seams and two very different prices.
+Everything above grades committed artifacts -- `adjustment_signoff` at 63/63, `fee_billing_run` at
+47/47 -- with no model anywhere in the loop. That proves the graders work. It says nothing about
+whether the model a user has configured can do the job — which matters, because
+`q2_accrual_adjustment.xlsx` is one of the *simplest* processes a user will bring. Two modes answer
+that, at two different seams and two very different prices. Both are case-independent, and
+`fee_billing_run` is registered for them.
 
 **`--model` grades the planning seam.** One call per repeat: propose a plan, grade it against the
 structural tier, record tokens, seconds and — when it fails — why. Repeat with `--repeats`; one
@@ -300,7 +521,7 @@ which a runbook should do.
 That is the argument for this mode in one paragraph. The reference conversion is a worked example of
 the destination; it was never evidence that kedge can get there.
 
-## What this eval does not cover
+## What the evals do not cover
 
 - **Nothing about the chat loop.** This is workbook in, notebook out. Whether the agent
   *converses* well about the conversion is a different eval.
@@ -308,7 +529,20 @@ the destination; it was never evidence that kedge can get there.
   from `mo.ui.*` and match the stage cell's own name exactly; anything looser bound strings and
   reported the run as driven while the scripted action went nowhere. What still cannot be played
   is reported as `NOT DRIVEN`, which is its own category and never a skip.
-- **No knowledge-pack item.** `consults_the_knowledge_pack` skips: `context/databases/example.yaml`
-  describes a different schema. Adding a pack for `fin.accruals` would make it gradeable.
-- **One workbook, one process shape.** A monthly adjustment with a sign-off. Nothing here says
-  anything about reconciliations, allocations, or anything with a Power Query in it.
+- **No knowledge-pack item, in either case.** `consults_the_knowledge_pack` skips both times:
+  `context/databases/example.yaml` describes a different schema. Packs for `fin.accruals` and
+  `fin.fee_invoice` would make them gradeable.
+- **Two workbooks, one process shape.** A monthly adjustment with a sign-off, and a monthly billing
+  run with a sign-off -- the same five beats on purpose, so that `fee_billing_run` varies the
+  difficulty of the spreadsheet and nothing else. What is still untested is a second *shape*: two
+  sources joined, an outbound payment file, a Power Query. That is a third case and it would not be
+  attributable if it were folded into either of these.
+- **`kedge.sql` is now exercised by both workbooks, and by one shape of literal.** `adjustment_signoff`
+  has `O'Brien & Partners`, `fee_billing_run` has `O'Hanlon & Reid Nominees`, and both post a
+  workbook statement that is genuinely broken, so non-negotiable 3 is tested twice rather than
+  once -- `fee_billing_run` used to post nothing that needed escaping and its
+  `generated_sql_is_valid` could not tell `kedge.sql` from concatenation. What neither covers is the
+  rest of the class the module exists for: a `NULL`, a date, a money value at the edge of exponent
+  notation. An apostrophe in a counterparty name is the ordinary case, not the whole of it.
+- **A pivot table, still.** `pivot_is_derived_not_read` is an unconditional skip until
+  `analysis/pivots.py` exists. The eval records the misclassification; it cannot yet grade the fix.

@@ -190,6 +190,63 @@ def test_one_unreconciled_region_among_passing_ones_is_not_a_passing_report() ->
     assert len(report.passed) == 2 and len(report.not_reconciled) == 1
 
 
+def test_the_two_kinds_of_declared_exception_are_counted_and_named_apart() -> None:
+    """A decision about the conversion and a fact about the spreadsheet are different facts.
+
+    A reader looking at amber needs to know which they have: one says "somebody chose this and
+    here is why", the other says "the workbook has nothing to check this against". Reporting
+    them with one word would lose the half that tells you whether to go and look at the
+    spreadsheet.
+    """
+    report = ReconciliationReport(
+        workbook="p.xlsx",
+        tolerance=Tolerance(),
+        regions=[
+            _region(ReconciliationStatus.PASSED, spec_id="a"),
+            _region(
+                ReconciliationStatus.NOT_RECONCILED,
+                spec_id="b",
+                reason=NotReconciledReason.NOT_REPRODUCED,
+            ),
+            _region(
+                ReconciliationStatus.NOT_RECONCILED,
+                spec_id="c",
+                reason=NotReconciledReason.NO_USABLE_BASELINE,
+            ),
+        ],
+    )
+
+    assert [r.spec_id for r in report.declared_not_reproduced] == ["b"]
+    assert [r.spec_id for r in report.declared_no_baseline] == ["c"]
+    assert [r.spec_id for r in report.declared_exceptions] == ["b", "c"]
+
+    headline = report.headline()
+    assert headline.startswith("CHECKED WITH EXCEPTIONS")
+    assert "1 region(s) declared not reproduced by this notebook" in headline
+    assert "1 region(s) the workbook cannot be a baseline for" in headline
+    assert "not a clean pass" in headline
+
+
+def test_a_report_whose_only_exception_is_a_missing_baseline_is_still_not_a_pass() -> None:
+    """Non-negotiable 6. Nothing about the wording may make an unchecked region a pass."""
+    report = ReconciliationReport(
+        workbook="p.xlsx",
+        tolerance=Tolerance(),
+        regions=[
+            _region(
+                ReconciliationStatus.NOT_RECONCILED,
+                spec_id="c",
+                reason=NotReconciledReason.NO_USABLE_BASELINE,
+            )
+        ],
+    )
+
+    assert report.status is ReconciliationStatus.NOT_RECONCILED
+    assert not report.status
+    assert report.colour == "amber"
+    assert report.passed == []
+
+
 def test_the_traffic_light_is_green_amber_red_in_that_order() -> None:
     assert ReconciliationStatus.PASSED.colour == "green"
     assert ReconciliationStatus.NOT_RECONCILED.colour == "amber"

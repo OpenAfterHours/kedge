@@ -48,14 +48,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from kedge.analysis.values import ERROR_VALUES
-from kedge.analysis.workbook import WorkbookOpenError, open_workbook, parse_a1_range
+from kedge.analysis.workbook import WorkbookOpenError, open_workbook
 from kedge.errors import ReconciliationError
 from kedge.reconcile.baseline import (
     BaselineVector,
     infer_regions,
     read_baselines,
+    region_cell_count,
     specs_from_mapping,
-    split_reference,
 )
 from kedge.reconcile.diagnose import diagnose
 from kedge.reconcile.model import (
@@ -67,6 +67,7 @@ from kedge.reconcile.model import (
     RegionResult,
     RegionSpec,
     Tolerance,
+    as_numeric_pair,
     signed_delta,
 )
 
@@ -232,7 +233,7 @@ def find_actual(
     if not spec.column:
         return None, None
 
-    wanted = _reference_length(spec.reference)
+    wanted = region_cell_count(spec)
     fallback: str | None = None
     for name, held in definitions.items():
         if name.startswith("_") or spec.column not in _column_names(held):
@@ -249,16 +250,6 @@ def find_actual(
         "region %r: no frame has %d rows; falling back to %r", spec.id, wanted or -1, fallback
     )
     return fallback, to_vector(definitions[fallback], column=spec.column)
-
-
-def _reference_length(reference: str) -> int | None:
-    """How many cells a region's A1 range covers, or None when it cannot be parsed."""
-    _, a1 = split_reference(reference)
-    bounds = parse_a1_range(a1)
-    if bounds is None:
-        return None
-    min_row, min_col, max_row, max_col = bounds
-    return (max_row - min_row + 1) * (max_col - min_col + 1)
 
 
 def _row_count(value: Any) -> int | None:
@@ -463,12 +454,14 @@ def _compare_cell(
             )
         return _mismatch(MismatchKind.TYPE_DIFFERS), None, None
 
-    if _is_number(expected) and _is_number(actual):
-        if not math.isfinite(float(actual)):
+    numbers = as_numeric_pair(expected, actual)
+    if numbers is not None:
+        expected_number, actual_number = numbers
+        if not math.isfinite(actual_number):
             return _mismatch(MismatchKind.NON_FINITE), None, None
-        delta = abs(float(actual) - float(expected))
-        relative = delta / abs(float(expected)) if float(expected) != 0.0 else None
-        if tolerance.matches(float(expected), float(actual)):
+        delta = abs(actual_number - expected_number)
+        relative = delta / abs(expected_number) if expected_number != 0.0 else None
+        if tolerance.matches(expected_number, actual_number):
             return None, delta, relative
         return _mismatch(MismatchKind.VALUE_DIFFERS, delta, relative), delta, relative
 
@@ -502,6 +495,7 @@ def reconcile_region(
     tolerance: Tolerance,
     max_mismatch_rows: int = _DEFAULT_MISMATCH_ROWS,
     not_reproduced: Mapping[str, str] | None = None,
+    no_baseline: Mapping[str, str] | None = None,
 ) -> RegionResult:
     """Reconcile one region and explain the outcome.
 
@@ -513,6 +507,10 @@ def reconcile_region(
             vector here, so this is the one place that has to know what a frame is.
         tolerance: The tolerances to apply, recorded on the result.
         max_mismatch_rows: How many mismatching rows to print side by side.
+        not_reproduced: Region id to why the notebook does not reproduce it. Honoured only
+            where the notebook produced nothing, because that is what the claim means.
+        no_baseline: Region id to why the workbook cannot be a baseline for it. Honoured only
+            where the notebook *did* produce values -- see below.
 
     Returns:
         A :class:`~kedge.reconcile.model.RegionResult`. It is ``PASSED`` only when rows were
@@ -529,7 +527,31 @@ def reconcile_region(
         "tolerance": tolerance,
     }
 
-    if baseline is None or baseline.status in ("unreadable", "empty", "absent"):
+    # "I compute this, and the workbook cannot check it" -- a fact about the spreadsheet, and
+    # the only honest reading of a formula column whose cached cells are calculated empty
+    # strings, or of a lookup that cached the text a paste left behind. Answered before the
+    # baseline is looked at, because the declaration is a statement about that baseline; and
+    # answered *after* `to_vector`, because it is only true if the notebook did produce the
+    # values. Withhold them and it is a different, weaker claim -- one this deliberately will
+    # not let a caller make by accident.
+    #
+    # The two declarations therefore cannot collide, however carelessly a caller fills the
+    # maps in: this one applies only where values arrived, `not_reproduced` only where none
+    # did, and each is the claim its own words make.
+    declared_unusable = (no_baseline or {}).get(spec.id)
+    if declared_unusable and actual is not None:
+        reason = NotReconciledReason.NO_USABLE_BASELINE
+        logger.info("region %r has no usable baseline: %s", spec.id, declared_unusable)
+        return RegionResult(
+            **common,
+            status=ReconciliationStatus.NOT_RECONCILED,
+            reason=reason,
+            detail=f"{reason.explanation} {declared_unusable}",
+            rows_expected=len(baseline.values) if baseline is not None else 0,
+            rows_actual=len(actual),
+        )
+
+    if baseline is None or baseline.status in ("unreadable", "incomplete", "empty", "absent"):
         reason = (
             baseline.reason
             if baseline is not None and baseline.reason is not None
@@ -715,6 +737,7 @@ def reconcile_values(
     spec_source: SpecSource = "provided",
     notes: Sequence[str] = (),
     not_reproduced: Mapping[str, str] | None = None,
+    no_baseline: Mapping[str, str] | None = None,
 ) -> ReconciliationReport:
     """Build a report from values already in hand.
 
@@ -736,6 +759,9 @@ def reconcile_values(
             proportion is left None rather than guessed at.
         spec_source: How the regions were arrived at: declared, inferred, provided or none.
         notes: Caveats about the run itself.
+        not_reproduced: Region id to why the notebook does not reproduce it.
+        no_baseline: Region id to why the workbook cannot be a baseline for it. See
+            :func:`reconcile_workbook` for the difference between the two.
 
     Returns:
         A complete :class:`~kedge.reconcile.model.ReconciliationReport`.
@@ -749,6 +775,7 @@ def reconcile_values(
             tolerance=tolerance,
             max_mismatch_rows=max_mismatch_rows,
             not_reproduced=not_reproduced,
+            no_baseline=no_baseline,
         )
         for spec in specs
     ]
@@ -806,6 +833,7 @@ def reconcile_workbook(
     spec_source: SpecSource | None = None,
     notes: Sequence[str] = (),
     not_reproduced: Mapping[str, str] | None = None,
+    no_baseline: Mapping[str, str] | None = None,
 ) -> ReconciliationReport:
     """Read the workbook's baselines and reconcile the supplied values against them.
 
@@ -827,6 +855,13 @@ def reconcile_workbook(
             than as a cell that failed to run. The distinction matters: a conversion that
             deliberately improves on a workbook column, rather than copying it, would otherwise
             be told to go and fix a bug that is not there.
+        no_baseline: Region id to the reason the *workbook* cannot be a baseline for it, where
+            the notebook does compute the column and pass its values in. Also
+            ``NOT_RECONCILED`` -- nothing checked is nothing claimed -- but a different fact
+            from ``not_reproduced`` and reported as one, because the alternative is to withhold
+            the values and misreport a computed column as an absent one. A formula column whose
+            cached cells are calculated empty strings and a lookup that cached the text a paste
+            left behind are both this, not that.
 
     Returns:
         A complete report. A workbook that cannot be opened produces a NOT_RECONCILED report
@@ -884,6 +919,7 @@ def reconcile_workbook(
             spec_source=spec_source,
             notes=run_notes,
             not_reproduced=not_reproduced,
+            no_baseline=no_baseline,
         )
     finally:
         handle.close()

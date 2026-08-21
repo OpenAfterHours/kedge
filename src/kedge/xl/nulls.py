@@ -22,13 +22,17 @@ zero and a null denominator.
 routine, and PLAN 2.6 flags it as a "silent type mismatch on join keys". In polars 1.43 the
 join is not in fact silent (see ``to_number``'s docstring), but every arithmetic use of the
 column is. ``to_number`` performs the coercion Excel does implicitly.
+
+``to_number`` answers that for a column. :mod:`kedge.xl.text` answers it for a single cell,
+which is what the comparison engine and the hand-in reader's guard need, and it owns the
+character class both of them strip so the two cannot drift apart.
 """
 
 from __future__ import annotations
 
-from typing import Final
-
 import polars as pl
+
+from kedge.xl.text import STRIP_PATTERN as _STRIP_PATTERN
 
 __all__ = [
     "Operand",
@@ -47,11 +51,6 @@ __all__ = [
 #: and an ambiguity that changes meaning silently has no place in this module. Pass
 #: ``pl.col("name")`` or ``pl.lit("text")`` and the intent is on the page.
 type Operand = pl.Expr | int | float
-
-#: Characters stripped before parsing a text-formatted number: whitespace (including the
-#: non-breaking and narrow non-breaking spaces that survive a copy-paste out of a web
-#: report), the comma group separator, and the currency symbols Excel accepts inline.
-_STRIP_PATTERN: Final[str] = r"[\s,$£€¥]"
 
 
 def _operand(value: Operand) -> pl.Expr:

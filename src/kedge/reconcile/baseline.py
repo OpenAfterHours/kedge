@@ -21,6 +21,17 @@ Nothing here guesses. A ``None`` is never read as a zero and never as a blank st
 because openpyxl cannot tell "Excel never cached anything here" from "Excel cached an empty
 cell", and inventing either answer is how a reconciliation becomes vacuous.
 
+**A region is not always a rectangle.** A column of formulas broken by an embedded subtotal
+row, a blank row or a cell somebody typed over is one logical operation with several ranges,
+and the enclosing rectangle is a different set of cells: it holds the subtotals, and it stops
+short of the last rows by however many the breaks consumed. Reading it would hand the
+comparison a vector that is the right *length* and the wrong *cells*, which is worse than no
+baseline at all — the rows after the first break are compared against their neighbours, so a
+correct conversion fails and an incorrect one can pass. So :class:`RegionSpec` carries the
+ranges themselves and :func:`read_baseline` reads them in order, and where they cannot be
+enumerated exactly the region degrades to NOT_RECONCILED rather than to the rectangle
+(PLAN 4.5; CONVENTIONS non-negotiable 6).
+
 References:
 - PLAN.md 1.5 (the dual load and the cached-value caveat), 4.5 (the reconciliation loop).
 """
@@ -49,9 +60,11 @@ __all__ = [
     "BaselineVector",
     "column_letters",
     "infer_regions",
+    "operation_ranges",
     "operation_reference",
     "read_baseline",
     "read_baselines",
+    "region_cell_count",
     "split_reference",
 ]
 
@@ -123,6 +136,14 @@ class BaselineVector:
     """True when the range was longer than :data:`MAX_BASELINE_ROWS` and was cut short."""
     unreadable: bool = False
     """True when the sheet or the range could not be resolved at all."""
+    incomplete: bool = False
+    """True when the region's ranges do not account for every cell it holds.
+
+    Distinct from :attr:`unreadable`, which is a reference nothing could resolve. This one
+    resolved perfectly well and still describes the wrong set of cells, so no vector is read
+    at all: a shorter one would be compared row against row with everything after the first
+    gap out by however many cells the gap held.
+    """
 
     @property
     def present_count(self) -> int:
@@ -140,10 +161,14 @@ class BaselineVector:
         return sum(1 for value in self.values if isinstance(value, str) and value in ERROR_VALUES)
 
     @property
-    def status(self) -> Literal["present", "partial", "absent", "empty", "unreadable"]:
+    def status(
+        self,
+    ) -> Literal["present", "partial", "absent", "empty", "unreadable", "incomplete"]:
         """What kind of baseline this is, in the terms the report uses."""
         if self.unreadable:
             return "unreadable"
+        if self.incomplete:
+            return "incomplete"
         if not self.values:
             return "empty"
         if self.present_count == 0:
@@ -160,6 +185,8 @@ class BaselineVector:
         status = self.status
         if status == "unreadable":
             return NotReconciledReason.BASELINE_RANGE_UNREADABLE
+        if status == "incomplete":
+            return NotReconciledReason.BASELINE_RANGE_INCOMPLETE
         if status == "empty":
             return NotReconciledReason.BASELINE_RANGE_EMPTY
         if status == "absent":
@@ -180,6 +207,96 @@ class BaselineVector:
 # =============================================================================
 
 
+@dataclass(frozen=True, slots=True)
+class _Segment:
+    """One resolved piece of a region: its A1 range and the rectangle it covers."""
+
+    a1: str
+    min_row: int
+    min_col: int
+    max_row: int
+    max_col: int
+
+    @property
+    def rows(self) -> int:
+        """How many rows the piece spans."""
+        return self.max_row - self.min_row + 1
+
+    @property
+    def width(self) -> int:
+        """How many columns the piece spans."""
+        return self.max_col - self.min_col + 1
+
+    @property
+    def cell_count(self) -> int:
+        """How many cells the piece covers."""
+        return self.rows * self.width
+
+    def overlaps(self, other: _Segment) -> bool:
+        """Whether two pieces share a cell."""
+        return not (
+            self.max_row < other.min_row
+            or other.max_row < self.min_row
+            or self.max_col < other.min_col
+            or other.max_col < self.min_col
+        )
+
+
+def _resolve_segments(spec: RegionSpec) -> tuple[str, list[_Segment]] | None:
+    """Resolve a region's ranges to one sheet and a list of rectangles.
+
+    Args:
+        spec: The region. Its ``segments`` are read in the order given; an unqualified one
+            inherits the sheet from ``reference``.
+
+    Returns:
+        ``(sheet, segments)``, or None when the ranges cannot be trusted to describe a
+        vector: no sheet, a range that will not parse, two sheets in one region, or two
+        pieces that overlap. Every one of those would put the wrong cell at some position,
+        so none of them may fall back to reading a rectangle.
+    """
+    default_sheet, _ = split_reference(spec.reference)
+    sheet: str | None = None
+    segments: list[_Segment] = []
+    for segment in spec.segments:
+        named, a1 = split_reference(segment)
+        named = named or default_sheet
+        if named is None:
+            logger.warning("region %r range %r names no sheet", spec.id, segment)
+            return None
+        if sheet is None:
+            sheet = named
+        elif named != sheet:
+            logger.warning(
+                "region %r spans two sheets, %r and %r; a baseline is one vector on one sheet",
+                spec.id,
+                sheet,
+                named,
+            )
+            return None
+        bounds = parse_a1_range(a1)
+        if bounds is None:
+            logger.warning("region %r has an unparseable range %r", spec.id, a1)
+            return None
+        segments.append(_Segment(a1, *bounds))
+
+    if sheet is None or not segments:
+        logger.warning("region %r names no range to read", spec.id)
+        return None
+
+    for index, segment in enumerate(segments):
+        for other in segments[index + 1 :]:
+            if segment.overlaps(other):
+                logger.warning(
+                    "region %r ranges %r and %r overlap, so its cells cannot be put in order",
+                    spec.id,
+                    segment.a1,
+                    other.a1,
+                )
+                return None
+    return sheet, segments
+
+
 def read_baseline(
     handle: WorkbookHandle,
     spec: RegionSpec,
@@ -189,55 +306,90 @@ def read_baseline(
     """Read the cached values for one region out of the workbook.
 
     A rectangle is flattened in reading order — down a column, along a row, row-major for a
-    genuine block — because the notebook side of the comparison is a single vector.
+    genuine block — because the notebook side of the comparison is a single vector. A region
+    given as several ranges is read range by range in the order they are given, and the
+    pieces are concatenated: the same vector, with the cells the region does not cover left
+    out rather than read as if they were part of it.
 
     Args:
         handle: An open workbook handle.
         spec: The region to read. Its ``reference`` must name a sheet, either in the
-            reference itself or not at all.
-        max_rows: Row ceiling. A longer range is read up to the ceiling and marked
-            truncated rather than silently shortened.
+            reference itself or not at all; ``ranges``, where given, are what is read.
+        max_rows: Row ceiling for the region as a whole, not per range. A longer region is
+            read up to the ceiling and marked truncated rather than silently shortened.
 
     Returns:
         A :class:`BaselineVector`. An unknown sheet or an unparseable reference comes back
         with ``unreadable`` set rather than raising: a region that cannot be located is a
-        NOT_RECONCILED result, not a crash (CONVENTIONS non-negotiable 4).
+        NOT_RECONCILED result, not a crash (CONVENTIONS non-negotiable 4). Ranges that do
+        not add up to the region's own ``cell_count`` come back ``incomplete``, which is the
+        same refusal for a different reason.
     """
-    sheet, a1 = split_reference(spec.reference)
-    if sheet is None:
-        logger.warning("region %r reference %r names no sheet", spec.id, spec.reference)
-        return BaselineVector(spec.id, spec.reference, "", unreadable=True)
+    resolved = _resolve_segments(spec)
+    if resolved is None:
+        named, _ = split_reference(spec.reference)
+        return BaselineVector(spec.id, spec.reference, named or "", unreadable=True)
+    sheet, segments = resolved
+
     if sheet not in handle.sheet_names:
         logger.warning("region %r names sheet %r, which is not in the workbook", spec.id, sheet)
         return BaselineVector(spec.id, spec.reference, sheet, unreadable=True)
 
-    bounds = parse_a1_range(a1)
-    if bounds is None:
-        logger.warning("region %r has an unparseable range %r", spec.id, a1)
-        return BaselineVector(spec.id, spec.reference, sheet, unreadable=True)
-
-    min_row, min_col, max_row, _max_col = bounds
-    requested_rows = max_row - min_row + 1
-    try:
-        rows = handle.read_range(
-            sheet, a1, view="values", max_rows=max_rows, max_cols=_MAX_BASELINE_COLS
+    covered = sum(segment.cell_count for segment in segments)
+    if spec.cell_count is not None and covered != spec.cell_count:
+        logger.warning(
+            "region %r holds %d cells but its %d range(s) cover %d; refusing to compare a "
+            "vector that would be out of step with the notebook",
+            spec.id,
+            spec.cell_count,
+            len(segments),
+            covered,
         )
-    except Exception as exc:  # a broad catch: an unreadable range is a finding, not a traceback
-        logger.warning("could not read %s for region %r: %s", spec.reference, spec.id, exc)
-        return BaselineVector(spec.id, spec.reference, sheet, unreadable=True)
+        return BaselineVector(spec.id, spec.reference, sheet, incomplete=True)
 
     values: list[Any] = []
     cells: list[str] = []
-    for row_offset, row in enumerate(rows):
-        for col_offset, value in enumerate(row):
-            values.append(value)
-            cells.append(cell_ref(min_row + row_offset, min_col + col_offset))
+    truncated = False
+    budget = max_rows
+    for index, segment in enumerate(segments):
+        if budget <= 0:
+            truncated = True
+            break
+        try:
+            rows = handle.read_range(
+                sheet, segment.a1, view="values", max_rows=budget, max_cols=_MAX_BASELINE_COLS
+            )
+        except Exception as exc:  # a broad catch: an unreadable range is a finding, not a crash
+            logger.warning("could not read %s for region %r: %s", segment.a1, spec.id, exc)
+            return BaselineVector(spec.id, spec.reference, sheet, unreadable=True)
 
-    truncated = requested_rows > len(rows) and len(rows) >= max_rows
+        short = len(rows) < segment.rows
+        if short and len(rows) >= budget:
+            _append_rows(values, cells, segment, rows)
+            truncated = True
+            break
+        if short and index < len(segments) - 1:
+            # A piece that came back short would put every later piece one position early,
+            # and a comparison one position out is a wrong answer rather than a missing one.
+            # The gap is filled with the absence it is: None is a missing baseline, so the
+            # region reports partial and cannot be signed off.
+            logger.warning(
+                "region %r: %s returned %d of %d rows; the gap is left as missing baseline",
+                spec.id,
+                segment.a1,
+                len(rows),
+                segment.rows,
+            )
+            _append_grid(values, cells, segment, rows)
+        else:
+            _append_rows(values, cells, segment, rows)
+        budget -= len(rows)
+
     logger.debug(
-        "region %r: read %d cells from %s (%d cached)",
+        "region %r: read %d cells from %d range(s) in %s (%d cached)",
         spec.id,
         len(values),
+        len(segments),
         spec.reference,
         sum(1 for value in values if value is not None),
     )
@@ -249,6 +401,51 @@ def read_baseline(
         cells=tuple(cells),
         truncated=truncated,
     )
+
+
+def _append_rows(
+    values: list[Any], cells: list[str], segment: _Segment, rows: Sequence[Sequence[Any]]
+) -> None:
+    """Append exactly what the read returned, flattened row-major."""
+    for row_offset, row in enumerate(rows):
+        for col_offset, value in enumerate(row):
+            values.append(value)
+            cells.append(cell_ref(segment.min_row + row_offset, segment.min_col + col_offset))
+
+
+def _append_grid(
+    values: list[Any], cells: list[str], segment: _Segment, rows: Sequence[Sequence[Any]]
+) -> None:
+    """Append the segment's whole rectangle, with None wherever the read fell short."""
+    for row_offset in range(segment.rows):
+        row: Sequence[Any] = rows[row_offset] if row_offset < len(rows) else ()
+        for col_offset in range(segment.width):
+            values.append(row[col_offset] if col_offset < len(row) else None)
+            cells.append(cell_ref(segment.min_row + row_offset, segment.min_col + col_offset))
+
+
+def region_cell_count(spec: RegionSpec) -> int | None:
+    """How many cells a region's ranges cover, or None when one of them will not parse.
+
+    The extent the report and the frame matching reason about. It is the sum over the
+    region's ranges rather than the area of ``reference``, because for a discontiguous
+    region the rectangle in ``reference`` merely encloses it.
+
+    Args:
+        spec: The region.
+
+    Returns:
+        The cell count, or None when any range is unparseable.
+    """
+    total = 0
+    for segment in spec.segments:
+        _, a1 = split_reference(segment)
+        bounds = parse_a1_range(a1)
+        if bounds is None:
+            return None
+        min_row, min_col, max_row, max_col = bounds
+        total += (max_row - min_row + 1) * (max_col - min_col + 1)
+    return total
 
 
 def read_baselines(
@@ -275,12 +472,66 @@ def read_baselines(
 # =============================================================================
 
 
+def operation_ranges(operation: LogicalOperation) -> list[str]:
+    """The exact ranges a discontiguous logical operation covers, in reading order.
+
+    The analyser already records them — a formula column broken by two subtotal rows is
+    three ranges — and they are the only description of the region that is neither too big
+    nor too small.
+
+    Args:
+        operation: A region from :class:`~kedge.analysis.model.WorkbookAnalysis`.
+
+    Returns:
+        The sheet-qualified ranges, or an empty list when the operation is a single
+        rectangle (its ``reference`` already says everything) or when the recorded ranges
+        do not parse.
+    """
+    if len(operation.ranges) < 2:
+        return []
+    for entry in operation.ranges:
+        _, a1 = split_reference(entry)
+        if parse_a1_range(a1) is None:
+            logger.warning("operation %r has an unparseable range %r", operation.id, entry)
+            return []
+    return list(operation.ranges)
+
+
+def _enclosing_range(operation: LogicalOperation) -> str | None:
+    """The one rectangle that contains every cell of a discontiguous operation."""
+    rows: list[int] = []
+    cols: list[int] = []
+    for entry in operation.ranges:
+        sheet, a1 = split_reference(entry)
+        if sheet is not None and sheet != operation.sheet:
+            return None
+        bounds = parse_a1_range(a1)
+        if bounds is None:
+            return None
+        rows.extend((bounds[0], bounds[2]))
+        cols.extend((bounds[1], bounds[3]))
+    if not rows:
+        return None
+    top_left = cell_ref(min(rows), min(cols))
+    bottom_right = cell_ref(max(rows), max(cols))
+    sheet = _quote_sheet(operation.sheet)
+    if top_left == bottom_right:
+        return f"{sheet}!{top_left}"
+    return f"{sheet}!{top_left}:{bottom_right}"
+
+
 def operation_reference(operation: LogicalOperation) -> str | None:
-    """The sheet-qualified A1 range a logical operation writes into.
+    """The sheet-qualified A1 range a logical operation occupies.
 
     The analyser records where a region starts and how many cells it covers, not the
     rectangle it fills, so the rectangle is reconstructed here from the anchor, the cell
     count and the orientation.
+
+    Where the operation is discontiguous there is no single range that is the operation and
+    nothing else, and this returns the rectangle that *encloses* it — which is bigger than
+    the operation, and is honest about being bigger. It is a label for the panel, never
+    something to read a baseline from: :func:`operation_ranges` is what covers the cells
+    themselves, and :func:`infer_regions` puts both on the spec.
 
     Args:
         operation: A region from :class:`~kedge.analysis.model.WorkbookAnalysis`.
@@ -289,6 +540,11 @@ def operation_reference(operation: LogicalOperation) -> str | None:
         A reference such as ``"Calc!G2:G501"``, or None for a block whose shape cannot be
         recovered from a cell count alone.
     """
+    if len(operation.ranges) > 1:
+        enclosing = _enclosing_range(operation)
+        if enclosing is not None:
+            return enclosing
+
     bounds = parse_a1_range(operation.anchor)
     if bounds is None:
         return None
@@ -381,6 +637,12 @@ def infer_regions(
             RegionSpec(
                 id=operation.id,
                 reference=reference,
+                ranges=operation_ranges(operation),
+                # The analyser's own count, carried so that ranges which do not add up to it
+                # -- it renders at most twenty of them, and a column broken by more breaks
+                # than that has the rest missing -- degrade the region rather than shorten
+                # its baseline.
+                cell_count=operation.cell_count,
                 column=_normalise_name(header) if header else None,
                 label=header or operation.id,
                 description=operation.description,

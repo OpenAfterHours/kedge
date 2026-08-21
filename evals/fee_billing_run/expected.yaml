@@ -1,0 +1,708 @@
+# What a good conversion of m11_management_fee_run.xlsx looks like.
+#
+# A rubric, not a fixture manifest. `tests/fixtures/manifest.py` declares what the analyser
+# should *find*; this declares what kedge should *do*. Nothing here asserts on phrasing -- the
+# same workbook planned twice will not produce the same words, and a check that demanded it
+# would go red on a model upgrade rather than on a regression.
+#
+# The sister rubric, `evals/adjustment_signoff/expected.yaml`, specifies target behaviour on a
+# simple workbook. This one is a **diagnostic**: the process shape is deliberately the same and
+# the only variable is the difficulty of the spreadsheet, so whatever fails here is attributable
+# to complexity rather than to a shape kedge has never seen. See
+# `evals/proposals/fee_billing_run.md`.
+#
+# Three tiers, kept apart because they cost different amounts and fail for different reasons:
+#
+#   deterministic  - no model needed. Run the notebook, compare numbers. A failure here is a
+#                    bug in kedge or in the generated code, never a matter of judgement.
+#   structural     - assertions about the shape of the plan. Needs a model; survives
+#                    nondeterminism.
+#   judgement      - things only a reader can settle. Recorded so they are read, not scored.
+#
+# The weighting is lopsided toward `deterministic` -- 49 points against 21 -- for the reason the
+# first rubric gives: a plan that reads well and produces the wrong pennies has failed.
+#
+# **The real ceiling is 63, not 70.** `pivot_is_derived_not_read` (4) and
+# `consults_the_knowledge_pack` (3) are unconditional SKIPs, each for a stated reason about
+# something kedge cannot yet be asked, so seven of the twenty-one structural points can never be
+# earned by anybody. Both are argued below; the arithmetic is recorded here so the headline count
+# does not overstate coverage by a tenth.
+#
+# **Every figure in `facts` is derived from `build_workbook.compute()`, never transcribed.** A
+# rubric quoting figures the workbook does not produce is worse than no rubric, because it fails
+# a correct conversion and sends somebody hunting a defect that is not there. The rot guard in
+# `tests/unit/test_evals_fee_billing_run.py` recomputes each of them.
+
+workbook: m11_management_fee_run.xlsx
+generated_by: build_workbook.py
+sha256_note: >
+  `build()` is byte-deterministic and CI regenerates it. The `Summary` pivot is the exception:
+  openpyxl reads a pivot table and cannot author one, so `--with-pivot` finishes that tab by
+  driving Excel over COM, and the committed file therefore carries a part no pure-Python build
+  reproduces. If the hash changes without build_workbook.py changing, look there first.
+
+# =============================================================================
+# THE PROCESS THE WORKBOOK RECORDS
+# =============================================================================
+#
+# Stated once so every expectation below can refer to it, and so a reader can check the rubric
+# against the workbook without reverse-engineering the generator. The same five beats as
+# `adjustment_signoff`, on purpose: extract, compute, approve, hand over, sign off.
+
+process:
+  - step: extract
+    human_action: >
+      Run the positions query against the warehouse and bring back the grid. Two months, because
+      the prior month is needed for the opening balance.
+    evidence_in_workbook: Positions rows 3-16 (the SQL) and the header on row 17
+  - step: collect the schedule
+    human_action: >
+      Paste the current fee schedule from the file Client Onboarding emailed. It arrives as
+      displayed text, so the negotiated rates are strings and the client codes keep their
+      leading zeros.
+    evidence_in_workbook: "Fee Schedule rows 1-2 (the preamble), header on row 4"
+  - step: compute
+    human_action: none - this is the arithmetic that should move into the notebook
+    evidence_in_workbook: Working columns B to AK, 34 heterogeneous formula shapes
+  - step: re-ask the overrides
+    human_action: >
+      Three clients' computed fees were typed over by the billing manager, each with a written
+      reason. Somebody has to say whether each one still applies this month.
+    evidence_in_workbook: the Overrides tab, columns A to F
+  - step: approve
+    human_action: The fee run is signed off before anything is posted.
+    evidence_in_workbook: the Sign-off tab exists at all
+  - step: post
+    human_action: Run the INSERT statements against the ledger.
+    evidence_in_workbook: Post rows 4-87, one statement per invoice, built by `&`
+  - step: reconcile
+    human_action: Compare against last month and comment on the variances.
+    evidence_in_workbook: the Recon tab, and the Summary pivot the manager actually reads
+
+# =============================================================================
+# FACTS
+# =============================================================================
+#
+# Every figure a grader compares against. Graders read `ctx.facts[...]`; nothing is hardcoded in
+# case.py, so the rot guard can check these against build_workbook.compute() rather than against
+# the workbook -- which would make the assertion tautological.
+
+facts:
+  # --- the run ---
+  clients_billed: 84
+  period_start: 2026-11-01
+  period_end: 2026-11-30
+  days_in_month: 30
+  first_client_code: "00001"
+  last_client_code: "00084"
+  posting_table: fin.fee_invoice
+  posting_statements: 84
+
+  # --- the tiered rate card (discrimination 1) ---
+  # An approximate-match VLOOKUP over these bands: `join_asof(strategy="backward")` on a sorted
+  # frame, with the boundary `>=` on the floor. `clients` is how many of the 84 land in each
+  # band *before* a negotiated rate overrides it, so an off-by-one at any edge moves a whole
+  # tier and shows up as a count that no longer matches.
+  fee_bands:
+    - {floor: 0.0, ceiling: 5000000.0, bps: 35.0, clients: 4}
+    - {floor: 5000000.0, ceiling: 20000000.0, bps: 27.5, clients: 7}
+    - {floor: 20000000.0, ceiling: 50000000.0, bps: 22.0, clients: 32}
+    - {floor: 50000000.0, ceiling: 100000000.0, bps: 18.5, clients: 41}
+  negotiated_rate_clients: 17
+  negotiated_rate_example: {client: "00001", bps: 20.0, band_bps: 27.5}
+
+  # --- totals a correct notebook reproduces to the penny ---
+  # Every one of these goes through Excel's 15-significant-digit collapse before rounding half
+  # away from zero. A bare .round(2) is a penny out, and the error propagates into the totals.
+  gross_fee_total_gbp: 8230033.34
+  prorated_total_gbp: 8123322.62
+  net_fee_total_gbp: 7921035.75
+  agreed_fee_total_gbp: 7616098.41
+  discount_total_gbp: 203103.48
+  running_total_final_gbp: 7616098.41
+
+  # --- pro-rating (discrimination 3) ---
+  # Three clients were onboarded mid-month, so DATEDIF(start, EOMONTH(start,0), "d") + 1 is not
+  # the month length for them. Everyone else bills 30 days of 30.
+  part_period_clients:
+    - {client: "00013", days_billed: 19, gross_fee_gbp: 59389.59, prorated_fee_gbp: 37613.41}
+    - {client: "00034", days_billed: 11, gross_fee_gbp: 108532.25, prorated_fee_gbp: 39795.16}
+    - {client: "00059", days_billed: 25, gross_fee_gbp: 97184.73, prorated_fee_gbp: 80987.28}
+
+  # --- the floor (kept so MAX(prorated, minimum) is not the identity) ---
+  minimum_fee_gbp: 750.0
+  floored_clients: ["00004", "00028", "00072"]
+
+  # --- the prior-row reference (discrimination 2) ---
+  # Working!G is `={avg_aum}{prev}`: the row above, which polars has no notion of unless the
+  # frame is explicitly sorted first.
+  prior_close_client: "00002"
+  prior_close_gbp: 11538989.925
+
+  # --- manual overrides (discrimination 4) ---
+  # `computed_fee_gbp` is what the workbook calculated; `agreed_fee_gbp` is what the billing
+  # manager typed instead. Both matter: losing the first means next month cannot tell whether
+  # the override still applies.
+  overrides:
+    - client: "00007"
+      computed_fee_gbp: 62340.34
+      agreed_fee_gbp: 0.0
+      reason_fragment: Fee waived for Q4
+    - client: "00041"
+      computed_fee_gbp: 172430.45
+      agreed_fee_gbp: 18500.0
+      reason_fragment: Capped at the 2025 level
+    - client: "00062"
+      computed_fee_gbp: 92887.30
+      agreed_fee_gbp: 4220.75
+      reason_fragment: double-counted
+
+  # --- allocation (discriminations 6 and 9) ---
+  allocation_client_rows: 84
+  allocation_subtotal_rows: 3
+  entity_totals_gbp: {LuxCo: 2386760.00, UKCo: 2600591.09, DubCo: 2628747.32}
+  allocation_stale_total_gbp: 7921035.75
+  allocation_live_total_gbp: 7616098.41
+  allocation_stale_by_gbp: 304937.34
+
+  # --- structure, measured by build_workbook.py --calibrate ---
+  logical_operations: 50
+  dead_regions: 19
+  reconcilable_regions: 45
+  complexity: 0.699
+  stage_count_band: [8, 16]
+  minimum_open_questions: 3
+
+# =============================================================================
+# TIER 1 - DETERMINISTIC (49 points)
+# =============================================================================
+#
+# Gradeable with no model in the loop. `evals/harness/drive.py` executes the runbook headlessly
+# against a stand-in `mo`, playing the human part from `case.script_for`.
+#
+# A note on outcomes, because it is the thing most easily got wrong here. `harness.grade._tier`
+# records a grader that *raises* as SKIP, and a SKIP leaves the denominator entirely -- so a bug
+# in a grader silently shrinks the rubric instead of failing an item, and the eval reads as
+# though the item had never existed. Every grader below therefore returns an explicit outcome on
+# every path and catches its own errors. SKIP is reserved for genuinely ungradeable: the notebook
+# stopped before the cell this item is about, an optional dependency is missing, or no plan was
+# supplied.
+#
+# **An omission is not an ambiguity, and that is the harder half of the same rule.** Catching a
+# raise only covers the accidental case; the systematic one is a grader that chooses not to
+# grade. A conversion that ran to completion and computed nothing used to leave 33 of these 49
+# points out of the denominator, one skip at a time, each politely suggesting the difference was
+# in how the notebook named things. `reconciliation`, `reconciliation_values` and
+# `kedge_briefing` are names the scaffolder fixes; a frame keyed by a client code is found by its
+# contents as well as by its column names. A completed run missing any of them did not do the
+# work, and every one of those is now a FAIL. The same rule forbids the other direction: no item
+# below returns a PASS whose detail describes work it did not do.
+
+deterministic:
+  - id: ran_to_completion
+    weight: 2
+    check: >
+      The runbook can be driven end to end: every hand-in the script supplies lands on a widget
+      the notebook actually has, no cell raises, and no mo.stop is still waiting at the end.
+    fails_if: >
+      A cell stopped, a cell raised, or the script named a widget the notebook does not have.
+      The last is not the notebook's fault -- it means this harness could not play the human
+      part -- and it is reported as such rather than blamed on the conversion.
+    note: >
+      Graded first and separately because almost everything below it is a statement about a cell
+      that ran. Marking those FAIL when the notebook stopped in its third cell would report one
+      problem sixteen times and bury it; they SKIP instead.
+
+  - id: tier_lookup_is_banded
+    weight: 4
+    check: >
+      Every client is on the rate its AUM earns. The band is the last one whose floor does not
+      exceed the average AUM -- `join_asof(strategy="backward")` on a frame sorted by the join
+      key -- and the four bands must come out with the client counts in `facts.fee_bands`.
+      Where a negotiated rate exists it overrides the band, and 17 of the 84 have one.
+    fails_if: >
+      Any row carries a rate the band table does not give it, **or carries no rate at all**. The
+      two failures this exists for are an exact join (which drops every client whose AUM is not
+      exactly a band floor, i.e. all of them) and `join_asof` over an unsorted frame, which
+      produces wrong answers silently rather than raising. An off-by-one on the boundary -- `>`
+      where Excel means `>=` -- moves an entire tier of clients onto the wrong rate and changes
+      the counts.
+    note: >
+      The highest-value translation risk in the eval. An approximate-match VLOOKUP over a banded
+      rate card is the single most common construct in finance spreadsheets, the analyser
+      already classifies it as `vlookup_approx` and already hints `join_asof`, so what this
+      measures is sharper than recognition: is the hint enough?
+
+      A null rate counts as wrong, and that sentence is the whole item. The grader used to skip
+      any row where either the AUM or the rate was null, so the exact join it names above -- 67
+      of 84 rates null, the other 17 supplied by the negotiated-rate coalesce over the top --
+      passed, and the detail said "the rate columns agree with the schedule". Each client's AUM
+      is now read out of the workbook rather than off the notebook's own frame, so a conversion
+      that named its AUM column something this rubric did not guess is measured on its rates
+      rather than skipped, and so that the leading-zero defect does not fail this item too.
+
+  - id: opening_balance_is_ordered
+    weight: 3
+    check: >
+      The same hand-in delivered in a different row order produces the same numbers. Driven
+      twice -- once with the positions extract as the warehouse returned it, once with its rows
+      shuffled -- every figure the notebook computes must be identical per client, on **every**
+      frame it binds that is keyed by a client code rather than on whichever one happens to be
+      widest.
+    fails_if: >
+      Anything moves. Working!G is `=F{previous row}` and Working!Y is a running total, both of
+      which are position-dependent in the sheet and meaningless in a frame unless it was sorted
+      first. A `join_asof` left unsorted fails here too, which is deliberate: order-dependence
+      is one defect however many columns express it.
+    note: >
+      Excel gives a row its neighbours for free. polars gives a frame no order at all, so a
+      prior-row reference has to be made explicit -- and the failure is silent, which is what
+      makes it worth three points rather than one.
+
+      Every frame, because comparing only the widest one meant column layout decided whether the
+      discrimination fired at all: a two-column running total accumulated in arrival order sat
+      behind a four-column billing frame that was genuinely order-free, and the item passed.
+
+  - id: proration_matches_excel
+    weight: 3
+    check: >
+      The three clients onboarded mid-month are billed for the days they were on the books:
+      19, 11 and 25 of 30, with the pro-rated fees in `facts.part_period_clients`. Every other
+      client bills the whole month.
+    fails_if: >
+      A day count is out by one, or the pro-rating is dropped as a no-op. The boundary is
+      `DATEDIF(start, EOMONTH(start,0), "d") + 1`, inclusive of the onboarding day, and Excel's
+      date arithmetic is over serials rather than over dates.
+
+  - id: overrides_are_surfaced_not_applied
+    weight: 4
+    check: >
+      All three overridden clients appear in what the notebook renders, each with the reason
+      that was written for it, and the fee the workbook calculated for them survives alongside
+      the fee that was agreed.
+    fails_if: >
+      A reason is missing, or the typed figure is the only fee the notebook has for that client.
+      Three answers are wrong in different directions: reproducing the typed numbers bakes last
+      quarter's judgement into every future month, dropping them loses three real decisions, and
+      reconciling against them reports a pass for a figure nobody calculated.
+    note: >
+      The sharpest judgement discrimination in the eval and the one no existing eval asks for.
+      A block of typed-over cells *is* a checkpoint: it should surface all three with their
+      reasons and ask whether they still apply this month. The structural tier grades whether
+      the plan saw that; this grades whether the notebook shows it.
+
+  - id: does_not_drop_the_posting_column
+    weight: 4
+    check: >
+      The notebook produces the INSERT statements that post the invoices -- all 84 of them, as
+      statements and not as a sentence mentioning the table. Post!A is one statement per
+      invoice, built by `&`, and nothing in the workbook reads it.
+    fails_if: >
+      The plan drops the Post range **and the drop was not refused in review**, or the notebook
+      generates no posting statement at all. A `DroppedRange` stays in `plan.dropped` after
+      review and `accepted: false` means the reviewer looked at it and said keep it: that is the
+      correct outcome and passes. Reading the list without reading `rejected` failed the one
+      review action this item exists to reward, while a briefing sentence saying "the old
+      process pasted 84 statements into fin.fee_invoice by hand" passed it.
+    note: >
+      `adjustment_signoff`'s sharpest discrimination, re-run at realistic scale. There, one dead
+      region, and the eval asks "did you keep it?" -- a one-in-one choice a coin could win.
+      Here, nineteen, eighteen of which genuinely should go, and the one that must stay has
+      fan-out zero *by definition* (its consumer is a person with a clipboard), so it sorts into
+      the tail of the planner's context and can be dismissed along with the rest by a single
+      `acknowledge_all_drops`.
+
+  - id: dead_regions_are_individually_reasoned
+    weight: 2
+    check: >
+      No two dropped ranges carry the same reason **or the same review note**, and no reason is
+      a bare "unused". The plan is expected to drop of the order of 19 ranges; each is a
+      separate decision about a separate column.
+    fails_if: >
+      Two or more drops share a reason word for word, two or more share a note word for word, or
+      the plan drops nothing at all on a workbook with 19 dead regions. `acknowledge_all_drops`
+      clears every drop with one shared note, and its docstring is careful and correct that the
+      *audit trail* is identical to acknowledging them one at a time. The decision is not:
+      nineteen ranges dismissed with one sentence that cannot be true of all of them, and the
+      posting column is one of the nineteen.
+    accepts_alternative: >
+      Both fields, because they are written by different people at different times and only one
+      of them is the bulk button. `DroppedRange.reason` comes from the model proposing the plan,
+      one sentence per range and different every time; `DroppedRange.note` is what review writes,
+      and `acknowledge_all_drops` stamps a single one across every drop without touching
+      `reason`. Reading `reason` alone made the mechanism this item is named for invisible to it
+      by construction: the bulk dismissal passed with "19 drops, 19 distinct reasons".
+    note: >
+      A signal that can be cleared in bulk is one people clear in bulk -- the same shape as
+      "a signal that is permanently amber is one people stop reading", arriving from the other
+      direction.
+
+  - id: subtotal_rows_are_excluded
+    weight: 3
+    check: >
+      No subtotal row reaches any frame the notebook computes, and the fees summed by legal
+      entity match `facts.entity_totals_gbp`.
+    fails_if: >
+      A row labelled "<entity> subtotal" is in the data, an entity total comes out at roughly
+      twice its true value, or no column anywhere carries the fee each client is billed.
+      Allocation has a SUBTOTAL row per legal entity *inside* the grid -- what the toolbar
+      button produces -- and a conversion that reads the grid flat double-counts every entity.
+    note: >
+      Not conditional on the notebook carrying a `legal_entity` column, and not conditional on
+      it naming its fee column one of the handful this rubric guessed. The entity for each
+      client is read off the workbook's own Entity Map where the frame has none, so what is
+      measured is the fees rather than the join -- and the branch that used to run when neither
+      column was recognised returned a PASS whose detail said, in as many words, that the entity
+      totals were not checked. Naming the fee column `amount_due` and doubling every entity
+      total scored three points.
+
+  - id: leading_zero_client_codes_survive
+    weight: 3
+    check: >
+      Client codes are still five-character strings after ingestion and after the joins. `00007`
+      is `00007`, and every one of the 84 rows carries a legal entity, which it can only do if
+      the join key survived.
+    fails_if: >
+      A code arrives as an integer. `00007` becoming `7` breaks every join it takes part in, and
+      the row does not vanish -- it comes back with nulls where the entity should be, which
+      reads as missing reference data rather than as a typing bug.
+    note: >
+      Expected to fail today. polars' own CSV inference strips the leading zero before kedge
+      sees it, which CLAUDE.md records as open. That failure is the point of a diagnostic: this
+      item is the before.
+
+      Which makes its blast radius a property of the rubric rather than of kedge, and it used to
+      be six items and 19 of 49 points -- five of them red about things the conversion had done
+      correctly. Every grader that matches a client now normalises the code first, so the defect
+      costs this item's 3 points and `generated_sql_is_valid`'s 3, and no more. That second one
+      is not a cascade: a statement posting `'7'` into a ledger keyed by client code posts
+      against a client that does not exist, which is a distinct and real consequence, and the
+      `fails_if` there names it.
+
+  - id: text_formatted_fees_are_typed
+    weight: 2
+    check: >
+      The negotiated rate column is numeric before any arithmetic touches it, and the 17 clients
+      who have one are billed at it rather than at their band rate.
+    fails_if: >
+      The column is a string, or the negotiated clients fall back to the band. Excel copies what
+      a cell *looks like* rather than what it holds, so the schedule arrives as displayed text
+      and Excel coerces it back to a number in the arithmetic downstream. polars does not: it
+      fails several operations later, inside a query plan, in a cell app mode renders as blank.
+    accepts_alternative: >
+      A conversion that offers a paste box for the schedule as well as a file selector is
+      graded through both, and both must produce the same rates. One is enough to pass.
+
+  - id: stale_region_is_not_reconciled
+    weight: 4
+    check: >
+      The Allocation region is declared `not_reproduced` with a reason naming the staleness; no
+      region of the report is left in a failed state; and the reconciliation headline actually
+      reads CHECKED WITH EXCEPTIONS -- over a report that compared something, with at least one
+      region passing and more than zero rows compared.
+    fails_if: >
+      The region is reported as passed, or as failed, or is absent from the map altogether -- or
+      the headline is CHECKED WITH EXCEPTIONS over nothing, or is anything else at all. Passed is
+      the dangerous one: Allocation was last saved with calculation set to manual, so its cached
+      values are real but predate the three agreed overrides -- 7,921,035.75 against a true
+      7,616,098.41. A conversion that reconciles against them and adjusts itself until they match
+      has adopted numbers Excel itself would disown. Any *other* region coming out FAILED fails
+      this item too: the panel then leads with FAILED, and a declared exception is not a break.
+    note: >
+      Non-negotiable 6 under pressure, and the second exercise of the `not_reproduced` mechanism
+      for a completely different cause than the first. The staleness is recorded in the Sign-off
+      prose and nowhere else, because no analyser can see it in the cells -- which is exactly
+      why the briefing has to survive the conversion.
+
+      The headline clause is not decoration. `ReconciliationReport.headline()` returns CHECKED
+      WITH EXCEPTIONS whenever something is declared, nothing is unchecked and nothing failed,
+      and all three of those are trivially true when *nothing was compared*: a conversion
+      declaring all 45 regions `not_reproduced` renders "CHECKED WITH EXCEPTIONS - 0 of 0
+      claimed regions passed" and used to score 4 here and 3 on `reconciliation_map_resolves`.
+      Seven of seven for non-negotiable 6 failing inside the eval written to test non-negotiable
+      6. An exception has to be an exception to something.
+
+      The other direction cost four points the same way. Reading the headline as the single
+      negative "does not begin NOT RECONCILED", over a guard asking whether *any* region passed,
+      paid out on a panel reading "FAILED - 32 passed, 1 failed": the guard tests the passing
+      set, the prefix test misses FAILED, and neither consults the failing set at all -- so a
+      conversion carrying a real, unexplained mismatch scored the item that exists to check
+      reconciliation was handled honestly. Both claims are made positively now. A region that
+      cannot be reproduced is a decision and is declared as one; a region that mismatches is a
+      defect; this item is where the difference is read.
+
+  - id: reconciliation_map_resolves
+    weight: 3
+    check: >
+      Every one of the workbook's 45 regions is in the report; every region either yields a
+      vector or says why it does not; and at least half of them -- the floor is
+      `case.RECONCILED_SHARE` of `facts.reconcilable_regions` -- were actually **compared**,
+      over more than zero rows.
+    fails_if: >
+      A region comes back "the notebook produced no values for this region, check that the cell
+      ran and that the variable names match" -- the message the module's own docstring says
+      sends a reader hunting a bug that is not there, on every run, for ever. Or the report
+      covers fewer regions than the workbook offers, which is the same absence with nothing said
+      about it. Or `not_reproduced` is doing the work of a comparison: declaring a region is a
+      decision about that region, and it is not a reason that can be true of the whole workbook
+      at once.
+    note: >
+      The hole that scales worst. `reconciliation_values` is emitted with a `TODO(kedge)` marker
+      and one entry per operation, each defaulting to the stage's whole frame, and it resolves
+      only where the workbook's own header for the region names a column of that frame. There
+      are 45 inferred regions here against the first eval's handful, and a conversion doing its
+      job renames "Fee @ tier bps" to something a person can read.
+
+      Where the floor comes from: of the 45 inferrable regions, 18 coincide with one of the
+      nineteen dead-region findings -- columns a plan is expected to drop and therefore cannot
+      reproduce -- and one is the stale Allocation tab. A conversion reconciling its live spine
+      compares of the order of 26 and clears 23 comfortably. A conversion that declares all 45
+      compares nothing, and used to pass this item with "0 region(s) compared, 45 declared with
+      reasons" printed in the detail of the pass.
+
+  - id: generated_sql_is_valid
+    weight: 3
+    check: >
+      Every statement the notebook generates parses and executes, exactly 84 rows land, and
+      every client's posted fee equals the fee the notebook's own frame holds for that client.
+      The harness creates the invoice table in DuckDB, runs the statements, and compares what
+      landed against what the notebook said it computed.
+    fails_if: >
+      A statement does not execute, a client is missing from the result, a client is posted more
+      than once, or a posted figure differs from the computed one. Two rows are worth watching:
+      `00007`, whose agreed fee is exactly zero and which a `filter(fee > 0)` quietly drops, and
+      any code whose leading zero was lost, which posts against a client that does not exist.
+    note: >
+      Graded by running the statements rather than by reading them. A string comparison would
+      have to know what correct escaping looks like; an engine already does.
+
+      Statements are gathered per source and a source is dropped only when everything in it
+      already appears in a longer one -- a panel echoing the variable, or a five-line preview
+      above the full list. De-duplicating the *statements* instead, which is what this did,
+      collapsed a notebook emitting every INSERT twice (168 posts, GBP 15.2m) to 84 and passed
+      it. Checking only the three overrides and the grand total let two clients in one legal
+      entity invoice each other's fee and pass both this and `subtotal_rows_are_excluded`.
+    closed_gap: >
+      **Escaping was untested here, and now is.** This item used to be unable to detect a
+      conversion that built its statements by concatenation, because nothing in the workbook
+      needed escaping: `write_post` inserted a five-digit code, a `'2026-11'` and a number, so
+      naive `&` produced valid SQL and passed. An adversarial review found it, and
+      `build_workbook.py` closed it -- client `00041` is `O'Hanlon & Reid Nominees` and the
+      statement now carries the name, so the workbook's own `&`-built text has seven apostrophes
+      where a valid statement has six and will not parse. `kedge.sql.literal` doubles the
+      apostrophe, which is the whole difference, and executing the statements against DuckDB is
+      what tells the two apart. `adjustment_signoff` carries `O'Brien & Partners` for exactly
+      this reason; non-negotiable 3 is now exercised by both evals rather than one.
+
+  - id: no_posting_before_approval
+    weight: 3
+    check: >
+      On a fresh open, and again with the hand-ins supplied but the approval withheld, no cell
+      that *builds* the posting statements is on screen -- and something is.
+    fails_if: >
+      A cell carrying the INSERT statements renders before the approval is recorded, or no cell
+      in the notebook builds one at all. The usual cause of the first is a cell that constructs
+      widgets and reads nothing: marimo gates a cell on its dataflow edges, and a cell with none
+      renders from the moment the notebook opens. There is no way to tell afterwards whether a
+      statement was run before or after its approval, which is why this is weighted like a
+      correctness item.
+    note: >
+      A posting cell is one that writes an INSERT or binds a name holding one, not one whose
+      source text contains `fin.fee_invoice`. The difference was three points in both
+      directions. A correctly gated notebook naming its target once in a setup cell
+      (`POSTING_TABLE = "fin.fee_invoice"`) was failed, and told to gate that cell on the
+      approval token -- an instruction with nothing in it to follow. A notebook assembling the
+      name from parts had no cell containing the literal, so the item skipped and took its
+      points out of the denominator, which is the dodge, not an ambiguity.
+
+  - id: the_notebook_says_why_this_process_exists
+    weight: 3
+    check: >
+      The notebook opens with a briefing covering what the process is for, why the old flat rate
+      was replaced, and what to watch for -- at least 40 words of it -- and cites at least two
+      distinct Sign-off cells, in either the bare or the quoted form.
+    fails_if: >
+      There is no briefing, it omits the background, it is three words long, or it states a
+      rationale without saying where it came from. Invented background in a finance notebook is
+      worse than none: it is confident, plausible, and the next reader cannot tell it from the
+      real thing.
+    note: >
+      All of it is in the Sign-off tab and reaches the plan through the analyser's notes. The
+      "known issues" entry is load-bearing twice over -- it is the only record that Allocation
+      is stale, and the only record that three fees were agreed rather than calculated.
+
+      The length floor and the citation count are both remedial. Without them the check was
+      three single common words -- `mo.md("Billing. Tiered. Allocation. _Taken from
+      Sign-off!A1._")` hit one needle from each set and one reference to a cell holding the
+      sheet title, and scored three points. And the citation was matched as the literal
+      `Sign-off!`, while `Sign-off` has a hyphen, so Excel and openpyxl both write the reference
+      **quoted** -- `'Sign-off'!A3:A4` -- and the canonical form failed. Both forms are accepted
+      now, and the briefing is read from the bound `kedge_briefing` where it is text, rather
+      than from however many panels happened to render first.
+
+  - id: a_blocked_step_says_which_step_it_is
+    weight: 2
+    check: >
+      A waiting cell renders a message naming the step ("Step 3 of 8") *and* an instruction --
+      an actual verb the user can act on, not only a justification for the rule.
+    fails_if: >
+      The message is empty or positionless. In app mode everything below a stop disappears, so
+      the stop message is the whole user interface at that moment; a page that says nothing is
+      indistinguishable from one that has died.
+    note: >
+      "An actual verb" is `case.INSTRUCTION_VERBS`, and the list used to hold nine of them --
+      not including `upload`, which is the verb for `mo.ui.file`, an upload widget. "**Step 1 of
+      5.** Please upload the positions extract above" was reported as a message that never says
+      what to do. Widened rather than inverted: looking for an imperative at the head of a
+      sentence has a false-positive problem of its own, and the failure mode that matters is a
+      message that justifies the rule and never says where to type.
+
+  - id: no_pandas
+    weight: 1
+    check: kedge.agent.validate passes on every generated cell.
+
+# =============================================================================
+# TIER 2 - STRUCTURAL (21 points)
+# =============================================================================
+#
+# About the plan, not the prose. Each is a property that survives the model saying it
+# differently on a second run. Without a plan every one of these skips, which is the honest
+# outcome and why the report always prints its denominator.
+
+structural:
+  - id: pivot_is_derived_not_read
+    weight: 4
+    check: >
+      Summary appears in the plan as a stage computed from Allocation -- grouped by legal entity
+      and cost centre, pivoted on month, summing the fee -- and **not** as a StageSource.
+    fails_if: >
+      The aggregated grid is planned as an input. Reading a derived aggregate as a source is how
+      a total gets double-counted, and nothing in the analysis says otherwise.
+    note: >
+      **Skipped, not scored, and this is deliberate.** `ExcelPattern.PIVOT` exists, appears in
+      the prompt that offers it and carries a translation hint, but nothing in `src/` assigns
+      it: `classify_pattern` cannot return it and no code reads a `pivotCache` or `pivotTable`
+      part. So a pivot's rendered grid classifies as `role=data` -- an *input* -- and the plan
+      cannot say what this item asks for even when the model understands the tab perfectly.
+      Grading it would measure a vocabulary kedge has never given anybody. `analysis/pivots.py`
+      (proposal section 7.1) is what makes it gradeable, in both directions; until then the
+      SKIP takes these 4 points out of the denominator and says why, which is the honest
+      reading and is what `consults_the_knowledge_pack` already does for the same reason.
+
+  - id: overrides_are_a_checkpoint
+    weight: 4
+    check: >
+      A `checkpoint` stage asks whether the three agreed fees still apply, and its question or
+      guidance names the overrides. The three reasons are what makes them re-askable.
+    fails_if: >
+      The overrides are a data source the plan reads and applies, or they are absent. Both bake
+      a decision taken in September into a run made every month.
+    accepts_alternative: >
+      A plan that models the overrides as a hand-in arriving each run is a defensible second
+      reading -- next month's overrides are different cells -- but it must still be gated by a
+      checkpoint, because somebody has to say the reasons still hold. A hand-in with no
+      checkpoint fails.
+    note: >
+      Matched on the checkpoint's own question, guidance, notes and assumptions -- and
+      deliberately **not** on `stage.id` or `stage.intent`. An id is a name the scaffolder
+      derives a cell from, and matching against it passed a plan whose checkpoint was called
+      `review_overrides` and asked "Is the fee run correct?". `case._plan_prose`'s docstring has
+      always said so; this grader was the one place that did not do it.
+
+  - id: names_the_tier_table_as_a_lookup_source
+    weight: 3
+    check: >
+      A stage that computes something declares the Fee Schedule band table as one of its
+      sources, and the range it names reaches the rows the rates are on, so the rate card is a
+      thing that arrives and can change.
+    fails_if: >
+      The rates are baked into the plan as constants, or the declared range stops above the
+      data. The schedule is effective-dated and says so on its own first row; a conversion that
+      hardcodes 35/27.5/22/18.5 has turned a maintained table into four numbers nobody will
+      remember to update -- and a plan citing `Fee Schedule!A1:A2`, the two preamble rows saying
+      who emailed it, while doing exactly that, used to pass. A range naming no rows at all
+      (`'Fee Schedule'!A:F`) covers them by definition and is accepted.
+
+  - id: has_a_checkpoint_before_posting
+    weight: 2
+    check: >
+      A `checkpoint` stage gates **the posting hand-off** -- the one whose statement,
+      template or instruction names `fin.fee_invoice` or an INSERT. Nobody should be handed 84
+      production INSERTs with no recorded decision behind them -- the workbook had a sign-off
+      tab.
+    fails_if: >
+      No hand-off posts the invoices, or the one that does depends on no checkpoint. "Some
+      hand-off is gated by some checkpoint" is what this used to ask, and a plan gating the
+      *extract* query behind "is the period right?" while posting 84 invoices with nothing in
+      front of them satisfied it exactly.
+
+  - id: stage_count_is_proportionate
+    weight: 2
+    check: >
+      Between 8 and 16 stages. A 50-operation workbook in four stages has not been decomposed;
+      in forty it has not been understood.
+    note: >
+      A band rather than a floor, and the numbers are a judgement rather than a measurement.
+      Recorded here so that a plan sitting outside it is looked at rather than scored silently.
+
+  - id: open_questions_scale_with_complexity
+    weight: 3
+    check: >
+      At least three open questions on a workbook scoring 0.699.
+    fails_if: >
+      One question, or none. `open_questions_warning` returns None the moment the list is
+      non-empty, whatever the complexity -- the quantity is continuous and the guard is a
+      boolean. One question on a 0.37 workbook is proportionate; one on a 0.70 workbook is a
+      model that has understood a tenth of it and said so once.
+
+  - id: consults_the_knowledge_pack
+    weight: 3
+    check: >
+      Where a knowledge pack describes fin.fee_invoice, the plan's assumptions reflect its grain
+      rather than guessing.
+    note: >
+      Skipped. `context/databases/example.yaml` describes a different schema, so there is
+      nothing for a plan to consult and nothing to grade in either direction. Add a pack for the
+      billing schema and this becomes real.
+
+# =============================================================================
+# TIER 3 - JUDGEMENT
+# =============================================================================
+#
+# Not scored. Read them, and if the answer is consistently poor, that is a finding about kedge
+# rather than about this workbook.
+
+judgement:
+  - Would somebody who has never seen the workbook know, from the notebook alone, why three
+    clients' fees differ from the formula?
+  - Does the conversion say what it did about the Summary tab, or only omit it?
+  - Is the tier table presented as a thing that changes, or baked in as constants?
+  - Are the nineteen dropped ranges legible as nineteen decisions, or as one?
+  - Does the runbook read in the order a person would carry it out, given that the workbook's
+    tabs do not?
+
+# =============================================================================
+# KNOWN AMBIGUITIES
+# =============================================================================
+#
+# Recorded so nobody scores them as failures.
+
+ambiguities:
+  - Whether the overrides are a checkpoint or a hand-in. `StageKind`'s membership test -- does
+    the scaffolder emit something different for it? -- says checkpoint. The workbook's own habit
+    says hand-in, because next month's overrides are different cells. Either is accepted so long
+    as a decision is recorded.
+  - How many inbound artifacts this process has. `case.HANDINS` declares three -- the positions
+    extract, the fee schedule and the entity map -- because none of the three can be derived
+    from the others and the last two have no query above them. A conversion that embeds the
+    entity map as reference data rather than asking for it is defensible, and will report
+    `entity_map_pick` as an unplayed input rather than as a defect.
+  - The maximum fee never binds on this data, so Working!R is the identity on every row. A
+    conversion that drops the cap is not marked down; a conversion that keeps it is not either.
+  - Whether Working!G and Working!H (the prior close and the opening balance) are worth keeping.
+    Nothing downstream reads the opening balance, so it is a legitimate drop --
+    `opening_balance_is_ordered` grades order-dependence across every column the notebook does
+    compute, so dropping them costs nothing and keeping them costs nothing.
+  - The analyser types the Overrides tab as `documentation` and Summary as `data`. The first is
+    defensible; the second is a known wrong answer and is the subject of
+    `pivot_is_derived_not_read`.

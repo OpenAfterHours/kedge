@@ -543,8 +543,10 @@ def xml_attr(text: str) -> str:
     """Escape text for an XML attribute, preserving newlines as ``&#10;``.
 
     XML attribute-value normalisation turns a literal newline into a space, so a
-    multi-line SQL statement must encode its line breaks numerically or the
-    statement comes back as one long line. Excel writes ``&#10;``; so do we.
+    multi-line SQL statement must escape its line breaks or the statement comes
+    back as one long line. Excel escapes them as ``_x000a_``; the fixtures use
+    the ``&#10;`` character reference, which is the readable form and the other
+    of the two ``kedge.analysis.connections`` decodes.
     """
     return (
         text.replace("&", "&amp;")

@@ -35,7 +35,15 @@ if str(EVAL_ROOT) not in sys.path:
     sys.path.insert(0, str(EVAL_ROOT))
 
 from adjustment_signoff import case as adjustment_case  # noqa: E402
-from harness.grade import grade, load_plan  # noqa: E402
+from harness.grade import (  # noqa: E402
+    CASES,
+    grade,
+    handins_for,
+    human_script,
+    load_case,
+    load_plan,
+    placeholder_handins,
+)
 from harness.model import Outcome  # noqa: E402
 
 PLAN_PATH = adjustment_case.CASE_DIR / "plan.yaml"
@@ -274,6 +282,136 @@ def test_a_notebook_that_stops_fails_completion_and_skips_the_rest(tmp_path: Pat
     assert outcome_of(report, "hands_over_rather_than_pretends") is Outcome.PASS
 
 
+# ── negative controls on the reconciliation panel ────────────────────────────
+#
+# Stub reports rather than notebook mutations. The question these ask -- can a declared
+# exception be told from a genuine break -- is a question about the *report*, and producing one
+# holding a real mismatch from the reference conversion would mean breaking the arithmetic,
+# which is a different item's business.
+
+
+def _reconciliation_context(regions: list[Any]) -> Any:
+    from harness.drive import NotebookRun
+
+    from kedge.reconcile.model import ReconciliationReport, Tolerance
+
+    report = ReconciliationReport(
+        workbook=adjustment_case.WORKBOOK.name,
+        tolerance=Tolerance(),
+        spec_source="inferred",
+        regions=regions,
+    )
+    run = NotebookRun(
+        path=adjustment_case.REFERENCE_NOTEBOOK,
+        definitions={"reconciliation": report},
+        cells_run=("reconciliation",),
+    )
+    return adjustment_case.Context(run=run, facts={}, notebook=adjustment_case.REFERENCE_NOTEBOOK)
+
+
+def _declared_sql_column() -> Any:
+    """``Adjustment!G``, correctly declared: rendered through ``kedge.sql`` instead."""
+    from kedge.reconcile.model import (
+        NotReconciledReason,
+        ReconciliationStatus,
+        RegionResult,
+        Tolerance,
+    )
+
+    return RegionResult(
+        spec_id="adjustment_sql",
+        reference="Adjustment!G17:G92",
+        status=ReconciliationStatus.NOT_RECONCILED,
+        reason=NotReconciledReason.NOT_REPRODUCED,
+        detail="rendered through kedge.sql; the workbook's own statement for ACC-00041 is invalid",
+        tolerance=Tolerance(),
+    )
+
+
+def _uplift_region(*, matching: bool) -> Any:
+    from kedge.reconcile.model import ReconciliationStatus, RegionResult, Tolerance
+
+    if matching:
+        return RegionResult(
+            spec_id="uplift",
+            reference="Adjustment!F17:F92",
+            status=ReconciliationStatus.PASSED,
+            tolerance=Tolerance(),
+            rows_compared=76,
+            rows_matched=76,
+        )
+    return RegionResult(
+        spec_id="uplift",
+        reference="Adjustment!F17:F92",
+        status=ReconciliationStatus.FAILED,
+        tolerance=Tolerance(),
+        rows_compared=76,
+        rows_matched=44,
+        rows_differing=32,
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario", "wrong", "outcome"),
+    [
+        (
+            "a-defect-declared-as-a-decision",
+            "Adjustment!G declared correctly, and the uplift column compared and mismatched. "
+            "The panel reads 'FAILED - 0 passed, 1 failed', which does not begin NOT RECONCILED "
+            "-- so a headline check written as a single negative paid out two points for "
+            "handling reconciliation honestly while carrying an unexplained break",
+            Outcome.FAIL,
+        ),
+        (
+            "an-exception-to-nothing",
+            "Adjustment!G declared and nothing else mapped at all. The panel reads 'CHECKED "
+            "WITH EXCEPTIONS - 0 of 0 claimed regions passed': an exception has to be an "
+            "exception *to* something, and an empty sentence in the green-ish half of a traffic "
+            "light is the false claim non-negotiable 6 exists to prevent",
+            Outcome.FAIL,
+        ),
+        (
+            "declared-and-everything-else-clean",
+            "the correct answer: Adjustment!G declared with its reason, every claimed region "
+            "compared and matching",
+            Outcome.PASS,
+        ),
+    ],
+)
+def test_a_declared_exception_is_told_apart_from_a_break(
+    scenario: str, wrong: str, outcome: Outcome
+) -> None:
+    """A region that cannot be reproduced is a decision; one that mismatches is a defect.
+
+    ``fee_billing_run``'s equivalent item had this defect and was fixed first; this is the same
+    fix and the same control on the first eval. Both halves of the claim are now positive --
+    nothing in ``report.failed``, and something actually compared and matched -- because the
+    negative form (does the headline avoid one prefix?) was satisfied by the two wrong answers
+    above.
+    """
+    regions = {
+        "a-defect-declared-as-a-decision": [
+            _declared_sql_column(),
+            _uplift_region(matching=False),
+        ],
+        "an-exception-to-nothing": [_declared_sql_column()],
+        "declared-and-everything-else-clean": [
+            _declared_sql_column(),
+            _uplift_region(matching=True),
+        ],
+    }[scenario]
+    grader = adjustment_case.DETERMINISTIC["a_declared_exception_does_not_read_as_a_defect"]
+
+    result = grader(_reconciliation_context(regions))
+
+    assert result.outcome is outcome, (
+        f"a_declared_exception_does_not_read_as_a_defect returned "
+        f"{result.outcome.value.upper()} where {outcome.value.upper()} is owed.\n"
+        f"The conversion under test has {wrong}.\n"
+        f"What the grader said: {(result.detail or '(nothing)')[:400]}"
+    )
+
+
 # ── negative controls on the plan ────────────────────────────────────────────
 
 
@@ -322,3 +460,99 @@ def test_no_plan_skips_the_structural_tier_rather_than_failing_it() -> None:
         "a missing plan must not be reported as a failed conversion"
     )
     assert report.ok
+
+
+# ── the harness holds no opinion about how many hand-ins a case has ──────────
+
+
+class _ThreeHandInCase:
+    """A case whose process asks for three inbound artifacts, named rather than counted.
+
+    ``adjustment_signoff`` has exactly two and returns them positionally, so it could never have
+    caught a two-hand-in assumption in case-independent code -- it *is* that assumption. This is
+    the smallest case that can, and it is a stand-in rather than a real eval because the defect
+    being guarded against lives in ``harness/``, not in anybody's rubric.
+    """
+
+    HANDINS = ("positions", "fee_schedule", "prior_positions")
+
+    @staticmethod
+    def write_handins(directory: Path) -> dict[str, Path]:
+        directory.mkdir(parents=True, exist_ok=True)
+        written = {}
+        for name in _ThreeHandInCase.HANDINS:
+            path = directory / f"{name}.csv"
+            path.write_text("client,amount\nC-001,1.00\n", encoding="utf-8")
+            written[name] = path
+        return written
+
+    @staticmethod
+    def script_for(*, positions: Path, fee_schedule: Path, prior_positions: Path) -> dict[str, Any]:
+        return {
+            "positions_pick": (positions,),
+            "fee_schedule_pick": (fee_schedule,),
+            "prior_positions_pick": (prior_positions,),
+            "approve_billing_decision": "approve",
+        }
+
+
+def test_a_case_may_name_its_handins_instead_of_counting_them(tmp_path: Path) -> None:
+    """Three artifacts, spread by keyword, with nothing in the harness aware there are three."""
+    handins = handins_for(_ThreeHandInCase, tmp_path / "handins-in")
+
+    assert set(handins) == set(_ThreeHandInCase.HANDINS)
+    assert all(path.is_file() for path in handins.values())
+
+    script = human_script(_ThreeHandInCase, handins)
+
+    assert script["positions_pick"] == (handins["positions"],)
+    assert script["prior_positions_pick"] == (handins["prior_positions"],)
+
+
+def test_a_case_that_returns_two_paths_is_still_spread_positionally(tmp_path: Path) -> None:
+    """The shape ``adjustment_signoff`` uses, driven through the generalised path unchanged.
+
+    The real case rather than a stand-in, because the claim is about that case: generalising was
+    not allowed to cost it an edit, so the proof of it has to be it.
+    """
+    handins = handins_for(adjustment_case, tmp_path / "handins-in")
+
+    assert isinstance(handins, tuple), "a positional case must not be forced into a mapping"
+
+    pre, post = handins
+
+    assert human_script(adjustment_case, handins) == adjustment_case.script_for(pre, post)
+
+
+@pytest.mark.parametrize(
+    "case", [_ThreeHandInCase, adjustment_case], ids=["three-named", "two-positional"]
+)
+def test_the_scripts_keys_are_readable_without_writing_a_file(case: Any, tmp_path: Path) -> None:
+    """What ``harness.convert._script_keys`` asks, and the invariant alignment rests on.
+
+    ``--convert`` re-keys the script onto a generated notebook's widget names, which needs the
+    keys and nothing else. If placeholders gave a different set from real hand-ins, alignment
+    would be computed for a script that is never played -- silently, because both are dicts of
+    the right shape.
+    """
+    from_placeholders = tuple(human_script(case, placeholder_handins(case)))
+    from_disk = tuple(human_script(case, handins_for(case, tmp_path / "handins-in")))
+
+    assert from_placeholders == from_disk
+
+
+def test_a_registered_case_with_no_module_says_so_rather_than_tracing() -> None:
+    """A case appears in ``--help`` from the moment it is registered, half-built included.
+
+    ``importlib`` reports that as ``ModuleNotFoundError: No module named 'x.case'``, which reads
+    like a broken harness rather than like an eval nobody has finished yet.
+    """
+    absent = [name for name in CASES if not (EVAL_ROOT / name / "case.py").is_file()]
+    if not absent:
+        pytest.skip("every registered case has a module, which is the intended end state")
+
+    with pytest.raises(SystemExit) as raised:
+        load_case(absent[0])
+
+    assert absent[0] in str(raised.value)
+    assert "case.py" in str(raised.value)

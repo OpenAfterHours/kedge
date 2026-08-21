@@ -595,6 +595,20 @@ def a_declared_exception_does_not_read_as_a_defect(ctx: Context) -> ItemResult:
 
     It is still not a pass. Nothing here can make an unchecked region one, and this insists on
     that as firmly as it insists on the wording.
+
+    And an exception is not a break. The headline check used to be the single negative
+    ``startswith("NOT RECONCILED")``, which nothing else qualified -- so a report reading
+    "FAILED - 32 passed, 1 failed" satisfied it and scored two points for handling
+    reconciliation honestly while carrying an unexplained mismatch, and a report that compared
+    *nothing* and declared its one region rendered "CHECKED WITH EXCEPTIONS - 0 of 0 claimed
+    regions passed" and scored the same. Neither consulted
+    :attr:`~kedge.reconcile.ReconciliationReport.failed`, and FAILED is the most severe status a
+    report can hold. So the claims are now made positively: something must actually have been
+    compared and matched, no region may be in ``report.failed``, and the headline must *read*
+    CHECKED WITH EXCEPTIONS rather than merely avoid one particular prefix. A region that cannot
+    be reproduced is a decision and is declared as one; a region that mismatches is a defect,
+    and this is the item that has to tell them apart. The same defect was found and fixed in
+    ``fee_billing_run``'s :func:`stale_region_is_not_reconciled`.
     """
     missing = ctx.need("reconciliation")
     if missing:
@@ -603,8 +617,9 @@ def a_declared_exception_does_not_read_as_a_defect(ctx: Context) -> ItemResult:
     report = getattr(check, "report", check)
     if report is None:
         return _skip("this run cited a recorded acceptance, so there are no live regions")
+    regions = list(getattr(report, "regions", []))
     region = next(
-        (item for item in getattr(report, "regions", []) if "G17" in (item.reference or "")),
+        (item for item in regions if "G17" in (item.reference or "")),
         None,
     )
     if region is None:
@@ -622,12 +637,55 @@ def a_declared_exception_does_not_read_as_a_defect(ctx: Context) -> ItemResult:
         )
     if "kedge.sql" not in region.detail and "invalid" not in region.detail.lower():
         return _fail("the region is declared, but the reason given explains nothing")
-    headline = report.headline()
-    if headline.startswith("NOT RECONCILED"):
+
+    broken = report.failed
+    if broken:
+        lines = [
+            f"{item.reference or item.spec_id}: {item.rows_differing} of "
+            f"{item.rows_compared} row(s) differ"
+            for item in broken
+        ]
         return _fail(
-            f"the panel still leads with NOT RECONCILED:\n  {headline[:160]}\n"
-            f"Every run of a correct notebook would show that for ever, and a signal that is "
-            f"permanently amber is one people stop reading."
+            f"Adjustment!G is declared, but {len(broken)} of {len(regions)} region(s) came out "
+            f"FAILED:\n  "
+            + "\n  ".join(lines[:6])
+            + (f"\n  ... and {len(lines) - 6} more" if len(lines) > 6 else "")
+            + f"\nThe panel therefore leads with {report.headline().split('.')[0]!r}, which is "
+            f"the most severe thing a reconciliation report can say. A region that cannot be "
+            f"reproduced is a decision, declared with a reason the way Adjustment!G is; a "
+            f"region that mismatches is a defect, and declaring Adjustment!G correctly says "
+            f"nothing about it. Either the arithmetic disagrees with the workbook and wants "
+            f"fixing, or the workbook is the thing that is wrong -- in which case say so, with "
+            f"`not_reproduced=` and the reason why, and it stops being a break."
+        )
+    if not report.passed or report.rows_compared <= 0:
+        return _fail(
+            f"the panel reads {report.headline().split('.')[0]!r} over "
+            f"{report.rows_compared} compared row(s) and {len(report.passed)} passing region(s). "
+            f"CHECKED WITH EXCEPTIONS says the regions that *were* claimed came out clean; with "
+            f"nothing claimed the sentence is empty, and an empty sentence in the green-ish half "
+            f"of a traffic light is the exact false claim non-negotiable 6 exists to prevent. "
+            f"{len(report.declared_not_reproduced)} of {len(regions)} region(s) are declared not "
+            f"reproduced. Declaring a region is a decision about one region, not a way to empty "
+            f"the set the headline is computed over."
+        )
+
+    headline = report.headline()
+    if not headline.startswith("CHECKED WITH EXCEPTIONS"):
+        unchecked = [
+            item
+            for item in regions
+            if item.status.value == "not_reconciled"
+            and getattr(item.reason, "value", None) != "not_reproduced"
+        ]
+        return _fail(
+            f"the panel leads with:\n  {headline[:160]}\n"
+            f"rather than CHECKED WITH EXCEPTIONS. Adjustment!G is declared as a decision, but "
+            f"{len(unchecked)} other region(s) are unchecked for reasons that are not decisions "
+            f"-- they render as 'check that the cell ran and that the variable names match', so "
+            f"every run of a correct notebook would show amber for ever, and a signal that is "
+            f"permanently amber is one people stop reading. Map them, or say why they are not "
+            f"reproduced."
         )
     return _pass(headline.split(".")[0][:90])
 

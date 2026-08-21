@@ -2,8 +2,17 @@
 
 Every type here is plain, serialisable data. The comparison engine builds them, the CLI
 prints them, the notebook panel renders them, and the agent receives them as a tool result.
-None of them import marimo, polars or openpyxl, so the whole schema is testable in
+None of them touch marimo, a workbook or a frame, so the whole schema is testable in
 isolation.
+
+**One import qualifies that, and it is worth being precise about which.** This module used to
+name marimo, polars and openpyxl and import none of them. It now imports
+:func:`kedge.xl.unambiguous_number` -- 150 lines of ``re`` and ``float``, no frame anywhere --
+because :func:`as_numeric_pair` needs Excel's rule for what text spells a number, and a second
+copy of that rule is exactly what non-negotiable 3 forbids. The package that re-exports it does
+import polars, so the sentence above is now about what these types *do* rather than about the
+import graph: nothing here opens a workbook, builds a frame or reaches a kernel, and every
+model can still be constructed, validated and serialised on its own.
 
 **The one invariant that matters more than any other.** openpyxl calculates nothing, so a
 workbook written by a tool rather than saved by Excel returns ``None`` for every formula
@@ -41,6 +50,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from kedge.xl.text import unambiguous_number
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -62,6 +73,7 @@ __all__ = [
     "RegionResult",
     "RegionSpec",
     "Tolerance",
+    "as_numeric_pair",
     "signed_delta",
     "worst_status",
 ]
@@ -172,10 +184,12 @@ class NotReconciledReason(StrEnum):
     PARTIAL_CACHED_VALUES = "partial_cached_values"
     BASELINE_RANGE_EMPTY = "baseline_range_empty"
     BASELINE_RANGE_UNREADABLE = "baseline_range_unreadable"
+    BASELINE_RANGE_INCOMPLETE = "baseline_range_incomplete"
     BASELINE_TRUNCATED = "baseline_truncated"
     NO_ACTUAL_VALUES = "no_actual_values"
     NOTEBOOK_FAILED = "notebook_failed"
     NOT_REPRODUCED = "not_reproduced"
+    NO_USABLE_BASELINE = "no_usable_baseline"
 
     @property
     def explanation(self) -> str:
@@ -208,6 +222,15 @@ _REASON_TEXT: dict[NotReconciledReason, str] = {
         "The workbook range named for this region could not be read, so no comparison was "
         "possible. Check the sheet name and the A1 reference. This is not a pass."
     ),
+    NotReconciledReason.BASELINE_RANGE_INCOMPLETE: (
+        "The ranges recorded for this region do not add up to the cells it holds, so the "
+        "workbook values could not be lined up against the notebook's rows. Comparing them "
+        "anyway would put the wrong cell beside the wrong row and report differences, or "
+        "agreement, that mean nothing. Nothing was compared and this is NOT a pass. A region "
+        "broken into very many pieces -- a formula column interrupted by dozens of subtotal "
+        "rows -- is the usual cause: reconcile an unbroken stretch of it, or declare the "
+        "region's ranges in the notebook."
+    ),
     NotReconciledReason.BASELINE_TRUNCATED: (
         "The workbook range named for this region is longer than the reconciler will read in "
         "one pass, so only its first rows were compared. The region as a whole is NOT signed "
@@ -217,6 +240,13 @@ _REASON_TEXT: dict[NotReconciledReason, str] = {
         "The notebook deliberately does not reproduce this region, and says why below. Nothing "
         "is claimed about it either way -- a region nobody checked is not a pass -- but this is "
         "a decision somebody made rather than a gap to go and fix."
+    ),
+    NotReconciledReason.NO_USABLE_BASELINE: (
+        "The notebook computes this region -- its values are counted below -- but the workbook "
+        "cannot serve as a baseline for it, and says why. Nothing is claimed either way: a "
+        "region that could not be checked is not a pass, whatever the reason it could not be. "
+        "This is a fact about the spreadsheet, not a decision about the conversion and not a "
+        "cell that failed to run."
     ),
     NotReconciledReason.NO_ACTUAL_VALUES: (
         "The notebook produced no values for this region, so there was nothing to compare. "
@@ -357,24 +387,77 @@ def signed_delta(expected: Any, actual: Any) -> float | None:
 
     Returns:
         ``actual - expected``, in days where both values are dates, or None where the pair is
-        not comparable as a magnitude (booleans, strings, mixed types, non-finite numbers).
+        not comparable as a magnitude (booleans, mixed types, non-finite numbers, or text that
+        does not unambiguously spell a number).
 
     Example:
         >>> signed_delta(2.68, 2.67)
         -0.009999999999999787
         >>> signed_delta("a", 1.0) is None
         True
+        >>> signed_delta("20.0", 25.0)  # Excel would coerce the text and so does this
+        5.0
     """
-    if isinstance(expected, bool) or isinstance(actual, bool):
-        return None
-    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
-        if not (math.isfinite(float(expected)) and math.isfinite(float(actual))):
+    numbers = as_numeric_pair(expected, actual)
+    if numbers is not None:
+        expected_number, actual_number = numbers
+        if not (math.isfinite(expected_number) and math.isfinite(actual_number)):
             return None
-        return float(actual) - float(expected)
+        return actual_number - expected_number
     expected_dt = _as_datetime(expected)
     actual_dt = _as_datetime(actual)
     if expected_dt is not None and actual_dt is not None:
         return (actual_dt - expected_dt).total_seconds() / 86_400.0
+    return None
+
+
+def as_numeric_pair(expected: Any, actual: Any) -> tuple[float, float] | None:
+    """The two values as floats when this is a numeric comparison, else None.
+
+    **A number spelled as text is a number, and refusing to say so makes doing the right thing
+    fail.** Excel coerces at the point of use, so a ``VLOOKUP`` that returns a text cell out of
+    a pasted rate card caches the *text* -- ``'20.0'`` -- and then multiplies by it perfectly
+    happily. A conversion that types the column, which it must if the arithmetic below it is
+    not to fail four operations later inside a query plan, produces ``20.0``; reading that pair
+    as a type difference makes the region unreconcilable **by construction**, so doing the
+    right thing is what breaks the check.
+
+    **The line is information loss, not type.** ``'00417'`` is a client code and a client code
+    is not the number 417: the leading zeros are the whole point, and reporting agreement there
+    would bless a join key that has already broken every join it takes part in. That
+    distinction lives in :func:`kedge.xl.unambiguous_number` -- non-negotiable 3 -- and is the
+    same rule :func:`kedge.ingest.coerce.coerce_numeric_text` applies to a hand-in column on
+    the way in, so the reader and the reconciler cannot disagree about what a number is.
+
+    Two strings are never coerced, even when both spell numbers: a text column against a text
+    column is a text comparison, and ``'417'`` against ``'417.0'`` is a difference the reader
+    is entitled to see.
+
+    Args:
+        expected: The value Excel cached.
+        actual: The value the notebook produced.
+
+    Returns:
+        ``(expected, actual)`` as floats when at least one side is a genuine number and the
+        other is either a number or text that unambiguously spells one; None otherwise, which
+        leaves the caller to report a type difference exactly as it did before.
+
+    Example:
+        >>> as_numeric_pair("20.0", 20.0)
+        (20.0, 20.0)
+        >>> as_numeric_pair("00417", 417.0) is None
+        True
+    """
+    expected_is_number = isinstance(expected, (int, float)) and not isinstance(expected, bool)
+    actual_is_number = isinstance(actual, (int, float)) and not isinstance(actual, bool)
+    if expected_is_number and actual_is_number:
+        return float(expected), float(actual)
+    if expected_is_number:
+        spelled = unambiguous_number(actual)
+        return (float(expected), spelled) if spelled is not None else None
+    if actual_is_number:
+        spelled = unambiguous_number(expected)
+        return (spelled, float(actual)) if spelled is not None else None
     return None
 
 
@@ -467,7 +550,31 @@ class RegionSpec(_Frozen):
     """
 
     id: str = Field(description="Stable slug, unique within a report.")
-    reference: str = Field(description="Sheet-qualified A1 range, e.g. 'Calc!G2:G501'.")
+    reference: str = Field(
+        description=(
+            "Sheet-qualified A1 range, e.g. 'Calc!G2:G501'. Where `ranges` is given this is "
+            "the rectangle enclosing them, and it is what the panel shows; the cells that "
+            "are actually read are `ranges`."
+        )
+    )
+    ranges: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The exact ranges the region covers, in reading order, when it is broken into "
+            "more than one -- a formula column interrupted by subtotal rows, say. Empty "
+            "means the region is the single rectangle named by `reference`."
+        ),
+    )
+    cell_count: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "How many cells the region holds, when that is known independently of the "
+            "ranges. Where they disagree the baseline cannot be built and the region "
+            "degrades to NOT_RECONCILED, rather than lining a short vector up against the "
+            "notebook's rows and comparing the wrong cell with the wrong row."
+        ),
+    )
     variable: str | None = Field(
         default=None, description="Notebook variable holding the frame or series."
     )
@@ -480,6 +587,16 @@ class RegionSpec(_Frozen):
     def label_or_id(self) -> str:
         """The label if one was given, otherwise the id."""
         return self.label or self.id
+
+    @property
+    def segments(self) -> tuple[str, ...]:
+        """The ranges the baseline reads, in reading order.
+
+        The explicit ``ranges`` where the region is discontiguous, and otherwise the one
+        rectangle in ``reference`` -- so a caller that knows nothing about discontiguity
+        reads exactly what it always did.
+        """
+        return tuple(self.ranges) if self.ranges else (self.reference,)
 
 
 class RegionResult(_Frozen):
@@ -673,21 +790,57 @@ class ReconciliationReport(_Frozen):
             region for region in self.regions if region.reason is NotReconciledReason.NOT_REPRODUCED
         ]
 
+    @property
+    def declared_no_baseline(self) -> list[RegionResult]:
+        """Regions the notebook computes but the workbook cannot be a baseline for.
+
+        A different fact from :attr:`declared_not_reproduced` and the reader needs both. There
+        the conversion chose not to reproduce something; here it did reproduce it and the
+        spreadsheet has nothing usable to check it against -- a formula column whose cached
+        values are empty strings, a lookup that cached the text a paste left behind. Answering
+        the two with the same mechanism would misreport a computed column as an absent one.
+
+        Still not passes. Nothing here can make an unchecked region one.
+        """
+        return [
+            region
+            for region in self.regions
+            if region.reason is NotReconciledReason.NO_USABLE_BASELINE
+        ]
+
+    @property
+    def declared_exceptions(self) -> list[RegionResult]:
+        """Every region excused with a reason, of either kind, in report order."""
+        excused = {
+            NotReconciledReason.NOT_REPRODUCED,
+            NotReconciledReason.NO_USABLE_BASELINE,
+        }
+        return [region for region in self.regions if region.reason in excused]
+
     def headline(self) -> str:
         """The single sentence that goes at the top of the panel and the CLI output."""
         status = self.status
         if not self.regions:
             return f"NOT RECONCILED - {NotReconciledReason.NO_REGIONS.explanation}"
-        declared = self.declared_not_reproduced
+        declared = self.declared_exceptions
         unchecked = [region for region in self.not_reconciled if region not in declared]
         counts = (
             f"{len(self.passed)} passed, {len(self.failed)} failed, {len(unchecked)} not reconciled"
         )
-        aside = (
-            f" {len(declared)} region(s) declared not reproduced by this notebook, with reasons."
-            if declared
-            else ""
-        )
+        # The two exceptions are counted apart because they say different things to a reader.
+        # "Not reproduced" is a decision about the conversion; "no usable baseline" is a fact
+        # about the spreadsheet, on a column the notebook did compute.
+        excuses = []
+        if self.declared_not_reproduced:
+            excuses.append(
+                f"{len(self.declared_not_reproduced)} region(s) declared not reproduced by "
+                f"this notebook"
+            )
+        if self.declared_no_baseline:
+            excuses.append(
+                f"{len(self.declared_no_baseline)} region(s) the workbook cannot be a baseline for"
+            )
+        aside = f" {' and '.join(excuses)}, with reasons." if excuses else ""
         if status is ReconciliationStatus.PASSED:
             return (
                 f"PASSED - {len(self.regions)} regions, {self.rows_compared} rows compared, "

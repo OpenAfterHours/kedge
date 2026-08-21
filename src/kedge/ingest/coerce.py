@@ -35,13 +35,13 @@ person behind it -- which is the right place for a judgement call.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import polars as pl
 
 from kedge.xl.nulls import to_number
+from kedge.xl.text import MAX_SIGNIFICANT_DIGITS, loses_information_as_a_number
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -54,20 +54,8 @@ __all__ = [
     "coerce_numeric_text",
 ]
 
-MAX_SIGNIFICANT_DIGITS = 15
-"""Beyond this a value does not survive ``Float64``, so coercing it would lose digits.
-
-The same limit Excel works to, which is why long identifiers are text in the source system as
-well. See :func:`kedge.xl.round_half_away` for the other place this number governs.
-"""
-
 SAMPLE_VALUES = 3
 """How many original values a report carries. Enough to recognise the column, not a data dump."""
-
-_LEADING_ZERO = re.compile(r"^[+-]?0\d")
-"""``00123``, ``0123`` -- an identifier. ``0``, ``0.5`` and ``-0.25`` are numbers and are fine."""
-
-_DIGITS = re.compile(r"\d")
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,15 +141,15 @@ def _is_numeric_text(values: Sequence[object]) -> bool:
 
     Parsing is delegated to :func:`kedge.xl.to_number` rather than re-implemented, so a column
     the reader coerces and a column a translation coerces cannot disagree about what a number
-    is. The extra rules here are all about *information loss*, which is a question ``to_number``
-    is right not to ask when it has been asked for explicitly.
+    is. The extra rules are all about *information loss*, which is a question ``to_number`` is
+    right not to ask when it has been asked for explicitly; they live in
+    :func:`kedge.xl.loses_information_as_a_number` because the comparison engine has to apply
+    exactly the same rule one cell at a time.
     """
     populated = [str(value).strip() for value in values if _populated(value)]
     if not populated:
         return False
-    if any(_LEADING_ZERO.match(value) for value in populated):
-        return False
-    if any(len(_DIGITS.findall(value)) > MAX_SIGNIFICANT_DIGITS for value in populated):
+    if any(loses_information_as_a_number(value) for value in populated):
         return False
 
     # One pass through the real parser: a column is numeric only if every populated value is.

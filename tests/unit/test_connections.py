@@ -155,6 +155,153 @@ def test_an_unnamed_connection_gets_a_positional_name_rather_than_being_dropped(
     assert [connection.name for connection in connections] == ["connection1"]
 
 
+# ── the part as Excel itself writes it ───────────────────────────────────────────────────────
+
+
+_EXCEL_WRITTEN_CONNECTIONS_XML = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<connections xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="xr16" '
+    'xmlns:xr16="http://schemas.microsoft.com/office/spreadsheetml/2017/revision16">'
+    '<connection id="1" xr16:uid="{00000000-0015-0000-FFFF-FFFF00000000}" name="PositionsExtract" '
+    'description="Client positions at day-end, current month and prior" type="1" '
+    'refreshedVersion="8" minRefreshableVersion="3" background="1" saveData="1">'
+    '<dbPr connection="ODBC;DSN=FinanceWarehouse;UID=svc_finread;DATABASE=FinanceWarehouse" '
+    'command="SELECT p.client_code,_x000a_       p.market_value_gbp_x000a_'
+    "  FROM fin.positions p_x000a_ WHERE p.status &lt;&gt; 'CLOSED'\"/>"
+    "</connection></connections>"
+)
+"""Verbatim from Excel, with the query shortened.
+
+Produced by opening ``evals/fee_billing_run/m11_management_fee_run.xlsx`` in Excel and saving
+it. Two things that workbook was authored with do not survive: the ``&#10;`` character
+references become ``_x000a_``, and ``commandType="2"`` is gone. Neither is malformed, so a
+reader that decodes neither reports success and hands the planner a corrupted query.
+"""
+
+
+def test_the_form_excel_actually_writes_reads_back_as_the_query_it_holds() -> None:
+    with _archive({CONNECTIONS_PART: _EXCEL_WRITTEN_CONNECTIONS_XML}) as archive:
+        connections, status, findings = extract_connections(archive)
+
+    assert (status, findings) == (ExtractionStatus.OK, [])
+    connection = connections[0]
+    assert connection.command is not None
+    assert connection.command.splitlines() == [
+        "SELECT p.client_code,",
+        "       p.market_value_gbp",
+        "  FROM fin.positions p",
+        " WHERE p.status <> 'CLOSED'",
+    ]
+    assert "_x000a_" not in connection.command
+    assert connection.command_type == "sql", "Excel drops commandType because 2 is its default"
+    assert connection.name == "PositionsExtract"
+    assert connection.kind == "odbc"
+    assert "svc_finread" not in (connection.connection_string_redacted or "")
+
+
+def test_a_missing_command_type_beside_a_command_is_the_schema_default() -> None:
+    xml = '<connections><connection name="X"><dbPr command="SELECT 1"/></connection></connections>'
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].command_type == "sql"
+
+
+def test_a_dbpr_with_no_command_is_not_given_a_command_type() -> None:
+    """The default describes a query. Where there is none, inventing one would be a claim."""
+    xml = (
+        "<connections>"
+        '<connection name="Local"><dbPr connection="WORKSHEET;Sheet1!A1:D9"/></connection>'
+        "</connections>"
+    )
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].command_type is None
+    assert connections[0].kind == "worksheet"
+
+
+def test_an_explicit_command_type_still_wins_over_the_default() -> None:
+    xml = (
+        "<connections>"
+        '<connection name="X"><dbPr command="dbo.haircuts" commandType="3"/></connection>'
+        "</connections>"
+    )
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].command_type == "table"
+
+
+def test_an_escaped_underscore_leaves_a_literal_x000a_alone() -> None:
+    """The case a search-and-replace for ``_x000a_`` gets wrong.
+
+    ``_x005f_`` is how OOXML writes an underscore that would otherwise open an escape, so
+    ``_x005f_x000a_`` is a column called ``_x000a_`` and not a line break. Decoding has to be
+    one pass that never rescans what it produced, or a legitimate identifier becomes whitespace.
+    """
+    xml = (
+        '<connections><connection name="X"><dbPr command='
+        '"SELECT _x005f_x000a_ AS odd,_x000a_       n FROM t"/></connection></connections>'
+    )
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].command == "SELECT _x000a_ AS odd,\n       n FROM t"
+
+
+def test_the_escape_is_decoded_wherever_it_appears_not_only_in_the_command() -> None:
+    xml = (
+        '<connections><connection name="Two_x000a_Lines" description="A_x0009_tab">'
+        '<dbPr connection="ODBC;DSN=X" command="SELECT 1"/></connection></connections>'
+    )
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].name == "Two\nLines"
+    assert connections[0].description == "A\ttab"
+
+
+def test_uppercase_hex_digits_decode_as_readily_as_lowercase() -> None:
+    xml = '<connections><connection name="A_x000D__x000A_B"/></connections>'
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].name == "A\r\nB"
+
+
+def test_an_escaped_surrogate_pair_becomes_the_one_character_it_encodes() -> None:
+    xml = '<connections><connection name="_xD83D__xDE00_ ok"/></connections>'
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].name == "\U0001f600 ok"
+
+
+def test_a_lone_surrogate_degrades_to_something_that_can_be_serialised() -> None:
+    """A half-escape must not put a byte sequence in the artifact that cannot be written out."""
+    xml = '<connections><connection name="_xD83D_ alone"/></connections>'
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, status, findings = extract_connections(archive)
+
+    assert (status, findings) == (ExtractionStatus.OK, [])
+    assert connections[0].name.encode("utf-8"), "a lone surrogate would raise here"
+    assert connections[0].model_dump_json()
+
+
+def test_text_carrying_no_escape_survives_untouched() -> None:
+    xml = (
+        "<connections>"
+        '<connection name="X"><dbPr command="SELECT max_x FROM t WHERE a_x_b = 1"/></connection>'
+        "</connections>"
+    )
+    with _archive({CONNECTIONS_PART: xml}) as archive:
+        connections, _, _ = extract_connections(archive)
+
+    assert connections[0].command == "SELECT max_x FROM t WHERE a_x_b = 1"
+
+
 # ── credentials ──────────────────────────────────────────────────────────────────────────────
 
 

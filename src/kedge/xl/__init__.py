@@ -74,11 +74,17 @@ from kedge.xl.nulls import (
     to_number,
 )
 from kedge.xl.rounding import MAX_DIGITS, round_down, round_half_away, round_up
+from kedge.xl.text import (
+    MAX_SIGNIFICANT_DIGITS,
+    loses_information_as_a_number,
+    unambiguous_number,
+)
 
 __all__ = [
     "EXCEL_ERROR_LITERALS",
     "MAX_DIGITS",
     "MAX_SERIAL",
+    "MAX_SIGNIFICANT_DIGITS",
     "MIN_SERIAL",
     "PHANTOM_LEAP_DAY_SERIAL",
     "ExcelArgumentError",
@@ -92,6 +98,7 @@ __all__ = [
     "error_text_to_null",
     "iferror",
     "is_error",
+    "loses_information_as_a_number",
     "mul",
     "round_down",
     "round_half_away",
@@ -101,4 +108,5 @@ __all__ = [
     "sub",
     "sum_horizontal",
     "to_number",
+    "unambiguous_number",
 ]

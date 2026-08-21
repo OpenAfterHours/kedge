@@ -13,8 +13,19 @@ structurally, by splitting the string into ``key=value`` pairs and masking sensi
 then by sweeping the result with a regular expression to catch credentials nested inside
 quoted sub-strings and URL query parameters.
 
+**Excel does not write this part the way this repository authors it, and both forms have to be
+read.** A newline inside ``dbPr@command`` cannot appear literally -- XML attribute-value
+normalisation would turn it into a space -- so it is escaped, and Excel's escape is the
+``_xHHHH_`` form of ``ST_Xstring`` rather than the ``&#10;`` character reference the fixtures
+here are authored with. Excel also drops ``commandType`` on save, because ``2`` is the
+attribute's schema default. A workbook that has been through Excel therefore used to read back
+with its query on one line, ``_x000a_`` littered through it, and no command type at all --
+silently, since neither is malformed. That string is what the planner is shown as the extract to
+hand over, so :func:`_decode_xstring` and :func:`_command_type` exist to undo both.
+
 References:
-- PLAN.md 1.5, M1. ECMA-376 Part 1 18.13 (``connections``, ``dbPr``, ``webPr``, ``textPr``).
+- PLAN.md 1.5, M1. ECMA-376 Part 1 18.13 (``connections``, ``dbPr``, ``webPr``, ``textPr``),
+  18.13.4 (``dbPr@commandType`` and its default), 22.9.2.19 (``ST_Xstring``).
 """
 
 from __future__ import annotations
@@ -68,6 +79,20 @@ _COMMAND_TYPES = {
     "4": "default",
     "5": "list",
 }
+_DEFAULT_COMMAND_TYPE = "2"
+"""What ``dbPr@commandType`` means when it is absent -- and it usually is.
+
+18.13.4 declares the attribute optional with a default of ``2``, so Excel omits it whenever the
+command is SQL, which is the overwhelmingly common case. Reading absence as "unknown" loses the
+fact on exactly the connections that matter most.
+"""
+
+# ECMA-376 22.9.2.19 (`ST_Xstring`): a character XML cannot carry is written as `_xHHHH_`, four
+# hex digits naming its UTF-16 code unit. A *literal* underscore that would otherwise open such
+# a sequence is escaped the same way, as `_x005F_`, so decoding must never rescan what it
+# produced: `_x005f_x000a_` is the seven characters `_x000a_`, not a newline.
+_XSTRING_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+_SURROGATE = re.compile(r"[\ud800-\udfff]")
 
 _PROVIDER_RE = re.compile(r"(?i)\bprovider\s*=\s*([^;]+)")
 _DRIVER_RE = re.compile(r"(?i)\bdriver\s*=\s*(\{[^}]*\}|[^;]+)")
@@ -226,16 +251,49 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", maxsplit=1)[-1]
 
 
-def _attr(element: ET.Element, name: str) -> str | None:
-    """Read an attribute by name, ignoring namespace and case."""
-    value = element.get(name)
-    if value is not None:
+def _decode_xstring(value: str) -> str:
+    """Decode OOXML's ``_xHHHH_`` escapes into the characters they stand for.
+
+    One left-to-right pass that never rescans its own output, which is the whole rule rather
+    than a detail: an escaped underscore decodes to ``_``, and if the result were rescanned
+    ``_x005f_x000a_`` -- the way a literal ``_x000a_`` has to be written -- would come back as a
+    newline. ``re.sub`` resumes after each match, so it has exactly that semantics.
+
+    The escape names a UTF-16 code unit, so a character outside the BMP arrives as an escaped
+    surrogate pair. Round-tripping through UTF-16 joins a pair back into the one character it
+    encodes and replaces any surrogate left on its own -- which matters, because a lone
+    surrogate in a ``str`` is a ``UnicodeEncodeError`` waiting for whatever serialises the
+    analysis, and a malformed workbook must cost a finding rather than a traceback.
+    """
+    if "_x" not in value:
         return value
-    wanted = name.lower()
-    for key, candidate in element.attrib.items():
-        if _local(key).lower() == wanted:
-            return candidate
-    return None
+    decoded = _XSTRING_ESCAPE.sub(lambda match: chr(int(match.group(1), 16)), value)
+    if not _SURROGATE.search(decoded):
+        return decoded
+    return decoded.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
+def _attr(element: ET.Element, name: str) -> str | None:
+    """Read an attribute by name, ignoring namespace and case, and decode its escapes.
+
+    Decoding here rather than at each call site is deliberate. Every attribute this module
+    reads is either an ``ST_Xstring`` -- ``dbPr@connection`` and ``@command``,
+    ``connection@name`` and ``@description``, ``webPr@url`` and ``@post``, ``textPr@sourceFile``
+    -- or a numeric or boolean token in which the escape cannot occur, so there is nothing here
+    that can be forgotten and no attribute a later one could be added beside undecoded.
+    """
+    value = element.get(name)
+    if value is None:
+        wanted = name.lower()
+        value = next(
+            (
+                candidate
+                for key, candidate in element.attrib.items()
+                if _local(key).lower() == wanted
+            ),
+            None,
+        )
+    return None if value is None else _decode_xstring(value)
 
 
 def _child(element: ET.Element, name: str) -> ET.Element | None:
@@ -297,10 +355,16 @@ def _provider(connection_string: str | None) -> str | None:
     return None
 
 
-def _command_type(raw: str | None) -> str | None:
-    if raw is None:
-        return None
-    stripped = raw.strip()
+def _command_type(raw: str | None, *, has_command: bool) -> str | None:
+    """Name a ``dbPr@commandType`` code, supplying the schema default when it is absent.
+
+    The default only stands in where there is a command to describe. A ``dbPr`` carrying a
+    connection string and nothing else -- a worksheet range, say -- has no query, and calling
+    the query it does not have SQL would be an invented claim rather than a recovered fact.
+    """
+    stripped = (raw or "").strip()
+    if not stripped and has_command:
+        stripped = _DEFAULT_COMMAND_TYPE
     return _COMMAND_TYPES.get(stripped, stripped) or None
 
 
@@ -317,7 +381,7 @@ def _parse_connection(element: ET.Element, ordinal: int) -> Connection:
     if db is not None:
         raw_string = _attr(db, "connection")
         command = _attr(db, "command")
-        command_type = _command_type(_attr(db, "commandType"))
+        command_type = _command_type(_attr(db, "commandType"), has_command=bool(command))
     if web is not None:
         raw_string = raw_string or _attr(web, "url")
         command = command or _attr(web, "post")

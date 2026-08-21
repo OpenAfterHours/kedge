@@ -98,7 +98,9 @@ class Acceptance:
             else "nothing was compared"
         )
         declared = (
-            f", {self.regions_declared} declared not reproduced" if self.regions_declared else ""
+            f", {self.regions_declared} declared as exceptions with reasons"
+            if self.regions_declared
+            else ""
         )
         return (
             f"This translation was reconciled against `{self.workbook}` on {when}: "
@@ -186,9 +188,7 @@ class AcceptanceStore:
         now: datetime | None = None,
     ) -> Acceptance:
         """Write the outcome of a live reconciliation as this translation's acceptance."""
-        claimed = [
-            region for region in report.regions if region not in report.declared_not_reproduced
-        ]
+        claimed = [region for region in report.regions if region not in report.declared_exceptions]
         acceptance = Acceptance(
             workbook=Path(report.workbook).name,
             workbook_sha256=report.workbook_sha256,
@@ -197,7 +197,7 @@ class AcceptanceStore:
             status="checked" if not report.failed and report.passed else report.status.value,
             regions_passed=len(report.passed),
             regions_claimed=len(claimed),
-            regions_declared=len(report.declared_not_reproduced),
+            regions_declared=len(report.declared_exceptions),
             rows_compared=report.rows_compared,
             tolerance=report.tolerance.describe(),
             headline=report.headline(),
@@ -227,6 +227,7 @@ def _reconcile_or_explain(
     tolerance: Tolerance | None,
     notebook: str | None,
     not_reproduced: Mapping[str, str] | None,
+    no_baseline: Mapping[str, str] | None,
 ) -> ReconciliationReport:
     """Reconcile, or return a report saying why nothing was compared.
 
@@ -243,6 +244,7 @@ def _reconcile_or_explain(
             tolerance=tolerance,
             notebook=notebook,
             not_reproduced=not_reproduced,
+            no_baseline=no_baseline,
         )
     except KedgeError as error:
         return ReconciliationReport(
@@ -359,6 +361,7 @@ def check_translation(
     *,
     handin_sha256: str | None = None,
     not_reproduced: Mapping[str, str] | None = None,
+    no_baseline: Mapping[str, str] | None = None,
     tolerance: Tolerance | None = None,
     notebook: str | None = None,
     watching_this_run: Sequence[str] = (),
@@ -377,6 +380,8 @@ def check_translation(
             acceptance's, the live comparison is meaningful and is re-run; when it does not,
             this run is a different period and the workbook is not its baseline.
         not_reproduced: Regions the notebook deliberately does not reproduce, and why.
+        no_baseline: Regions the notebook does reproduce but the workbook cannot check, and
+            why. Two different facts, and the panel keeps them apart.
         tolerance: Tolerances for the live comparison.
         notebook: Path of the notebook, recorded with a new acceptance.
         watching_this_run: What *does* check today's numbers — the contract, the drift report,
@@ -398,6 +403,7 @@ def check_translation(
             tolerance=tolerance,
             notebook=notebook,
             not_reproduced=not_reproduced,
+            no_baseline=no_baseline,
         )
         if report.passed and not report.failed:
             store.record(report, handin_sha256=handin_sha256, notebook=notebook)
@@ -421,6 +427,7 @@ def check_translation(
             tolerance=tolerance,
             notebook=notebook,
             not_reproduced=not_reproduced,
+            no_baseline=no_baseline,
         )
         if report.passed and not report.failed:
             store.record(report, handin_sha256=handin_sha256, notebook=notebook)

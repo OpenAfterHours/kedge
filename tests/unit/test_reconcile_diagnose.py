@@ -285,13 +285,46 @@ def test_dates_out_by_varying_amounts_are_not_called_a_serial_offset() -> None:
 # ── text-formatted numbers ──────────────────────────────────────────────────
 
 
-def test_a_string_against_the_same_number_is_diagnosed_as_a_text_formatted_number() -> None:
-    diagnoses = _diagnose(["1234.5", "99.0"], [1234.5, 99.0], column="notional")
+def test_a_string_against_the_same_number_is_no_longer_a_mismatch_at_all() -> None:
+    """This used to be the rule's headline case, and the expectation was wrong.
+
+    Excel coerces a text-formatted number at the point of use, so ``'1234.5'`` and ``1234.5``
+    are the same value. The engine now reads them as one, which leaves nothing to diagnose --
+    and leaving it as a mismatch made a workbook whose ``VLOOKUP`` cached a pasted text cell
+    unreconcilable however right the conversion was.
+    """
+    assert _diagnose(["1234.5", "99.0"], [1234.5, 99.0], column="notional") == []
+
+
+def test_digits_that_are_an_identifier_against_the_number_are_diagnosed_the_other_way_round() -> (
+    None
+):
+    """What is left for the rule to fire on, and the advice is the opposite one.
+
+    ``00417`` is a client code. ``to_number`` would turn it into 417 and break every join it
+    takes part in, so the remedy names the text side as the correct one -- and no
+    ``kedge.xl`` symbol, because there is no Excel-semantics function that fixes this.
+    """
+    diagnoses = _diagnose(["00417", "00099"], [417.0, 99.0], column="client_code")
 
     top = diagnoses[0]
     assert top.cause is DiagnosticCause.TEXT_FORMATTED_NUMBER
-    assert top.remedy_symbol == "kedge.xl.to_number"
-    assert "notional" in top.remedy
+    assert top.remedy_symbol is None
+    assert "client_code" in top.remedy
+    assert "keep_as_text" in top.remedy
+    assert any("00417" in item for item in top.evidence)
+
+
+def test_a_two_bps_rate_difference_is_not_reported_as_a_date_epoch_offset() -> None:
+    """A whole-number delta on a *text* expected side used to answer the date rule's filter.
+
+    It could not arise before, because a VALUE_DIFFERS with non-numeric expected carried no
+    delta. Now that text spelling a number is compared as the number, a rate one or two out
+    would have been diagnosed as the 1900 leap-year bug.
+    """
+    diagnoses = _diagnose(["20.0", "27.5"], [22.0, 29.5], column="tier_bps")
+
+    assert not any(d.cause is DiagnosticCause.DATE_SERIAL_OFFSET for d in diagnoses)
 
 
 def test_a_string_that_is_not_a_number_is_not_a_text_formatting_problem() -> None:

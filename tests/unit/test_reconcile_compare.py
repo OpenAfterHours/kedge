@@ -138,7 +138,11 @@ def test_a_trailing_row_with_no_cached_value_is_missing_baseline_not_a_missing_r
         ("#DIV/0!", 0.0, MismatchKind.EXCEL_ERROR),
         (1.0, float("inf"), MismatchKind.NON_FINITE),
         (1.0, float("nan"), MismatchKind.NON_FINITE),
-        ("1234.5", 1234.5, MismatchKind.TYPE_DIFFERS),
+        # Was ("1234.5", 1234.5) -> TYPE_DIFFERS. That expectation was wrong: Excel coerces a
+        # text-formatted number at the point of use, so '1234.5' and 1234.5 are the same value
+        # and the pair is now a match -- see the tests below. A client code is the case the
+        # kind still has to catch, and it is why the distinction is drawn where it is.
+        ("00417", 417.0, MismatchKind.TYPE_DIFFERS),
         (date(2026, 1, 1), date(2026, 1, 2), MismatchKind.VALUE_DIFFERS),
         (46203.0, date(2026, 7, 25), MismatchKind.TYPE_DIFFERS),
         ("Equity", "Cash", MismatchKind.VALUE_DIFFERS),
@@ -152,6 +156,113 @@ def test_disagreements_are_classified_finely_enough_to_diagnose(
     comparison = compare_vectors([expected], [actual], tolerance=TOLERANCE)
 
     assert comparison.mismatches[0].kind is kind
+
+
+# ── a cached number spelled as text ─────────────────────────────────────────
+
+
+def test_a_cached_number_spelled_as_text_matches_the_number() -> None:
+    """The eval's tier rate, and the reason this rule exists.
+
+    ``Working!J`` is ``VLOOKUP(client, negotiated, 2, FALSE)`` over a schedule whose rate column
+    is text, because somebody pasted it. VLOOKUP returns the cell verbatim, so seventeen of
+    eighty-four rows cache the string ``'20.0'`` -- and Excel goes on multiplying by it. A
+    conversion that types the column, which it must, produced ``20.0`` and the region failed
+    on every one of those rows: doing the right thing was what broke the check.
+    """
+    comparison = compare_vectors(
+        ["20.0", 35.0, "27.5", 22.0], [20.0, 35.0, 27.5, 22.0], tolerance=TOLERANCE
+    )
+
+    assert (comparison.rows_compared, comparison.rows_matched, comparison.rows_differing) == (
+        4,
+        4,
+        0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("cached", "computed"),
+    [
+        ("20.0", 20.0),
+        ("1,234.56", 1234.56),
+        ("£1,000", 1000.0),
+        ("(1,234.50)", -1234.5),
+        ("12%", 0.12),
+        (" 417 ", 417.0),
+    ],
+)
+def test_every_spelling_excel_would_coerce_is_compared_as_the_number(
+    cached: str, computed: float
+) -> None:
+    comparison = compare_vectors([cached], [computed], tolerance=TOLERANCE)
+
+    assert comparison.rows_matched == 1
+
+
+def test_a_client_code_never_compares_equal_to_the_number_it_looks_like() -> None:
+    """The check this must not weaken, and the whole reason leading zeros matter.
+
+    ``00417`` is a client code. If it reconciled against ``417`` the report would bless a join
+    key that has already broken every join it takes part in -- which is a far worse outcome
+    than the amber it gets instead.
+    """
+    comparison = compare_vectors(["00417", "00099"], [417.0, 99.0], tolerance=TOLERANCE)
+
+    assert comparison.rows_matched == 0
+    assert comparison.rows_differing == 2
+    assert {m.kind for m in comparison.mismatches} == {MismatchKind.TYPE_DIFFERS}
+
+
+def test_a_sixteen_digit_identifier_is_not_a_number_either() -> None:
+    """It does not survive Float64, which is why it is text in the source system too."""
+    comparison = compare_vectors(["1234567890123456"], [1234567890123456.0], tolerance=TOLERANCE)
+
+    assert comparison.mismatches[0].kind is MismatchKind.TYPE_DIFFERS
+
+
+def test_text_that_spells_a_different_number_is_a_value_difference_with_a_delta() -> None:
+    """Once the text is read as a number, a disagreement is a disagreement about the number.
+
+    Reporting it as a type difference would throw away the delta, and the delta is what tells
+    a reader whether they are looking at a rounding mode or at the wrong rate entirely.
+    """
+    comparison = compare_vectors(["20.0"], [25.0], tolerance=TOLERANCE)
+
+    assert comparison.mismatches[0].kind is MismatchKind.VALUE_DIFFERS
+    assert comparison.mismatches[0].absolute_delta == pytest.approx(5.0)
+    assert comparison.mismatches[0].signed_delta == pytest.approx(5.0)
+
+
+def test_text_that_is_not_a_number_at_all_is_still_a_type_difference() -> None:
+    comparison = compare_vectors(["n/a"], [5.0], tolerance=TOLERANCE)
+
+    assert comparison.mismatches[0].kind is MismatchKind.TYPE_DIFFERS
+
+
+def test_two_text_columns_are_compared_as_text_however_numeric_they_look() -> None:
+    """Coercion needs a number on one side. Two text cells are a text comparison.
+
+    ``'417'`` against ``'417.0'`` is a real difference in a column of identifiers, and folding
+    them together would hide it.
+    """
+    comparison = compare_vectors(["417", "20.0"], ["417.0", "20.00"], tolerance=TOLERANCE)
+
+    assert comparison.rows_matched == 0
+    assert {m.kind for m in comparison.mismatches} == {MismatchKind.VALUE_DIFFERS}
+
+
+def test_the_notebook_side_may_be_the_text_one() -> None:
+    """The claim is symmetric: it is about whether the two cells hold the same number."""
+    assert compare_vectors([20.0], ["20.0"], tolerance=TOLERANCE).rows_matched == 1
+    assert compare_vectors([417.0], ["00417"], tolerance=TOLERANCE).rows_matched == 0
+
+
+def test_a_text_rate_still_has_to_be_within_tolerance() -> None:
+    """Coercion decides what is compared, never whether it passes."""
+    tight = Tolerance(absolute=1e-9, relative=0.0)
+
+    assert compare_vectors(["20.0"], [20.000001], tolerance=tight).rows_differing == 1
 
 
 def test_matching_dates_and_strings_and_booleans_are_matches() -> None:
@@ -236,11 +347,139 @@ def test_an_unreadable_range_is_not_reconciled_rather_than_an_exception() -> Non
     assert result.reason is NotReconciledReason.BASELINE_RANGE_UNREADABLE
 
 
+def test_a_baseline_whose_ranges_do_not_add_up_is_not_reconciled_rather_than_compared() -> None:
+    """A short baseline would be compared from the top, so every later row is out of step.
+
+    The region has to stop at the baseline: a comparison one position out reports
+    differences, and agreement, that mean nothing at all.
+    """
+    incomplete = BaselineVector(
+        spec_id="rwa", reference="Calc!G2:G6", sheet="Calc", incomplete=True
+    )
+
+    result = reconcile_region(SPEC, incomplete, [1.0, 2.0, 3.0], tolerance=TOLERANCE)
+
+    assert result.status is ReconciliationStatus.NOT_RECONCILED
+    assert result.reason is NotReconciledReason.BASELINE_RANGE_INCOMPLETE
+    assert result.rows_compared == 0
+    assert "NOT a pass" in result.detail
+
+
 def test_a_region_the_notebook_produced_nothing_for_is_not_reconciled() -> None:
     result = reconcile_region(SPEC, _baseline((1.0, 2.0)), None, tolerance=TOLERANCE)
 
     assert result.status is ReconciliationStatus.NOT_RECONCILED
     assert result.reason is NotReconciledReason.NO_ACTUAL_VALUES
+
+
+# ── two different kinds of exception, and a reader needs both ───────────────
+
+
+def test_a_region_the_conversion_declined_to_reproduce_says_so_rather_than_reading_as_a_bug() -> (
+    None
+):
+    result = reconcile_region(
+        SPEC,
+        _baseline((1.0, 2.0)),
+        None,
+        tolerance=TOLERANCE,
+        not_reproduced={SPEC.id: "rendered through kedge.sql instead."},
+    )
+
+    assert result.status is ReconciliationStatus.NOT_RECONCILED
+    assert result.reason is NotReconciledReason.NOT_REPRODUCED
+    assert result.rows_actual == 0
+
+
+def test_a_region_the_workbook_cannot_be_a_baseline_for_is_a_third_thing() -> None:
+    """The gap this spelling fills. The notebook computes the column; the workbook cannot check it.
+
+    ``Working!V`` is ``IF(agreed=net,"","OVERRIDE")``, so eighty-one of its cells hold a
+    calculated *empty string* and openpyxl's cached view returns those as None -- no baseline,
+    however right the column is. Before this existed the only way to say so was to withhold the
+    values, which reported a computed column as an absent one and sent a reader hunting a bug.
+    """
+    result = reconcile_region(
+        SPEC,
+        _baseline((None, None)),
+        ["", "OVERRIDE"],
+        tolerance=TOLERANCE,
+        no_baseline={SPEC.id: "The cells hold a calculated empty string; Excel caches nothing."},
+    )
+
+    assert result.status is ReconciliationStatus.NOT_RECONCILED
+    assert result.reason is NotReconciledReason.NO_USABLE_BASELINE
+    assert result.rows_actual == 2, "the notebook did compute the column and the report says so"
+    assert result.rows_expected == 2
+    assert "calculated empty string" in result.detail
+    assert not result.status, "nothing checked is still not a pass"
+
+
+def test_declaring_no_baseline_without_producing_the_values_is_not_honoured() -> None:
+    """The declaration claims the notebook computes the column. With no values it is unsupported.
+
+    Degrading to NO_ACTUAL_VALUES rather than accepting the claim keeps the two spellings from
+    collapsing into one: a caller that genuinely does not reproduce a region has
+    ``not_reproduced=`` for that, and says so in different words.
+    """
+    result = reconcile_region(
+        SPEC,
+        _baseline((1.0, 2.0)),
+        None,
+        tolerance=TOLERANCE,
+        no_baseline={SPEC.id: "the cached cells are empty strings"},
+    )
+
+    assert result.reason is NotReconciledReason.NO_ACTUAL_VALUES
+
+
+def test_the_two_declarations_are_keyed_on_different_facts_and_cannot_collide() -> None:
+    """Whether the notebook produced values decides which claim is even applicable.
+
+    ``not_reproduced`` is honoured only where nothing arrived and ``no_baseline`` only where
+    something did, so a caller who names one region in both maps still gets the claim its own
+    words make rather than whichever the implementation happened to test first.
+    """
+    both = {SPEC.id: "declared in both maps"}
+    computed = reconcile_region(
+        SPEC,
+        _baseline((1.0, 2.0)),
+        [1.0, 2.0],
+        tolerance=TOLERANCE,
+        not_reproduced=both,
+        no_baseline=both,
+    )
+    absent = reconcile_region(
+        SPEC,
+        _baseline((1.0, 2.0)),
+        None,
+        tolerance=TOLERANCE,
+        not_reproduced=both,
+        no_baseline=both,
+    )
+
+    assert computed.reason is NotReconciledReason.NO_USABLE_BASELINE
+    assert absent.reason is NotReconciledReason.NOT_REPRODUCED
+
+
+def test_a_declared_baseline_gap_is_not_compared_even_where_it_would_have_passed() -> None:
+    """The declaration is about the *workbook*, so the comparison is not made at all.
+
+    Comparing anyway and reporting the outcome would put the amber back that the declaration
+    exists to remove -- and would make the panel's verdict depend on data the declarer has
+    already said cannot be trusted.
+    """
+    result = reconcile_region(
+        SPEC,
+        _baseline((1.0, 2.0)),
+        [1.0, 2.0],
+        tolerance=TOLERANCE,
+        no_baseline={SPEC.id: "the cached values are stale."},
+    )
+
+    assert result.reason is NotReconciledReason.NO_USABLE_BASELINE
+    assert result.rows_compared == 0
+    assert result.status is not ReconciliationStatus.PASSED
 
 
 def test_a_failing_region_reports_counts_worst_deltas_and_a_capped_sample() -> None:

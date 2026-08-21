@@ -117,9 +117,10 @@ zip directly (PLAN §1.5).
 
 The trap is the newlines. XML attribute-value normalisation turns a literal
 newline inside an attribute into a space, so the multi-line SQL is stored as
-`&#10;` character references, exactly as Excel writes it. A reader that does not
-decode character references gets one long line back; a reader that lets
-normalisation apply gets spaces. `test_legacy_sql_statement_keeps_its_line_breaks`
+`&#10;` character references. Excel writes the same newlines as `_x000a_`
+instead — `evals/fee_billing_run` is where that was found — so a reader has to
+decode both. A reader that does not decode character references gets one long
+line back; a reader that lets normalisation apply gets spaces. `test_legacy_sql_statement_keeps_its_line_breaks`
 pins the recovered statement at 17 newlines.
 
 ### `cross_sheet_chain.xlsx`

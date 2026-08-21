@@ -239,6 +239,56 @@ def test_an_all_text_data_row_is_not_mistaken_for_a_header(tmp_path: Path) -> No
     assert detect_layout(path) == (0, 0)
 
 
+def test_a_scalar_block_beside_the_grid_does_not_hide_the_header_row(tmp_path: Path) -> None:
+    """A worksheet is a sheet with tables drawn on it, not a table.
+
+    A rate card with `Minimum fee | 750` and `Maximum fee | 250000` parked two columns to its
+    right is completely ordinary, and the header row shares a row with one of them. Testing
+    every populated cell for numerality rejected that row for carrying `250000` three columns
+    away, `detect_layout` fell back to (0, 0), and `read_data` then read the sheet's *title*
+    as the header -- one unusable column where a rate card should be.
+    """
+    path = _xlsx(
+        tmp_path / "schedule.xlsx",
+        [
+            ["Fee schedule -- effective 2026-11-01"],
+            ["Do not edit."],
+            [None, None, None, "Minimum fee", 750.0],
+            ["client_code", "negotiated_bps", None, "Maximum fee", 250000.0],
+            ["00001", "20.0", None, "Standard discount", 0.025],
+            ["00006", "27.5"],
+            ["00011", "21.5"],
+        ],
+    )
+
+    assert detect_layout(path) == (3, 3)
+
+    frame, layout = read_data(path)
+    assert frame.columns[:2] == ["client_code", "negotiated_bps"]
+    assert layout.preamble_rows == 3
+    assert frame["client_code"].to_list()[:2] == ["00001", "00006"], (
+        "the leading zeros are the client code, and must survive the read"
+    )
+
+
+def test_a_data_row_beside_a_text_side_block_is_still_not_a_header(tmp_path: Path) -> None:
+    """The narrowing must not let a data row through on the strength of a caption beside it.
+
+    The grid is the widest run of adjacent cells, so it is the grid that gets the numeric
+    test -- a text label parked to the right cannot vouch for a row of numbers.
+    """
+    path = _xlsx(
+        tmp_path / "schedule.xlsx",
+        [
+            ["00001", "20.0", None, "Standard discount", 0.025],
+            ["client_code", "negotiated_bps", None, "Maximum fee", 250000.0],
+            ["00006", "27.5"],
+        ],
+    )
+
+    assert detect_layout(path) == (1, 1)
+
+
 def test_a_layout_that_cannot_be_determined_degrades_to_the_first_row(tmp_path: Path) -> None:
     path = tmp_path / "exposures.xlsx"
     path.write_bytes(b"not a workbook")

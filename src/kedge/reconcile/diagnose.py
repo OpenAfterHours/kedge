@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import date
 from typing import TYPE_CHECKING, Any
 
 from kedge.analysis.values import ERROR_VALUES
@@ -432,12 +433,17 @@ def _row_counts(
 
 def _dates(mismatches: Sequence[Mismatch], column: str | None) -> Diagnosis | None:
     """Whole-day offsets and unconverted serials: the 1900 date system."""
+    # `isinstance(..., date)` rather than "not a number", which is what this used to say. The
+    # loose form only ever meant "a date" because a VALUE_DIFFERS with a non-numeric expected
+    # side carried no delta to filter on; now that text spelling a number is compared as the
+    # number, a rate two bps out would answer to the loose test and be reported as a 1900
+    # epoch offset.
     day_offsets = [
         m
         for m in mismatches
         if m.absolute_delta is not None
         and m.kind is MismatchKind.VALUE_DIFFERS
-        and not _is_number(m.expected)
+        and isinstance(m.expected, date)
         and abs(m.absolute_delta - round(m.absolute_delta)) < 1e-9
         and 1 <= round(m.absolute_delta) <= 2
     ]
@@ -521,7 +527,15 @@ def _dates(mismatches: Sequence[Mismatch], column: str | None) -> Diagnosis | No
 
 
 def _text_numbers(mismatches: Sequence[Mismatch], column: str | None) -> Diagnosis | None:
-    """A number on one side and a string holding that number on the other."""
+    """Digits on one side and a number on the other, where the two are not the same thing.
+
+    **This rule used to fire on the safe case and no longer can.** ``'20.0'`` against ``20.0``
+    was a type difference; the engine now reads it as the number Excel reads it as, so a pair
+    still reaching here is one :func:`kedge.xl.unambiguous_number` refused -- which means the
+    text is an identifier spelled in digits, or a spelling of a number that would not survive
+    the round trip. ``00417`` is not 417, and the advice for that is the opposite of the advice
+    for a text-formatted quantity: keep the column as text and fix the *numeric* side.
+    """
     pairs = [
         m
         for m in mismatches
@@ -535,26 +549,31 @@ def _text_numbers(mismatches: Sequence[Mismatch], column: str | None) -> Diagnos
     if not pairs:
         return None
 
+    sample = pairs[0].expected if isinstance(pairs[0].expected, str) else pairs[0].actual
     return Diagnosis(
         cause=DiagnosticCause.TEXT_FORMATTED_NUMBER,
         confidence=0.85,
         headline=(
-            "A text-formatted number: one side holds a string that reads as a number and the "
-            "other holds the number."
+            "One side holds digits that are an identifier and the other holds them as a "
+            "number. Reconciliation will not treat the two as equal."
         ),
         evidence=[
-            f"{len(pairs)} row(s) differ only in type, for example row {pairs[0].row}: Excel "
-            f"{pairs[0].expected!r}, notebook {pairs[0].actual!r}.",
-            "Excel coerces text-formatted numbers on the fly; polars keeps them as String, "
-            "so they compare unequal and never match as a join key.",
+            f"{len(pairs)} row(s) pair text with a number, for example row {pairs[0].row}: "
+            f"Excel {pairs[0].expected!r}, notebook {pairs[0].actual!r}.",
+            f"{sample!r} is text kedge refuses to read as a quantity: a leading zero or more "
+            f"than 15 significant digits means an account, a cost centre or a client code, "
+            f"and coercing it loses the identity it is made of.",
+            "Text that unambiguously spells a number -- '20.0' against 20.0 -- is already "
+            "compared as the number Excel coerces it to, so this is not that case.",
         ],
         remedy=(
-            f"Normalise the column at load with to_number({_column_expr(column)}) from "
-            f"kedge.xl, which strips the thousands separators and currency symbols Excel "
-            f"tolerates, and assert the dtype in the hand-in contract so the next delivery "
-            f"cannot reintroduce it."
+            f"Keep {_column_expr(column)} as text on both sides rather than coercing it: pass "
+            f"it in keep_as_text= to read_data() so the hand-in reader leaves it alone, "
+            f"declare it string in the contract, and cast the numeric side to match. If the "
+            f"column really is a quantity that merely arrived formatted as text, to_number() "
+            f"from kedge.xl is the conversion -- but check the leading zeros first."
         ),
-        remedy_symbol="kedge.xl.to_number",
+        remedy_symbol=None,
         reference="PLAN 2.6 (text-formatted numbers)",
         affected_rows=len(pairs),
     )

@@ -56,7 +56,7 @@ from harness.align import align_inputs
 from harness.cellgen import CellOutcome, convert
 from harness.drive import run_notebook, unused_inputs, workspace_overrides
 from harness.findings import ReDriveLog, aligned_drives, coverage_for, scaffold_defects
-from harness.grade import grade
+from harness.grade import grade, handins_for, human_script, placeholder_handins
 from harness.render import plan_layout, write_notebook
 from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
 
@@ -184,12 +184,11 @@ def _case_name(case: Any) -> str:
 def _script_keys(case: Any) -> tuple[str, ...]:
     """The names a case uses for the human's actions, without needing real hand-in files.
 
-    ``script_for`` takes the two hand-in paths because its *values* are those paths; its keys
-    never depend on them, and alignment is only ever about keys. Asking for them with placeholder
-    paths keeps :func:`align_inputs` free of the temporary directory the real drive needs.
+    ``script_for`` takes the hand-in paths because its *values* are those paths; its keys never
+    depend on them, and alignment is only ever about keys. Asking for them with placeholder paths
+    keeps :func:`align_inputs` free of the temporary directory the real drive needs.
     """
-    placeholder = Path("pre.csv")
-    return tuple(case.script_for(placeholder, Path("post.csv")))
+    return tuple(human_script(case, placeholder_handins(case)))
 
 
 class _DrivenCase:
@@ -212,8 +211,9 @@ class _DrivenCase:
         self._alignment = alignment
         self._log = log
 
-    def script_for(self, pre: Path, post: Path) -> dict[str, Any]:
-        return self._alignment.apply(self._case.script_for(pre, post))
+    def script_for(self, *handins: Path, **named: Path) -> dict[str, Any]:
+        """Both spreads, because which one arrives is the wrapped case's decision, not this one's."""
+        return self._alignment.apply(self._case.script_for(*handins, **named))
 
     def __getattr__(self, name: str) -> Any:
         value = getattr(self._case, name)
@@ -374,8 +374,7 @@ def driven_run(notebook: Path, case: Any, root: Path) -> tuple[NotebookRun, tupl
         was empty was asserting nothing.
     """
     alignment = align_inputs(notebook, _script_keys(case))
-    pre, post = case.write_handins(root / "handins-in")
-    script, unplayed = alignment.bind(case.script_for(pre, post))
+    script, unplayed = alignment.bind(human_script(case, handins_for(case, root / "handins-in")))
     run = run_notebook(
         notebook,
         inputs=script,

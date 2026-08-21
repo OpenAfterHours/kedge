@@ -626,11 +626,14 @@ def build(path: Path) -> None:
 
 
 def _connections_xml() -> bytes:
-    """The extract query as Excel stores it: newlines as character references.
+    """The extract query with its newlines as character references.
 
     XML attribute-value normalisation turns a literal newline inside an attribute into a space,
-    so multi-line SQL has to be written as ``&#10;`` -- which is what Excel does, and what
-    ``kedge.analysis.connections`` is built to read back.
+    so multi-line SQL has to be escaped somehow or the query comes back as one line.
+    ``&#10;`` is one of the two forms ``kedge.analysis.connections`` reads. It is *not* the one
+    Excel writes: driving Excel over ``evals/fee_billing_run`` showed it re-encoding the same
+    newlines as ``_x000a_`` and dropping ``commandType`` on the way out. Both forms are decoded,
+    and this workbook is authored in the readable one.
     """
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
