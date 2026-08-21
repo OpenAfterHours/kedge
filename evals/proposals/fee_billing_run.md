@@ -95,10 +95,12 @@ measure nothing.
 
 ---
 
-## 2. Five things that are true today, and only a bigger workbook can show
+## 2. Six things that are true today, and only a bigger workbook can show
 
 Each is verifiable in the tree as it stands. Three are measurements from the probe above; two are
-present-tense defects reachable on a **committed fixture** right now.
+present-tense defects reachable on a **committed fixture** right now. The sixth was found by
+*building* the workbook rather than by reading the code, which is the case for this eval in
+miniature -- it surfaced before a single grader existed.
 
 ### 2.1 The one operation that must never be dropped sorts dead last in the planner's context
 
@@ -259,6 +261,49 @@ sees everything. The defect is that the *model* reasons over a truncated view wh
 was handed says it is complete -- and a complex workbook turns each of those six caps from a
 theoretical limit into a live one.
 
+### 2.6 An empty-string formula result is indistinguishable from a cell nobody calculated
+
+Found while wiring the cached values into the generator, not by reading the code.
+
+`Working` has an override flag: `=IF(agreed=net,"","OVERRIDE")`. On the eighty-one rows with no
+override it returns an empty string. Excel stores that as -- verified by driving Excel over COM
+rather than assumed:
+
+```xml
+<c r="B1" t="str"><f>IF(A1=A2,"","DIFF")</f><v/></c>
+<c r="B2" t="str"><f>IF(A1=A2,"SAME","DIFF")</f><v>SAME</v></c>
+```
+
+openpyxl's `data_only` view hands back `None` for the first of those -- confirmed against the file
+Excel itself wrote, not against a generated one -- and `values.add_formula` counts `cached is None`
+as *no cached value*. So a workbook that Excel has fully calculated reports:
+
+```
+formula cells 3214, cached present 3133, coverage 0.975, status partial
+blocker: cached values cover only 97% of formula cells; the regions without them cannot be
+         reconciled (recalculate and re-save in Excel to complete the baseline)
+```
+
+Two things are wrong here and the second is worse than the first. The coverage figure is untrue:
+every one of those cells *was* calculated. And **the remediation is unfollowable** -- it tells the
+user to recalculate and re-save in Excel, which cannot help, because Excel is what wrote the file.
+A user who follows the instruction exactly gets the identical blocker back, which is the
+"permanently amber" failure CLAUDE.md already names, with an added instruction that wastes their
+time before it fails.
+
+The fix is small and the signal is already in the file: `t="str"` with an empty `<v/>` is a
+calculated empty string, where an uncalculated numeric cell carries no `t` at all. What is missing
+is that openpyxl's `data_only` view discards the attribute before kedge sees it, so the fix has to
+read it from the sheet XML the handle already holds.
+
+`tests/unit/test_evals_fee_billing_run.py::test_an_empty_string_result_reads_as_an_uncalculated_cell`
+pins the current behaviour exactly -- 81 missing, matching the 81 empty-string rows -- so the
+assertion inverts the day it is fixed rather than quietly passing.
+
+The eval keeps the column rather than working around it. `IF(...,"",...)` is what people write, the
+blocker is a *verification* blocker so `convertible` stays at 1.00 and all 50 operations remain
+reconcilable, and a workaround would hide the one defect this exercise has already paid for.
+
 ---
 
 ## 3. The process the workbook records
@@ -287,18 +332,20 @@ it, because a design that scores 0.55 stresses nothing new and one that triages 
 graded at all. Measured:
 
 ```
-operations              49     target (45, 60)
-distinct patterns       16     target >= 12
-complexity           0.699     target (0.68, 0.75)
+operations              50     target (45, 60)
+distinct patterns       15     target >= 12
+complexity           0.698     target (0.68, 0.75)
 verdict     proceed_with_care  must not be 'stop'
 convertible           1.00
+reconcilable ops        50     of 50
+inferred regions        45
 sheets                  10
-cross-sheet ops         19
-findings                45
-dead regions            25
-dependency edges        51
-column profiles         75
-manual carry        ranks 25 of 49  (fan-out 0)
+cross-sheet ops         21
+findings                40
+dead regions            19
+dependency edges        60
+column profiles         77
+manual carry        ranks 32 of 50  (fan-out 0)
 digest truncation     none
 ```
 
@@ -312,8 +359,8 @@ spike settled that the design could not:
   the process would really do it (a pasted code column, and a `SUMIFS` by key). Section 1.1 warned
   that uniformity hides complexity; the opposite error is just as easy and it inflates rather than
   collapses.
-- **25 dead regions, not the 15-plus predicted** -- so P2's haystack is bigger than expected and
-  discrimination 5 is correspondingly sharper.
+- **19 dead regions, above the 15-plus predicted** -- so P2's haystack is real and discrimination 5
+  is sharper than the first eval's one-in-one choice by an order of magnitude.
 - **The workbook sits deliberately under `_MAX_OPERATIONS`.** At 49 the planner sees every
   operation, so the eval measures conversion quality rather than truncation. Truncation is a
   different question and the cheap way to ask it is a *variant* of this workbook past 80, not a
@@ -572,6 +619,7 @@ once before it is changed, so the fix has a before and an after.
 | `*_omitted` keys for the six silent caps | 2.5 | Make the docstring's promise true; `hostile.xlsx` is the regression test and it already fails |
 | Complexity-scaled `open_questions_warning` | P5 | Expect questions in proportion to the workbook rather than at least one |
 | A `kedge.xl` banded-lookup helper | 4, disc. 1 | Approximate-match `VLOOKUP` is Excel semantics, and non-negotiable 3 says Excel semantics live in `kedge.xl` -- a sorted `join_asof` with the boundary condition fixed in one place and tested against Excel |
+| Read `t="str"` when counting cached values | 2.6 | An empty-string result is a calculated value; today it reports as a gap, with a remediation the user cannot follow. The attribute is in the sheet XML the handle already holds |
 
 `acknowledge_all_drops` (2.2) is deliberately absent from that table. The right answer there is a
 design decision rather than a defect -- possibly a cap on how many drops one note may cover, possibly

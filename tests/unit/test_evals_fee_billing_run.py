@@ -209,6 +209,95 @@ def test_the_process_notes_survive_into_the_analysis(analysis: WorkbookAnalysis)
 
 
 # =============================================================================
+# THE RECONCILIATION BASELINE
+# =============================================================================
+
+
+def test_the_workbook_carries_a_reconciliation_baseline(analysis: WorkbookAnalysis) -> None:
+    """Without cached values the whole reconciliation half of the rubric is ungradeable.
+
+    ``infer_regions`` proposes nothing, every region degrades to "not reconciled", and triage
+    reports a blocker -- so items about whether a translation reproduces the workbook cannot be
+    scored at all, in either direction.
+    """
+    from kedge.analysis.workbook import open_workbook
+    from kedge.reconcile.baseline import infer_regions
+
+    assert analysis.cached_values.cached_present_count > 3_000
+    assert all(op.cached_values_present for op in analysis.operations)
+
+    with open_workbook(WORKBOOK) as handle:
+        regions = infer_regions(handle, analysis)
+    assert len(regions) > 30, f"only {len(regions)} reconcilable regions"
+
+
+def test_the_allocation_tab_is_stale_on_purpose(analysis: WorkbookAnalysis) -> None:
+    """Discrimination 9, and the only place in the eval where the cached values are *wrong*.
+
+    ``Allocation`` is left on manual calculation, so its figures predate the three agreed
+    overrides. A conversion that reconciles against them and adjusts itself until they match has
+    adopted numbers Excel itself would disown. The correct answer is to declare the region not
+    reproduced, with the reason, and report CHECKED WITH EXCEPTIONS.
+
+    The staleness is recorded in the Sign-off prose and nowhere else, because no analyser can
+    see it in the cells -- which is exactly why the briefing has to survive the conversion.
+    """
+    from openpyxl import load_workbook
+
+    values = load_workbook(WORKBOOK, data_only=True)
+    working = values["Working"]
+    allocation = values["Allocation"]
+
+    agreed = evalgen.LETTERS["agreed_fee"]
+    net = evalgen.LETTERS["net_fee"]
+    codes = {code for code, _agreed, _reason, _on in evalgen.OVERRIDES}
+
+    live = 0.0
+    stale_expected = 0.0
+    for offset in range(evalgen.CLIENTS):
+        row = evalgen.WORKING_FIRST_ROW + offset
+        live += working[f"{agreed}{row}"].value
+        stale_expected += working[f"{net}{row}"].value
+
+    # A client row carries a code in column A; a subtotal row does not. Reading the sheet rather
+    # than recomputing the layout keeps this a check on the file and not on the generator.
+    banked = sum(
+        row[4].value
+        for row in allocation.iter_rows(min_row=2, max_col=5)
+        if row[0].value is not None
+    )
+    assert abs(banked - stale_expected) < 0.05, "Allocation should hold the pre-override figures"
+    assert abs(banked - live) > 1.0, "Allocation must disagree with Working, or nothing is stale"
+    assert codes, "the overrides are what make the two differ"
+
+
+def test_an_empty_string_result_reads_as_an_uncalculated_cell(
+    analysis: WorkbookAnalysis,
+) -> None:
+    """A defect in kedge, pinned here because this workbook is the first thing to reach it.
+
+    ``=IF(agreed=net,"","OVERRIDE")`` returns an empty string on the 81 rows with no override.
+    Excel stores that as ``<c t="str"><f>...</f><v/></c>`` -- verified by driving Excel, not
+    assumed -- and openpyxl's ``data_only`` view hands back ``None`` for it, which
+    ``values.add_formula`` counts as *no cached value*.
+
+    So a workbook that is fully calculated reports partial coverage and a verification blocker,
+    and the blocker's remediation is unfollowable: it says "recalculate and re-save in Excel",
+    which cannot help, because Excel is what wrote the file. The ``t="str"`` attribute is the
+    signal that would tell the two apart, and it is discarded before kedge sees it.
+
+    When that is fixed this assertion inverts, and the eval will have paid for itself once.
+    """
+    coverage = analysis.cached_values
+    missing = coverage.formula_cell_count - coverage.cached_present_count
+    empty_string_rows = evalgen.CLIENTS - len(evalgen.OVERRIDES)
+    assert missing == empty_string_rows, (
+        f"{missing} formula cells report no cached value; expected exactly the "
+        f"{empty_string_rows} rows whose override flag is an empty string"
+    )
+
+
+# =============================================================================
 # DETERMINISM
 # =============================================================================
 

@@ -486,10 +486,10 @@ footer {
 
 <!-- 2 ─────────────────────────────────────────────────── -->
 <section>
-  <div class="sec-head"><div class="sec-num">§2</div><h2>Five things that are true today, and only a bigger workbook can show</h2></div>
+  <div class="sec-head"><div class="sec-num">§2</div><h2>Six things that are true today, and only a bigger workbook can show</h2></div>
 
   <div class="body">
-    <p>Each is verifiable in the tree as it stands. Three are measurements from the probes above; two are present-tense defects reachable on a <strong>committed fixture</strong> right now.</p>
+    <p>Each is verifiable in the tree as it stands. Three are measurements from the probes above; two are present-tense defects reachable on a <strong>committed fixture</strong> right now. The sixth was found by <em>building</em> the workbook rather than by reading the code, which is the case for this eval in miniature &mdash; it surfaced before a single grader existed.</p>
   </div>
 
   <h3><span class="h3num">2.1</span>The one operation that must never be dropped sorts dead last in the planner's context</h3>
@@ -588,6 +588,38 @@ findings on Summary: ['preamble_rows']</pre>
     <p>Pivot tables are heavily used in finance processes, so this is not an edge case to be declared out of scope; it is a capability the analyser has to grow. <a href="#s71" style="color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px">&sect;7.1</a> specifies it.</p>
   </div>
 
+  <h3><span class="h3num">2.6</span>An empty-string formula result is indistinguishable from a cell nobody calculated</h3>
+
+  <div class="body">
+    <p>Found while wiring the cached values into the generator, not by reading the code.</p>
+    <p><code>Working</code> has an override flag: <code>=IF(agreed=net,"","OVERRIDE")</code>. On the eighty-one rows with no override it returns an empty string. Excel stores that as &mdash; verified by driving Excel over COM rather than assumed:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Measured &mdash; as Excel itself saved it</div>
+<pre>&lt;c r="B1" t="str"&gt;&lt;f&gt;IF(A1=A2,"","DIFF")&lt;/f&gt;<b>&lt;v/&gt;</b>&lt;/c&gt;
+&lt;c r="B2" t="str"&gt;&lt;f&gt;IF(A1=A2,"SAME","DIFF")&lt;/f&gt;&lt;v&gt;SAME&lt;/v&gt;&lt;/c&gt;</pre>
+  </div>
+
+  <div class="body">
+    <p>openpyxl's <code>data_only</code> view hands back <code>None</code> for the first of those &mdash; confirmed against the file Excel itself wrote, not against a generated one &mdash; and <code>values.add_formula</code> counts <code>cached is None</code> as <em>no cached value</em>. So a workbook that Excel has fully calculated reports:</p>
+  </div>
+
+  <div class="readout">
+    <div class="readout-label">Measured &mdash; the resulting blocker</div>
+<pre>formula cells <b>3214</b>, cached present <b>3133</b>, coverage <b>0.975</b>, status <b>partial</b>
+
+blocker: cached values cover only 97% of formula cells; the regions without
+         them cannot be reconciled <b>(recalculate and re-save in Excel to
+         complete the baseline)</b></pre>
+  </div>
+
+  <div class="body">
+    <p>Two things are wrong here and the second is worse than the first. The coverage figure is untrue: every one of those cells <em>was</em> calculated. And <strong>the remediation is unfollowable</strong> &mdash; it tells the user to recalculate and re-save in Excel, which cannot help, because Excel is what wrote the file. A user who follows the instruction exactly gets the identical blocker back: the "permanently amber" failure CLAUDE.md already names, with an added instruction that wastes their time before it fails.</p>
+    <p>The fix is small and the signal is already in the file: <code>t="str"</code> with an empty <code>&lt;v/&gt;</code> is a calculated empty string, where an uncalculated numeric cell carries no <code>t</code> at all. What is missing is that openpyxl's <code>data_only</code> view discards the attribute before kedge sees it, so the fix has to read it from the sheet XML the handle already holds.</p>
+    <p>The eval keeps the column rather than working around it. <code>IF(...,"",...)</code> is what people write, the blocker is a <em>verification</em> blocker so <code>convertible</code> stays at 1.00 and all 50 operations remain reconcilable, and a workaround would hide the one defect this exercise has already paid for.</p>
+  </div>
+
   <h3><span class="h3num">2.5</span>Truncation is already silent, and it is already happening</h3>
 
   <div class="body">
@@ -658,18 +690,20 @@ the four dropped, ranked last because they are severity=info:
 
   <div class="readout">
     <div class="readout-label">Calibration &mdash; m11_management_fee_run.xlsx</div>
-<pre>operations              <b>49</b>     target (45, 60)
-distinct patterns       <b>16</b>     target &gt;= 12
-complexity           <b>0.699</b>     target (0.68, 0.75)
+<pre>operations              <b>50</b>     target (45, 60)
+distinct patterns       <b>15</b>     target &gt;= 12
+complexity           <b>0.698</b>     target (0.68, 0.75)
 verdict     <b>proceed_with_care</b>  must not be 'stop'
 convertible           1.00
+reconcilable ops        <b>50</b>     of 50
+inferred regions        <b>45</b>
 sheets                  10
-cross-sheet ops         19
-findings                45
-dead regions            <b>25</b>
-dependency edges        51
-column profiles         75
-manual carry     ranks <b>25 of 49</b>  (fan-out 0)
+cross-sheet ops         21
+findings                40
+dead regions            <b>19</b>
+dependency edges        60
+column profiles         77
+manual carry     ranks <b>32 of 50</b>  (fan-out 0)
 digest truncation     none
 
 <b>IN BAND</b></pre>
@@ -679,7 +713,7 @@ digest truncation     none
     <p><strong>1.9 times the complexity of anything kedge has ever converted.</strong> Three things the spike settled that the design could not:</p>
     <ul class="plain" style="margin-left:0">
       <li><strong>Two columns had to be rewritten before the workbook was hard at all.</strong> A reference whose target moves per row &mdash; <code>=Positions!$A{n}</code> filled down, and <code>=Working!$S{n}</code> on <code>Allocation</code> &mdash; normalises to a <em>different</em> R1C1 string on every row, so one column became eighty-four operations and the first measurement came back at <strong>208 operations, complexity 0.855</strong>. Both are now written the way the process would really do it (a pasted code column, and a <code>SUMIFS</code> by key). &sect;1.1 warned that uniformity hides complexity; the opposite error is just as easy and it inflates rather than collapses.</li>
-      <li><strong>25 dead regions, not the 15-plus predicted</strong> &mdash; so P2's haystack is bigger than expected and discrimination 5 is correspondingly sharper.</li>
+      <li><strong>19 dead regions, above the 15-plus predicted</strong> &mdash; so P2's haystack is real, and discrimination 5 is sharper than the first eval's one-in-one choice by an order of magnitude.</li>
       <li><strong>The workbook sits deliberately under <code>_MAX_OPERATIONS</code>.</strong> At 49 the planner sees every operation, so the eval measures conversion quality rather than truncation. Truncation is a different question and the cheap way to ask it is a <em>variant</em> of this workbook past 80, not a second eval.</li>
     </ul>
     <p>Note what is <em>not</em> in that list: no macros, no external links, no circular references, no <code>.xlsb</code>. Those are <code>hostile.xlsx</code>'s job, and they triage to <code>stop</code>. This workbook must triage to <code>proceed</code> or <code>proceed_with_care</code>, because an eval about conversion quality that refuses to convert measures nothing.</p>
@@ -873,7 +907,7 @@ class PivotExtraction(_Frozen):
   <h3><span class="h3num">7.3</span>The product changes the diagnosis already points at</h3>
 
   <div class="body">
-    <p>Four, beyond 7.1. Each is small, each has its evidence in &sect;2, and the reason they are listed separately from 7.1 is sequencing rather than doubt &mdash; the eval should measure the current behaviour once before it is changed, so the fix has a before and an after.</p>
+    <p>Five, beyond 7.1. Each is small, each has its evidence in &sect;2, and the reason they are listed separately from 7.1 is sequencing rather than doubt &mdash; the eval should measure the current behaviour once before it is changed, so the fix has a before and an after.</p>
   </div>
 
   <div class="tablewrap">
@@ -883,6 +917,7 @@ class PivotExtraction(_Frozen):
         <tr><td>A second ranking key in <code>_operation_digest</code></td><td class="mono">&sect;2.1</td><td>Rank a flagged <code>dead_region</code> or a generated-SQL region above the zero-fan-out tail, so a manual carry cannot be truncated away</td></tr>
         <tr><td><code>*_omitted</code> keys for the six silent caps</td><td class="mono">&sect;2.5</td><td>Make the docstring's promise true; <code>hostile.xlsx</code> is the regression test and it already fails</td></tr>
         <tr><td>Complexity-scaled <code>open_questions_warning</code></td><td class="mono">P5</td><td>Expect questions in proportion to the workbook rather than at least one</td></tr>
+        <tr><td>Read <code>t="str"</code> when counting cached values</td><td class="mono">&sect;2.6</td><td>An empty-string result is a calculated value; today it reports as a gap, with a remediation the user cannot follow. The attribute is in the sheet XML the handle already holds</td></tr>
         <tr><td>A <code>kedge.xl</code> banded-lookup helper</td><td class="mono">&sect;4.1</td><td>Approximate-match <code>VLOOKUP</code> is Excel semantics, and non-negotiable 3 says Excel semantics live in <code>kedge.xl</code> &mdash; a sorted <code>join_asof</code> with the boundary condition fixed in one place and tested against Excel</td></tr>
       </tbody>
     </table>
