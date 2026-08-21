@@ -3,8 +3,10 @@
 Status: proposal. Nothing here is built.
 
 Every figure in section 1 and section 2 was measured against the tree at `305fe62`, by running the
-real analyser and the real `build_proposal_context` over the committed fixtures. Where a claim is a
-prediction rather than a measurement it says so.
+real analyser and the real `build_proposal_context` over the committed fixtures and over three probe
+workbooks built for this proposal -- one of them a genuine pivot table constructed by driving Excel
+over COM, per CLAUDE.md's rule that ground truth about Excel is generated rather than reasoned about.
+Where a claim is a prediction rather than a measurement it says so.
 
 ---
 
@@ -32,6 +34,13 @@ one join, an outbound file) and therefore cannot distinguish "kedge struggles wi
 spreadsheets" from "kedge has never seen a second input". Holding the shape fixed makes the result
 attributable. The two proposals are complementary and neither substitutes for the other; if only one
 is built, this is the cheaper one and it is the one that tells you where you actually are.
+
+**Diagnostic does not mean tolerant.** Measuring first is a sequencing choice, not a scope one: the
+standing rule is that really hard spreadsheets are the target, so where this eval shows the pipeline
+cannot cope with a construct, the pipeline changes. Section 2.4 is already an example -- pivot tables
+are ubiquitous in finance and the analyser cannot see one, so section 7.1 specifies the extractor
+rather than recording the limitation. Nothing this eval finds should end up in "out of scope"; the
+only question is the order things are built in.
 
 ---
 
@@ -153,23 +162,64 @@ So the largest single translation burden in a complex conversion is a hole nothi
 at scale, whose failure mode is a wall of text telling the reader to go and look for bugs that do not
 exist. That is worth knowing before a user finds it.
 
-### 2.4 `ExcelPattern.PIVOT` is never assigned by any code path in `src/`
+### 2.4 A pivot table reads as a data sheet, and everything needed to translate it is already on disk
 
-Grep the whole tree. `ExcelPattern.PIVOT` appears in exactly three places -- two translation-hint
-tables in `analysis/regions.py` and one in `notebook/scaffold.py` -- and in **no** assignment.
-`classify_pattern` cannot return it; nothing else sets `excel_pattern`. Nothing anywhere in `src/`
-reads a `pivotCache` or a `pivotTable` part.
+This is the sharpest of the five, and it is not a gap. It is a **silent wrong answer**.
 
-A pivot table is therefore invisible: no operation, no finding, no blocker, no open question. The
-summary tab a manager actually reads is, to kedge, an empty sheet. And because
+Grep the whole tree first. `ExcelPattern.PIVOT` appears in exactly three places -- two
+translation-hint tables in `analysis/regions.py` and one in `notebook/scaffold.py` -- and in **no**
+assignment. `classify_pattern` cannot return it; nothing else sets `excel_pattern`. Nothing anywhere
+in `src/` reads a `pivotCache` or a `pivotTable` part. Because
 `tests/unit/test_agent_prompts.py` asserts every `ExcelPattern` member appears in the prompt that
-offers it, the model is told about a vocabulary word the analyser can never hand it -- which is the
-mirror image of the `StageKind.HANDOFF` bug already recorded in CLAUDE.md, where the enum grew and
-the prose did not.
+offers it, the model is told about a vocabulary word the analyser can never hand it -- the mirror
+image of the `StageKind.HANDOFF` bug already in CLAUDE.md, where the enum grew and the prose did not.
 
-Whether the right answer is "parse pivot caches" or "raise a blocker saying a pivot table was found
-and cannot be read" is a design question. Silence is not one of the options, and silence is what
-happens now.
+What that costs is worse than silence. A pivot table writes its **rendered result** into the sheet as
+ordinary cached cells, so the tab does not come back empty -- it comes back looking like data. Driving
+Excel to build a real pivot (row fields `entity` and `cost_centre`, column field `month`, page field
+`region`, `Sum of fee_gbp`) over a 198-row source and re-reading it:
+
+```
+sheets: ['Allocation', 'Summary']
+  Allocation: role=data formula_cells=0 max_row=199
+  Summary:    role=data formula_cells=0 max_row=11     <- the pivot
+operations: 0        -> on Summary: 0
+findings on Summary: ['preamble_rows']
+```
+
+`Summary` is classified **`role=data`**. Not `output`, not `calculation`, not unknown -- an *input*.
+A conversion reading that plan has been told the aggregated summary is a source table, when it is a
+derived view of the tab beside it. Reading a derived aggregate as a source is how a total gets
+double-counted, and nothing in the analysis says otherwise.
+
+And the translation is not a research problem. openpyxl already parses the whole thing; the same
+workbook, read back:
+
+```
+pivots on Summary: 1
+  name='FeeSummary' location='A3:E11' cacheId=6
+  source: sheet='Allocation' ref='A1:F199'
+  cache fields: ['client','entity','cost_centre','month','region','fee_gbp']
+  rowFields:  ['entity', 'cost_centre']
+  colFields:  ['month']
+  pageFields: ['region']
+  dataField:  field='fee_gbp' name='Sum of fee_gbp' aggregation='sum'
+```
+
+That is a complete, machine-readable specification of
+
+```python
+alloc.filter(pl.col("region") == region).group_by(["entity", "cost_centre", "month"])
+     .agg(pl.col("fee_gbp").sum()).collect().pivot(on="month", ...)
+```
+
+with no guessing anywhere in it -- source range, grouping keys, the pivoted axis, the filter field
+and the aggregation function all read straight off the part. It is exactly the kind of deterministic
+extraction `analysis/` exists to do, it needs no new dependency, and the enum member, the prompt entry
+and the translation hint it would populate **all already exist**. Only the extractor is missing.
+
+Pivot tables are heavily used in finance processes, so this is not an edge case to be declared out of
+scope; it is a capability the analyser has to grow. Section 7.1 specifies it.
 
 ### 2.5 Truncation is already silent, and it is already happening
 
@@ -252,12 +302,12 @@ quirks measures the reader, not the conversion."*
 | 4 | A manual override is a decision to re-ask, not a number to bake in | `Overrides` |
 | 5 | Seventeen dead regions are dead; the eighteenth posts the fees | `Working` abandoned columns, and `Post` |
 | 6 | An embedded subtotal row is not data | `Allocation` |
-| 7 | A pivot table is a tab the conversion cannot see into | `Summary` |
+| 7 | A pivot table is a derived aggregation, never a data source | `Summary` |
 | 8 | Text-formatted numbers, and a leading zero that must survive | `Fee Schedule` |
 | 9 | Stale cached values on one sheet must not reconcile as passed | `Allocation`, saved on manual calculation |
 | 10 | Tab order is not dependency order | `Entity Map` is the eighth tab and feeds the fourth |
 
-Five are worth expanding.
+Six are worth expanding.
 
 **Number 1 is the highest-value translation risk in the whole proposal.** `=VLOOKUP(AUM, tiers, 3, TRUE)`
 over a banded rate table is the single most common construct in finance spreadsheets and the one
@@ -286,6 +336,15 @@ planner's context (section 2.1) and can be dismissed along with the rest by a si
 `acknowledge_all_drops` (section 2.2). Same question, and the first time it has been asked in a way
 that can distinguish understanding from luck.
 
+**Number 7 is a wrong answer rather than a missing one, which is why it is graded hard.** The
+`Summary` tab is a pivot over `Allocation`, and today it classifies as `role=data` (section 2.4) --
+so a plan can legitimately conclude the aggregated figures are an input. The desired output is that
+the summary is *derived*: one stage grouping `Allocation` by entity and cost centre, reproducing the
+pivot's own cached grid as its reconciliation region. Once the extractor of section 7.1 exists this
+is gradeable in both directions -- the conversion must recompute the summary and must **not** read it
+as a source -- and it needs no `visible_cells` trickery, because a sheet consumed without being
+declared is visible in the plan alone.
+
 **Number 9 is non-negotiable 6 under pressure.** `Allocation` was last saved with calculation set to
 manual, so its cached values are real but stale -- `PARTIAL_CACHED_VALUES` fires. A conversion that
 reconciles against them reports a pass against numbers Excel itself would disown. The correct
@@ -313,7 +372,7 @@ recorded before the first run, so the eval can be **wrong**.
 | P1 | Triage returns `proceed_with_care`, complexity 0.68-0.75 | High | Measured on the probe: 49 ops gave 0.665 |
 | P2 | The plan's `dropped` list arrives with 15+ entries and is cleared in one action | High | `acknowledge_all_drops` exists and is the path of least resistance |
 | P3 | The `Post` column is dropped, or kept with a reason that does not mention that a person runs it | Medium-high | It ranks last, it is an `info` `dead_region`, and there are seventeen like it |
-| P4 | `Summary` produces nothing at all -- not even an open question | Very high | `ExcelPattern.PIVOT` has no assignment site |
+| P4 | `Summary` is planned as a **data source** rather than as a derived aggregate | Very high | Measured: a real pivot classifies `role=data`, 0 operations, 0 findings |
 | P5 | The plan carries 1-3 open questions, satisfying `open_questions_warning` | High | The guard is `if self.open_questions: return None` -- binary, on a continuous quantity |
 | P6 | `reconciliation_values` comes back with under half its entries resolvable | Medium-high | The default is the whole frame; the key is the workbook's own header |
 | P7 | The tier lookup is translated as an exact join or a `when/then` ladder rather than `join_asof` | Medium | The hint is one line in a digest of 50 operations |
@@ -359,9 +418,11 @@ them.
 
 ### Structural (~20 points)
 
-`recognises_the_pivot_tab` (3) -- does the plan mention `Summary` at all, in any form, including an
-open question saying it cannot be read? Currently expected to fail, and recorded as the measurement
-of section 2.4.
+`pivot_is_derived_not_read` (4) -- `Summary` appears in the plan as a stage computed from
+`Allocation`, with the pivot's grouping keys and aggregation named, and **not** as a `StageSource`.
+Graded in both directions, because reading it as a source is the wrong answer and omitting it
+entirely is merely an incomplete one. Expected to fail before section 7.1 lands; that failure is the
+baseline the extractor is measured against.
 
 `overrides_are_a_checkpoint` (4) -- `names_the_tier_table_as_a_lookup_source` (3) --
 `has_a_checkpoint_before_posting` (2) -- `stage_count_is_proportionate` (2), 8-16, because a
@@ -377,11 +438,74 @@ the tier table presented as a thing that changes, or baked in as constants?
 
 ---
 
-## 7. What has to change to run it
+## 7. What has to change
 
-Phase 1 needs **no `src/` change at all** -- that is the proposal's main claim and its main
-attraction. It needs three small harness changes, all of which are limits `adjustment_signoff`
-happened not to hit:
+Two lists, and they are different in kind. The **harness** changes are what phase 1 needs to run at
+all. The **product** changes are what the workbook shows kedge cannot yet do, of which one -- the
+pivot extractor -- is already established as needed rather than merely predicted, so it is specified
+here in full.
+
+### 7.1 A pivot extractor: `analysis/pivots.py`
+
+Established by measurement in section 2.4, not waiting on the eval. Pivot tables are ubiquitous in
+finance processes, openpyxl already parses every part of one, and today a pivot's rendered grid
+misclassifies as `role=data` -- so the cost of the gap is a wrong answer rather than a missing one.
+
+`PowerQueryExtraction` is the exact precedent and the shape to copy: an extractor that is normally
+absent, degrades to a status plus a `Finding` rather than an exception, and hangs off
+`WorkbookAnalysis` beside its peers.
+
+```python
+class PivotTable(_Frozen):
+    name: str                       # 'FeeSummary'
+    sheet: str                      # where the rendered grid sits
+    location: str                   # 'A3:E11' -- the cached result, in A1
+    source_sheet: str | None        # 'Allocation'
+    source_ref: str | None          # 'A1:F199'
+    source_name: str | None         # a defined name or table, when that is the source
+    row_fields: list[str]
+    column_fields: list[str]
+    page_fields: list[str]          # filters
+    data_fields: list[PivotDataField]   # (field, caption, aggregation)
+    refreshed_on: datetime | None
+    stale: bool                     # source has more rows than the cache recorded
+
+class PivotExtraction(_Frozen):
+    status: ExtractionStatus = ExtractionStatus.ABSENT
+    tables: list[PivotTable] = Field(default_factory=list)
+    detail: str | None = None
+```
+
+Five consequences, each small and each in an existing seam:
+
+1. **A `LogicalOperation` per pivot**, with `excel_pattern=ExcelPattern.PIVOT` -- which finally
+   assigns the enum member that already exists, already appears in the prompt, and already carries
+   the translation hint `.group_by(...).agg(...) or .pivot(...)`. `ranges` is the rendered grid, so
+   the pivot reconciles against its own cached output like any other region, and `references` points
+   at the source range so it lands in the dependency graph as a **descendant** of the sheet it
+   aggregates. That single edge is what stops a plan reading it as an input.
+2. **`classify.py` learns the role.** A sheet whose cells are wholly inside a pivot's `location` is
+   `output`, never `data`. This is the fix for the misclassification, and it is a shape heuristic of
+   exactly the kind that module already contains.
+3. **Two findings.** `PIVOT_SOURCE_UNRESOLVABLE` when the cache source is an external connection or
+   an OLAP cube rather than a worksheet range -- genuinely unconvertible without the warehouse, and
+   an honest blocker. `PIVOT_CACHE_STALE` when the recorded cache is narrower than the source range
+   now is, because the grid on screen is then answering a question about last month's data.
+4. **`triage` counts them.** A pivot is real process, so it belongs in `complexity`; an unresolvable
+   source belongs in `verification_blockers`, since the code can be written and the numbers cannot be
+   proved.
+5. **`SCHEMA_VERSION` goes to `1.1`.** Additive with a default, so a `.kedge/analysis.json` written
+   by an older build still validates.
+
+Deliberately not in scope for 7.1: calculated fields and calculated items (a formula stored inside
+the pivot, which is a small expression language of its own), and `GETPIVOTDATA` references, which are
+formulas the analyser already tokenises and which should resolve to the pivot's operation id once
+there is one to resolve to. Both are follow-ups, and both should be findings rather than silence in
+the meantime.
+
+### 7.2 Harness changes for phase 1
+
+Three, all limits `adjustment_signoff` happened not to hit:
 
 1. **The two-hand-in tuple.** `harness/grade.py:61` and `harness/convert.py:377` both do
    `pre, post = case.write_handins(...)`. This workbook has three inbound artifacts (positions
@@ -399,11 +523,22 @@ happened not to hit:
    collapses the workbook back to seven operations (see 1.1) would otherwise pass everything while
    measuring nothing.
 
-What phase 2 might need is exactly what phases 1 finds, and writing that list now would be guessing.
-The candidates visible from here are: a second ranking key in `_operation_digest`, an
-`*_omitted` key for the six silent caps, a `PIVOT` assignment site or a blocker, a
-complexity-scaled `open_questions_warning`, and possibly a `kedge.xl` banded-lookup helper. Every one
-is small. None should be built before the eval says it is needed.
+### 7.3 The product changes the diagnosis already points at
+
+Four, beyond 7.1. Each is small, each has its evidence in section 2, and the reason they are listed
+separately from 7.1 is sequencing rather than doubt -- the eval should measure the current behaviour
+once before it is changed, so the fix has a before and an after.
+
+| Change | Evidence | Shape |
+|---|---|---|
+| A second ranking key in `_operation_digest` | 2.1 | Rank a flagged `dead_region` or a generated-SQL region above the zero-fan-out tail, so a manual carry cannot be truncated away |
+| `*_omitted` keys for the six silent caps | 2.5 | Make the docstring's promise true; `hostile.xlsx` is the regression test and it already fails |
+| Complexity-scaled `open_questions_warning` | P5 | Expect questions in proportion to the workbook rather than at least one |
+| A `kedge.xl` banded-lookup helper | 4, disc. 1 | Approximate-match `VLOOKUP` is Excel semantics, and non-negotiable 3 says Excel semantics live in `kedge.xl` -- a sorted `join_asof` with the boundary condition fixed in one place and tested against Excel |
+
+`acknowledge_all_drops` (2.2) is deliberately absent from that table. The right answer there is a
+design decision rather than a defect -- possibly a cap on how many drops one note may cover, possibly
+nothing at all -- and it should be settled after seeing a real eighteen-drop plan, not before.
 
 ---
 
@@ -422,15 +557,21 @@ it until `--convert` was built.
    it arrives before a single grader is written.
 3. **`expected.yaml` and `case.py`**, informed by step 2 rather than by guesswork about what will be
    hard.
-4. **`--convert` a model through it**, from the beginning and not at the end.
-5. **The reference conversion last, not first** -- deliberately inverting the first eval's order. Its
+4. **The pivot extractor (7.1)**, with its own unit tests over an Excel-built fixture. It sits here
+   rather than first only so that step 2 records the `role=data` misclassification once, as the
+   before; it does not depend on anything in steps 1-3 and could equally land ahead of them.
+5. **`--convert` a model through it**, from the beginning and not at the end.
+6. **The three remaining product changes (7.3)**, each measured against the run from step 2.
+7. **The reference conversion last, not first** -- deliberately inverting the first eval's order. Its
    only jobs are to prove the graders can pass and to serve as the worked example; writing it first
    is what let the graders be shaped around a hand-written answer that hid the defects.
 
 Sizing: the generator is the bulk of it, perhaps 900-1,200 lines because heterogeneity cannot be
-looped. The rubric and graders scale with the ten discriminations, call it 1,200. Steps 1 and 2
-together are maybe a third of the work and return most of the diagnostic value, which is the same
-argument `rebate_payfile` makes for its own phase 1 and is the right way round for both.
+looped. The rubric and graders scale with the ten discriminations, call it 1,200. The pivot extractor
+is small -- openpyxl does the parsing, so it is a mapping layer, a role heuristic, two findings and a
+schema bump, call it 300 lines plus tests. Steps 1 and 2 together are maybe a quarter of the work and
+return most of the diagnostic value, which is the same argument `rebate_payfile` makes for its own
+phase 1 and is the right way round for both.
 
 ---
 
@@ -445,9 +586,11 @@ argument `rebate_payfile` makes for its own phase 1 and is the right way round f
 - **Not a parsing gauntlet.** Two format nasties only -- text-formatted numbers and the leading-zero
   code -- and both carry process meaning.
 - **Still nothing about the chat loop.** Workbook in, notebook out.
-- **No new `src/` capability in phase 1.** If a discrimination cannot be graded without new
-  product code, it belongs in `rebate_payfile` instead. That constraint is what keeps this eval a
-  measurement rather than a second specification.
+- **Not a second specification.** A discrimination here must be gradeable against a workbook and a
+  conversion, not against machinery that has to be designed first. That is what keeps this eval a
+  measurement. It is *not* a licence to declare a hard construct out of scope: section 7.1 exists
+  precisely because pivot tables are common enough that the answer is to build the extractor. The
+  test is "can this be graded?", never "can kedge already do this?"
 
 ---
 
@@ -458,11 +601,13 @@ argument `rebate_payfile` makes for its own phase 1 and is the right way round f
    input that should arrive as a hand-in each run. `StageKind`'s membership test -- *does the
    scaffolder emit something different for it?* -- says checkpoint. The workbook's own habit says
    hand-in. I think checkpoint and I am not confident.
-2. **Should the pivot tab be a blocker or an open question?** A blocker is honest and stops a
-   conversion that might otherwise be fine, since the pivot is usually derivable from the tab beneath
-   it. An open question is proportionate and easy to ignore. The answer probably depends on whether
-   anything downstream *reads* the pivot, which is knowable: a `GETPIVOTDATA` reference is a formula
-   and the analyser would see it.
+2. **Where does an unresolvable pivot source stop the run?** Settled: a worksheet-sourced pivot is
+   extracted and translated (section 7.1). What is still open is the pivot whose cache comes off an
+   external connection or an OLAP cube -- no `worksheetSource`, nothing in the workbook to recompute
+   from. That is genuinely unconvertible without the warehouse, so it is a `verification_blocker` at
+   least; whether it should also be a *conversion* blocker depends on whether the rest of the
+   workbook stands without it, which the analyser can see and the triage scorer currently cannot
+   express.
 3. **How hard is too hard?** If this workbook triages to `stop`, the eval is unrunnable and has to be
    softened. If it triages to `proceed`, it may not be stressing triage at all. `proceed_with_care`
    is the target and it is a narrow band to hit deliberately -- which is itself worth knowing about
