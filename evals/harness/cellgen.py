@@ -36,11 +36,20 @@ from kedge.agent.validate import (
     validate_cell,
 )
 from kedge.notebook.codegen import analyse_cells
-from kedge.notebook.scaffold import build_cells
+from kedge.notebook.scaffold import (
+    build_cells,
+    holes_in,
+)
+from kedge.notebook.scaffold import (
+    split_hole as _split_hole,
+)
+from kedge.notebook.scaffold import (
+    strip_marker as _without_the_marker,
+)
 from kedge.plan.propose import CompletionRequest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Sequence
     from pathlib import Path
 
     from kedge.analysis.model import WorkbookAnalysis
@@ -60,7 +69,6 @@ __all__ = [
     "holes_in",
 ]
 
-_GATE_LINE = re.compile(r"^_gate_\w+\s*=")
 _FENCE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
 
 
@@ -225,67 +233,6 @@ class ConversionResult:
         blocks = [f"generation: {self.summary_line()}"]
         blocks.extend(cell.render() for cell in self.generated)
         return "\n".join(blocks)
-
-
-def holes_in(cells: Iterable[ScaffoldCell]) -> tuple[ScaffoldCell, ...]:
-    """The cells the scaffolder left for the model, found by its own marker.
-
-    By marker rather than by role, so a scaffolder that grows a second kind of unwritten cell is
-    measured by this eval on the day it ships rather than on the day somebody notices.
-    """
-    return tuple(cell for cell in cells if TODO_MARKER in cell.code)
-
-
-def _split_hole(code: str) -> tuple[str, str]:
-    """Split a scaffolded stage cell into the part kedge wrote and the part it left.
-
-    The header is every line up to and including the ``TODO(kedge)`` comment, plus any
-    ``_gate_...`` assignment below it. The gate is not translation: it is the line that makes a
-    cell downstream of a checkpoint invisible until the checkpoint is recorded, and a model that
-    rewrote the body without it would silently un-gate the notebook -- the exact defect
-    ``harness/drive.py:visible_cells`` was written to catch. It is kept out of the hole so it
-    cannot be lost, and so a model is not marked down for a line it was never asked to write.
-
-    Returns:
-        ``(header, placeholder)``. The header is returned with no trailing newline.
-    """
-    lines = code.splitlines()
-    marker = next((index for index, line in enumerate(lines) if TODO_MARKER in line), None)
-    if marker is None:
-        return "", code
-    end = marker + 1
-    while end < len(lines) and (
-        _GATE_LINE.match(lines[end]) or lines[end].lstrip().startswith("#")
-    ):
-        end += 1
-    return "\n".join(lines[:end]), "\n".join(lines[end:])
-
-
-def _without_the_marker(header: str) -> str:
-    """The header with the ``TODO(kedge)`` instruction removed, for a hole that got filled.
-
-    The marker is an instruction to a model, not documentation of the stage, and leaving it above
-    working code has two costs. :func:`holes_in` finds holes by that marker, so every translated
-    cell goes on reading as unfinished for ever -- the eval's own report said five holes and five
-    filled while the artifact it kept still declared five holes. And the kept notebook is meant to
-    be *read*: a reviewer opening it finds "TODO(kedge): translate this stage" above a finished
-    translation and cannot tell what was actually left undone.
-
-    Only the marker's own comment run is dropped, plus the bare ``#`` separator above it if there
-    is one. Everything the scaffolder wrote about the stage -- intent, sources, assumptions, the
-    operations it implements -- is documentation and stays.
-    """
-    lines = header.splitlines()
-    start = next((index for index, line in enumerate(lines) if TODO_MARKER in line), None)
-    if start is None:
-        return header
-    end = start + 1
-    while end < len(lines) and lines[end].lstrip().startswith("#"):
-        end += 1
-    if start and lines[start - 1].strip() == "#":
-        start -= 1
-    kept = [*lines[:start], *lines[end:]]
-    return "\n".join(kept).rstrip("\n")
 
 
 def _body_of(response: str) -> str:

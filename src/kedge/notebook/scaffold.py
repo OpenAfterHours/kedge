@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "HEAD_CELL_NAMES",
     "TAIL_CELL_NAMES",
+    "TODO_MARKER",
     "CellRole",
     "CellSource",
     "CellSync",
@@ -100,6 +101,10 @@ __all__ = [
     "build_cells",
     "cell_name_for",
     "head_handin_is_read",
+    "holes_in",
+    "is_unwritten",
+    "split_hole",
+    "strip_marker",
     "sync_notebook",
 ]
 
@@ -359,6 +364,117 @@ class ScaffoldCell:
     stage_id: str | None = None
     hide_code: bool = False
     """Always False. The user must be able to read what was written (PLAN 1.1)."""
+
+
+# =============================================================================
+# HOLES
+# =============================================================================
+#
+# The scaffolder writes cells it deliberately leaves unwritten, and marks each one. Until now
+# nothing in `src/` read those marks: the code that finds them lived in `evals/harness/cellgen.py`
+# and shipped nowhere, so the product could write a hole and had no way to say it had one. These
+# four functions are that seam, in the module that writes the marker, so the thing that finds a
+# hole and the thing that makes one cannot drift apart.
+
+
+TODO_MARKER = "TODO(kedge)"
+"""The marker written above every body the scaffolder leaves for somebody else to write.
+
+Three places emit it and a hole is found by the marker rather than by the role, so a fourth
+that ships tomorrow is counted tomorrow: :func:`_stage_cell` for an untranslated stage,
+:func:`_reconcile_values_cell` for the region map, and
+:meth:`kedge.plan.model.Stage.effective_handoff` for a hand-off the plan gave no statement.
+"""
+
+_GATE_LINE = re.compile(r"^_gate_\w+\s*=")
+"""A checkpoint gate assignment, which sits below the marker and is not translation."""
+
+
+def is_unwritten(code: str) -> bool:
+    """Whether a cell body is still a hole the scaffolder left.
+
+    Args:
+        code: The cell's source.
+
+    Returns:
+        True when the marker is present anywhere in it.
+    """
+    return TODO_MARKER in code
+
+
+def holes_in(cells: Iterable[ScaffoldCell]) -> tuple[ScaffoldCell, ...]:
+    """The cells the scaffolder left for somebody else, in the order it emitted them.
+
+    Order matters and is the scaffolder's own: a hole is filled against the names defined above
+    it, so filling them out of order asks for a translation of a frame that does not exist yet.
+
+    Args:
+        cells: The scaffolded cells.
+
+    Returns:
+        Those still carrying the marker.
+    """
+    return tuple(cell for cell in cells if is_unwritten(cell.code))
+
+
+def split_hole(code: str) -> tuple[str, str]:
+    """Split a scaffolded cell into the part kedge wrote and the part it left.
+
+    The header is every line up to and including the marker's comment run, plus any ``_gate_...``
+    assignment below it. The gate is not translation: it is the line that makes a cell downstream
+    of a checkpoint invisible until the checkpoint is recorded, and a body rewritten without it
+    would silently un-gate the notebook. It is kept out of the hole so it cannot be lost, and so
+    nobody is asked to write a line they were never shown the reason for.
+
+    Args:
+        code: The cell's source.
+
+    Returns:
+        ``(header, placeholder)``, the header with no trailing newline. A cell with no marker
+        comes back as ``("", code)`` -- it is not a hole, and reporting it as an empty one would
+        invite a caller to overwrite a finished cell.
+    """
+    lines = code.splitlines()
+    marker = next((index for index, line in enumerate(lines) if TODO_MARKER in line), None)
+    if marker is None:
+        return "", code
+    end = marker + 1
+    while end < len(lines) and (
+        _GATE_LINE.match(lines[end]) or lines[end].lstrip().startswith("#")
+    ):
+        end += 1
+    return "\n".join(lines[:end]), "\n".join(lines[end:])
+
+
+def strip_marker(header: str) -> str:
+    """The header with the marker's own instruction removed, for a hole that has been filled.
+
+    The marker is an instruction to whoever writes the body, not documentation of the stage, and
+    leaving it above working code costs twice. :func:`holes_in` finds holes by it, so a
+    translated cell would read as unfinished for ever and every count of what is left would be
+    wrong. And the notebook is meant to be *read*: a reviewer who finds "TODO(kedge): translate
+    this stage" above a finished translation cannot tell what was actually left undone.
+
+    Only the marker's own comment run goes, plus the bare ``#`` separator above it. Everything
+    else the scaffolder wrote -- intent, sources, assumptions, the operations it implements --
+    is documentation of the stage and stays.
+
+    Args:
+        header: The header half of :func:`split_hole`.
+
+    Returns:
+        The header without the marker. One that never had it is returned unchanged.
+    """
+    lines = header.splitlines()
+    start = next((index for index, line in enumerate(lines) if TODO_MARKER in line), None)
+    if start is None:
+        return header
+    end = start + 1
+    while end < len(lines) and lines[end].lstrip().startswith("#"):
+        end += 1
+    if start and lines[start - 1].strip() == "#":
+        start -= 1
+    return "\n".join([*lines[:start], *lines[end:]]).rstrip("\n")
 
 
 # =============================================================================
