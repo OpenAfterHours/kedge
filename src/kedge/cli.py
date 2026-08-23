@@ -62,6 +62,7 @@ from kedge.workspace import Workspace, iter_markers
 
 if TYPE_CHECKING:
     from kedge.analysis.model import WorkbookAnalysis
+    from kedge.notebook.fill import FillReport
     from kedge.plan import PlanRun, PlanStore, ProcessPlan
 
 logger = logging.getLogger(__name__)
@@ -1289,6 +1290,218 @@ def _print_remaining_blockers(plan: ProcessPlan, workbook: Path) -> None:
     console.print(f"[yellow]{len(blockers)} blocker(s) still stand[/yellow]")
     for blocker in blockers:
         typer.echo(f"  - {blocker}")
+
+
+# ── convert ──────────────────────────────────────────────────────────────────────────────────
+#
+# The verb that finishes a conversion, and the only one besides `plan propose` that needs a model.
+#
+# Scaffolding an approved plan writes a notebook whose structure is settled and whose arithmetic
+# is not: every stage kedge cannot translate comes out as a documented passthrough carrying
+# `TODO(kedge)`. Such a notebook *runs*, which is deliberate -- the hand-in machinery works from
+# the moment the plan is approved -- and is exactly why nothing on screen counts the holes. This
+# is the command that fills them and, more importantly, the command that says how many it could
+# not, because a conversion that is two thirds done and silent about it is the failure mode the
+# whole verb exists to close.
+#
+# Headless by construction. It writes through `FileNotebookDriver`, so there is no marimo process,
+# no kernel and no browser anywhere near it: a notebook file, an approved plan, and a model
+# endpoint. Nothing here approves anything -- an unapproved plan is refused, and the exit code
+# says whether every hole was filled.
+
+
+@app.command()
+def convert(
+    workbook: Annotated[Path, typer.Argument(help="The workbook whose notebook to finish.")],
+    analysis: Annotated[
+        Path | None,
+        typer.Option(
+            "--analysis", help="Convert against this analysis.json instead of the saved one."
+        ),
+    ] = None,
+    model: Annotated[
+        str | None, typer.Option("--model", help="Name a model instead of the configured one.")
+    ] = None,
+    max_attempts: Annotated[
+        int | None,
+        typer.Option(
+            "--max-attempts",
+            help="Attempts per cell, including gate repairs. Defaults to kedge's own cap.",
+        ),
+    ] = None,
+    no_sync: Annotated[
+        bool,
+        typer.Option(
+            "--no-sync",
+            help="Do not scaffold first; fill only the holes already in the notebook.",
+        ),
+    ] = False,
+    keep_going: Annotated[
+        bool,
+        typer.Option("--keep-going", help="Carry on through a model-endpoint failure."),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the conversion report as JSON.")
+    ] = False,
+) -> None:
+    """Write the cell bodies the scaffold left unwritten, and report what could not be written.
+
+    Runs the approved plan into the notebook first -- a plan approved since the last open lands as
+    the cells it was missing -- then reads the notebook back and asks the model for one body per
+    `TODO(kedge)` hole, in the scaffolder's order, gating every answer through kedge's validation
+    gate. A stage somebody has already translated carries no marker, is not a hole, and is never
+    asked about or overwritten.
+
+    Six outcomes are reported, not two. A hole nobody asked about, one filled first time, one
+    filled after the gate sent it back, one the gate refused every time, one answered with prose,
+    and one the endpoint never answered are six different things to do next -- and the last is not
+    the model's judgement, so it is never counted as one. A model-endpoint failure abandons the
+    run by default rather than putting the same dead endpoint five more questions; `--keep-going`
+    presses on.
+
+    Exit codes: 0 when every hole was filled, or when there were none, and 1 when anything is
+    still unwritten -- so a script can tell a finished conversion from one that needs a person.
+    """
+    workspace = _plan_workspace(workbook)
+    store = _plan_store(workspace)
+    plan = _plan_in_force(store)
+    if plan is None:
+        raise _fail(_nothing_to_convert(store, workbook))
+
+    facts = (
+        _explicit_analysis(workspace, workbook, analysis)
+        if analysis is not None
+        else _saved_analysis(workspace)
+    )
+    # `--json` prints JSON and nothing else. A machine reading stdout has to be able to parse it,
+    # so the two lines below are the terminal's rather than the command's.
+    if facts is None and not as_json:
+        _console().print(
+            f"[yellow]warning[/yellow] no analysis saved for {_plain(workbook.name)}, so every "
+            f'cell is written against the plan alone. Run `kedge inspect "{_plain(workbook)}"` '
+            f"first if the arithmetic matters."
+        )
+
+    _ensure_notebook(workspace, announce=not as_json)
+
+    # Imported here, as every other command imports the package it needs: the agent's validation
+    # gate and the notebook bridge are several hundred milliseconds that `kedge --help` must not
+    # pay for. The attempt cap is kedge's own rather than a literal three repeated here, which is
+    # also why the flag defaults to None instead of to a number.
+    from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
+    from kedge.notebook.filedriver import FileNotebookDriver
+    from kedge.notebook.fill import convert_notebook
+    from kedge.plan.propose import completer_from_config
+
+    try:
+        completer = completer_from_config(workspace.config)
+    except KedgeError as exc:
+        raise _fail(str(exc)) from exc
+
+    if not as_json:
+        _console().print(
+            f"[dim]plan v{plan.version} for {_plain(plan.workbook)}; filling into "
+            f"{_plain(workspace.notebook_path.name)}[/dim]"
+        )
+    try:
+        report = asyncio.run(
+            convert_notebook(
+                plan,
+                FileNotebookDriver.for_workspace(workspace),
+                completer=completer,
+                analysis=facts,
+                model=model or workspace.config.model.model,
+                max_attempts=max_attempts if max_attempts is not None else MAX_VALIDATION_ATTEMPTS,
+                stop_on_error=not keep_going,
+                sync=not no_sync,
+                workbook_path=workspace.workbook_path,
+                handins_dir=workspace.handins_dir,
+                contract_path=workspace.contract_path,
+            )
+        )
+    except (KedgeError, OSError) as exc:
+        raise _fail(f"the conversion could not run: {exc}") from exc
+
+    if as_json:
+        typer.echo(json.dumps(report.as_dict(), indent=2, default=str))
+    else:
+        _print_conversion(report, workspace.notebook_path)
+    if not report.complete:
+        raise typer.Exit(code=1)
+
+
+def _nothing_to_convert(store: PlanStore, workbook: Path) -> str:
+    """Why there is no approved plan, told apart from there being no plan at all.
+
+    The two need different next steps and reading one as the other sends the user round a loop:
+    "propose a plan" is useless advice to somebody who has one sitting unapproved, and "approve
+    it" is useless advice to somebody who has none.
+    """
+    try:
+        latest = store.latest()
+    except KedgeError:
+        latest = None
+    if latest is None:
+        return _no_plan_message(workbook)
+    return (
+        f"plan v{latest.version} for {workbook.name} is '{latest.approval.state.value}', not "
+        f"'approved', and nothing is written to a notebook before a plan is approved. Read it "
+        f'with `kedge plan show "{workbook}"`, then `kedge plan approve "{workbook}"`.'
+    )
+
+
+def _ensure_notebook(workspace: Workspace, *, announce: bool = True) -> None:
+    """Make sure there is a notebook file to convert into, creating an empty one if not.
+
+    The placeholder is :data:`kedge.notebook.codegen.EMPTY_NOTEBOOK` -- an app and not one cell.
+    This command used to carry its own copy, written to dodge a collision the open sequence's
+    placeholder caused: that one declared an unnamed cell doing ``import marimo as mo``, and
+    ``kedge_setup`` imports ``mo`` too, so the sync's very first cell breached marimo's
+    single-definition rule. Refused whole -- and it is the cell that imports ``pl``, ``kedge.xl``,
+    ``kedge.sql`` and every path constant the rest of the notebook reads, so the conversion
+    completed, reported nothing wrong, and left a notebook where every stage failed on a name
+    that was never bound. That is fixed at the source now (``docs/marimo-api.md`` §4.4), and one
+    constant is what keeps the two commands from drifting back apart.
+    """
+    from kedge.notebook.codegen import EMPTY_NOTEBOOK
+
+    path = workspace.notebook_path
+    if path.is_file():
+        return
+    workspace.ensure_dirs()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(EMPTY_NOTEBOOK, encoding="utf-8")
+    if announce:
+        _console().print(f"[dim]created an empty notebook at {_plain(path)}[/dim]")
+
+
+def _print_conversion(report: FillReport, notebook: Path) -> None:
+    """Draw a conversion: what was scaffolded, every hole and its attempts, what is still owed."""
+    console = _console()
+    if report.scaffolded_summary:
+        console.print(f"[dim]{_plain(report.scaffolded_summary)}[/dim]")
+    typer.echo(report.render())
+    console.print(f"\n[green]notebook[/green] {_plain(notebook)}")
+    if report.holes == 0:
+        console.print(
+            "[dim]the notebook had no unwritten cells; nothing was asked of a model[/dim]"
+        )
+        return
+    if report.complete:
+        console.print(
+            f"[green]{report.filled} cell(s) written[/green] "
+            f"[dim]({report.first_time} first time, {report.after_retries} after retries); "
+            f"nothing is left unwritten[/dim]"
+        )
+        return
+    console.print(f"[yellow]{len(report.unfilled)} cell(s) still to write[/yellow]")
+    for cell in report.unfilled:
+        detail = f" -- {cell.detail}" if cell.detail else ""
+        typer.echo(f"  - {cell.name}: {cell.outcome.value}{detail}")
+    console.print(
+        "[dim]each of these keeps the scaffolder's passthrough, so the notebook still runs and "
+        "still carries its TODO(kedge) marker. Run this again, or write them in the chat.[/dim]"
+    )
 
 
 # ── reconcile ────────────────────────────────────────────────────────────────────────────────
