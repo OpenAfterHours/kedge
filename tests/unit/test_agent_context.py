@@ -173,6 +173,77 @@ def test_notebook_state_falls_back_to_a_cell_listing() -> None:
     assert state.cells[0].defs == ()
 
 
+# ── which cells are still holes ──────────────────────────────────────────────────────────────
+#
+# The scaffolder writes a plan's shape and leaves every translation for somebody else, marked
+# `TODO(kedge)`. The block pinned into every turn listed all of them with defs and refs and said
+# nothing about which were finished, so the one thing the model most needed -- a work list with
+# a termination condition -- was the one thing the notebook never told it.
+
+
+def test_a_listing_that_kept_its_code_says_which_cells_are_still_holes() -> None:
+    state = NotebookState.from_cells(
+        [
+            CellInfo(id="A", name="imports", code="import polars as pl"),
+            CellInfo(id="B", name="apply_uplift", code="# TODO(kedge): translate\nx = y"),
+        ]
+    )
+    assert state.cells[0].unwritten is False
+    assert state.cells[1].unwritten is True
+    assert [cell.label for cell in state.unwritten] == ["apply_uplift"]
+
+
+def test_a_state_that_cannot_read_a_body_says_nothing_rather_than_written(
+    graph: GraphView,
+) -> None:
+    """The honest degrade, and the one that matters.
+
+    ``GraphView`` carries no source on either driver -- reading the graph is how kedge asks what
+    depends on what *without* recording a read against marimo's staleness guard -- and a listing
+    taken with ``with_code=False`` carries none either. Neither can tell a hole from a
+    translation, so both leave it unknown. Defaulting to "written" would have the block quietly
+    report a scaffold as a finished conversion, which is the failure this flag exists to stop.
+    """
+    from_graph = NotebookState.from_graph(graph)
+    assert all(cell.unwritten is None for cell in from_graph.cells)
+    assert from_graph.unwritten == ()
+    assert "[unwritten]" not in from_graph.render()
+
+    structural = NotebookState.from_cells([CellInfo(id="A", name="imports", code=None)])
+    assert structural.cells[0].unwritten is None
+    assert structural.unwritten == ()
+
+
+def test_the_block_flags_each_hole_and_counts_them_once() -> None:
+    cells = tuple(
+        CellFacts(id=f"c{index}", name=f"stage_{index}", unwritten=index >= 3) for index in range(5)
+    )
+    rendered = NotebookState(cells=cells).render()
+
+    assert "2 of 5 cells are still unwritten placeholders" in rendered
+    assert "stage_3 (c3) [unwritten]" in rendered
+    assert "stage_4 (c4) [unwritten]" in rendered
+    assert "stage_0 (c0) defines" in rendered
+    assert "list_cells(unwritten=true)" in rendered
+    # Four mentions and no more: the heading that says where the flag came from, the sentence
+    # that counts them, and one flag per hole.
+    assert rendered.count("[unwritten]") == 4
+    assert "[unwritten] from the notebook file as last saved" in rendered
+
+
+def test_a_notebook_with_nothing_left_to_write_costs_the_block_nothing() -> None:
+    """This block is re-sent on every step of every turn, so a finished notebook pays nothing.
+
+    The flag is worth a handful of tokens while there is work outstanding and must be worth
+    literally zero once there is not.
+    """
+    written = tuple(CellFacts(id=f"c{i}", name=f"stage_{i}", unwritten=False) for i in range(5))
+    silent = tuple(CellFacts(id=f"c{i}", name=f"stage_{i}") for i in range(5))
+
+    assert "unwritten" not in NotebookState(cells=written).render()
+    assert NotebookState(cells=written).render() == NotebookState(cells=silent).render()
+
+
 def test_notebook_state_warns_about_existing_breakage() -> None:
     state = NotebookState(
         cells=(CellFacts(id="A", name="one"),),

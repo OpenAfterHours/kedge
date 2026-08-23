@@ -68,6 +68,50 @@ def test_role_prompt_tells_the_model_to_show_the_query_behind_a_paste() -> None:
     assert "never compose the query" in role
 
 
+def test_the_agent_is_told_the_scaffolder_leaves_holes_and_that_filling_them_is_the_job() -> None:
+    """`TODO(kedge)` appeared in no prompt at all while the scaffolder wrote six of them.
+
+    A real conversion left every arithmetic stage a passthrough and said nothing about it: the
+    agent had never been given the word for a hole, so an open-ended request had no work list and
+    no termination condition. The marker is imported rather than typed, because a prompt that
+    names a different string from the one the scaffolder writes is the same defect one step on.
+    """
+    from kedge.notebook.scaffold import TODO_MARKER
+
+    prompt = build_system_prompt()
+    assert TODO_MARKER in prompt
+
+    role = load_prompt("role.md")
+    assert TODO_MARKER in role
+    # The three things that make it a work list rather than a curiosity.
+    assert "list_cells(unwritten=true)" in role
+    assert "in order" in role
+    assert "_gate_" in role
+
+
+def test_the_tool_prompt_says_how_to_ask_for_less_than_the_whole_notebook() -> None:
+    """The whole-notebook listing does not fit under the cap, and the tail is where the holes are."""
+    tools = load_prompt("tools.md")
+    assert "list_cells(unwritten=true)" in tools
+    assert "with_code=false" in tools
+
+
+def test_every_list_cells_parameter_is_named_in_the_tool_prompt() -> None:
+    """A filter the schema offers and the prompt never mentions is one nobody will use.
+
+    `list_cells` is the tool the model reaches for first and the one whose result is capped
+    hardest, so its parameters are the ones worth holding to the same rule as the tool list
+    itself.
+    """
+    from kedge.agent.tools import TOOL_SPECS
+
+    spec = next(item for item in TOOL_SPECS if item.name == "list_cells")
+    tools = load_prompt("tools.md")
+
+    missing = [name for name in spec.properties if name not in tools]
+    assert not missing, f"list_cells parameters absent from tools.md: {missing}"
+
+
 def test_system_prompt_states_the_marimo_single_definition_rule_and_the_escape_hatch() -> None:
     prompt = build_system_prompt().lower()
     assert "exactly one cell" in prompt or "exactly one owning cell" in prompt

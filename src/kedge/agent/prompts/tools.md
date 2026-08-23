@@ -17,6 +17,12 @@ edits are protected from being silently overwritten. If it comes back stale, cal
 for that cell, look at what the user actually wrote, and decide again with that in front of you.
 Do not simply resubmit.
 
+A whole scaffolded notebook does not fit under the payload cap below, and most of it is fixed
+machinery you never edit. So narrow the request rather than asking for all of it:
+`list_cells(unwritten=true)` returns only the cells still carrying a `TODO(kedge)` marker — the
+ones left for you — and that listing is also the read `edit_cell` requires. `cell=` returns one
+body. `with_code=false` gives a structural listing and leaves the staleness guard armed.
+
 ## The workbook
 
 | Tool | Use it for |

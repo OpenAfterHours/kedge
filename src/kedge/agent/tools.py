@@ -75,6 +75,7 @@ from kedge.agent.validate import (
     violations_from_kernel_error,
 )
 from kedge.errors import KedgeError
+from kedge.notebook.scaffold import TODO_MARKER, is_unwritten
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -469,7 +470,10 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "The notebook as the kernel currently sees it: id, name, code, defs and refs. Call it "
             "before editing anything — the user edits cells directly, so what you remember is "
-            "stale. Reading a cell's code is also what allows a later edit_cell to replace it."
+            "stale. Reading a cell's code is also what allows a later edit_cell to replace it. "
+            "A whole scaffolded notebook does not fit under the payload cap, and most of it is "
+            "fixed machinery you never edit, so narrow the request: unwritten=true is the work "
+            "list, cell= is one body."
         ),
         properties={
             "cell": _string("One cell id or name. Omitted, every cell is listed."),
@@ -478,6 +482,14 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
                 "description": (
                     "Include each cell's source. Default true. False gives a structural listing "
                     "and leaves marimo's staleness guard armed for every cell."
+                ),
+            },
+            "unwritten": {
+                "type": "boolean",
+                "description": (
+                    "List only the cells the scaffolder left for you — the ones still carrying a "
+                    "TODO(kedge) marker. Default false. Finding them reads every cell's source, "
+                    "so the listing that comes back is also the read edit_cell requires."
                 ),
             },
         },
@@ -1301,9 +1313,24 @@ class ToolRegistry:
     # ── notebook tools ───────────────────────────────────────────────────────────────────
 
     async def _tool_list_cells(self, args: Mapping[str, Any]) -> ToolResult:
+        """List the notebook, or the part of it the model asked for.
+
+        The filter is not a convenience. A scaffolded runbook is twenty-odd cells and some
+        thirty thousand bytes of source, over half of it the fixed head, so the whole-notebook
+        listing arrives truncated at :data:`MAX_PAYLOAD_BYTES` -- and the tail it loses is
+        exactly where the untranslated stages sit. ``unwritten=true`` asks for those alone,
+        which is both the smaller payload and the actual work list.
+
+        There is no ``role`` filter to go with it, and there cannot honestly be one here:
+        :class:`~kedge.notebook.model.CellInfo` carries no role, and the scaffolder's
+        :data:`~kedge.notebook.scaffold.CellRole` is decided from the plan at build time and
+        persisted nowhere. Inferring it from cell names would put a second copy of the
+        scaffolder's naming rules in this module, to rot the first time either changes.
+        """
         driver = self._require_driver()
         target = args.get("cell")
         with_code = bool(args.get("with_code", True))
+        holes_only = bool(args.get("unwritten", False))
         if target:
             cell = await driver.get_cell(str(target))
             body = cell.code or "(no source was returned)"
@@ -1313,10 +1340,16 @@ class ToolRegistry:
             )
             return ToolResult.note(text, summary=f"read cell {cell.name or cell.id}")
 
-        cells = await driver.list_cells(with_code=with_code)
+        # The marker is in the source, so selecting on it needs the source whatever the caller
+        # said about showing it.
+        cells = await driver.list_cells(with_code=with_code or holes_only)
         known = {cell.id: cell for cell in (self._state.cells if self._state else ())}
         lines: list[str] = []
+        shown = 0
         for position, cell in enumerate(cells, start=1):
+            if holes_only and not (cell.code and is_unwritten(cell.code)):
+                continue
+            shown += 1
             node = known.get(cell.id)
             defines = ", ".join(node.defs) if node and node.defs else "-"
             refs = ", ".join(node.refs) if node and node.refs else "-"
@@ -1326,7 +1359,22 @@ class ToolRegistry:
             )
             if with_code and cell.code:
                 lines.append(f"```python\n{cell.code}\n```")
-        text = "\n".join(lines) or "the notebook has no cells yet."
+
+        if not cells:
+            return ToolResult.note("the notebook has no cells yet.", summary="0 cell(s)")
+        if holes_only:
+            if not shown:
+                text = (
+                    f"no cell of the {len(cells)} in the notebook still carries a "
+                    f"{TODO_MARKER} marker: every hole the scaffolder left has been filled."
+                )
+                return ToolResult.note(text, summary="0 unwritten cell(s)")
+            heading = f"{shown} of {len(cells)} cells are still unwritten, in notebook order:"
+            text = "\n".join([heading, "", *lines])
+            return ToolResult.note(
+                text, summary=f"{shown} unwritten cell(s)", caps=self._context.caps
+            )
+        text = "\n".join(lines)
         return ToolResult.note(text, summary=f"{len(cells)} cell(s)", caps=self._context.caps)
 
     async def _refuse_without_an_approved_plan(self) -> ToolResult | None:

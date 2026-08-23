@@ -617,6 +617,104 @@ async def test_list_cells_returns_the_bodies_and_the_graph(registry: ToolRegistr
     assert "defines: pl" in result.text
 
 
+# ── listing only the holes ───────────────────────────────────────────────────────────────────
+#
+# A 23-cell scaffolded runbook is some 31,000 bytes of source, so the whole-notebook listing
+# came back truncated at the payload cap -- and the tail it lost was where every untranslated
+# stage sat. Over half the budget went on the fixed head, which the model never edits. The cap
+# is right; spending it on the head is not.
+
+
+class ScaffoldedDriver(FakeDriver):
+    """A notebook that has been scaffolded: fixed head, then stages, two of them still holes."""
+
+    _CELLS = (
+        CellInfo(id="AAaa", name="kedge_setup", code="import polars as pl\n" + "# pad\n" * 200),
+        CellInfo(id="BBbb", name="handin_frame", code="handin_frame = 1\n" + "# pad\n" * 200),
+        CellInfo(
+            id="CCcc",
+            name="load_pre_adjustment",
+            code="# Stage 1 of 3: load\n# TODO(kedge): translate this stage.\n"
+            "load_pre_adjustment = handin_frame  # passthrough until translated",
+        ),
+        CellInfo(id="DDdd", name="document_extract", code="document_extract = mo.md('written')"),
+        CellInfo(
+            id="EEee",
+            name="apply_uplift",
+            code="# Stage 3 of 3: uplift\n# TODO(kedge): translate this stage.\n"
+            "apply_uplift = load_pre_adjustment  # passthrough until translated",
+        ),
+    )
+
+    def __init__(self, *, cells: tuple[CellInfo, ...] | None = None) -> None:
+        super().__init__()
+        self._cells = self._CELLS if cells is None else cells
+        self.with_code_calls: list[bool] = []
+
+    async def list_cells(self, *, with_code: bool = True) -> tuple[CellInfo, ...]:
+        self.with_code_calls.append(with_code)
+        if with_code:
+            return self._cells
+        return tuple(CellInfo(id=cell.id, name=cell.name) for cell in self._cells)
+
+
+async def test_list_cells_can_return_just_the_cells_the_scaffolder_left(tmp_path: Path) -> None:
+    driver = ScaffoldedDriver()
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert result.summary == "2 unwritten cell(s)"
+    assert "2 of 5 cells are still unwritten" in result.text
+    assert "load_pre_adjustment" in result.text and "apply_uplift" in result.text
+    # The head is the thing that was eating the budget, and none of it comes back.
+    assert "kedge_setup" not in result.text and "handin_frame (BBbb)" not in result.text
+    assert "document_extract" not in result.text
+    # Positions stay the notebook's own, so they line up with the pinned state block.
+    assert "3. load_pre_adjustment" in result.text and "5. apply_uplift" in result.text
+
+
+async def test_the_hole_listing_is_a_fraction_of_the_whole_notebook(tmp_path: Path) -> None:
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=ScaffoldedDriver())
+
+    everything = await tools.dispatch("list_cells", {})
+    holes = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert holes.byte_count * 4 < everything.byte_count
+
+
+async def test_asking_for_the_holes_reads_the_source_even_when_bodies_are_not_wanted(
+    tmp_path: Path,
+) -> None:
+    """The marker is in the source, so selecting on it needs the source whatever else was asked."""
+    driver = ScaffoldedDriver()
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True, "with_code": False})
+
+    assert driver.with_code_calls == [True]
+    assert "apply_uplift" in result.text
+    assert "```python" not in result.text
+
+
+async def test_a_notebook_with_no_holes_left_says_so_rather_than_returning_nothing(
+    tmp_path: Path,
+) -> None:
+    """The termination condition. An empty listing reads as a failed call, not as finished work."""
+    driver = ScaffoldedDriver(
+        cells=(CellInfo(id="AAaa", name="kedge_setup", code="import polars as pl"),)
+    )
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert result.summary == "0 unwritten cell(s)"
+    assert "TODO(kedge)" in result.text
+    assert "every hole the scaffolder left has been filled" in result.text
+
+
 async def test_probe_returns_the_kernel_value(registry: ToolRegistry) -> None:
     result = await registry.dispatch("probe", {"code": "load_handin.height"})
     assert result.ok

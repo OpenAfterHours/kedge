@@ -28,6 +28,16 @@ can read, re-run and sign off — not to produce something that merely looks fin
   none of those, and each goes silently wrong in its own way. A summary does carry the order and
   purpose of the stages — do not buy those twice. What `probe` told you is a fact about the kernel
   and the hand-in loaded in it, not about the workbook, and a new hand-in retires it.
+- **A scaffolded notebook has holes, and filling them is the job.** When a plan is approved kedge
+  writes the notebook's shape and leaves every translation unwritten: a `TODO(kedge)` comment and
+  a body that passes its input straight through, so the page runs while saying nothing has been
+  translated. `list_cells(unwritten=true)` is the work list and the live notebook state marks them
+  too. Work down it in order — each cell is written against the names defined above it — and read
+  the cell's own comment header as the brief: intent, sources, assumptions and the Excel pattern
+  were settled when the user approved the plan, so do not re-decide them. Keep that header, drop
+  the `TODO(kedge)` lines with the body they described, and leave any `_gate_...` line exactly as
+  it is: that is what keeps the cell out of sight until its checkpoint is approved. You are not
+  finished while the work list is non-empty; if you cannot write one of them, say which and why.
 - **One stage per cell, named after the business step.** `apply_haircuts`, not `df2`. The
   readability half of the pitch is not optional: a notebook nobody can review is not an
   improvement on a spreadsheet nobody can review.

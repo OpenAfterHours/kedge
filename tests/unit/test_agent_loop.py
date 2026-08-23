@@ -29,6 +29,7 @@ from kedge.agent.context import (
     CARRY_BLOCK_TURNS,
     MAX_EVICTED_SHAPE_CHARS,
     ContextMessage,
+    NotebookState,
     TokenCounter,
 )
 from kedge.agent.loop import (
@@ -905,6 +906,174 @@ async def test_the_name_registry_and_notebook_state_are_pinned_into_every_turn()
     assert "one owning cell per public name" in system["content"]
     assert "load_handin (MJUe)" in system["content"]
     assert "Cell bodies are not shown" in system["content"]
+
+
+# ── which cells are still holes ───────────────────────────────────────────────────────────────────────────────────
+#
+# The flag comes from the notebook *file*, not from the kernel, and that is the whole design.
+# Asking the kernel means `list_cells(with_code=True)`, and reading a cell's code is what records
+# a read for marimo's staleness guard -- doing it once per turn would permanently disarm the
+# check that stops `edit_cell` overwriting what the user typed while the model was thinking. The
+# `.py` costs no kernel call and records no read; the price is that it is the notebook as last
+# saved, which is why the block says so.
+
+
+_SCAFFOLDED = """import marimo
+
+__generated_with = "0.23.15"
+app = marimo.App()
+
+
+@app.cell
+def imports():
+    import polars as pl
+    return
+
+
+@app.cell
+def load_handin():
+    # Stage 1 of 2: load
+    # TODO(kedge): translate this stage. LazyFrame throughout.
+    load_handin = pl
+    return
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+
+
+def _workspace_with_notebook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str | None
+) -> Any:
+    """A real workspace whose notebook file holds ``source``, or has no notebook file at all."""
+    from openpyxl import Workbook as OpenpyxlWorkbook
+
+    from kedge.workspace import Workspace
+
+    monkeypatch.setenv("KEDGE_HOME", str(tmp_path / "home"))
+    workbook = tmp_path / "process.xlsx"
+    OpenpyxlWorkbook().save(workbook)
+    workspace = Workspace.for_workbook(workbook)
+    workspace.ensure_dirs()
+    if source is not None:
+        workspace.notebook_path.write_text(source, encoding="utf-8")
+    return workspace
+
+
+async def test_the_pinned_block_marks_the_cells_the_scaffolder_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: a scaffolded file on disk, the kernel's own cell list, one flag in the block.
+
+    ``FakeDriver.read_graph`` names ``imports`` and ``load_handin``, and the file leaves the
+    second a hole. Nothing here reads a cell's code through the driver, which is the constraint
+    the whole route exists to satisfy.
+    """
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, _SCAFFOLDED)
+    agent = build(ScriptedClient([]), context=ToolContext(driver=FakeDriver(), workspace=workspace))
+
+    rendered = (await agent._notebook_state()).render()
+
+    assert "1 of 2 cells are still unwritten placeholders" in rendered
+    assert "load_handin (MJUe) [unwritten]" in rendered
+    assert "imports (AAaa) defines" in rendered
+    # And the block does not claim the flag came from the kernel, because it did not.
+    assert "[unwritten] from the notebook file as last saved" in rendered
+
+
+@pytest.mark.parametrize(
+    ("source", "why"),
+    [
+        (None, "no notebook file has been written yet"),
+        ("not a marimo notebook at all\n", "the file does not construct an app"),
+        ("import marimo\napp = marimo.App()\ndef broken(:\n", "the file does not parse"),
+    ],
+)
+async def test_a_file_that_cannot_be_read_leaves_the_flag_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str | None, why: str
+) -> None:
+    """Byte-identical to a state that was never offered any bodies. No guess, no half answer."""
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, source)
+    agent = build(ScriptedClient([]), context=ToolContext(driver=FakeDriver(), workspace=workspace))
+
+    rendered = (await agent._notebook_state()).render()
+
+    assert rendered == NotebookState.from_graph(await FakeDriver().read_graph()).render(), why
+    assert "unwritten" not in rendered
+
+
+async def test_a_cell_the_kernel_has_and_the_file_does_not_is_left_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worst case to guess on: a cell just created, whose body has not reached disk.
+
+    Read as written it drops off the work list; read as a hole it invites the model to overwrite
+    a cell it has just finished. Unknown is the only honest answer.
+    """
+    renamed = _SCAFFOLDED.replace("def imports():", "def imports_only():")
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, renamed)
+    agent = build(ScriptedClient([]), context=ToolContext(driver=FakeDriver(), workspace=workspace))
+
+    state = await agent._notebook_state()
+
+    assert [cell.unwritten for cell in state.cells] == [None, True]
+    assert "1 of 2 cells are still unwritten" in state.render()
+
+
+async def test_reading_the_bodies_never_asks_the_kernel_for_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The constraint, asserted rather than trusted to review.
+
+    ``list_cells(with_code=True)`` records a read for every cell, which disarms
+    ``StaleCellError`` for the whole notebook -- so the per-turn rebuild must never call it. A
+    regression here would be silent: the flag would go on working and the user's edits would
+    quietly stop being protected.
+    """
+
+    class CountingDriver(FakeDriver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.listings: list[bool] = []
+
+        async def list_cells(self, *, with_code: bool = True) -> tuple[CellInfo, ...]:
+            self.listings.append(with_code)
+            return await super().list_cells(with_code=with_code)
+
+    driver = CountingDriver()
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, _SCAFFOLDED)
+    agent = build(ScriptedClient([]), context=ToolContext(driver=driver, workspace=workspace))
+
+    assert "[unwritten]" in (await agent._notebook_state()).render()
+    assert driver.listings == []
+
+
+async def test_the_listing_fallback_is_offered_the_same_bodies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The graph is the primary path; the fallback must not lose the flag when it takes over."""
+
+    class NoGraphDriver(FakeDriver):
+        async def read_graph(self) -> GraphView:
+            msg = "the kernel has no session"
+            raise KedgeError(msg)
+
+        async def list_cells(self, *, with_code: bool = True) -> tuple[CellInfo, ...]:
+            return (CellInfo(id="AAaa", name="imports"), CellInfo(id="MJUe", name="load_handin"))
+
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, _SCAFFOLDED)
+    agent = build(
+        ScriptedClient([]), context=ToolContext(driver=NoGraphDriver(), workspace=workspace)
+    )
+
+    assert "load_handin (MJUe) [unwritten]" in (await agent._notebook_state()).render()
+
+
+async def test_no_workspace_attached_means_no_flag_rather_than_an_error() -> None:
+    agent = build(ScriptedClient([]), context=ToolContext(driver=FakeDriver()))
+
+    assert "unwritten" not in (await agent._notebook_state()).render()
 
 
 async def test_history_is_replayed_but_the_notebook_is_not_taken_from_it() -> None:
