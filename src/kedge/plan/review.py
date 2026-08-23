@@ -27,6 +27,7 @@ References:
 from __future__ import annotations
 
 import logging
+import re
 import textwrap
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -40,14 +41,16 @@ from kedge.plan.model import (
     ProcessPlan,
     SourceOrigin,
     Stage,
+    StageKind,
     StageSource,
 )
 from kedge.plan.triage import complexity
+from kedge.sql import changes_data
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
-    from kedge.analysis.model import WorkbookAnalysis
+    from kedge.analysis.model import LogicalOperation, ProcessNote, WorkbookAnalysis
     from kedge.plan.triage import TriageResult
 
 logger = logging.getLogger(__name__)
@@ -688,6 +691,302 @@ def reject(
 # =============================================================================
 # WARNINGS
 # =============================================================================
+#
+# Five of the checks below are about what :mod:`kedge.notebook.scaffold` will *do* with the plan,
+# and two of those need a predicate the scaffolder owns: which stage kinds it emits hand-in cells
+# for, and when a stage's upstream frame silently resolves to the notebook's head hand-in.
+#
+# **They are reimplemented here rather than imported, deliberately.** CLAUDE.md's layering is
+# ``analysis/ -> plan/ -> notebook/ -> agent/ -> server/``; the scaffolder imports this package,
+# so importing it back inverts the dependency, and hiding that inside a function body to dodge
+# the import cycle would make the inversion less visible rather than less real. It would also
+# drag the whole scaffolder -- templates, house-rule checks, marimo code strings -- into a review
+# pass that renders text.
+#
+# The reimplementation is three lines and the risk is obvious: the scaffolder changes, these
+# quietly start describing a notebook nobody builds any more. So the copies are not trusted to
+# stay true -- ``tests/unit/test_plan_review.py`` asserts each one against the scaffolder's own
+# function over a battery of stages, and a change to either side fails there. That is the same
+# mechanism ``test_agent_prompts.py`` uses to keep a hand-written prompt honest about
+# :class:`~kedge.plan.model.StageKind`, and for the same reason: a copy of a rule is fine as long
+# as something fails when it drifts.
+
+_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: frozenset[StageKind] = frozenset({StageKind.CHECKPOINT})
+"""Stage kinds whose own ``handin`` source produces no cells.
+
+Mirrors the ``if stage.is_checkpoint: ... continue`` that ``scaffold.build_cells`` takes before
+it reaches ``_handin_cells``. Kept as a set rather than a bare comparison so the tripwire test
+can assert it against the scaffolder for every member of :class:`StageKind`.
+"""
+
+_FORMULA_STRING_LITERAL = re.compile(r'"((?:[^"]|"")*)"')
+"""One double-quoted run inside an Excel formula. ``""`` is Excel's escaped quote."""
+
+_SQL_CLAUSE_WORDS = frozenset({"from", "into", "join", "set", "table", "values", "where"})
+"""Keywords that separate a statement from a sentence that happens to open with a verb."""
+
+_MAX_NAMED = 4
+"""How many things a warning names before it says "and N more". Enough to act on, short enough
+to read on an approval card."""
+
+
+def _generates_sql_that_writes(operation: LogicalOperation) -> bool:
+    """Whether this formula region concatenates a statement that changes data.
+
+    The ``="UPDATE ... "&F17&"..."`` column that real workbooks are full of. The analyser cannot
+    type it as anything better than ``text_manipulation`` -- it is string concatenation, and
+    nothing in the workbook reads the result, so it is also reported as a dead region -- but its
+    consumer is a person with a clipboard and dropping it deletes the step that changes the data
+    (``prompts/propose_vocabulary.md``).
+
+    Judged on the prose the formula concatenates, with the cell references taken out, and the
+    verdict on that prose comes from :func:`kedge.sql.changes_data` -- non-negotiable 3, and the
+    same reason it lives there: a prefix match calls ``SELECT ... FOR UPDATE`` a write. Two SQL
+    clause keywords are required as well, because ``changes_data`` is asked about a *statement*
+    and this is asked about a formula: ``="Delete row "&A1&" from the tracker"`` opens with a
+    writing verb and contains ``from``, and is a sentence.
+    """
+    formula = operation.r1c1 or operation.sample_a1 or ""
+    text = " ".join(
+        match.group(1).replace('""', '"') for match in _FORMULA_STRING_LITERAL.finditer(formula)
+    )
+    if not text.strip():
+        return False
+    words = {word.strip("(),;'").lower() for word in text.split()}
+    return len(words & _SQL_CLAUSE_WORDS) >= 2 and changes_data(text)
+
+
+def _stage_handin_label(stage: Stage) -> str | None:
+    """The label of this stage's *own* hand-in, or ``None`` if it reads the notebook's.
+
+    Mirrors ``scaffold._named_handin``: the ``ref`` is what separates "another file, arriving
+    later" from "the file at the top of the notebook". Kept true by the tripwire test above.
+    """
+    for source in stage.sources:
+        if source.origin is SourceOrigin.HANDIN and source.ref:
+            return source.ref
+    return None
+
+
+def _reads_the_head_handin(stage: Stage) -> bool:
+    """Whether this stage names the notebook's own hand-in as an input, on purpose."""
+    return any(source.origin is SourceOrigin.HANDIN and not source.ref for source in stage.sources)
+
+
+def _falls_through_to_the_head_handin(stage: Stage, checkpoint_ids: set[str]) -> bool:
+    """Whether the scaffolder would build this stage on ``handin_frame`` by default.
+
+    Mirrors ``scaffold._upstream_name``, which walks ``depends_on`` for the first dependency
+    that is not a checkpoint -- a checkpoint's output is a decision record, not a frame -- and
+    ``return "handin_frame"`` when it finds none. Kept true by the tripwire test above.
+    """
+    if _stage_handin_label(stage) is not None:
+        return False
+    return not any(dependency not in checkpoint_ids for dependency in stage.depends_on)
+
+
+def _transitive_depends_on(plan: ProcessPlan) -> dict[str, set[str]]:
+    """Stage id to every stage that must run before it, following ``depends_on`` all the way.
+
+    "Upstream" has to mean transitively or the check it feeds is trivially defeated: a checkpoint
+    two steps above a production ``UPDATE`` is still an approval in front of it, and a plan that
+    put one there would be told it had not.
+    """
+    by_id = {stage.id: stage for stage in plan.stages}
+    resolved: dict[str, set[str]] = {}
+
+    def walk(stage_id: str, seen: frozenset[str]) -> set[str]:
+        if stage_id in resolved:
+            return resolved[stage_id]
+        stage = by_id.get(stage_id)
+        if stage is None or stage_id in seen:
+            # A cycle cannot reach here through a validated plan (`_check_stage_graph` refuses
+            # one), but this walks whatever it is handed and must terminate regardless.
+            return set()
+        upstream: set[str] = set()
+        for dependency in stage.depends_on:
+            upstream.add(dependency)
+            upstream |= walk(dependency, seen | {stage_id})
+        resolved[stage_id] = upstream
+        return upstream
+
+    return {stage.id: walk(stage.id, frozenset()) for stage in plan.stages}
+
+
+def _cite(note: ProcessNote) -> str:
+    """One note as a briefing would cite it: ``Sign-off!A3:A4 (Purpose)``.
+
+    The same shape :class:`~kedge.plan.model.Briefing`'s own field description asks for, so the
+    warning hands the reviewer text that can be pasted into ``sources`` as it stands.
+    """
+    where = f"{note.origin}!{note.location}" if note.location else note.origin
+    return f"{where} ({note.heading})" if note.heading else where
+
+
+def _and_more(items: Sequence[str], limit: int = _MAX_NAMED) -> str:
+    """Join up to ``limit`` names, then say how many were not named."""
+    if len(items) <= limit:
+        return ", ".join(items)
+    return f"{', '.join(items[:limit])} and {len(items) - limit} more"
+
+
+def _no_handoff_warning(plan: ProcessPlan, analysis: WorkbookAnalysis | None) -> list[str]:
+    """The plan computes everything, on a workbook that plainly reaches outside itself.
+
+    A hand-off is the one stage kind that computes nothing: it holds a statement for the user to
+    run somewhere kedge cannot reach. With no such stage there is no ``Handoff``, so no
+    ``statement``, no ``mutates``, no confirmation cell and no token -- the whole mechanism that
+    gates a re-extract on the update having actually been carried out never engages, because
+    there is no statement for it to inspect. A plan that types that step ``output`` instead
+    scaffolds to a cell that computes a frame nobody runs.
+    """
+    if analysis is None:
+        return []
+    if any(stage.is_handoff or stage.handoff is not None for stage in plan.stages):
+        return []
+
+    evidence = [
+        f"connection {connection.name!r} ({connection.kind})"
+        for connection in analysis.connections
+        if connection.command
+    ]
+    evidence += [
+        f"Power Query {query.name!r}" for query in analysis.power_query.queries if query.m_source
+    ]
+    evidence += [
+        f"{operation.ranges[0] if operation.ranges else operation.id}, a formula column that "
+        f"builds a statement that writes"
+        for operation in analysis.operations
+        if _generates_sql_that_writes(operation)
+    ]
+    if not evidence:
+        return []
+    return [
+        f"no stage hands anything over, but the analysis records work that happens outside the "
+        f"workbook: {_and_more(evidence)} — without a `kind: handoff` stage the plan carries no "
+        f"statement, so the notebook asks for no confirmation that it was run and nothing "
+        f"downstream can be gated on the step having been carried out"
+    ]
+
+
+def _unapproved_write_warnings(plan: ProcessPlan) -> list[str]:
+    """A production write with nobody asked first.
+
+    Whether the text writes is :func:`kedge.sql.changes_data`, reached through
+    :attr:`~kedge.plan.model.Handoff.statement_writes` -- non-negotiable 3, and the reason it
+    belongs there is that a prefix match calls ``SELECT ... FOR UPDATE`` a write. A declared
+    ``mutates`` counts too: the claim is enough to want an approval in front of it even where
+    the text does not parse as one.
+    """
+    upstream = _transitive_depends_on(plan)
+    checkpoint_ids = {stage.id for stage in plan.stages if stage.is_checkpoint}
+    warnings: list[str] = []
+    for stage in plan.stages:
+        if stage.handoff is None and not stage.is_handoff:
+            continue
+        if not stage.effective_handoff().needs_confirmation:
+            continue
+        if upstream[stage.id] & checkpoint_ids:
+            continue
+        elsewhere = [
+            f"{other!r}" for other in sorted(checkpoint_ids - upstream[stage.id] - {stage.id})
+        ]
+        where = (
+            f"the plan's checkpoint(s) — {_and_more(elsewhere)} — are not upstream of it"
+            if elsewhere
+            else "the plan has no checkpoint at all"
+        )
+        warnings.append(
+            f"stage {stage.id!r} hands over a statement that changes data and no checkpoint runs "
+            f"before it: {where}. Nothing stands between opening the notebook and a production "
+            f"write, and a checkpoint placed after one approves something already done"
+        )
+    return warnings
+
+
+def _dropped_briefing_warning(plan: ProcessPlan, analysis: WorkbookAnalysis | None) -> list[str]:
+    """The workbook explained itself and the plan threw it away.
+
+    :class:`~kedge.plan.model.Briefing` refuses prose that cites nothing, because invented
+    background in a finance notebook is confident, plausible and unattributable. Nothing refused
+    a briefing that never arrived -- and the notebook then tells its reader, in as many words,
+    that the workbook carried no description of what the process is for. On a workbook with a
+    Purpose, a Background, a Scope and a Known issues section that is a confident falsehood in
+    the one register the project exists to protect, which makes it the worse half of the
+    asymmetry rather than the safer one.
+    """
+    if analysis is None or not analysis.notes:
+        return []
+    if plan.briefing is not None and not plan.briefing.is_empty:
+        return []
+    citations = [_cite(note) for note in analysis.notes]
+    said = "carries no briefing" if plan.briefing is None else "carries an empty briefing"
+    return [
+        f"the plan {said} while the analyser recovered {len(analysis.notes)} note(s) from the "
+        f"workbook: {_and_more(citations)} — the notebook will tell whoever opens it that the "
+        f"workbook carried no description of what the process is for, which is the one thing in "
+        f"a conversion nobody can reconstruct afterwards. Fill `briefing`, citing these"
+    ]
+
+
+def _stranded_handin_warnings(plan: ProcessPlan) -> list[str]:
+    """A hand-in declared where the scaffolder does not look for one.
+
+    ``build_cells`` emits the three receiver cells for every stage kind but ``checkpoint``, which
+    it has already ``continue``d past. A re-extract declared on the checkpoint that gates it
+    therefore produces no selector, no receipt and no frame, and the file the rest of the process
+    exists to verify against has nowhere to arrive. Nothing else reports it: the plan validates,
+    the notebook scaffolds, and the missing input surfaces as a stage built on the wrong frame.
+    """
+    ignored = _and_more(sorted(kind.value for kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES))
+    warnings: list[str] = []
+    for stage in plan.stages:
+        if stage.kind not in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES:
+            continue
+        label = _stage_handin_label(stage)
+        if label is None:
+            continue
+        warnings.append(
+            f"stage {stage.id!r} declares a hand-in ({label!r}) on a `kind: {stage.kind.value}` "
+            f"stage, and the scaffolder emits hand-in cells for every kind but {ignored} — so no "
+            f"selector cell, no receipt cell and no frame will be written for it, and that file "
+            f"has nowhere to arrive. Declare the hand-in on the stage that reads the file"
+        )
+    return warnings
+
+
+def _accidental_head_handin_warnings(plan: ProcessPlan) -> list[str]:
+    """A stage gated by a checkpoint, and built on the head hand-in because of it.
+
+    ``_upstream_name`` walks ``depends_on`` for the first dependency that is not a checkpoint,
+    and falls through to ``handin_frame`` when every one of them is. A stage whose only
+    dependency is the checkpoint approving it therefore builds on the notebook's own input rather
+    than on the result it names -- and that fall-through is also what ``head_handin_is_read``
+    tests, so it switches the fixed head hand-in back on: six cells of machinery, and an
+    ``mo.stop`` that blocks the page until somebody supplies a file no step of the process asks
+    for. A stage with no dependencies at all reads the head hand-in by construction and is left
+    alone; this is about the plan that named a dependency and got a different frame.
+    """
+    checkpoint_ids = {stage.id for stage in plan.stages if stage.is_checkpoint}
+    if not checkpoint_ids:
+        return []
+    warnings: list[str] = []
+    for stage in plan.stages:
+        if stage.generates_no_code or not stage.depends_on or _reads_the_head_handin(stage):
+            continue
+        if not _falls_through_to_the_head_handin(stage, checkpoint_ids):
+            continue
+        gates = _and_more([f"{gate!r}" for gate in sorted(stage.depends_on)])
+        warnings.append(
+            f"stage {stage.id!r} depends only on checkpoint stage(s) — {gates} — which record a "
+            f"decision rather than produce a frame, so the scaffolder falls through to "
+            f"`handin_frame` and builds this stage on the notebook's own hand-in instead of on "
+            f"the result it names. That also emits the fixed head hand-in, whose `mo.stop` "
+            f"blocks the page until a file no step of this process asks for is supplied. List "
+            f"the stage whose frame this reads in `depends_on` as well as the checkpoint that "
+            f"gates it"
+        )
+    return warnings
 
 
 def review_warnings(
@@ -702,9 +1001,23 @@ def review_warnings(
     that are legal but suspicious, and the most important of them is an empty ``open_questions``
     on a workbook complex enough that the model should have had a question (PLAN 6.2).
 
+    **Every warning names what it found.** This list is rendered on the approval card the user
+    reads before clicking Approve, and a card that says "something may be wrong" is a card people
+    stop reading -- the argument CLAUDE.md already makes about a permanently amber ``NOT
+    RECONCILED``. So a warning quotes the connection, the range, the stage or the cells it is
+    about, or it does not go in.
+
+    The checks split in two. Some are about the plan on its own terms -- ordering, confidence,
+    unanswered questions -- and some are about what the scaffolder will build from it: a plan can
+    be entirely valid and still scaffold a notebook with an input that has nowhere to arrive, a
+    production statement nobody was asked to approve, or a briefing that tells its reader the
+    workbook explained nothing. Those are the expensive ones, because nothing downstream reports
+    them: the plan validates, the notebook scaffolds, and it runs.
+
     Args:
         plan: The plan under review.
-        analysis: The analysis it was written against, used for the complexity check.
+        analysis: The analysis it was written against. Everything that compares the plan against
+            the workbook's own facts is skipped without it; nothing raises.
         triage_result: A pre-computed triage, saving a second complexity pass.
     """
     warnings: list[str] = []
@@ -780,6 +1093,14 @@ def review_warnings(
                     f"stages reference {len(invented)} operation id(s) that are not in the "
                     f"analysis: {', '.join(sorted(invented)[:5])}"
                 )
+
+    # What the scaffolder will make of this. Each of these was observed on one real conversion,
+    # which produced a notebook that opened, ran, and was wrong.
+    warnings.extend(_no_handoff_warning(plan, analysis))
+    warnings.extend(_unapproved_write_warnings(plan))
+    warnings.extend(_dropped_briefing_warning(plan, analysis))
+    warnings.extend(_stranded_handin_warnings(plan))
+    warnings.extend(_accidental_head_handin_warnings(plan))
     return warnings
 
 

@@ -12,17 +12,32 @@ whole guarantee and are asserted here from several directions:
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 import pytest
+from observed_conversion import OBSERVED_COMPLEXITY, observed_analysis, observed_plan
 
 from conftest import make_analysis, make_draft, make_operation, make_plan
-from kedge.analysis.model import ExcelPattern
+from kedge.analysis.model import (
+    Connection,
+    ExcelPattern,
+    ExtractionStatus,
+    PowerQuery,
+    PowerQueryExtraction,
+    ProcessNote,
+)
+from kedge.notebook.scaffold import _named_handin, _upstream_name, build_cells
 from kedge.plan.model import (
     Approval,
     ApprovalState,
     Assessment,
+    Briefing,
     Checkpoint,
     Confidence,
     DroppedRange,
+    Handoff,
+    HandoffMedium,
     OpenQuestion,
     PlanError,
     ProcessPlan,
@@ -32,8 +47,11 @@ from kedge.plan.model import (
     StageSource,
 )
 from kedge.plan.review import (
+    _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES,
     PlanNotApprovableError,
     _drop_refusal_question,
+    _falls_through_to_the_head_handin,
+    _stage_handin_label,
     acknowledge_all_drops,
     acknowledge_drop,
     add_question,
@@ -52,7 +70,8 @@ from kedge.plan.review import (
     review_warnings,
     split_stage,
 )
-from kedge.plan.triage import TriageResult, TriageVerdict, triage
+from kedge.plan.store import plan_from_yaml
+from kedge.plan.triage import TriageResult, TriageVerdict, complexity, triage
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -1069,6 +1088,595 @@ def test_a_clean_plan_against_its_own_analysis_warns_about_nothing_structural() 
     )
     assert review_warnings(plan, analysis, triage_result=triage(analysis)) == []
     assert "REVIEW WARNINGS" not in render_plan(plan, analysis=analysis)
+
+
+# =============================================================================
+# WARNINGS ABOUT WHAT THE SCAFFOLDER WILL BUILD
+# =============================================================================
+#
+# Five checks, every one of them a defect observed on one real conversion whose artifacts are
+# copied into `observed_conversion.py`. That plan was valid, was approved, and scaffolded a
+# notebook that opened and ran; `review_warnings` had one thing to say about it and it was about
+# open questions. The tests below come in pairs on purpose: a warning that fires on a correct
+# plan is worse than no warning, so each one is asserted against the reference plan too.
+
+_NEW_WARNINGS = {
+    "no hand-off": "no stage hands anything over",
+    "unapproved write": "and no checkpoint runs before it",
+    "dropped briefing": "while the analyser recovered",
+    "stranded hand-in": "the scaffolder emits hand-in cells for every kind but",
+    "head hand-in by accident": "depends only on checkpoint stage(s)",
+}
+"""Marker to distinctive substring, so one list serves both directions of every assertion."""
+
+
+def _fired(warnings: list[str]) -> set[str]:
+    """Which of the new warnings this list contains."""
+    return {
+        marker
+        for marker, substring in _NEW_WARNINGS.items()
+        if any(substring in warning for warning in warnings)
+    }
+
+
+def _handin(ref: str | None = None) -> StageSource:
+    return StageSource(origin=SourceOrigin.HANDIN, ref=ref)
+
+
+def _update_handoff(**overrides: Any) -> Handoff:
+    """A hand-off carrying the statement the observed workbook's G column concatenates."""
+    fields: dict[str, Any] = {
+        "instruction": "Run this against FinanceWarehouse, then re-extract.",
+        "built_from": "adjust",
+        "template": "UPDATE fin.accruals SET accrual_gbp = {after} WHERE trade_id = {trade_id}",
+        "mutates": True,
+    }
+    fields.update(overrides)
+    return Handoff(**fields)
+
+
+# ── the observed run, replayed ──────────────────────────────────────────────
+
+
+def test_the_defective_plan_that_was_approved_now_raises_every_warning_it_earns() -> None:
+    """The regression the whole exercise is for.
+
+    Four independent defects, one warning. Named in `observed_conversion`'s docstring; each one
+    is asserted here by the thing it should have said out loud.
+    """
+    warnings = review_warnings(observed_plan(), observed_analysis())
+
+    assert _fired(warnings) == {
+        "no hand-off",
+        "dropped briefing",
+        "stranded hand-in",
+        "head hand-in by accident",
+    }, "the fifth needs a `Handoff` object to inspect, and this plan never made one"
+
+    text = "\n".join(warnings)
+    assert "'AccrualExtract'" in text, "name the connection, not 'a connection'"
+    assert "Adjustment!G17:G92" in text, "name the range that concatenates the UPDATE"
+    assert "Sign-off!A3:A4 (Purpose)" in text, "name the notes, so they can be pasted into sources"
+    assert "'verify_post_adjustment'" in text
+    assert "'prepare_sign_off'" in text
+
+
+def test_the_reference_plan_raises_none_of_them() -> None:
+    """A correct conversion of the same workbook, against the same facts."""
+    reference = plan_from_yaml(
+        (
+            Path(__file__).resolve().parents[2] / "evals" / "adjustment_signoff" / "plan.yaml"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert _fired(review_warnings(reference, observed_analysis())) == set()
+
+
+def test_the_trimmed_analysis_scores_what_the_whole_one_did() -> None:
+    """The fixture drops the column profiles; complexity must not notice."""
+    assert complexity(observed_analysis()) == OBSERVED_COMPLEXITY
+
+
+# ── 1. nothing is handed over ───────────────────────────────────────────────
+
+
+def test_a_plan_that_hands_nothing_over_names_the_connection_it_ignored() -> None:
+    analysis = make_analysis(
+        connections=[Connection(name="AccrualExtract", kind="odbc", command="SELECT 1")]
+    )
+    warnings = review_warnings(_clean_plan(), analysis)
+    assert any("connection 'AccrualExtract' (odbc)" in warning for warning in warnings)
+
+
+def test_a_power_query_with_no_hand_off_is_named_too() -> None:
+    analysis = make_analysis(
+        power_query=PowerQueryExtraction(
+            status=ExtractionStatus.OK,
+            queries=[PowerQuery(name="MonthlyExposures", m_source="let Source = ... in Source")],
+        )
+    )
+    assert any(
+        "Power Query 'MonthlyExposures'" in w for w in review_warnings(_clean_plan(), analysis)
+    )
+
+
+def test_a_formula_column_that_concatenates_an_update_is_named_by_its_range() -> None:
+    """The `="UPDATE ... "&F17&"..."` column. Nothing in the workbook reads it, so the analyser
+    calls it a dead region; its consumer is a person with a clipboard."""
+    analysis = make_analysis(
+        operations=[
+            make_operation(
+                "adjustment_g17_g92",
+                sheet="Adjustment",
+                anchor="G17",
+                ranges=["Adjustment!G17:G92"],
+                r1c1='="UPDATE t SET a = "&RC[-1]&" WHERE id = \'"&RC[-2]&"\';"',
+                sample_a1='="UPDATE t SET a = "&F17&" WHERE id = \'"&A17&"\';"',
+                functions=[],
+                excel_pattern=ExcelPattern.TEXT_MANIPULATION,
+            )
+        ]
+    )
+    warnings = review_warnings(_clean_plan(stages=[Stage(id="s", intent="x")]), analysis)
+    assert any("Adjustment!G17:G92" in warning and "writes" in warning for warning in warnings)
+
+
+def test_a_sentence_that_opens_with_a_verb_is_not_mistaken_for_a_statement() -> None:
+    """`="Delete row "&A1&" from the tracker"` opens with a writing verb and contains `from`."""
+    analysis = make_analysis(
+        operations=[
+            make_operation(
+                "note_col",
+                r1c1='="Delete row "&RC[-1]&" from the tracker"',
+                sample_a1='="Delete row "&A1&" from the tracker"',
+                functions=[],
+                excel_pattern=ExcelPattern.TEXT_MANIPULATION,
+            )
+        ]
+    )
+    plan = _clean_plan(stages=[Stage(id="s", intent="x", operations=["note_col"])])
+    assert _fired(review_warnings(plan, analysis)) == set()
+
+
+def test_a_plan_that_does_hand_the_query_over_is_not_asked_about_it() -> None:
+    analysis = make_analysis(
+        connections=[Connection(name="AccrualExtract", kind="odbc", command="SELECT 1")]
+    )
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="extract_query",
+                intent="Hand over the extract",
+                kind=StageKind.HANDOFF,
+                handoff=Handoff(instruction="Run this", statement="SELECT 1"),
+            )
+        ]
+    )
+    assert "no hand-off" not in _fired(review_warnings(plan, analysis))
+
+
+def test_the_hand_off_check_is_skipped_without_an_analysis() -> None:
+    """`review_warnings(plan)` still works; the checks that need facts simply do not fire."""
+    assert _fired(review_warnings(_clean_plan())) == set()
+
+
+# ── 2. a production write with nobody asked ─────────────────────────────────
+
+
+def _write_plan(*, checkpoint_before: bool) -> ProcessPlan:
+    """Load, adjust, hand over an UPDATE -- with the approval before it or after it."""
+    return _clean_plan(
+        stages=[
+            Stage(
+                id="load",
+                intent="Read the extract",
+                kind=StageKind.LOAD,
+                sources=[_handin("pre-adjustment extract")],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="adjust",
+                intent="Apply the uplift",
+                depends_on=["load"],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="approve",
+                intent="Approve the adjustment before it is applied",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["adjust"] if checkpoint_before else ["apply_update"],
+            ),
+            Stage(
+                id="apply_update",
+                intent="Hand over the UPDATE",
+                kind=StageKind.HANDOFF,
+                depends_on=["approve"] if checkpoint_before else ["adjust"],
+                handoff=_update_handoff(),
+            ),
+        ]
+    )
+
+
+def test_a_statement_that_writes_with_the_only_checkpoint_after_it_is_reported() -> None:
+    """The observed shape: an approval that approves something already done."""
+    warnings = review_warnings(_write_plan(checkpoint_before=False))
+    assert any(
+        "'apply_update'" in warning and "'approve'" in warning and "not upstream of it" in warning
+        for warning in warnings
+    )
+
+
+def test_the_same_plan_with_the_checkpoint_moved_above_the_update_is_clean() -> None:
+    assert "unapproved write" not in _fired(review_warnings(_write_plan(checkpoint_before=True)))
+
+
+def test_a_plan_with_no_checkpoint_at_all_is_told_so_in_as_many_words() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
+            Stage(
+                id="apply_update",
+                intent="Hand over the UPDATE",
+                kind=StageKind.HANDOFF,
+                handoff=_update_handoff(),
+            ),
+        ]
+    )
+    assert any("no checkpoint at all" in warning for warning in review_warnings(plan))
+
+
+def test_a_checkpoint_two_stages_upstream_still_counts_as_an_approval() -> None:
+    """ "Upstream" means transitively. A checkpoint one stage further up is still in front of it,
+    and a plan that put one there must not be told it had not."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="load", intent="Read it", kind=StageKind.LOAD, sources=[_handin()]),
+            Stage(
+                id="approve",
+                intent="Approve the adjustment",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["load"],
+            ),
+            Stage(
+                id="adjust",
+                intent="Apply the uplift",
+                depends_on=["approve", "load"],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="apply_update",
+                intent="Hand over the UPDATE",
+                kind=StageKind.HANDOFF,
+                depends_on=["adjust"],
+                handoff=_update_handoff(),
+            ),
+        ]
+    )
+    assert "unapproved write" not in _fired(review_warnings(plan))
+
+
+def test_a_read_only_hand_off_needs_no_checkpoint_in_front_of_it() -> None:
+    """The extract query. `changes_data` is asked, and answers no -- including for a locking
+    read, which is why the question goes through `kedge.sql` rather than a keyword search."""
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="extract_query",
+                intent="Hand over the extract",
+                kind=StageKind.HANDOFF,
+                handoff=Handoff(
+                    instruction="Run this",
+                    statement="SELECT trade_id, last_update FROM fin.accruals FOR UPDATE",
+                ),
+            )
+        ]
+    )
+    assert "unapproved write" not in _fired(review_warnings(plan))
+
+
+def test_a_hand_off_that_only_claims_to_mutate_is_checked_as_well() -> None:
+    """`mutates` is a claim and the statement is the fact, but a claimed write still wants an
+    approval in front of it -- erring towards a checkpoint costs a reviewer one line."""
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="raise_ticket",
+                intent="Ask the DBA to run the migration",
+                kind=StageKind.HANDOFF,
+                handoff=Handoff(
+                    instruction="Raise a ticket",
+                    medium=HandoffMedium.TEXT,
+                    statement="Ask the DBA to run the Q2 migration",
+                    mutates=True,
+                ),
+            )
+        ]
+    )
+    assert "unapproved write" in _fired(review_warnings(plan))
+
+
+# ── 3. the briefing that never arrived ──────────────────────────────────────
+
+
+def _notes() -> list[ProcessNote]:
+    return [
+        ProcessNote(
+            source="sheet",
+            origin="Sign-off",
+            location="A3:A4",
+            heading="Purpose",
+            text="To record the Q2 2026 uplift.",
+        ),
+        ProcessNote(
+            source="docx",
+            origin="procedure.docx",
+            text="Run the extract, apply the uplift, re-extract.",
+        ),
+    ]
+
+
+def test_a_missing_briefing_names_the_sheets_and_cells_that_were_dropped() -> None:
+    """The most valuable of the five. `Briefing` refuses prose without citations; nothing
+    refused a briefing that never arrived, and the notebook then said the workbook explained
+    nothing."""
+    warnings = review_warnings(_clean_plan(), make_analysis(notes=_notes()))
+    assert any(
+        "carries no briefing" in warning
+        and "Sign-off!A3:A4 (Purpose)" in warning
+        and "procedure.docx" in warning
+        for warning in warnings
+    )
+
+
+def test_a_briefing_that_says_nothing_counts_as_a_missing_one() -> None:
+    plan = _clean_plan(briefing=Briefing(sources=["Sign-off!A3:A4"]))
+    warnings = review_warnings(plan, make_analysis(notes=_notes()))
+    assert any("carries an empty briefing" in warning for warning in warnings)
+
+
+def test_a_briefing_that_says_something_is_not_reported() -> None:
+    plan = _clean_plan(
+        briefing=Briefing(purpose="The quarterly uplift", sources=["Sign-off!A3:A4 (Purpose)"])
+    )
+    assert "dropped briefing" not in _fired(review_warnings(plan, make_analysis(notes=_notes())))
+
+
+def test_a_workbook_that_explained_nothing_is_not_asked_for_a_briefing() -> None:
+    """An honest blank is a correct answer where there was nothing to recover."""
+    assert "dropped briefing" not in _fired(review_warnings(_clean_plan(), make_analysis()))
+
+
+# ── 4. a hand-in with nowhere to arrive ─────────────────────────────────────
+
+
+def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nowhere_to_arrive() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
+            Stage(
+                id="verify",
+                intent="Check the re-extract against what was predicted",
+                kind=StageKind.CHECKPOINT,
+                sources=[_handin("post-adjustment extract")],
+                depends_on=["adjust"],
+            ),
+        ]
+    )
+    warnings = review_warnings(plan)
+    assert any(
+        "'verify'" in warning
+        and "'post-adjustment extract'" in warning
+        and "no selector cell, no receipt cell and no frame" in warning
+        for warning in warnings
+    )
+
+
+def test_the_same_hand_in_on_the_stage_that_reads_it_is_not_reported() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
+            Stage(
+                id="post_adjustment",
+                intent="The re-extract",
+                kind=StageKind.LOAD,
+                sources=[_handin("post-adjustment extract")],
+                depends_on=["adjust"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "stranded hand-in" not in _fired(review_warnings(plan))
+
+
+def test_a_checkpoint_naming_the_notebooks_own_hand_in_is_not_reported() -> None:
+    """`{origin: handin}` with no ref is the file at the top of the notebook, which every stage
+    may read. Only a *named* second hand-in needs cells of its own."""
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="agree",
+                intent="Agree the figures with Risk",
+                kind=StageKind.CHECKPOINT,
+                sources=[_handin()],
+            )
+        ]
+    )
+    assert "stranded hand-in" not in _fired(review_warnings(plan))
+
+
+# ── 5. the head hand-in, switched on by accident ────────────────────────────
+
+
+def test_a_stage_gated_only_by_a_checkpoint_is_told_it_will_read_the_head_hand_in() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
+            Stage(
+                id="verify",
+                intent="Check the re-extract",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["adjust"],
+            ),
+            Stage(
+                id="sign_off",
+                intent="The impact statement",
+                kind=StageKind.OUTPUT,
+                sources=[StageSource(origin=SourceOrigin.STAGE, ref="verify")],
+                depends_on=["verify"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    warnings = review_warnings(plan)
+    assert any(
+        "'sign_off'" in warning and "verify" in warning and "`handin_frame`" in warning
+        for warning in warnings
+    )
+
+
+def test_a_stage_that_also_depends_on_the_frame_it_reads_is_not_reported() -> None:
+    """The fix the warning asks for: gate on the checkpoint, depend on the frame as well."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
+            Stage(
+                id="verify",
+                intent="Check the re-extract",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["adjust"],
+            ),
+            Stage(
+                id="sign_off",
+                intent="The impact statement",
+                kind=StageKind.OUTPUT,
+                depends_on=["verify", "adjust"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "head hand-in by accident" not in _fired(review_warnings(plan))
+
+
+def test_a_stage_that_declares_the_head_hand_in_on_purpose_is_not_reported() -> None:
+    plan = _clean_plan(
+        stages=[
+            Stage(id="agree", intent="Agree the figures", kind=StageKind.CHECKPOINT),
+            Stage(
+                id="report",
+                intent="Report on the hand-in",
+                kind=StageKind.OUTPUT,
+                sources=[_handin()],
+                depends_on=["agree"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "head hand-in by accident" not in _fired(review_warnings(plan))
+
+
+def test_a_stage_with_its_own_hand_in_is_not_reported() -> None:
+    """Its own hand-in outranks its dependencies: `_upstream_name` returns that frame."""
+    plan = _clean_plan(
+        stages=[
+            Stage(id="agree", intent="Agree the figures", kind=StageKind.CHECKPOINT),
+            Stage(
+                id="post_adjustment",
+                intent="The re-extract",
+                kind=StageKind.LOAD,
+                sources=[_handin("post-adjustment extract")],
+                depends_on=["agree"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "head hand-in by accident" not in _fired(review_warnings(plan))
+
+
+# ── the layering tripwire ───────────────────────────────────────────────────
+#
+# `review.py` reimplements two of the scaffolder's predicates rather than importing them, because
+# `analysis/ -> plan/ -> notebook/` runs the other way and a function-local import to dodge the
+# cycle would hide the inversion rather than avoid it. The reasoning is in the WARNINGS banner of
+# `review.py`; this is the half that keeps it honest. A test may cross layers freely, so both
+# copies are asserted against the scaffolder's own code here, and a change to either side fails.
+
+
+def test_the_only_kind_the_scaffolder_ignores_a_hand_in_for_is_the_one_review_names() -> None:
+    """Scaffold one stage of every `StageKind`, each declaring its own hand-in, and see which
+    ones got no hand-in cells. That set is what `_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES` claims."""
+    stages = [
+        Stage(
+            id=f"stage_{kind.value}",
+            intent=f"A {kind.value} stage that reads a file of its own",
+            kind=kind,
+            sources=[_handin(f"{kind.value} extract")],
+            confidence=Confidence.HIGH,
+            handoff=Handoff(instruction="Run this", statement="SELECT 1")
+            if kind is StageKind.HANDOFF
+            else None,
+        )
+        for kind in StageKind
+    ]
+    plan = _approved(_clean_plan(stages=stages))
+
+    cells = build_cells(plan)
+    ignored = {
+        stage.kind
+        for stage in plan.stages
+        if not any(cell.role == "handin" and cell.stage_id == stage.id for cell in cells)
+    }
+
+    assert ignored == _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES
+
+
+def test_the_review_copy_of_named_handin_agrees_with_the_scaffolders() -> None:
+    stages = [
+        Stage(id="a", intent="x", sources=[_handin("second extract")]),
+        Stage(id="b", intent="x", sources=[_handin()]),
+        Stage(id="c", intent="x", sources=[StageSource(origin=SourceOrigin.RANGE, ref="S!A1")]),
+        Stage(id="d", intent="x"),
+    ]
+    for stage in stages:
+        assert _stage_handin_label(stage) == _named_handin(stage), stage.id
+
+
+def test_the_review_copy_of_the_head_handin_fallthrough_agrees_with_the_scaffolders() -> None:
+    """`_upstream_name` returns `handin_frame` exactly when review says it falls through."""
+    stages = [
+        Stage(id="gate", intent="Approve it", kind=StageKind.CHECKPOINT),
+        Stage(id="other_gate", intent="Approve it again", kind=StageKind.CHECKPOINT),
+        Stage(id="frame", intent="Compute something", confidence=Confidence.HIGH),
+        Stage(id="alone", intent="No dependencies at all", confidence=Confidence.HIGH),
+        Stage(
+            id="gated_only",
+            intent="Gated, and nothing else",
+            depends_on=["gate", "other_gate"],
+            confidence=Confidence.HIGH,
+        ),
+        Stage(
+            id="gated_and_fed",
+            intent="Gated, and reads a frame",
+            depends_on=["gate", "frame"],
+            confidence=Confidence.HIGH,
+        ),
+        Stage(
+            id="own_handin",
+            intent="Reads a file of its own",
+            sources=[_handin("second extract")],
+            depends_on=["gate"],
+            confidence=Confidence.HIGH,
+        ),
+    ]
+    plan = _clean_plan(stages=stages)
+    names = {stage.id: stage.id for stage in plan.stages}
+    checkpoints = {stage.id for stage in plan.stages if stage.is_checkpoint}
+
+    for stage in plan.stages:
+        if stage.is_checkpoint:
+            continue
+        assert _falls_through_to_the_head_handin(stage, checkpoints) == (
+            _upstream_name(stage, names, checkpoints) == "handin_frame"
+        ), stage.id
 
 
 # =============================================================================
