@@ -462,6 +462,63 @@ class _StubDriver:
         )
 
 
+class _MemoryDriver:
+    """A notebook held in a dict: enough of the driver for a real `sync_notebook` to run against.
+
+    `_StubDriver` above is deliberately smaller — it exists so the plan gate is the only thing
+    under test, and it never reaches a sync. This one has to be a notebook, because the number the
+    scaffold step now reports is a fact about what is in one.
+    """
+
+    def __init__(self, cells: dict[str, str] | None = None) -> None:
+        self.cells: dict[str, str] = dict(cells or {})
+        self.listings = 0
+
+    async def list_cells(self, *, with_code: bool = True):
+        from kedge.notebook.model import CellInfo
+
+        self.listings += 1
+        return tuple(
+            CellInfo(id=f"C{index}", name=name, code=code if with_code else None)
+            for index, (name, code) in enumerate(self.cells.items())
+        )
+
+    async def create_cell(self, code: str, *, name: str, **_kw: object):
+        from kedge.notebook.model import CellRef, MutationResult
+
+        self.cells[name] = code
+        return MutationResult(
+            operation="create_cell", cell=CellRef(id=name, name=name), ran=True, status="idle"
+        )
+
+    async def edit_cell(self, target: str, code: str, **_kw: object):
+        from kedge.notebook.model import CellRef, MutationResult
+
+        self.cells[target] = code
+        return MutationResult(
+            operation="edit_cell", cell=CellRef(id=target, name=target), ran=True, status="idle"
+        )
+
+
+def _scaffold_of(plan: object, workspace: Workspace) -> dict[str, str]:
+    """The notebook a first open would leave behind, keyed by cell name.
+
+    Built with the same three paths `_step_scaffold` passes, so a reopen against it reports its
+    cells as unchanged rather than as seventeen divergences.
+    """
+    from kedge.notebook.scaffold import build_cells
+
+    return {
+        cell.name: cell.code
+        for cell in build_cells(
+            plan,
+            handins_dir=workspace.handins_dir,
+            workbook_path=workspace.workbook_path,
+            contract_path=workspace.contract_path,
+        )
+    }
+
+
 def _bare_workspace(tmp_path: Path, home: Path) -> Workspace:
     """A workspace for a real workbook, with no plan of any kind saved for it."""
     workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
@@ -877,6 +934,166 @@ async def test_the_scaffold_step_does_not_claim_no_plan_was_named_when_one_was(
     assert "was not adopted" in with_flag.frames[-1].detail
     assert str(named) in with_flag.frames[-1].detail
     assert without.frames[-1].detail == "no approved plan, so there is nothing to scaffold"
+
+
+async def test_the_scaffold_step_says_how_many_cells_are_still_to_write(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scaffolded notebook runs, so nothing on screen said the conversion was unfinished.
+
+    The stage bodies are passthroughs on purpose — the hand-in machinery is meant to be
+    exercisable the moment a plan is approved — so the page opens, renders and steps through
+    exactly as a finished conversion does. "17 written" was true and told the user nothing.
+    """
+    from conftest import make_approved_plan
+    from kedge.server.hub import _step_scaffold
+
+    workspace = _bare_workspace(tmp_path, home)
+    driver = _MemoryDriver()
+    monkeypatch.setattr(
+        "kedge.notebook.driver.NotebookDriver.for_workspace", lambda _workspace: driver
+    )
+    plan = make_approved_plan()
+    job = OpenJob(job_id="fresh", workbook=str(workspace.workbook_path))
+
+    await _step_scaffold(workspace, plan, job)
+
+    detail = job.frames[-1].detail
+    assert job.frames[-1].state == "ok"
+    assert "17 cells scaffolded, 4 still to write" in detail
+    assert "TODO(kedge)" in detail, "the user needs the marker to search the notebook for"
+
+
+async def test_the_cells_still_to_write_are_counted_off_the_notebook_not_the_scaffold(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This step runs on every open, and only the first one finds an empty notebook.
+
+    Counted off a fresh `build_cells` the number would be four for ever, including on the open
+    after the last hole was filled — a progress report that never moves is one nobody reads.
+    """
+    from conftest import make_approved_plan
+    from kedge.server.hub import _step_scaffold
+
+    workspace = _bare_workspace(tmp_path, home)
+    plan = make_approved_plan()
+    written = _scaffold_of(plan, workspace)
+    written["apply_haircuts"] = "apply_haircuts = load_handin.with_columns(haircut=0.1)\n"
+    driver = _MemoryDriver(written)
+    monkeypatch.setattr(
+        "kedge.notebook.driver.NotebookDriver.for_workspace", lambda _workspace: driver
+    )
+    job = OpenJob(job_id="reopen", workbook=str(workspace.workbook_path))
+
+    await _step_scaffold(workspace, plan, job)
+
+    detail = job.frames[-1].detail
+    assert "17 cells scaffolded, 3 still to write" in detail
+    assert "4 still to write" not in detail
+    assert driver.cells["apply_haircuts"].startswith("apply_haircuts = load_handin"), (
+        "the translated cell must still be the user's, not the scaffold's"
+    )
+
+
+async def test_a_conversion_with_no_holes_left_is_said_so_rather_than_left_silent(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Zero is the one number worth saying out loud: it is the end of the conversion."""
+    from conftest import make_approved_plan
+    from kedge.notebook.scaffold import is_unwritten
+    from kedge.server.hub import _step_scaffold
+
+    workspace = _bare_workspace(tmp_path, home)
+    plan = make_approved_plan()
+    written = {
+        name: (f"{name} = 1\n" if is_unwritten(code) else code)
+        for name, code in _scaffold_of(plan, workspace).items()
+    }
+    monkeypatch.setattr(
+        "kedge.notebook.driver.NotebookDriver.for_workspace",
+        lambda _workspace: _MemoryDriver(written),
+    )
+    job = OpenJob(job_id="finished", workbook=str(workspace.workbook_path))
+
+    await _step_scaffold(workspace, plan, job)
+
+    assert "All 17 scaffolded cells have been written." in job.frames[-1].detail
+    assert "still to write" not in job.frames[-1].detail
+
+
+async def test_a_notebook_that_will_not_list_costs_the_count_rather_than_the_step(
+    tmp_path: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrong count is worse than no count on a step whose job is to say what is unfinished.
+
+    The sync itself succeeded, so the step is `ok` and says what it wrote. It just declines to
+    guess at the half it could not read.
+    """
+    from conftest import make_approved_plan
+    from kedge.errors import NotebookError
+    from kedge.server.hub import _step_scaffold
+
+    class _ListsOnce(_MemoryDriver):
+        async def list_cells(self, *, with_code: bool = True):
+            if self.listings:
+                msg = "the kernel stopped answering"
+                raise NotebookError(msg)
+            return await super().list_cells(with_code=with_code)
+
+    driver = _ListsOnce()
+    monkeypatch.setattr(
+        "kedge.notebook.driver.NotebookDriver.for_workspace", lambda _workspace: driver
+    )
+    workspace = _bare_workspace(tmp_path, home)
+    job = OpenJob(job_id="halfblind", workbook=str(workspace.workbook_path))
+
+    await _step_scaffold(workspace, make_approved_plan(), job)
+
+    assert job.frames[-1].state == "ok"
+    assert "17 written" in job.frames[-1].detail
+    assert "still to write" not in job.frames[-1].detail
+    assert "scaffolded cells have been written" not in job.frames[-1].detail
+
+
+async def test_the_placeholder_notebook_leaves_the_scaffold_a_name_of_its_own(
+    tmp_path: Path, home: Path
+) -> None:
+    """The placeholder used to define ``mo``, and ``kedge_setup`` defines ``mo``.
+
+    So on every fresh workbook the notebook's whole preamble -- ``pl``, ``kedge.xl``,
+    ``kedge.sql``, ``kedge.runs``, ``WORKBOOK``, ``HANDIN_DIR``, ``CONTRACT_PATH``, ``RUNS_DIR``,
+    ``ACCEPTANCE_PATH`` -- was refused for a duplicate definition, and the sync went on to write
+    every stage beneath it against names that were never bound. In app mode that is a page that
+    just ends.
+
+    Asserted through ``multiply_defined`` over the file the two steps actually produce, not
+    against the placeholder's text: a test that checked the constant has no ``@app.cell`` in it
+    would go green again the moment somebody adds a placeholder that clashes on a different name.
+    """
+    from conftest import make_approved_plan
+    from kedge.notebook.codegen import analyse_document, multiply_defined, read_notebook
+    from kedge.notebook.filedriver import FileNotebookDriver
+    from kedge.notebook.scaffold import sync_notebook
+    from kedge.server.hub import _step_notebook
+
+    workspace = _bare_workspace(tmp_path, home)
+    job = OpenJob(job_id="placeholder", workbook=str(workspace.workbook_path))
+    await _step_notebook(workspace, job)
+
+    plan = make_approved_plan()
+    async with FileNotebookDriver.for_workspace(workspace) as driver:
+        result = await sync_notebook(
+            plan,
+            driver,
+            handins_dir=workspace.handins_dir,
+            workbook_path=workspace.workbook_path,
+            contract_path=workspace.contract_path,
+        )
+
+    assert result.named("refused") == (), "the placeholder must not cost the scaffold a cell"
+    assert "kedge_setup" in result.named("created")
+    analyses, _ = analyse_document(read_notebook(workspace.notebook_path))
+    assert multiply_defined(analyses) == {}, "two cells define the same name"
 
 
 async def test_the_named_plan_survives_the_whole_open_sequence(

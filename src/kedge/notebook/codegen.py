@@ -69,6 +69,7 @@ __all__ = [
     "BUILTIN_NAMES",
     "CELL_INDENT",
     "CELL_SEPARATOR",
+    "EMPTY_NOTEBOOK",
     "MAX_LINE_LENGTH",
     "CellAnalysis",
     "FileCell",
@@ -108,6 +109,50 @@ the four module-level dunders that resolve without being defined anywhere. Resta
 standard library rather than imported, because the point of this module is to have nothing
 private to lose.
 """
+
+EMPTY_NOTEBOOK = """import marimo
+
+app = marimo.App(width="medium")
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+"""The notebook kedge writes when there is nothing there yet: an app, and not one cell.
+
+Written only when no notebook exists. kedge's real cells come from an approved plan through
+``notebook/scaffold.py``, and a notebook with no cells is the honest state before one exists --
+better than refusing to open, and better than inventing cells nobody reviewed.
+
+**It has no cells because a placeholder cell is not free.** This began as a stub carrying an
+unnamed ``import marimo as mo``, on the reasoning that marimo wants a cell to open. It does not.
+Measured against marimo 0.23.15: ``marimo edit`` serves a cell-free file without complaint and
+puts a single *empty* unnamed cell into the kernel so the editor has somewhere to type -- so the
+placeholder was never doing the job it was written for, and the empty cell marimo supplies in its
+place defines nothing and cannot collide with anything.
+
+The cell cost more than it bought: ``kedge_setup`` -- the first cell the scaffolder writes --
+imports ``mo`` as well, so the very first cell of every fresh conversion breached marimo's
+single-definition rule. That is the cell importing ``pl``, ``kedge.xl``, ``kedge.sql`` and
+``kedge.runs`` and defining ``WORKBOOK``, ``HANDIN_DIR``, ``CONTRACT_PATH``, ``RUNS_DIR`` and
+``ACCEPTANCE_PATH``, so whichever way the collision resolved the conversion ran on, reported
+nothing wrong, and left a notebook where every stage below fails on a name that was never bound.
+In app mode that renders as a page that just ends (CLAUDE.md, "a broken conversion and a
+conversion waiting patiently look identical").
+
+**The two bridges resolved it differently**, which is worth knowing when reading a notebook that
+was written before this changed. :mod:`kedge.notebook.filedriver` *refuses* ``kedge_setup``
+outright, so the preamble is simply absent from the file; the live kernel *accepts* both cells, so
+the notebook on disk defines ``mo`` twice and marimo errors both of them at run time. Starting
+from no cells avoids both: ``kedge_setup`` owns ``mo``, which is what every cell beneath it
+already expects.
+
+It lives here rather than beside either caller because it is the notebook *file format*, which is
+what this module is for, and because two copies of it is how the collision above got written down
+twice and fixed once. ``tests/contract/test_empty_notebook_live.py`` is the proof that a real
+``marimo edit`` serves it and that scaffolding onto it defines nothing twice.
+"""
+
 
 _WRITE_RETRIES = 6
 _WRITE_RETRY_DELAY = 0.05
