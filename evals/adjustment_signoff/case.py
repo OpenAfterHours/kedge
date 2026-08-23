@@ -968,23 +968,102 @@ def hands_over_rather_than_pretends(ctx: Context) -> ItemResult:
     return _pass(", ".join(stage.id for stage in handoffs))
 
 
-def takes_two_handins(ctx: Context) -> ItemResult:
-    if ctx.plan is None:
-        return _no_plan()
+def _declared_handins(plan: Any) -> dict[str, str]:
+    """Stage id to the label of the hand-in it declares, for every stage that declares one.
+
+    Mirrors :func:`kedge.notebook.scaffold._named_handin`'s *reading* of a plan -- a
+    ``{origin: handin, ref: ...}`` source -- and nothing about whether the scaffolder acts on it.
+    That second question is :func:`_emitted_handins`, and the whole point of
+    :func:`takes_two_handins` is that the two answers can differ.
+    """
     from kedge.plan.model import SourceOrigin
 
-    named = [
-        source.ref
-        for stage in ctx.plan.stages
-        for source in stage.sources
-        if source.origin is SourceOrigin.HANDIN and source.ref
-    ]
-    if not named:
+    declared: dict[str, str] = {}
+    for stage in plan.stages:
+        for source in stage.sources:
+            if source.origin is SourceOrigin.HANDIN and source.ref and stage.id not in declared:
+                declared[stage.id] = source.ref
+    return declared
+
+
+def _emitted_handins(plan: Any) -> tuple[set[str], bool, str]:
+    """What the scaffolder will *actually* ask the user for: staged hand-ins, and the head one.
+
+    Answered by scaffolding the plan rather than by re-deriving the rule, because re-deriving it
+    is how this item came to be green on a plan whose second hand-in had nowhere to arrive:
+    ``build_cells`` skips a ``checkpoint`` stage before it ever looks for a hand-in source, so a
+    re-extract declared on a checkpoint is read by the plan schema, rendered on the approval card,
+    and then silently emitted as nothing. A predicate copied out of the scaffolder would be a
+    second copy of a rule, and a second copy rots.
+
+    Returns:
+        The stage ids the scaffolder emits hand-in cells for, whether the notebook's own head
+        hand-in is emitted as well, and why neither could be counted -- ``""`` when they could. A
+        plan that will not scaffold at all is a different finding and belongs to whichever item is
+        about that, so it comes back as a reason rather than as a traceback or a zero.
+    """
+    from kedge.notebook.scaffold import HEAD_CELL_NAMES, build_cells
+
+    try:
+        cells = build_cells(plan, allow_unapproved=True)
+    except Exception as error:
+        # Broad on purpose: this item is about hand-ins, and *every* way a plan can fail to
+        # scaffold is somebody else's finding. Turning one of them into a red hand-in item would
+        # report the wrong defect, and letting it propagate would take the whole tier down.
+        logger.warning("the plan would not scaffold, so its hand-in cells cannot be counted")
+        return set(), False, f"{type(error).__name__}: {error}"
+    staged = {cell.stage_id for cell in cells if cell.role == "handin" and cell.stage_id}
+    head = any(cell.role == "handin" and cell.name in HEAD_CELL_NAMES for cell in cells)
+    return staged, head, ""
+
+
+def takes_two_handins(ctx: Context) -> ItemResult:
+    """Graded on the cells the scaffolder emits, never on the sources the plan declares.
+
+    The weak version of this item asked only that *some* stage declare a hand-in with a ``ref``,
+    and a real model-written plan passed it while the notebook it scaffolded had exactly one place
+    to put a grid. Both its load steps carried a hand-in; one of them was typed ``checkpoint``, and
+    ``build_cells`` returns early for a checkpoint before ``_named_handin`` is consulted. An item
+    that is green on a plan whose re-extract has nowhere to arrive is worse than no item.
+    """
+    if ctx.plan is None:
+        return _no_plan()
+    declared = _declared_handins(ctx.plan)
+    if not declared:
         return _fail(
             "no stage declares a hand-in of its own. The re-extract cannot be the notebook's "
             "head hand-in: it does not exist when the notebook is opened."
         )
-    return _pass(", ".join(named))
+
+    staged, head, unscaffoldable = _emitted_handins(ctx.plan)
+    if unscaffoldable:
+        return _skip(
+            f"the plan declares hand-ins on {', '.join(sorted(declared))} but would not "
+            f"scaffold, so what the notebook asks for could not be counted -- {unscaffoldable}"
+        )
+
+    lost = sorted(set(declared) - staged)
+    if lost:
+        detail = ", ".join(f"{stage} ({declared[stage]!r})" for stage in lost)
+        return _fail(
+            f"the plan declares a hand-in on {detail} and the scaffolder emits no cell for it, "
+            f"so that grid has nowhere to arrive. `build_cells` returns early for a `checkpoint` "
+            f"stage before it looks for a hand-in source: the source is read, shown on the "
+            f"approval card, and then dropped. Declaring the input is not the same as the "
+            f"notebook asking for it."
+        )
+    if len(staged) + (1 if head else 0) < 2:
+        return _fail(
+            f"the notebook will ask for {len(staged) + (1 if head else 0)} grid, and this "
+            f"process brings back two: the extract, then the re-extract that proves the update "
+            f"took. Emitted for: {', '.join(sorted(staged)) or 'no stage'}."
+        )
+    named = ", ".join(f"{stage} ({declared.get(stage, 'unnamed')})" for stage in sorted(staged))
+    return _pass(
+        f"{len(staged)} staged hand-in(s) emitted"
+        + (" plus the notebook's own head hand-in" if head else "")
+        + f": {named}"
+    )
 
 
 def generates_the_update_from_the_frame(ctx: Context) -> ItemResult:
@@ -1045,23 +1124,164 @@ def raises_the_memo_discrepancy(ctx: Context) -> ItemResult:
     )
 
 
+def _upstream_closure(plan: Any, start: str) -> set[str]:
+    """Every stage ``start`` runs after, transitively, following ``depends_on``.
+
+    Bounded by the visited set, so a plan whose graph has a cycle in it -- which the schema does
+    not forbid -- terminates rather than hanging a sweep.
+    """
+    by_id = {stage.id: stage for stage in plan.stages}
+    seen: set[str] = set()
+    queue = list(by_id[start].depends_on) if start in by_id else []
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        upstream = by_id.get(current)
+        if upstream is not None:
+            queue.extend(upstream.depends_on)
+    return seen
+
+
+def _mutating_handoffs(plan: Any) -> list[Any]:
+    """Hand-offs whose text would change data, judged from the text and not from the flag.
+
+    ``kedge.sql.changes_data`` behind :attr:`~kedge.plan.model.Handoff.statement_writes` is the
+    fact; ``mutates`` is the claim. Grading position against the claim would let a plan escape
+    this item by under-declaring, which is the same plan defect
+    :func:`mutates_agrees_with_the_statement` exists to catch.
+    """
+    return [
+        stage
+        for stage in plan.stages
+        if stage.is_handoff and stage.effective_handoff().needs_confirmation
+    ]
+
+
 def has_a_checkpoint_before_the_update(ctx: Context) -> ItemResult:
+    """Position, not presence -- and reachability, not a single edge.
+
+    Two ways the presence version of this was wrong, and a real model-written plan exercised
+    both. A checkpoint sitting *after* the update satisfies "the plan has a checkpoint", and a
+    checkpoint gating the read-only extract satisfies "some hand-off names a checkpoint in
+    ``depends_on``" while the UPDATE has nothing in front of it. Neither is a recorded decision
+    before a production write. So the question is asked of the mutating hand-off specifically,
+    and answered over the whole upstream closure rather than one edge: a checkpoint two stages
+    up is still a decision the user made before being handed the statement, and refusing it
+    would mark a correct plan down for its decomposition.
+    """
     if ctx.plan is None:
         return _no_plan()
     checkpoints = {stage.id for stage in ctx.plan.stages if stage.is_checkpoint}
     if not checkpoints:
         return _fail("the plan has no checkpoint at all")
-    gated = [
-        stage
-        for stage in ctx.plan.stages
-        if stage.is_handoff and checkpoints.intersection(stage.depends_on)
-    ]
-    if not gated:
+
+    mutating = _mutating_handoffs(ctx.plan)
+    if not mutating:
         return _fail(
-            "no hand-off is gated by a checkpoint. Nobody should be handed a production UPDATE "
-            "with no recorded decision behind it -- the workbook had a sign-off tab."
+            "no hand-off carries a statement that writes, so there is nothing for a checkpoint "
+            "to gate. The process applies an UPDATE to fin.accruals; a plan that never hands it "
+            "over has lost the step that changes the data."
         )
-    return _pass(", ".join(stage.id for stage in gated))
+
+    upstream = {stage.id: _upstream_closure(ctx.plan, stage.id) for stage in mutating}
+    ungated = [stage for stage in mutating if not checkpoints & upstream[stage.id]]
+    if ungated:
+        return _fail(
+            f"{', '.join(stage.id for stage in ungated)} hands over a statement that writes with "
+            f"no checkpoint anywhere upstream of it. The plan's checkpoints are "
+            f"{', '.join(sorted(checkpoints))}, and being in the plan is not being in front of "
+            f"the UPDATE: a decision recorded afterwards is a decision about something that has "
+            f"already happened. What does run first: "
+            f"{', '.join(sorted(upstream[ungated[0].id])) or 'nothing at all'}."
+        )
+    return _pass(
+        ", ".join(
+            f"{stage.id} after {', '.join(sorted(checkpoints & upstream[stage.id]))}"
+            for stage in mutating
+        )
+    )
+
+
+def mutates_agrees_with_the_statement(ctx: Context) -> ItemResult:
+    """``mutates`` is a claim; the statement is the fact, and the plan is where they must agree.
+
+    The notebook now errs the safe way on its own -- :attr:`~kedge.plan.model.Handoff.
+    needs_confirmation` is ``mutates or statement_writes``, so an ``UPDATE`` declared read-only
+    still gets a tick-box -- which is exactly why this belongs in the rubric rather than being
+    left to the scaffolder to compensate for. A contradiction the product silently survives is
+    one nobody has to fix, and the approval card still renders the flag: a reviewer reading
+    "changes nothing" over an ``UPDATE fin.accruals`` is being told something false at the moment
+    they are deciding.
+    """
+    if ctx.plan is None:
+        return _no_plan()
+    handoffs = [stage for stage in ctx.plan.stages if stage.handoff is not None]
+    if not handoffs:
+        return _skip(
+            "the plan carries no hand-off, so there is no statement for `mutates` to agree or "
+            "disagree with. `hands_over_rather_than_pretends` is the item about that."
+        )
+    contradicting = [
+        stage for stage in handoffs if stage.effective_handoff().contradicts_its_own_statement
+    ]
+    if contradicting:
+        return _fail(
+            f"{', '.join(stage.id for stage in contradicting)} declares `mutates: false` over a "
+            f"statement kedge.sql.changes_data reads as a write. The flag is what the approval "
+            f"card shows a reviewer, and it is telling them the opposite of what the text does."
+        )
+    writes = [stage.id for stage in handoffs if stage.effective_handoff().statement_writes]
+    return _pass(
+        f"{len(handoffs)} hand-off(s) agree with their own statements"
+        + (f"; writing: {', '.join(writes)}" if writes else "; none of them writes")
+    )
+
+
+def the_briefing_survives_the_workbook(ctx: Context) -> ItemResult:
+    """The one part of a workbook nobody can reconstruct, and the plan is where it is kept or lost.
+
+    ``Sign-off`` carries Purpose, Background, Scope and Known issues, and the analyser extracts
+    all eight notes with the sheet and cells each came from. A plan that leaves ``briefing`` null
+    scaffolds a notebook whose first cell tells its reader that *"the workbook this was converted
+    from carried no description of what the process is for"* -- which is false, confidently false,
+    and in the one register this project exists to protect.
+
+    The asymmetry is what makes this worth a rubric item. ``Briefing`` refuses prose with no
+    citations, so an *invented* briefing cannot be written down; nothing anywhere notices one that
+    never arrived. Sources are graded as well as prose because a briefing with neither is the
+    honest answer for some workbooks and is the wrong answer for this one.
+    """
+    if ctx.plan is None:
+        return _no_plan()
+    briefing = getattr(ctx.plan, "briefing", None)
+    if briefing is None or briefing.is_empty:
+        return _fail(
+            "the plan carries no briefing. The workbook's Sign-off tab holds Purpose, "
+            "Background, Scope and Known issues, and the analyser recovers every one of them "
+            "with the cells it came from -- so the notebook this scaffolds opens by telling its "
+            "reader the workbook explained nothing, which is not true."
+        )
+    if not briefing.sources:
+        return _fail(
+            "the briefing states a purpose or a background and cites nothing. Invented "
+            "background in a finance notebook is worse than none: it is confident, plausible, "
+            "and the next reader cannot tell it from the real thing."
+        )
+    if not (briefing.purpose and briefing.background):
+        missing = ", ".join(
+            name for name in ("purpose", "background") if not getattr(briefing, name)
+        )
+        return _fail(
+            f"the briefing has no {missing}. The background is the half nobody can reconstruct "
+            f"from the code -- why a flat 4.5% uplift, why statutory ledger only -- and it is "
+            f"written out in full on the Sign-off tab."
+        )
+    return _pass(
+        f"purpose, background and {len(briefing.watch_for)} thing(s) to watch for, cited to "
+        f"{', '.join(briefing.sources[:3])}" + (" and more" if len(briefing.sources) > 3 else "")
+    )
 
 
 def does_not_trust_the_impact_summary(ctx: Context) -> ItemResult:
@@ -1102,5 +1322,7 @@ STRUCTURAL: dict[str, Callable[[Context], ItemResult]] = {
     "raises_the_memo_discrepancy": raises_the_memo_discrepancy,
     "does_not_trust_the_impact_summary": does_not_trust_the_impact_summary,
     "has_a_checkpoint_before_the_update": has_a_checkpoint_before_the_update,
+    "mutates_agrees_with_the_statement": mutates_agrees_with_the_statement,
+    "the_briefing_survives_the_workbook": the_briefing_survives_the_workbook,
     "consults_the_knowledge_pack": consults_the_knowledge_pack,
 }

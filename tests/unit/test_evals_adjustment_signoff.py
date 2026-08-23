@@ -242,6 +242,58 @@ def test_every_scored_item_declares_a_weight(rubric: dict[str, Any]) -> None:
             assert item.get("check"), f"{tier}/{item['id']} says nothing to check"
 
 
+def test_the_weights_still_lean_on_the_deterministic_tier(rubric: dict[str, Any]) -> None:
+    """A plan that reads well and produces the wrong pennies has failed, and the weights say so.
+
+    The structural tier grew when it stopped grading the presence of a field and started grading
+    the shape the scaffolder consumes, which is a good reason to move a balance and a bad reason
+    to lose track of it. Asserted as a share rather than as a pair of totals, so adding an item is
+    allowed and tipping the rubric over is not.
+    """
+    weights = {
+        tier: sum(int(item["weight"]) for item in rubric[tier])
+        for tier in ("deterministic", "structural")
+    }
+
+    assert weights["deterministic"] > weights["structural"] * 1.5, weights
+
+
+def test_the_workbook_still_explains_itself_where_the_briefing_item_looks(cached: Any) -> None:
+    """The rot guard for ``the_briefing_survives_the_workbook``.
+
+    That item is only a discrimination while the Sign-off tab actually carries prose somebody
+    wrote for the next reader. Strip the headings out of the generator and a plan with
+    ``briefing: null`` becomes the *honest* answer, the item becomes a trap, and nothing else in
+    the suite would notice: the workbook would still open, still analyse and still reconcile.
+    """
+    sheet = cached["Sign-off"]
+    headings = {str(sheet.cell(row=row, column=1).value or "").strip() for row in range(1, 20)}
+    prose = " ".join(str(sheet.cell(row=row, column=1).value or "") for row in range(1, 20))
+
+    assert {"Purpose", "Background", "Scope", "Known issues"} <= headings
+    assert "reforecast" in prose, "the background a conversion cannot reconstruct has gone"
+    assert str(evalgen.UPLIFT_RATE * 100) in prose or "4.5%" in prose
+
+
+def test_the_committed_plan_keeps_that_prose_and_says_where_it_came_from() -> None:
+    """The other half: the reference plan must pass the item it is the positive control for.
+
+    Both halves are asserted because either alone is satisfiable by accident. A plan citing cells
+    that hold nothing is as useless as prose citing nothing at all, so every source names a sheet
+    the workbook has.
+    """
+    from kedge.plan.store import plan_from_yaml
+
+    plan = plan_from_yaml((EVAL_DIR / "plan.yaml").read_text(encoding="utf-8"))
+    briefing = plan.briefing
+
+    assert briefing is not None and not briefing.is_empty
+    assert briefing.purpose and briefing.background
+    assert briefing.sources
+    sheets = {source.split("!")[0] for source in briefing.sources if "!" in source}
+    assert "Sign-off" in sheets, briefing.sources
+
+
 # ── the reference plan says what the statement does ──────────────────────────
 
 

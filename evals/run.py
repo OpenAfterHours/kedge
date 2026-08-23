@@ -30,13 +30,31 @@ costs materially more than a sweep::
     uv run python evals/run.py adjustment_signoff --convert gpt-5.6-terra
     uv run python evals/run.py adjustment_signoff --convert gpt-5.6-terra --plan plan.yaml
 
-The two live modes are the only things here that spend money or touch the network, they are
-never the default, and each says what it is about to do before it does it.
+**Convert from the model's own plan** (``--plan-from``). The composed path, and the only one a hub
+user actually takes: propose a plan with a model, approve it, scaffold *that*, fill its holes, and
+grade the whole thing::
+
+    uv run python evals/run.py adjustment_signoff --convert gpt-5.6-terra --plan-from gpt-5.6-terra
+
+The live modes are the only things here that spend money or touch the network, they are never the
+default, and each says what it is about to do before it does it.
 
 **Why the tiers are split across the modes.** ``--model`` grades the structural tier only, and
-``--convert`` is what earns the deterministic tier. Handing the committed reference notebook to a
-model-written plan would print a near-perfect total made mostly of points a human earned, under a
-model's name -- the precise false confidence this whole apparatus exists to remove.
+``--convert`` is what earns the deterministic tier.
+
+**And what the refusals are actually about.** One composition is confounded: a model's plan graded
+alongside a notebook the model did not write. That prints a near-perfect total made mostly of
+points a human earned, under a model's name -- the precise false confidence this apparatus exists
+to remove, and almost invisible in a tidy table. It is refused, by name: ``--plan-from`` without
+``--convert`` would do exactly that against the committed reference conversion. ``--model`` with
+``--convert`` is refused too, for a duller reason -- a sweep and a conversion are two different
+reports and neither is a section of the other.
+
+The *reverse* composition carries no such confound, because both halves are the model's, and it is
+:data:`--plan-from`. Its score is reported under a heading of its own and is **not** comparable
+with a ``--convert`` figure: one measures cell bodies against a human's plan, the other measures a
+whole conversion. Expect the composed number to be materially lower, and read the gap as the
+subject rather than as noise.
 
 The report always prints its denominator. "20/20" over a rubric of sixteen items is not a pass,
 and :meth:`~harness.model.EvalReport.headline` will not render it as though it were.
@@ -60,7 +78,7 @@ if str(EVAL_ROOT) not in sys.path:
 from harness.grade import CASES, as_json, grade, load_case, load_plan  # noqa: E402
 
 if TYPE_CHECKING:
-    from harness.live import ModelSpec
+    from harness.live import MeteredCall, ModelSpec
     from harness.sweep import Price
 
 logger = logging.getLogger(__name__)
@@ -75,8 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)-7s %(name)s: %(message)s",
     )
 
-    if args.model and args.convert:
-        parser.error("--model sweeps the planning seam and --convert grades a notebook; pick one")
+    _refuse_confounded(parser, args)
 
     case = load_case(args.case)
     if args.model:
@@ -84,6 +101,44 @@ def main(argv: list[str] | None = None) -> int:
     if args.convert:
         return _convert(args, case)
     return _grade(args, case)
+
+
+def _refuse_confounded(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse the combinations that would print one model's name over another author's marks.
+
+    Narrowed from a blanket ban on "a model in the loop for the plan *and* a notebook being
+    graded", which caught the composed path -- a model's plan, scaffolded, filled by the same
+    model -- along with the thing it was aimed at. That path is the only one a hub user takes and
+    it has no confound in it: every point on the board is the model's.
+
+    What is left is named rather than approximated:
+
+    - ``--plan-from`` without ``--convert`` *is* the confounded composition. The committed
+      reference conversion would be graded against a model-written plan and the deterministic
+      tier -- 45 of the rubric's points, all of them a human's -- would land under the model's
+      name.
+    - ``--model`` with ``--convert`` is two reports, not one. A sweep tabulates several models
+      over the planning seam; a conversion grades one notebook. Neither is a section of the other.
+    - ``--plan`` with ``--plan-from`` names two different plans for one conversion.
+    """
+    if args.model and args.convert:
+        parser.error(
+            "--model sweeps the planning seam and --convert grades a notebook; pick one. For the "
+            "composed path -- a model's plan, scaffolded, and its holes filled by the same model "
+            "-- use --convert MODEL --plan-from MODEL."
+        )
+    if args.plan_from and not args.convert:
+        parser.error(
+            "--plan-from says who proposes the plan for a conversion, so it needs --convert. On "
+            "its own it would grade the committed reference conversion against a model-written "
+            "plan: a near-perfect total made mostly of points a human earned, printed under a "
+            "model's name."
+        )
+    if args.plan_from and args.plan:
+        parser.error(
+            "--plan reads a plan off disk and --plan-from asks a model for one; pick one. The "
+            "conversion is scaffolded from exactly one plan and the report has to say which."
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -130,6 +185,14 @@ def _parser() -> argparse.ArgumentParser:
         metavar="MODEL",
         default=None,
         help="convert with this model and grade the notebook it produces.",
+    )
+    live.add_argument(
+        "--plan-from",
+        metavar="MODEL",
+        default=None,
+        help="propose the plan for --convert with this model rather than reading the case's "
+        "committed one. The composed path: model plan, scaffolded, filled by a model. Its score "
+        "is reported as such and is not comparable with a plain --convert figure.",
     )
     live.add_argument(
         "--repeats", type=int, default=1, help="runs per model. One sample is noise; default 1."
@@ -205,28 +268,61 @@ def _sweep(args: argparse.Namespace, case: Any) -> int:
 
 
 def _convert(args: argparse.Namespace, case: Any) -> int:
-    """Phase 2: scaffold the plan, have the model fill every hole, then drive and grade it."""
-    from harness.convert import convert_and_grade
+    """Phase 2: scaffold the plan, have the model fill every hole, then drive and grade it.
+
+    Two shapes, and the difference is one flag. Without ``--plan-from`` the plan is the case's own
+    approved one and the score is about cell bodies alone -- that is the baseline. With it, the
+    plan is proposed first, by a model, and the score is about the whole conversion. The report
+    says which it was, on a line of its own, because the two numbers are not comparable and the
+    only thing between a reader and treating them as though they were is that line.
+    """
+    from harness.convert import convert_and_grade, no_plan_proposed
     from harness.live import ModelSpec, resolve_model
 
-    plan = load_plan(args.plan or _reference_plan(case))
-    if plan is None:
-        msg = (
-            "no plan to convert: pass --plan, or put a plan.yaml beside the case's reference "
-            "conversion"
-        )
-        raise SystemExit(msg)
-
     spec = ModelSpec(
-        model=args.convert, base_url=args.base_url, api_key_ref=args.api_key_ref, label=None
+        model=args.convert,
+        base_url=args.base_url,
+        api_key_ref=args.api_key_ref,
+        label=f"{args.convert} (cells)" if args.plan_from else None,
+    )
+    planner = (
+        ModelSpec(
+            model=args.plan_from,
+            base_url=args.base_url,
+            api_key_ref=args.api_key_ref,
+            label=f"{args.plan_from} (plan)",
+        )
+        if args.plan_from
+        else None
     )
     if args.dry_run:
-        return _dry_run(args, [spec])
+        return _dry_run(args, [planner, spec] if planner is not None else [spec])
 
     resolved = resolve_model(spec, kedge_home=args.kedge_home)
     if not resolved.ready:
         print(f"{spec.name}: {resolved.failure.value} -- {resolved.detail}")
         return 1
+
+    plan_origin = ""
+    planner_cost = ""
+    if planner is None:
+        plan = load_plan(args.plan or _reference_plan(case))
+        if plan is None:
+            msg = (
+                "no plan to convert: pass --plan, or put a plan.yaml beside the case's reference "
+                "conversion"
+            )
+            raise SystemExit(msg)
+    else:
+        _announce(f"one plan proposal with {planner.name}, before any cell is asked for")
+        plan, plan_origin, planner_cost, failure = _propose(args, planner)
+        if plan is None:
+            report = no_plan_proposed(case, plan_origin=plan_origin, detail=failure)
+            print(report.render())
+            if planner_cost:
+                print(f"\nplan seam cost: {planner_cost}")
+            return report.exit_code()
+        _keep_plan(args, plan)
 
     _announce(
         f"one conversion with {spec.name}: a completion per scaffolded hole, plus a retry per "
@@ -241,11 +337,102 @@ def _convert(args: argparse.Namespace, case: Any) -> int:
         notebook=notebook,
         model=args.convert,
         temperature=args.temperature,
+        plan_origin=plan_origin,
     )
     print(report.render())
+    if planner_cost:
+        print(f"\nplan seam cost: {planner_cost}")
     if completer is not None:
-        print(f"\ncost: {completer.usage.describe()} over {completer.seconds:.1f}s")
+        print(f"cell seam cost: {completer.usage.describe()} over {completer.seconds:.1f}s")
     return report.exit_code()
+
+
+def plan_failure_detail(model: str, call: MeteredCall) -> str:
+    """Why the composed path never got a plan, attributed rather than assumed.
+
+    The distinction ``evals/README.md`` calls the point of the whole apparatus, applied one level
+    up. A model that produced no plan may have refused the JSON schema, timed out, been
+    rate-limited, had no key in the keyring, or written prose no repair round could turn into a
+    plan -- and only the last two are its judgement.
+    :attr:`~harness.live.Failure.about_the_model` already decides that, so this quotes it rather
+    than re-deciding it, and the endpoint's own text travels with the verdict because a
+    classification with no evidence is unactionable.
+
+    Args:
+        model: The model that was asked.
+        call: What came back, already classified by :func:`~harness.sweep.propose_once`.
+
+    Returns:
+        One sentence for :attr:`~harness.convert.ConversionReport.detail`.
+    """
+    blame = (
+        "the model's own output never validated as a plan"
+        if call.failure.about_the_model
+        else "a fact about the integration, the account or the endpoint -- not the model's "
+        "judgement, and not a conversion that graded badly"
+    )
+    return f"no plan from {model}: {call.failure.value} ({blame}). {call.detail}".rstrip()
+
+
+def _propose(args: argparse.Namespace, planner: ModelSpec) -> tuple[Any, str, str, str]:
+    """Ask a model for a plan and approve it, so the scaffolder will take it.
+
+    Approval is a human act everywhere else and it is performed here, deliberately and in one
+    place, because a scaffold is what is being measured and ``build_cells`` refuses an unapproved
+    plan. Two consequences worth stating rather than discovering. Every outstanding ``dropped``
+    range is acknowledged, which is what a reviewer clicking through the card would do -- and a
+    plan that drops the wrong thing still loses ``does_not_drop_the_sql_column``, so nothing is
+    laundered by the acknowledgement. And a plan with a blocker that acknowledgement does not
+    clear is not talked into approval: it comes back as ``NO_PLAN`` with the blocker quoted,
+    because a plan kedge would refuse to scaffold is a result about the model, not a run to fudge.
+
+    Returns:
+        The approved plan or ``None``; where it came from; what the request cost; and, when there
+        is no plan, the attributed reason.
+    """
+    from harness.live import resolve_model
+    from harness.sweep import Bench, propose_once
+
+    origin = f"proposed by {planner.model}"
+    resolved = resolve_model(planner, kedge_home=args.kedge_home)
+    bench = Bench.load(args.case, temperature=args.temperature)
+    plan, call = propose_once(resolved, bench)
+    cost = f"{call.usage.describe()} over {call.seconds:.1f}s"
+
+    if plan is None:
+        return None, origin, cost, plan_failure_detail(planner.model, call)
+
+    from kedge.plan.model import PlanError
+    from kedge.plan.review import acknowledge_all_drops, approve
+
+    try:
+        approved = approve(
+            acknowledge_all_drops(plan, note="Acknowledged by evals/run.py --plan-from."),
+            by="evals/run.py --plan-from",
+        )
+    except (PlanError, ValueError) as exc:
+        return (
+            None,
+            origin,
+            cost,
+            f"{planner.model} proposed a plan kedge will not scaffold, so no cell was ever "
+            f"asked for: {exc}",
+        )
+    return approved, origin, cost, ""
+
+
+def _keep_plan(args: argparse.Namespace, plan: Any) -> None:
+    """Write the model's plan beside the notebook it was converted into.
+
+    Same argument as keeping the notebook: a conversion nobody can read afterwards cannot be
+    argued with, and on the composed path half of what is being argued about is the plan.
+    """
+    from kedge.plan.store import plan_to_yaml
+
+    notebook = args.out or (EVAL_ROOT / args.case / f"converted-{_slug(args.convert)}.py")
+    path = notebook.with_name(f"plan-from-{_slug(args.plan_from)}.yaml")
+    path.write_text(plan_to_yaml(plan), encoding="utf-8")
+    print(f"plan written to {path}\n")
 
 
 def _dry_run(args: argparse.Namespace, specs: list[ModelSpec]) -> int:

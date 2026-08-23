@@ -94,14 +94,23 @@ re-extract. `_handin_cells` never fires for a checkpoint stage, so:
 2. **`prepare_sign_off` lost its upstream.** Its only dependency is that checkpoint, and
    `_upstream_name` falls through to `return "handin_frame"` (`scaffold.py:2019`) -- so the
    sign-off builds on the notebook's fixed head hand-in rather than on the verified result.
-3. **That fall-through switched the head hand-in back on.** `head_handin_is_read` returns True
-   the moment any stage resolves to `handin_frame`, so six cells and 11,175 bytes of hand-in
-   machinery were emitted for an input no step of the process names -- 35% of the notebook's
-   code -- and its `mo.stop` blocks the page until the user supplies a file they have no use
-   for. The reference plan, where every load stage declares its own hand-in, emits none of it.
+3. **The head hand-in came back on.** `head_handin_is_read` returns True the moment any stage
+   resolves to `handin_frame`, so six cells and 11,175 bytes of hand-in machinery were emitted
+   for an input no step of the process names -- 35% of the notebook's code -- and its `mo.stop`
+   blocks the page until the user supplies a file they have no use for. The reference plan,
+   where every load stage declares its own hand-in, emits none of it.
 
-Every one of those is the documented, correct behaviour of the code it passes through. The
-defect is that a single mistyped enum produces them silently.
+Consequences 1 and 2 are the mistyped enum's alone. **Consequence 3 is not, and the first draft
+of this document said it was.** `document_extract` also falls through: it declares
+`depends_on: []` and sources of `query` and `range` with no hand-in among them, so
+`_upstream_name` returns `handin_frame` for it too -- and `head_handin_is_read` iterates in
+`ordered_stages()`, so it returns True there before it ever reaches the sign-off. Correcting the
+checkpoint's `kind` alone would have left the head hand-in exactly where it was. Two independent
+fall-throughs, one of which is arguably legitimate: a stage with no dependencies at all may
+genuinely be the one that reads the notebook's own hand-in.
+
+Every one of these is the documented, correct behaviour of the code it passes through. The
+defect is that they happen silently.
 
 ### The review gate said almost nothing
 
@@ -142,7 +151,7 @@ one is not.**
 |---|---|---|
 | 1 | **There is no conversion driver.** The loop that enumerates `TODO(kedge)` holes and asks for each one exists only in `evals/harness/cellgen.py`. | `grep -rn "TODO" src/kedge/agent/ src/kedge/server/` returns nothing. The string appears in `scaffold.py` and `plan/model.py` only -- the code that *writes* the markers. Nothing that reads them ships. |
 | 2 | **The agent is never told the markers mean anything.** | `TODO` appears in no file under `src/kedge/agent/prompts/`. `role.md` and `tools.md` describe a copilot that translates regions on request; neither describes a scaffold with holes in it, nor says that filling them is the job. |
-| 3 | **`list_cells` cannot show the notebook it is asked to complete.** | 23 cells, 31,664 bytes of raw code, wrapped in JSON with id/name/defs/refs -- over the 32,768 cap. The log records `byte_count: 32768, truncated: true` on the first call of the conversion turn. `tools.md` then instructs: *"you have seen a slice ... do not state a total"*. Every hole is in the truncated tail. |
+| 3 | **`list_cells` cannot show the notebook it is asked to complete.** | 23 cells, 31,664 bytes of raw code, wrapped in JSON with id/name/defs/refs -- over the 32,768 cap. The log records `byte_count: 32768, truncated: true` on the first call of the conversion turn. `tools.md` then instructs: *"you have seen a slice ... do not state a total"*. Every hole is in the truncated tail. **Measured since:** the *gold* plan's 24-cell listing comes back at 32,089 bytes -- 679 under the cap. So the reference scaffold does not truncate, and sits one stage away from the cliff; what pushed the observed run over was the 11,175 bytes of spurious head hand-in machinery from gap 5. Both readings matter, and the second is the more alarming. |
 | 4 | **More than half that budget is machinery the model never edits.** | The fixed head is 10 cells and 17,447 bytes of the 31,664. `list_cells` offers `cell` and `with_code` and nothing else -- no filter by role, no "unwritten only", no pagination. |
 | 5 | **`review_warnings` does not check the things the scaffolder consumes.** | No warning for zero hand-offs, for a mutating step with no checkpoint upstream, for `briefing is None` beside a non-empty `analysis.notes`, for a `handin` source on a stage kind that ignores it, or for a stage whose upstream silently resolves to `handin_frame`. |
 | 6 | **The structural tier grades presence, not shape.** | Eight items, nineteen of sixty-three points, and it never grades the briefing, the checkpoint's *position* relative to the mutating step, or the `mutates` flag. Sharper still: `takes_two_handins` asks only that "at least one stage declares a hand-in with a `ref`", and **this plan passes it** -- both its load stages carry one -- while the scaffolder emits hand-in cells for exactly one of them, because the other sits on a `checkpoint`. An item can be green on a plan whose second hand-in has nowhere to arrive. |

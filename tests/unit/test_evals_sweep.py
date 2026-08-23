@@ -11,6 +11,13 @@ remove, and it would be almost impossible to spot in a tidy table. So the tests 
 mark is the structural tier's, and the two structural items that need something a plan cannot
 supply skip with a reason rather than passing quietly.
 
+Every mark below is **derived from ``expected.yaml``**, never typed -- see
+:data:`NEEDS_MORE_THAN_A_PLAN`, which also reconciles the two structural totals this repo now
+prints. A sweep grades a plan and reports the tier out of 21; an offline run drives the notebook
+as well and reports it out of 23. Both are right, the gap is one named item, and the reason to
+write that down is that two different totals for the same tier is exactly how a number goes wrong
+quietly.
+
 **Negative controls.** A sweep that has only ever seen a good run is a sweep whose polarity nobody
 has checked, and the failure this project has already met once was a *misattribution*: an endpoint
 refusing an explicit temperature on every request, read as "structured output unsupported", with
@@ -41,6 +48,7 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 from openai import (
     APIConnectionError,
     APITimeoutError,
@@ -75,10 +83,63 @@ from harness.sweep import (  # noqa: E402
 
 URL = "https://example.invalid/v1"
 
-FULL_MARKS = 16
-"""What the structural tier is worth to a plan alone: 19 declared, less the two items that need
-something a plan sweep has not got. Written down so a rubric change fails a test here rather than
-silently moving every score in the table."""
+
+def _weights(tier: str) -> dict[str, int]:
+    """Every item's weight in one tier of ``expected.yaml``, read rather than transcribed.
+
+    The rubric is the only place these figures exist, and a test that retypes one is a second copy
+    of it. Not hypothetical: the structural tier grew from 19 points to 24 when it stopped grading
+    the presence of a plan's fields and started grading the shape the scaffolder consumes, and six
+    tests in this file went red on their literals rather than on anything about a sweep.
+    """
+    rubric = yaml.safe_load(adjustment_case.RUBRIC.read_text(encoding="utf-8"))
+    return {str(entry["id"]): int(entry.get("weight", 1)) for entry in rubric[tier]}
+
+
+STRUCTURAL_WEIGHTS = _weights(TIER)
+
+DETERMINISTIC_POINTS = sum(_weights("deterministic").values())
+"""The marks a sweep pointedly does not award. Printed above the table, and asserted below."""
+
+NEEDS_MORE_THAN_A_PLAN = ("does_not_trust_the_impact_summary", "consults_the_knowledge_pack")
+"""The two structural items a plan-only leg cannot grade -- named, not counted, because they are
+ungradeable for two different reasons.
+
+``does_not_trust_the_impact_summary`` reads a *driven notebook*: the Sign-off tab's stale figures
+are either carried into the output or they are not, and a plan cannot say which.
+``consults_the_knowledge_pack`` skips for everybody, sweep or not, because no pack describes
+``fin.accruals``.
+
+Naming them is also the answer to a figure that would otherwise disagree with itself across the
+repo. A full offline run -- ``evals/run.py adjustment_signoff --plan ...``, which drives the
+notebook -- reports the structural tier out of **23**: everything declared, less the knowledge
+pack. A sweep reports **21**, because the notebook-reading item skips as well. Two different
+structural totals, both correct, and the difference is exactly these two entries.
+
+Both halves are pinned. This tuple is asserted to be the *whole* skip set by
+:func:`test_the_items_a_plan_cannot_answer_skip_with_a_reason`, so a new rubric item that also
+needs a notebook goes red here rather than silently shrinking :data:`FULL_MARKS`; and the driven
+figure is pinned exactly by ``TIER_SCORES`` in ``tests/unit/test_evals_convert.py``."""
+
+FULL_MARKS = sum(STRUCTURAL_WEIGHTS.values()) - sum(
+    STRUCTURAL_WEIGHTS[item] for item in NEEDS_MORE_THAN_A_PLAN
+)
+"""What the structural tier is worth to a plan alone: everything declared, less the two above.
+
+Derived, never typed, so a rubric change moves it here and every test below goes on asserting the
+thing it was written to assert. It was a literal ``16``, and the rubric moved underneath it."""
+
+DROPPED_COLUMN_COSTS = STRUCTURAL_WEIGHTS["does_not_drop_the_sql_column"]
+"""What a plan pays for deleting the step that changes the data -- the eval's sharpest single
+discrimination, and the only item this file's negative control makes a model fail."""
+
+DROPS_THE_COLUMN = FULL_MARKS - DROPPED_COLUMN_COSTS
+"""What that plan scores: full marks less that one item, and nothing else moving.
+
+Kept as arithmetic rather than as a number because the arithmetic is the claim. A bare ``18`` says
+a plan lost some marks; ``FULL_MARKS - DROPPED_COLUMN_COSTS`` says which one it lost, and a
+mutation that made the plan fail a *second* item fails this test instead of quietly agreeing with
+whatever the new total happens to be."""
 
 
 # ── the bench, and the plans a leg can be scripted to produce ────────────────
@@ -234,7 +295,12 @@ def test_a_plan_is_scored_out_of_the_structural_tiers_own_denominator(
     assert leg.scores == (FULL_MARKS,)
     assert leg.available == FULL_MARKS
     assert report.available == FULL_MARKS
-    assert report.points_declared == 19, "the tier declares 19; three of them need a notebook"
+    declared = sum(STRUCTURAL_WEIGHTS.values())
+    withheld = declared - FULL_MARKS
+    assert report.points_declared == declared, (
+        f"the tier declares {declared}; {withheld} of those points sit on "
+        f"{', '.join(NEEDS_MORE_THAN_A_PLAN)}, which a plan alone cannot answer"
+    )
 
 
 def test_no_deterministic_mark_is_ever_credited_to_a_model(bench: Bench, good: str) -> None:
@@ -253,12 +319,16 @@ def test_no_deterministic_mark_is_ever_credited_to_a_model(bench: Bench, good: s
     )
     assert graded <= set(adjustment_case.STRUCTURAL)
     assert report.available is not None
-    assert report.available < 63, "63/63 is the committed reference run, not a model result"
+    committed = DETERMINISTIC_POINTS + sum(STRUCTURAL_WEIGHTS.values())
+    assert report.available < committed, (
+        f"{committed} is what the whole rubric declares over a driven notebook, and it is the "
+        f"committed reference run's number, not a model result"
+    )
 
     document = json.loads(as_json(report))
     assert document["tier"] == TIER
     assert document["not_graded"]["tier"] == "deterministic"
-    assert document["not_graded"]["points"] == 45
+    assert document["not_graded"]["points"] == DETERMINISTIC_POINTS
     assert "totals_to_the_penny" not in as_json(report)
 
 
@@ -267,7 +337,7 @@ def test_the_items_a_plan_cannot_answer_skip_with_a_reason(bench: Bench, good: s
     report = _one(bench, ScriptedCompleter([good]))
 
     skipped = {item.id: item.detail for item in report.ungradeable}
-    assert set(skipped) == {"does_not_trust_the_impact_summary", "consults_the_knowledge_pack"}
+    assert set(skipped) == set(NEEDS_MORE_THAN_A_PLAN)
     assert "harness/convert.py" in skipped["does_not_trust_the_impact_summary"]
     assert "knowledge pack" in skipped["consults_the_knowledge_pack"]
 
@@ -308,7 +378,7 @@ def test_a_plan_that_drops_the_sql_column_loses_marks_and_is_attributed_to_the_m
 
     leg = report.legs[0]
     assert leg.outcome is Outcome.FAIL
-    assert leg.scores == (13,)
+    assert leg.scores == (DROPS_THE_COLUMN,)
     assert leg.attributions == {Failure.NONE: 1}
     assert leg.attribution_cell() == "answered first time"
     assert any("does_not_drop_the_sql_column FAIL" in line for line in leg.why())
@@ -319,21 +389,24 @@ def test_a_plan_that_drops_the_sql_column_loses_marks_and_is_attributed_to_the_m
 def test_repeats_that_disagree_are_reported_as_a_range_and_never_as_a_mean(
     bench: Bench, good: str, drops_the_column: str
 ) -> None:
-    """A model that scores 16, 13, 16 is not a 15-scoring model, and a table showing only the
-    mean says it is."""
+    """A model that scores full marks, then drops the SQL column, then scores full marks again is
+    not a model that scores the average of the three, and a table showing only the mean says it
+    is. Every figure below is derived, so what is asserted is the *shape* -- best, worst, spread,
+    and each repeat listed in order -- rather than three digits that a rubric change invalidates.
+    """
     completer = ScriptedCompleter([good, drops_the_column, good])
 
     report = _one(bench, completer, repeats=3)
 
     leg = report.legs[0]
-    assert leg.scores == (FULL_MARKS, 13, FULL_MARKS)
-    assert leg.spread == 3
-    assert leg.score_cell() == f"13-{FULL_MARKS}/{FULL_MARKS}"
+    assert leg.scores == (FULL_MARKS, DROPS_THE_COLUMN, FULL_MARKS)
+    assert leg.spread == DROPPED_COLUMN_COSTS
+    assert leg.score_cell() == f"{DROPS_THE_COLUMN}-{FULL_MARKS}/{FULL_MARKS}"
     assert leg.outcome is Outcome.FAIL, "two good runs do not cancel a bad one"
 
     table = render(report)
-    assert f"13-{FULL_MARKS}/{FULL_MARKS}" in table
-    assert "16, 13, 16" in table
+    assert f"{DROPS_THE_COLUMN}-{FULL_MARKS}/{FULL_MARKS}" in table
+    assert f"{FULL_MARKS}, {DROPS_THE_COLUMN}, {FULL_MARKS}" in table
 
 
 # =============================================================================
@@ -358,8 +431,8 @@ def test_an_endpoint_failure_is_attributed_rather_than_scored_as_zero(
 ) -> None:
     """Four different findings, none of them about the model's ability to plan a workbook.
 
-    A table rendering them as ``0/16`` alongside a model that answered badly is how a proxy
-    problem gets a model replaced -- so none of them scores, and none of them is a FAIL either.
+    A table rendering them as ``0`` out of full marks, alongside a model that answered badly, is
+    how a proxy problem gets a model replaced -- so none of them scores, and none is a FAIL.
     They are SKIPs, because a FAIL in this table means "this model's judgement was wrong" and a
     timeout means "kedge's read gap elapsed while a reasoning model was thinking".
 
@@ -635,11 +708,11 @@ def test_the_json_carries_the_denominator_the_spread_and_the_attribution(
     document = json.loads(as_json(report))
     leg = document["legs"][0]
     assert document["available"] == FULL_MARKS
-    assert document["points_declared"] == 19
-    assert leg["scores"] == [FULL_MARKS, 13]
+    assert document["points_declared"] == sum(STRUCTURAL_WEIGHTS.values())
+    assert leg["scores"] == [FULL_MARKS, DROPS_THE_COLUMN]
     assert leg["best"] == FULL_MARKS
-    assert leg["worst"] == 13
-    assert leg["spread"] == 3
+    assert leg["worst"] == DROPS_THE_COLUMN
+    assert leg["spread"] == DROPPED_COLUMN_COSTS
     assert leg["attribution"] == {"none": 2}
     assert leg["outcome"] == "fail"
     assert [repeat["available"] for repeat in leg["repeats"]] == [FULL_MARKS, FULL_MARKS]

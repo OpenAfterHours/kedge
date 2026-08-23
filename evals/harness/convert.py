@@ -19,15 +19,20 @@ The pipeline is five steps, and every one of them is machinery that already exis
 5. **Grade it** with :func:`harness.grade.grade` and the case's own rubric, unmodified, and
    report what the run said about kedge as well as about the model -- :mod:`harness.findings`.
 
-## Six outcomes, not two
+## Seven outcomes, not two
 
 A model that scores nothing must be distinguishable from a harness that could not measure it, so
 a hole ends in one of four states (:class:`~harness.cellgen.CellOutcome`) and a whole conversion
-in one of six (:class:`ConversionOutcome`). "Nothing was ever asked", "the endpoint failed part
-way through", "the model never satisfied the validation gate", "the notebook would not render",
-"the notebook rendered and then stopped halfway" and "the notebook ran and graded badly" are six
-different things to tell somebody choosing a model, and only the last of them is about the
-model's judgement.
+in one of seven (:class:`ConversionOutcome`). "No plan was ever proposed", "nothing was ever
+asked", "the endpoint failed part way through", "the model never satisfied the validation gate",
+"the notebook would not render", "the notebook rendered and then stopped halfway" and "the
+notebook ran and graded badly" are seven different things to tell somebody choosing a model, and
+only the last of them is about the model's judgement.
+
+:attr:`ConversionOutcome.NO_PLAN` exists for the composed path, where the plan is asked of a model
+rather than read off disk (``--convert MODEL --plan-from MODEL``). A run that never got a plan
+never scaffolded a cell, and folding it into ``INCOMPLETE`` -- whose docstring reads "the gaps are
+the model's" -- would file an unreachable endpoint as a model that writes bad code.
 
 :attr:`ConversionOutcome.INTERRUPTED` earns its place from a measured failure. A completer that
 answers the first hole and then raises on every request used to come back as ``INCOMPLETE`` --
@@ -78,6 +83,7 @@ __all__ = [
     "ConversionReport",
     "convert_and_grade",
     "driven_run",
+    "no_plan_proposed",
 ]
 
 
@@ -113,6 +119,16 @@ class ConversionOutcome(StrEnum):
     """Every hole ended in :attr:`~harness.cellgen.CellOutcome.ERROR`, or there were no holes.
     Nothing was measured about the model."""
 
+    NO_PLAN = "no_plan"
+    """The plan was to come from a model and none arrived, so nothing was ever scaffolded.
+
+    Only reachable on the composed path (``--convert MODEL --plan-from MODEL``), where the plan is
+    the first thing asked for rather than a file read off disk. It earns a member of its own for
+    the same reason :attr:`INTERRUPTED` did: a run that ended before a single cell was requested
+    must not be reported as a model writing bad cells. Whether the *plan* failure was the model's
+    judgement is a question :class:`~harness.live.Failure` already answers, and
+    :attr:`ConversionReport.detail` carries that attribution rather than re-deciding it here."""
+
 
 @dataclass(frozen=True, slots=True)
 class ConversionReport:
@@ -127,7 +143,10 @@ class ConversionReport:
     """
 
     case: str
-    result: ConversionResult
+    result: ConversionResult | None
+    """``None`` only for :attr:`ConversionOutcome.NO_PLAN`, where nothing was ever scaffolded and
+    so there is no generation denominator to state. Every other outcome has one, including the
+    ones where it is zero."""
     outcome: ConversionOutcome
     report: EvalReport | None = None
     notebook: Path | None = None
@@ -137,6 +156,15 @@ class ConversionReport:
     coverage: Coverage | None = None
     defects: tuple[Defect, ...] = ()
     detail: str = ""
+    plan_origin: str = ""
+    """Where the plan came from, when it did not come from the case's committed one.
+
+    Empty means the gold plan, which is the default and the baseline every published ``--convert``
+    figure is measured against. Set, it names the model that proposed it -- and
+    :meth:`headline` then says so on a line of its own, above the score, because the composed
+    path's total and the gold-plan path's total are two different measurements and a reader who
+    mistakes one for the other has been handed the false confidence this whole apparatus exists
+    to remove."""
 
     @property
     def ok(self) -> bool:
@@ -147,15 +175,26 @@ class ConversionReport:
 
     def headline(self) -> str:
         """One line carrying the score, the generation denominator, and how far it got."""
-        left = f"{self.case}: {self.outcome.value}, {self.result.summary_line()}"
+        generation = self.result.summary_line() if self.result is not None else "no plan to convert"
+        left = f"{self.case}: {self.outcome.value}, {generation}"
         if self.defects:
             left += f"; {len(self.defects)} scaffolder defect(s) found"
         if self.report is None:
-            return f"{left}; not graded -- {self.detail}" if self.detail else f"{left}; not graded"
-        lines = [left, self.report.headline()]
+            head = f"{left}; not graded -- {self.detail}" if self.detail else f"{left}; not graded"
+            return "\n".join([head, *self._provenance()])
+        lines = [left, *self._provenance(), self.report.headline()]
         if self.coverage is not None:
             lines.append(self.coverage.headline())
         return "\n".join(lines)
+
+    def _provenance(self) -> list[str]:
+        """The line that stops a composed score being read as a gold-plan score."""
+        if not self.plan_origin:
+            return []
+        return [
+            f"COMPOSED PATH -- plan: {self.plan_origin}. Not comparable with a --convert figure, "
+            f"which starts from the case's own approved plan and measures the cell bodies alone."
+        ]
 
     def render(self) -> str:
         blocks = [self.headline(), ""]
@@ -163,7 +202,8 @@ class ConversionReport:
             blocks.append("Defects in the scaffolded conversion (kedge's, not the model's)")
             blocks.extend(defect.render() for defect in self.defects)
             blocks.append("")
-        blocks.extend([self.result.render(), ""])
+        if self.result is not None:
+            blocks.extend([self.result.render(), ""])
         if self.coverage is not None and (self.coverage.undriven or self.coverage.ungradeable):
             blocks.extend([self.coverage.render(), ""])
         if self.report is not None:
@@ -179,6 +219,34 @@ class ConversionReport:
 def _case_name(case: Any) -> str:
     """What to call the case in a report: ``adjustment_signoff``, not ``adjustment_signoff.case``."""
     return getattr(case, "__name__", "case").split(".")[0]
+
+
+def no_plan_proposed(case: Any, *, plan_origin: str, detail: str) -> ConversionReport:
+    """A composed run that ended before anything was scaffolded, with the reason kept.
+
+    The composed path asks a model for the plan first, and that request can fail every way a
+    request can: the key was never in the keyring, the endpoint refused the JSON schema, a proxy
+    returned a 404 for an id nobody enabled, or the model's own output never validated as a plan
+    after every repair round. Only the last of those is the model's judgement, and
+    :attr:`~harness.live.Failure.about_the_model` is where that is already decided -- so this
+    takes the sentence rather than re-deriving it, and refuses to invent a conversion score for a
+    conversion nobody attempted.
+
+    Args:
+        case: The eval case, for its name.
+        plan_origin: Who the plan was asked of.
+        detail: What happened, already attributed.
+
+    Returns:
+        A :class:`ConversionReport` with no result, no report and a non-zero exit code.
+    """
+    return ConversionReport(
+        case=_case_name(case),
+        result=None,
+        outcome=ConversionOutcome.NO_PLAN,
+        plan_origin=plan_origin,
+        detail=detail,
+    )
 
 
 def _script_keys(case: Any) -> tuple[str, ...]:
@@ -232,6 +300,7 @@ def convert_and_grade(
     model: str = "",
     temperature: float = 0.2,
     max_attempts: int = MAX_VALIDATION_ATTEMPTS,
+    plan_origin: str = "",
 ) -> ConversionReport:
     """The whole seam: scaffold, generate, lay out, render, drive, grade.
 
@@ -253,6 +322,8 @@ def convert_and_grade(
         model: The model name on each request.
         temperature: Sent with each request.
         max_attempts: Validation attempts per hole.
+        plan_origin: Who wrote the plan, when it was not the case's committed one. Carried
+            onto the report so the composed path's total cannot be read as a gold-plan total.
 
     Returns:
         The :class:`ConversionReport`.
@@ -277,6 +348,7 @@ def convert_and_grade(
             case=_case_name(case),
             result=result,
             outcome=ConversionOutcome.NO_MODEL,
+            plan_origin=plan_origin,
             detail=(
                 "the scaffolder left no TODO(kedge) holes in this plan, so the model was never "
                 "asked for anything and nothing about it was measured. That is a statement about "
@@ -288,6 +360,7 @@ def convert_and_grade(
             case=_case_name(case),
             result=result,
             outcome=ConversionOutcome.NO_MODEL,
+            plan_origin=plan_origin,
             detail=(
                 "every request to the model failed, so nothing about the model was measured. "
                 f"First failure: {result.generated[0].detail}"
@@ -302,6 +375,7 @@ def convert_and_grade(
             case=_case_name(case),
             result=result,
             outcome=ConversionOutcome.UNRENDERABLE,
+            plan_origin=plan_origin,
             layout=layout,
             detail=f"the conversion would not render as a notebook: {exc}",
         )
@@ -327,6 +401,7 @@ def convert_and_grade(
         layout=layout,
         coverage=coverage,
         defects=defects,
+        plan_origin=plan_origin,
     )
 
 

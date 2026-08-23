@@ -322,3 +322,257 @@ def test_no_plan_skips_the_structural_tier_rather_than_failing_it() -> None:
         "a missing plan must not be reported as a failed conversion"
     )
     assert report.ok
+
+
+# ── negative controls on the shape the scaffolder consumes ───────────────────
+#
+# The four items below used to grade *presence*, and a real model-written plan passed five of the
+# structural tier's eight while scaffolding into a notebook with no briefing, no hand-off, a
+# checkpoint below the update rather than above it, and one place to put a grid in a process that
+# brings back two. Each mutation here is one of those defects, reproduced on the reference plan
+# rather than invented -- so the polarity of the tightened graders is checked against the shape
+# that actually got past the loose ones.
+
+
+def restaged(plan: Any, changes: dict[str, dict[str, Any]]) -> Any:
+    """The reference plan with named stages rebuilt through the schema's own validators.
+
+    ``model_copy`` alone would skip them, and two of the mutations below turn on a validator
+    running: retyping a stage as a ``checkpoint`` is only faithful if the confidence default
+    moves with it, and ``depends_on`` is only faithful if the generated hand-off's ``built_from``
+    edge is re-added the way a loaded plan would have it.
+    """
+    from kedge.plan.model import Stage
+
+    stages = [
+        Stage.model_validate({**stage.model_dump(mode="python"), **changes[stage.id]})
+        if stage.id in changes
+        else stage
+        for stage in plan.stages
+    ]
+    return plan.model_copy(update={"stages": stages})
+
+
+def graded_plan(plan: Any) -> Any:
+    return grade(adjustment_case, notebook=adjustment_case.REFERENCE_NOTEBOOK, plan=plan)
+
+
+def test_a_plan_with_no_briefing_fails_the_briefing_item() -> None:
+    """The asymmetry the item exists for: an invented briefing is refused, an absent one was not.
+
+    ``Briefing`` will not validate prose without citations, so a fabricated background cannot
+    reach a plan at all. Nothing anywhere noticed one that never arrived -- and the notebook it
+    scaffolds opens by telling its reader the workbook carried no description of what the process
+    is for, which the Sign-off tab flatly contradicts.
+    """
+    report = graded_plan(load_plan(PLAN_PATH).model_copy(update={"briefing": None}))
+
+    assert outcome_of(report, "the_briefing_survives_the_workbook") is Outcome.FAIL
+    assert "Sign-off" in detail_of(report, "the_briefing_survives_the_workbook")
+    # The notebook is the reference one, which has its own briefing written in. The plan-side
+    # item and the notebook-side item are about the same loss at two different points, and only
+    # the one whose input was mutated may move.
+    assert outcome_of(report, "the_notebook_says_why_this_process_exists") is Outcome.PASS
+
+
+def test_a_briefing_that_cites_nothing_fails_even_though_the_schema_allowed_it() -> None:
+    """``cadence`` and ``audience`` are prose the validator does not ask for sources for.
+
+    So there is a shape of briefing that is non-empty, valid, and unattributable, and the rubric
+    has to catch it because the schema deliberately does not.
+    """
+    from kedge.plan.model import Briefing
+
+    briefing = Briefing(cadence="Quarterly, after the reforecast", audience="Financial Control")
+    assert not briefing.is_empty and not briefing.sources, "the schema stopped allowing this"
+
+    report = graded_plan(load_plan(PLAN_PATH).model_copy(update={"briefing": briefing}))
+
+    assert outcome_of(report, "the_briefing_survives_the_workbook") is Outcome.FAIL
+    assert "cites nothing" in detail_of(report, "the_briefing_survives_the_workbook")
+
+
+def test_a_briefing_with_no_background_fails_because_that_is_the_irrecoverable_half() -> None:
+    from kedge.plan.model import Briefing
+
+    briefing = Briefing(purpose="Records the quarterly uplift.", sources=["Sign-off!A3:A4"])
+
+    report = graded_plan(load_plan(PLAN_PATH).model_copy(update={"briefing": briefing}))
+
+    assert outcome_of(report, "the_briefing_survives_the_workbook") is Outcome.FAIL
+    assert "background" in detail_of(report, "the_briefing_survives_the_workbook")
+
+
+def test_declaring_the_update_read_only_fails_the_mutates_item() -> None:
+    """``mutates`` is a claim; the statement is the fact, and the card renders the claim.
+
+    The notebook now compensates -- ``needs_confirmation`` is ``mutates or statement_writes`` --
+    which is precisely why the rubric has to say something. A contradiction the product silently
+    survives is one nobody has to fix, and a reviewer reading "changes nothing" over an
+    ``UPDATE fin.accruals`` is being told something false at the moment they are deciding.
+    """
+    plan = load_plan(PLAN_PATH)
+    read_only = restaged(
+        plan,
+        {
+            "update_statement": {
+                "handoff": {
+                    **plan.stages[4].effective_handoff().model_dump(mode="python"),
+                    "mutates": False,
+                }
+            }
+        },
+    )
+    assert read_only.stages[4].id == "update_statement"
+
+    report = graded_plan(read_only)
+
+    assert outcome_of(report, "mutates_agrees_with_the_statement") is Outcome.FAIL
+    assert "changes_data" in detail_of(report, "mutates_agrees_with_the_statement")
+    # The checkpoint item must not move: it reads the statement, never the flag, so a plan cannot
+    # escape it by under-declaring.
+    assert outcome_of(report, "has_a_checkpoint_before_the_update") is Outcome.PASS
+
+
+def test_a_checkpoint_below_the_update_fails_although_the_plan_still_has_one() -> None:
+    """The observed defect: one checkpoint, in the plan, recorded after the write it is about."""
+    plan = restaged(
+        load_plan(PLAN_PATH),
+        {
+            "update_statement": {"depends_on": ["adjust"]},
+            "approve_adjustment": {"depends_on": ["update_statement"]},
+        },
+    )
+    assert any(stage.is_checkpoint for stage in plan.stages), "the mutation removed the checkpoint"
+
+    report = graded_plan(plan)
+
+    assert outcome_of(report, "has_a_checkpoint_before_the_update") is Outcome.FAIL
+    assert "already happened" in detail_of(report, "has_a_checkpoint_before_the_update")
+
+
+def test_a_checkpoint_gating_only_the_read_only_extract_fails() -> None:
+    """The second hole in the presence version, and the one that would not look like a defect.
+
+    The old grader asked whether *any* hand-off named a checkpoint in ``depends_on``. A plan that
+    puts an approval in front of the extract query and nothing in front of the UPDATE satisfies
+    that and hands over a production write with no decision behind it. The chain from the extract
+    to the update is broken here deliberately, because with it intact the checkpoint really is
+    upstream and the plan really is fine.
+    """
+    plan = restaged(
+        load_plan(PLAN_PATH),
+        {
+            "approve_adjustment": {"depends_on": []},
+            "extract_query": {"depends_on": ["approve_adjustment"]},
+            "pre_adjustment": {"depends_on": []},
+            "update_statement": {"depends_on": ["adjust"]},
+        },
+    )
+
+    report = graded_plan(plan)
+
+    assert outcome_of(report, "has_a_checkpoint_before_the_update") is Outcome.FAIL
+    assert "update_statement" in detail_of(report, "has_a_checkpoint_before_the_update")
+
+
+def test_a_checkpoint_two_stages_upstream_still_passes() -> None:
+    """Reachability, not one edge. A correct plan must not be marked down for its decomposition.
+
+    Approve the scope, then compute the uplift, then hand over the statement: a defensible
+    decomposition in which the checkpoint is two edges above the UPDATE and never named in its
+    ``depends_on``. A one-hop grader calls that ungated, which is the false-negative half of
+    grading position rather than presence.
+    """
+    plan = restaged(
+        load_plan(PLAN_PATH),
+        {
+            "approve_adjustment": {"depends_on": ["pre_adjustment"]},
+            "adjust": {"depends_on": ["approve_adjustment"]},
+            "update_statement": {"depends_on": ["adjust"]},
+        },
+    )
+    update = next(stage for stage in plan.stages if stage.id == "update_statement")
+    assert "approve_adjustment" not in update.depends_on, "the mutation left a direct edge"
+
+    report = graded_plan(plan)
+
+    assert outcome_of(report, "has_a_checkpoint_before_the_update") is Outcome.PASS
+
+
+def test_a_re_extract_declared_on_a_checkpoint_fails_the_two_handins_item() -> None:
+    """The sharpest of the four, because the loose version was green on exactly this plan.
+
+    ``build_cells`` returns early for a ``checkpoint`` stage before ``_named_handin`` is
+    consulted, so the hand-in is read by the schema, rendered on the approval card, and emitted
+    as nothing. The plan still declares two hand-ins; the notebook has one place to put a grid.
+    """
+    plan = restaged(load_plan(PLAN_PATH), {"post_adjustment": {"kind": "checkpoint"}})
+    handins = [
+        source
+        for stage in plan.stages
+        for source in stage.sources
+        if source.origin.value == "handin" and source.ref
+    ]
+    assert len(handins) == 2, "the mutation removed a declared hand-in rather than stranding it"
+
+    report = graded_plan(plan)
+
+    assert outcome_of(report, "takes_two_handins") is Outcome.FAIL
+    assert "nowhere to arrive" in detail_of(report, "takes_two_handins")
+
+
+def test_a_plan_that_declares_no_handin_of_its_own_still_fails_for_the_old_reason() -> None:
+    """The original check survives the tightening: a re-extract cannot be the head hand-in."""
+    plan = load_plan(PLAN_PATH)
+    stripped = restaged(
+        plan,
+        {stage.id: {"sources": []} for stage in plan.stages if stage.id.endswith("_adjustment")},
+    )
+
+    report = graded_plan(stripped)
+
+    assert outcome_of(report, "takes_two_handins") is Outcome.FAIL
+    assert "head hand-in" in detail_of(report, "takes_two_handins")
+
+
+def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> None:
+    """The real artifact, not a mutation of the reference: one model-written plan, verbatim.
+
+    ``tests/unit/observed_conversion.py`` carries the plan a model actually proposed through the
+    hub and a user actually approved. It is a better input than anything a test author would
+    invent -- the mistyped ``kind`` on the re-extract is not a mistake anyone writes on purpose,
+    and it is the one that cost the notebook its second hand-in silently.
+
+    The item-by-item outcome is asserted rather than the total, because the total moves whenever a
+    weight does and what is being pinned here is *which* items see the defect. Two are worth
+    reading twice: ``takes_two_handins`` was **green** on this plan while the notebook it
+    scaffolded had one place to put a grid, and ``mutates_agrees_with_the_statement`` skips rather
+    than failing -- a plan with no hand-off at all has no statement for the flag to contradict,
+    and saying "the `mutates` flag is wrong" about a plan that has none would report the wrong
+    defect. ``hands_over_rather_than_pretends`` is the item about that, and it is red.
+    """
+    from observed_conversion import observed_plan
+
+    report = graded_plan(observed_plan())
+    outcomes = {
+        item.id: item.outcome
+        for tier in report.tiers
+        if tier.name == "structural"
+        for item in tier.items
+    }
+
+    assert outcomes == {
+        "hands_over_rather_than_pretends": Outcome.FAIL,
+        "takes_two_handins": Outcome.FAIL,
+        "generates_the_update_from_the_frame": Outcome.FAIL,
+        "does_not_drop_the_sql_column": Outcome.PASS,
+        "raises_the_memo_discrepancy": Outcome.PASS,
+        "does_not_trust_the_impact_summary": Outcome.PASS,
+        "has_a_checkpoint_before_the_update": Outcome.FAIL,
+        "mutates_agrees_with_the_statement": Outcome.SKIP,
+        "the_briefing_survives_the_workbook": Outcome.FAIL,
+        "consults_the_knowledge_pack": Outcome.SKIP,
+    }, report.render()
+    assert "nowhere to arrive" in detail_of(report, "takes_two_handins")
+    assert "Sign-off" in detail_of(report, "the_briefing_survives_the_workbook")
