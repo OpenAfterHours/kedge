@@ -539,13 +539,32 @@ class LegResult:
         """What the leg cost in money, or ``None`` when nobody can say."""
         return None if price is None else price.of(self.usage)
 
-    def score_cell(self) -> str:
-        """``16/16``, or ``12-16/16`` when the repeats disagreed, or ``-`` when nothing scored."""
+    def score_cell(self, out_of: int | None = None) -> str:
+        """``21/21``, or ``18-21/21`` when the repeats disagreed, or ``-`` when nothing scored.
+
+        ``out_of`` is the *sweep's* denominator, and passing it is what stops a leg printing full
+        marks out of a denominator only it has. A plan the scaffolder refuses makes two items skip
+        that every other leg was graded on, and the leg then earned 18 out of 18 -- rendered
+        ``18/18 PASS`` directly beneath a header saying legs are scored out of 21, with the skip
+        that caused it named nowhere. That is the reconciliation sin in a table: a measurement
+        that was not taken, reported as a result that was.
+
+        Args:
+            out_of: The denominator every leg is being compared on. Defaults to this leg's own,
+                which is right only when nothing was ungradeable.
+
+        Returns:
+            The cell, with a marker when this leg was scored on less than the sweep was.
+        """
         if not self.scores or self.available is None:
             return "-"
         low, high = min(self.scores), max(self.scores)
         head = str(low) if low == high else f"{low}-{high}"
-        return f"{head}/{self.available}"
+        denominator = self.available if out_of is None else out_of
+        short = out_of is not None and out_of > self.available
+        return f"{head}/{denominator}" + (
+            f" ({out_of - self.available} unmeasured)" if short else ""
+        )
 
     def attribution_cell(self) -> str:
         """Why the leg came out as it did, in one cell.
@@ -568,8 +587,23 @@ class LegResult:
             for failure, count in counts.most_common()
         )
 
-    def why(self) -> tuple[str, ...]:
-        """The lines a reader needs under the table when the leg is not a clean pass."""
+    def why(self, out_of: int | None = None) -> tuple[str, ...]:
+        """The lines a reader needs under the table when the leg is not a clean pass.
+
+        A repeat scored on *less* than the sweep's denominator lists its skips as well as its
+        failures, and that is not tidiness. A leg whose plan the scaffolder refused had an item
+        skip, scored full marks on what was left, and rendered ``PASS`` -- with the sentence
+        saying kedge could not build a notebook from that plan appearing nowhere in the report at
+        all. A skip is a measurement nobody took, and the reader has to be told which one.
+
+        Only the short repeats, because the items that skip for *every* leg are already named in
+        the preamble and repeating them per leg would bury the one that is about this plan.
+
+        Args:
+            out_of: The sweep's denominator. Without it no repeat counts as short and only
+                failures are listed, which is the old behaviour and the right default for a
+                caller that has no baseline to compare against.
+        """
         lines: list[str] = []
         for item in self.repeats:
             prefix = f"repeat {item.repeat}" if len(self.repeats) > 1 else "run"
@@ -581,6 +615,16 @@ class LegResult:
                 f"{prefix}: {failed.id} FAIL: {_clip(failed.detail)}"
                 for failed in item.failed_items
             )
+            short = out_of is not None and item.available is not None and item.available < out_of
+            if short and item.tier is not None:
+                lines.append(
+                    f"{prefix}: scored out of {item.available}, not {out_of} -- "
+                    f"{out_of - item.available} point(s) could not be measured on this plan"
+                )
+                lines.extend(
+                    f"{prefix}: {skipped.id} SKIP: {_clip(skipped.detail)}"
+                    for skipped in item.tier.skipped
+                )
         return tuple(lines)
 
 
@@ -611,12 +655,24 @@ class SweepReport:
 
     @property
     def ungradeable(self) -> tuple[ItemResult, ...]:
-        """The structural items that skipped, taken from the first leg that scored anything."""
+        """The structural items that skipped for every leg -- the ones the denominator excludes.
+
+        Taken from the *best-measured* repeat rather than from the first one that scored
+        anything, because those are two different lists whenever a plan makes an extra item skip
+        and the preamble states the first as though it applied to everybody. A leg the scaffolder
+        refused to build a notebook from would have put its own skip in this list, and the sweep
+        would have announced that nobody could be graded on it.
+
+        What is missing from a *particular* leg is that leg's business, and
+        :meth:`LegResult.why` is where it is said.
+        """
+        best: tuple[ItemResult, ...] = ()
+        highest = -1
         for leg in self.legs:
             for repeat in leg.scored:
-                if repeat.tier is not None:
-                    return repeat.tier.skipped
-        return ()
+                if repeat.tier is not None and repeat.tier.available > highest:
+                    highest, best = repeat.tier.available, repeat.tier.skipped
+        return best
 
     @property
     def skipped_after_asking(self) -> tuple[LegResult, ...]:
@@ -866,14 +922,14 @@ def render(report: SweepReport) -> str:
     # a leg that answered twice and timed out once is a PASS overall -- and the repeat that cost
     # seconds and produced nothing would have been explained nowhere. `why()` is already empty for
     # a leg with nothing wrong, so this drops no filtering that was doing any work.
-    troubled = [leg for leg in report.legs if leg.why()]
+    troubled = [leg for leg in report.legs if leg.why(report.available)]
     if troubled:
         blocks.extend(["", "Why"])
         for leg in troubled:
             blocks.append(f"  {leg.name}")
             blocks.extend(
                 textwrap.fill(line, width=94, initial_indent="    ", subsequent_indent="      ")
-                for line in leg.why()
+                for line in leg.why(report.available)
             )
     if report.notes:
         blocks.extend(["", "Notes", *(f"  - {note}" for note in report.notes)])
@@ -914,7 +970,10 @@ def _table(report: SweepReport) -> str:
     if priced:
         headers.append("cost")
 
-    rows = [_row(leg, report.prices.get(leg.name), priced=priced) for leg in report.legs]
+    rows = [
+        _row(leg, report.prices.get(leg.name), priced=priced, out_of=report.available)
+        for leg in report.legs
+    ]
     widths = [
         max([len(header), *(len(row[index]) for row in rows)])
         for index, header in enumerate(headers)
@@ -924,12 +983,14 @@ def _table(report: SweepReport) -> str:
     return "\n".join(lines)
 
 
-def _row(leg: LegResult, price: Price | None, *, priced: bool) -> list[str]:
+def _row(
+    leg: LegResult, price: Price | None, *, priced: bool, out_of: int | None = None
+) -> list[str]:
     row = [
         leg.name,
         str(len(leg.repeats)),
         leg.outcome.marker,
-        leg.score_cell(),
+        leg.score_cell(out_of),
         ", ".join(str(score) for score in leg.scores) or "-",
         leg.attribution_cell(),
         _tokens_cell(leg.usage),

@@ -617,6 +617,192 @@ async def test_list_cells_returns_the_bodies_and_the_graph(registry: ToolRegistr
     assert "defines: pl" in result.text
 
 
+# ── listing only the holes ───────────────────────────────────────────────────────────────────
+#
+# A 23-cell scaffolded runbook is some 31,000 bytes of source, so the whole-notebook listing
+# came back truncated at the payload cap -- and the tail it lost was where every untranslated
+# stage sat. Over half the budget went on the fixed head, which the model never edits. The cap
+# is right; spending it on the head is not.
+
+
+class ScaffoldedDriver(FakeDriver):
+    """A notebook that has been scaffolded: fixed head, then stages, two of them still holes."""
+
+    _CELLS = (
+        CellInfo(id="AAaa", name="kedge_setup", code="import polars as pl\n" + "# pad\n" * 200),
+        CellInfo(id="BBbb", name="handin_frame", code="handin_frame = 1\n" + "# pad\n" * 200),
+        CellInfo(
+            id="CCcc",
+            name="load_pre_adjustment",
+            code="# Stage 1 of 3: load\n# TODO(kedge): translate this stage.\n"
+            "load_pre_adjustment = handin_frame  # passthrough until translated",
+        ),
+        CellInfo(id="DDdd", name="document_extract", code="document_extract = mo.md('written')"),
+        CellInfo(
+            id="EEee",
+            name="apply_uplift",
+            code="# Stage 3 of 3: uplift\n# TODO(kedge): translate this stage.\n"
+            "apply_uplift = load_pre_adjustment  # passthrough until translated",
+        ),
+    )
+
+    def __init__(self, *, cells: tuple[CellInfo, ...] | None = None) -> None:
+        super().__init__()
+        self._cells = self._CELLS if cells is None else cells
+        self.with_code_calls: list[bool] = []
+
+    async def list_cells(self, *, with_code: bool = True) -> tuple[CellInfo, ...]:
+        self.with_code_calls.append(with_code)
+        if with_code:
+            return self._cells
+        return tuple(CellInfo(id=cell.id, name=cell.name) for cell in self._cells)
+
+
+async def test_list_cells_can_return_just_the_cells_the_scaffolder_left(tmp_path: Path) -> None:
+    driver = ScaffoldedDriver()
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert result.summary == "2 unwritten cell(s)"
+    assert "2 of 5 cells are still unwritten" in result.text
+    assert "load_pre_adjustment" in result.text and "apply_uplift" in result.text
+    # The head is the thing that was eating the budget, and none of it comes back.
+    assert "kedge_setup" not in result.text and "handin_frame (BBbb)" not in result.text
+    assert "document_extract" not in result.text
+    # Positions stay the notebook's own, so they line up with the pinned state block.
+    assert "3. load_pre_adjustment" in result.text and "5. apply_uplift" in result.text
+
+
+async def test_the_hole_listing_is_a_fraction_of_the_whole_notebook(tmp_path: Path) -> None:
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=ScaffoldedDriver())
+
+    everything = await tools.dispatch("list_cells", {})
+    holes = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert holes.byte_count * 4 < everything.byte_count
+
+
+_GUARDED_NOTEBOOK = """import marimo
+
+__generated_with = "0.23.15"
+app = marimo.App()
+
+
+@app.cell
+def seeded():
+    seeded_value = 1
+    return
+
+
+@app.cell
+def hole():
+    # TODO(kedge): translate this stage.
+    hole_value = seeded_value
+    return
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+
+
+def _file_backed_tools(tmp_path: Path) -> tuple[ToolRegistry, Any]:
+    """A registry over a real file bridge, so the staleness guard is the real one."""
+    from kedge.notebook.filedriver import FileNotebookDriver
+
+    notebook = tmp_path / "notebook.py"
+    notebook.write_text(_GUARDED_NOTEBOOK, encoding="utf-8")
+    driver = FileNotebookDriver(notebook)
+    return _notebook_tools(NotebookState(), tmp_path / "plans", driver=driver), driver
+
+
+async def test_filtering_on_the_marker_without_bodies_is_refused_rather_than_overridden(
+    tmp_path: Path,
+) -> None:
+    """The combination disarmed the guard for the whole notebook and showed nothing for it.
+
+    The marker is in the source, so `unwritten` has to read every cell's code -- and on both
+    bridges reading a cell's code is what records a read, which is what lets a later `edit_cell`
+    replace that cell. Honouring `with_code=false` while reading anyway meant the model was told
+    the guard was still armed, got no bodies back to show for the read, and could then overwrite
+    an edit the user had made in the pane while it was thinking. Asserted on the guard's actual
+    state, because asserting on the call is what pinned the defect as intended behaviour.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True, "with_code": False})
+
+    assert not result.ok
+    assert result.summary == "conflicting arguments"
+    # Instruction first: a stuck caller needs to know what to type, not only why.
+    assert result.text.startswith("Drop `with_code: false`")
+    # And the guard is exactly where `with_code=false` promised to leave it.
+    with pytest.raises(StaleCellError):
+        await driver.edit_cell("seeded", "seeded_value = 404")
+
+
+async def test_a_structural_listing_still_leaves_the_guard_armed(tmp_path: Path) -> None:
+    """The promise `with_code=false` makes, asserted at the tool rather than at the driver.
+
+    `test_filedriver.py` holds this for the bridge; nothing held it for the tool the model
+    actually calls, which is how the tool came to break it while that test stayed green.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
+
+    assert (await tools.dispatch("list_cells", {"with_code": False})).ok
+    with pytest.raises(StaleCellError):
+        await driver.edit_cell("seeded", "seeded_value = 404")
+
+
+async def test_the_hole_listing_returns_bodies_and_so_arms_the_edit_that_follows(
+    tmp_path: Path,
+) -> None:
+    """The other half of the trade, and the reason the combination above is no loss.
+
+    `unwritten=true` on its own returns the holes with their bodies -- the comment header in each
+    is the brief the model works from -- and that read is what `edit_cell` requires next.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert "TODO(kedge)" in result.text
+    assert "```python" in result.text
+    assert result.summary == "1 unwritten cell(s)"
+    assert "1. seeded" not in result.text, "the written cell is not part of the work list"
+    assert (await driver.edit_cell("hole", "hole_value = 2")).ok
+
+
+async def test_naming_one_cell_takes_precedence_over_the_filter(tmp_path: Path) -> None:
+    """Documented precedence rather than a silently ignored argument."""
+    tools, _ = _file_backed_tools(tmp_path)
+
+    result = await tools.dispatch("list_cells", {"cell": "seeded", "unwritten": True})
+
+    assert result.ok
+    assert "seeded_value = 1" in result.text
+
+
+async def test_a_notebook_with_no_holes_left_says_so_rather_than_returning_nothing(
+    tmp_path: Path,
+) -> None:
+    """The termination condition. An empty listing reads as a failed call, not as finished work."""
+    driver = ScaffoldedDriver(
+        cells=(CellInfo(id="AAaa", name="kedge_setup", code="import polars as pl"),)
+    )
+    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert result.summary == "0 unwritten cell(s)"
+    assert "TODO(kedge)" in result.text
+    assert "every hole the scaffolder left has been filled" in result.text
+
+
 async def test_probe_returns_the_kernel_value(registry: ToolRegistry) -> None:
     result = await registry.dispatch("probe", {"code": "load_handin.height"})
     assert result.ok

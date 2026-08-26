@@ -150,6 +150,30 @@ To skip validation, use: async with cm.get_context(skip_validation=True) as ctx
 kedge's own validation gate should catch this *before* submitting, so the model gets a clean
 violation list rather than a kernel traceback.
 
+### 4.4 A cell-free notebook loads, and the kernel supplies its own empty cell
+
+Verified against marimo 0.23.15 (`tests/contract/test_empty_notebook_live.py`). A `.py` holding
+`marimo.App(...)` and **no** `@app.cell` at all is served, health-checks and bootstraps a session
+without complaint. `list_cells()` then comes back with **one** cell — unnamed, empty — which
+marimo puts in the kernel so the editor has somewhere to type. It defines nothing, so it collides
+with nothing.
+
+That is why `codegen.EMPTY_NOTEBOOK` declares no cells. The placeholder it replaced carried an
+unnamed cell doing `import marimo as mo`, and `kedge_setup` — the first cell the scaffolder writes
+— imports `mo` too, so on every fresh workbook the two collided under §4.2's rule. The claim in
+the old constant's docstring, that a notebook needs one cell to "open cleanly", is false: cell-free
+is smaller and opens cleanly.
+
+**The two bridges fail differently, and a test must assert both symptoms.** Through
+`FileNotebookDriver` the sync *refuses* `kedge_setup` before writing, so the preamble is absent
+and `multiply_defined` over the file comes back **empty** — a regression test asserting only
+`multiply_defined == {}` goes green on a broken notebook. Through the live kernel both cells are
+accepted and `multiply_defined` reports `{'mo': (0, 1)}`. Assert no refusals *and* nothing defined
+twice; each catches one bridge.
+
+Do not stamp `__generated_with` into a seeded notebook. marimo rewrites it on save, the contract
+suite's own fixtures omit it, and a hard-coded version goes stale on every marimo bump.
+
 ## 5. HTTP kernel API
 
 > **Where this lives in kedge.** Everything in this section is implemented in

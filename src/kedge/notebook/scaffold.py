@@ -88,6 +88,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "HEAD_CELL_NAMES",
     "TAIL_CELL_NAMES",
+    "TODO_MARKER",
     "CellRole",
     "CellSource",
     "CellSync",
@@ -100,6 +101,10 @@ __all__ = [
     "build_cells",
     "cell_name_for",
     "head_handin_is_read",
+    "holes_in",
+    "is_unwritten",
+    "split_hole",
+    "strip_marker",
     "sync_notebook",
 ]
 
@@ -359,6 +364,191 @@ class ScaffoldCell:
     stage_id: str | None = None
     hide_code: bool = False
     """Always False. The user must be able to read what was written (PLAN 1.1)."""
+
+
+# =============================================================================
+# HOLES
+# =============================================================================
+#
+# The scaffolder writes cells it deliberately leaves unwritten, and marks each one. Until now
+# nothing in `src/` read those marks: the code that finds them lived in `evals/harness/cellgen.py`
+# and shipped nowhere, so the product could write a hole and had no way to say it had one. These
+# four functions are that seam, in the module that writes the marker, so the thing that finds a
+# hole and the thing that makes one cannot drift apart.
+#
+# The rule they enforce is narrower than it first looks, and the narrowing is the point. Finding
+# the marker *anywhere* in a body -- a plain substring test -- read a reviewer's own
+# `# TODO(kedge): ...` note under a finished translation as an unwritten cell, and the conversion
+# driver then truncated the translation at the note and wrote a model's answer over it. A hole is
+# the marker in a shape the scaffolder writes: in the cell's leading comment run, or embedded in
+# code where no comment character precedes it. Neither is a shape a person produces by accident.
+
+
+TODO_MARKER = "TODO(kedge)"
+"""The marker written above every body the scaffolder leaves for somebody else to write.
+
+Three places emit it and a hole is found by the marker rather than by the role, so a fourth
+that ships tomorrow is counted tomorrow: :func:`_stage_cell` for an untranslated stage,
+:func:`_values_cell` for the region map, and
+:meth:`kedge.plan.model.Stage.effective_handoff` for a hand-off the plan gave no statement.
+
+The first two write it as a Python comment in the cell's **leading comment run**; the third
+embeds it in the statement string itself, as SQL's own ``--`` comment. Those two shapes are what
+:func:`is_unwritten` looks for, and looking for the marker *anywhere* instead was a real bug --
+see that function.
+"""
+
+_GATE_LINE = re.compile(r"^_gate_\w+\s*=")
+"""A checkpoint gate assignment, which sits below the marker and is not translation."""
+
+
+def _marker_in_leading_comments(code: str) -> int | None:
+    """The line the scaffolder's own marker comment sits on, or ``None``.
+
+    "Leading" is the whole of it. The scaffolder writes its marker into the run of comments at
+    the top of a cell, above the passthrough body -- always, in both places that write a Python
+    comment. So a marker that appears *after* an executable statement was put there by somebody
+    else, and treating it as a hole is destructive rather than merely wrong: everything above it
+    becomes the header, the note itself is deleted by :func:`strip_marker`, and a model's answer
+    is appended below a translation that is now dead code. That is not hypothetical -- a
+    reviewer's ``# TODO(kedge): E-12 still needs the statutory-only filter`` under a finished
+    translation was truncated and overwritten exactly that way.
+
+    Args:
+        code: The cell's source.
+
+    Returns:
+        The index of the marker's line, or ``None`` when the leading comment run holds none.
+    """
+    for index, line in enumerate(code.splitlines()):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return None  # the first statement: the leading comment run is over.
+        if TODO_MARKER in line:
+            return index
+    return None
+
+
+def _marker_outside_a_comment(code: str) -> bool:
+    """Whether the marker sits in code rather than in a Python comment.
+
+    The one shape a person does not write by accident. A hand-off the plan gave no statement gets
+    ``-- TODO(kedge): ... Paste the query or command this step runs`` *inside the statement
+    literal*, so the marker reaches the file with no ``#`` in front of it. A human's note always
+    has one, wherever in the cell it sits.
+
+    Such a cell still owes work -- there is no statement to hand anybody -- but there is nothing
+    a splice could safely replace, which is why :func:`split_hole` refuses it and the conversion
+    driver leaves it alone. The plan is where that one is fixed.
+    """
+    return any(
+        TODO_MARKER in line and "#" not in line[: line.index(TODO_MARKER)]
+        for line in code.splitlines()
+    )
+
+
+def is_unwritten(code: str) -> bool:
+    """Whether a cell body still carries work the scaffolder left for somebody else.
+
+    A substring test over the whole body was wrong in one direction that costs a user their work:
+    a finished translation carrying a reviewer's ``TODO(kedge)`` note read as a hole, and the
+    conversion driver truncated it at the note and appended a model's answer over the top. So the
+    marker is recognised in the two shapes the scaffolder writes and in neither of the shapes a
+    person does -- see :func:`_marker_in_leading_comments` and :func:`_marker_outside_a_comment`.
+
+    Args:
+        code: The cell's source.
+
+    Returns:
+        True when the marker is one the scaffolder wrote.
+    """
+    return _marker_in_leading_comments(code) is not None or _marker_outside_a_comment(code)
+
+
+def holes_in(cells: Iterable[ScaffoldCell]) -> tuple[ScaffoldCell, ...]:
+    """The cells the scaffolder left for somebody else, in the order it emitted them.
+
+    Order matters and is the scaffolder's own: a hole is filled against the names defined above
+    it, so filling them out of order asks for a translation of a frame that does not exist yet.
+
+    Not every hole can be *filled* -- see :func:`split_hole`, which refuses the one shape that has
+    no placeholder to replace. A caller writing cells has to honour that refusal; a caller
+    counting what a notebook still owes should not.
+
+    Args:
+        cells: The scaffolded cells.
+
+    Returns:
+        Those still carrying the marker.
+    """
+    return tuple(cell for cell in cells if is_unwritten(cell.code))
+
+
+def split_hole(code: str) -> tuple[str, str]:
+    """Split a scaffolded cell into the part kedge wrote and the part it left.
+
+    The header is every line up to and including the marker's comment run, plus any ``_gate_...``
+    assignment below it. The gate is not translation: it is the line that makes a cell downstream
+    of a checkpoint invisible until the checkpoint is recorded, and a body rewritten without it
+    would silently un-gate the notebook. It is kept out of the hole so it cannot be lost, and so
+    nobody is asked to write a line they were never shown the reason for.
+
+    **The header can never contain a statement kedge did not write.** Everything above the marker
+    is comments, by construction: the marker is only recognised inside the leading comment run, so
+    a cell whose marker follows executable code is not a hole at all and comes back unsplit. Below
+    the marker only comments and ``_gate_`` assignments are absorbed, and both are kedge's own.
+
+    Args:
+        code: The cell's source.
+
+    Returns:
+        ``(header, placeholder)``, the header with no trailing newline. A cell this cannot split
+        comes back as ``("", code)`` -- it is not a fillable hole, and reporting it as an empty one
+        would invite a caller to overwrite a finished cell. Two cases reach that: a cell with no
+        marker at all, and a hand-off whose marker is embedded in its statement string, where
+        there is no placeholder body to replace.
+    """
+    marker = _marker_in_leading_comments(code)
+    if marker is None:
+        return "", code
+    lines = code.splitlines()
+    end = marker + 1
+    while end < len(lines) and (
+        _GATE_LINE.match(lines[end]) or lines[end].lstrip().startswith("#")
+    ):
+        end += 1
+    return "\n".join(lines[:end]), "\n".join(lines[end:])
+
+
+def strip_marker(header: str) -> str:
+    """The header with the marker's own instruction removed, for a hole that has been filled.
+
+    The marker is an instruction to whoever writes the body, not documentation of the stage, and
+    leaving it above working code costs twice. :func:`holes_in` finds holes by it, so a
+    translated cell would read as unfinished for ever and every count of what is left would be
+    wrong. And the notebook is meant to be *read*: a reviewer who finds "TODO(kedge): translate
+    this stage" above a finished translation cannot tell what was actually left undone.
+
+    Only the marker's own comment run goes, plus the bare ``#`` separator above it. Everything
+    else the scaffolder wrote -- intent, sources, assumptions, the operations it implements --
+    is documentation of the stage and stays.
+
+    Args:
+        header: The header half of :func:`split_hole`.
+
+    Returns:
+        The header without the marker. One that never had it is returned unchanged.
+    """
+    lines = header.splitlines()
+    start = next((index for index, line in enumerate(lines) if TODO_MARKER in line), None)
+    if start is None:
+        return header
+    end = start + 1
+    while end < len(lines) and lines[end].lstrip().startswith("#"):
+        end += 1
+    if start and lines[start - 1].strip() == "#":
+        start -= 1
+    return "\n".join([*lines[:start], *lines[end:]]).rstrip("\n")
 
 
 # =============================================================================
@@ -1396,7 +1586,7 @@ def _stage_cell(
     gates = [names[item] for item in stage.depends_on if item in checkpoints]
 
     lines = [
-        f"# Stage {index} of {total}: {stage.id}  "
+        f"# Stage {index} of {total}: {_one_line(stage.id)}  "
         f"[{stage.kind.value}, confidence {stage.confidence.value}]",
         *_comment("Intent", stage.intent),
     ]
@@ -1480,7 +1670,7 @@ def _checkpoint_cells(
 
     gates = _gate_tokens(stage, names, gated or {})
     ui_lines = [
-        f"# Checkpoint {index} of {total}: {stage.id}",
+        f"# Checkpoint {index} of {total}: {_one_line(stage.id)}",
         *(f"_after_{name} = {gate}" for gate in gates),
         "# Deliberately NOT automated. Forcing a judgement call into code either fabricates",
         "# logic that was never there or silently drops a control (PLAN 2.2). Recording the",
@@ -1513,8 +1703,8 @@ def _checkpoint_cells(
     )
 
     gate_lines = [
-        f"# Gate for checkpoint '{stage.id}'. mo.stop halts this cell and every cell downstream",
-        "# of it, so nothing proceeds on an unapproved checkpoint.",
+        f"# Gate for checkpoint '{_one_line(stage.id)}'. mo.stop halts this cell and every cell",
+        "# downstream of it, so nothing proceeds on an unapproved checkpoint.",
         "#",
         "# A decision already recorded against this run stands: reopening the notebook must not",
         "# ask again for something somebody already signed, and the dropdown above comes back",
@@ -1620,6 +1810,8 @@ def _handin_cells(
     and "this run consumed these files" stays a defensible claim about all of them.
     """
     heading = f"### {label}"
+    drop_label = f"Drop {label} here"
+    audit_label = f"**{label}**"
     waiting = _waiting(
         index,
         total,
@@ -1628,7 +1820,7 @@ def _handin_cells(
     )
     gates = _gate_tokens(stage, {}, gated or {})
     selector_lines = [
-        f"# Stage {index} of {total}: {stage.id} -- the hand-in this stage reads.",
+        f"# Stage {index} of {total}: {_one_line(stage.id)} -- the hand-in this stage reads.",
         *_comment("Intent", stage.intent),
         "#",
         "# A second hand-in, arriving later than the notebook's own. Everything below this cell",
@@ -1646,7 +1838,13 @@ def _handin_cells(
             else []
         ),
         *(f"_after_{name} = {gate}" for gate in gates),
-        f'{name}_drop = mo.ui.file(kind="area", label="Drop {label} here")',
+        # `!r` rather than interpolation into a quoted literal, exactly as `heading` and
+        # `waiting` are handled three lines down. A hand-in ref is plan-supplied free text, and
+        # `the "after" extract` -- an entirely ordinary thing to call one -- closed the literal
+        # early and took the whole scaffold down with `cell ... would not parse`. It is the same
+        # class of bug as non-negotiable 3's apostrophe in a counterparty name; the concatenation
+        # here happens to be building Python rather than SQL.
+        f'{name}_drop = mo.ui.file(kind="area", label={drop_label!r})',
         f"{name}_pick = mo.ui.file_browser(",
         '    multiple=False, label="...or select it on this machine"',
         ")",
@@ -1663,8 +1861,8 @@ def _handin_cells(
     ]
 
     receipt_lines = [
-        f"# The receipt for {label}. Same store, same hashing, same audit line as the hand-in",
-        "# at the top of the notebook -- a mid-process extract is evidence too.",
+        f"# The receipt for {_one_line(label)}. Same store, same hashing, same audit line as",
+        "# the hand-in at the top of the notebook -- a mid-process extract is evidence too.",
         "#",
         "# `previous_handin` is what makes resuming real: if this run already took a hand-in at",
         "# this step, and the managed copy is still on disk and still hashes the same, it is",
@@ -1693,12 +1891,14 @@ def _handin_cells(
         "kedge.runs.record_handin(",
         f"    KEDGE_RUNS, KEDGE_RUN_ID, {stage.id!r}, {name}_handin",
         ")",
-        f'mo.md(f"**{label}** `{{{name}_handin.audit_line()}}`")',
+        # The label is a repr'd constant concatenated with the f-string rather than interpolated
+        # into it, for the reason the selector's `drop_label` carries: it is plan-supplied text.
+        f'mo.md({audit_label!r} + f" `{{{name}_handin.audit_line()}}`")',
     ]
 
     frame_lines = [
-        f"# {label} as a frame. read_data is the reader the contract check uses, so a layout",
-        "# note here means what it means at the top of the notebook.",
+        f"# {_one_line(label)} as a frame. read_data is the reader the contract check uses, so a",
+        "# layout note here means what it means at the top of the notebook.",
         f"_data, _layout = kedge.ingest.read_data({name}_handin.path)",
         f"{name}_frame = _data.lazy()",
         "_notes = _layout.notes()",
@@ -1792,8 +1992,8 @@ def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list
     confirmed = f"{name}_confirmed"
 
     ui_lines = [
-        f"# Confirmation for '{stage.id}'. The statement above changes data, so nothing below",
-        "# this appears until somebody says it has been run -- and what they say is recorded.",
+        f"# Confirmation for '{_one_line(stage.id)}'. The statement above changes data, so nothing",
+        "# below this appears until somebody says it has been run -- and what they say is recorded.",
         "#",
         "# Reads the statement so this cell is itself hidden until there is something to",
         "# confirm. A tick-box offering 'I have run it' above a statement that has not",
@@ -1881,8 +2081,8 @@ def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
     `kedge.sql.literal` renders as a proper `DATE` literal.
     """
     lines = [
-        f"# Inputs for '{stage.id}'. Fill these in first -- the statement below is built from",
-        "# them, and the run records what they were.",
+        f"# Inputs for '{_one_line(stage.id)}'. Fill these in first -- the statement below is built",
+        "# from them, and the run records what they were.",
     ]
     for parameter in handoff.parameters:
         variable = f"{name}_{_identifier(parameter)}"
@@ -1923,7 +2123,7 @@ def _handoff_cells(
     gates = _gate_tokens(stage, names, gated)
 
     lines = [
-        f"# Stage {index} of {total}: {stage.id}  [handoff]",
+        f"# Stage {index} of {total}: {_one_line(stage.id)}  [handoff]",
         "# kedge does not run this. It holds no connection and issues no statement -- what it",
         "# does is work out exactly what needs running, say where, and wait for what comes back.",
         *_comment("Intent", stage.intent),
@@ -2017,6 +2217,21 @@ def _upstream_name(stage: Stage, names: dict[str, str], checkpoints: set[str]) -
         if dependency in names and dependency not in checkpoints:
             return names[dependency]
     return "handin_frame"
+
+
+def _one_line(text: str) -> str:
+    """Plan-supplied text flattened onto one line, for interpolation into a comment.
+
+    A ``#`` comment ends at a newline, so a stage id or a hand-in label carrying one turns the
+    rest of kedge's own sentence into a line of code -- and :func:`_check_house_rules` then
+    refuses the whole scaffold with a syntax error naming a cell nobody can see. Prose routed
+    through :func:`_comment` is already safe, because ``textwrap.wrap`` collapses whitespace;
+    this is for the lines that build a comment by hand.
+
+    It is the comment half of the same rule ``{value!r}`` enforces for a generated *literal*:
+    plan text is free-form, and free-form text put into code unescaped breaks the code.
+    """
+    return " ".join(text.split())
 
 
 def _comment(label: str, text: str, *, width: int = 92) -> list[str]:

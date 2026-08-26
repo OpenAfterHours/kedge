@@ -1159,39 +1159,26 @@ def _plan_identity_note(workspace: Workspace, plan: Any) -> str:
 
 
 async def _step_notebook(workspace: Workspace, job: OpenJob) -> None:
-    """Make sure a notebook file exists for marimo to open."""
+    """Make sure a notebook file exists for marimo to open.
+
+    From :data:`~kedge.notebook.codegen.EMPTY_NOTEBOOK`, which is an app and no cells. The
+    placeholder this used to write carried an unnamed ``import marimo as mo``, in the belief that
+    marimo needs a cell to open a file. It does not, and that cell collided with ``kedge_setup``
+    -- the first cell the scaffolder writes, which imports ``mo`` too -- so on every fresh workbook
+    the notebook's whole preamble was refused for a duplicate definition and the conversion
+    carried on without it. The constant lives in ``codegen`` because that module owns the notebook
+    file format, and because this collision was the direct cost of the same text existing twice.
+    """
+    from kedge.notebook.codegen import EMPTY_NOTEBOOK
+
     path = workspace.notebook_path
     if path.is_file():
         job.step("notebook", "ok", f"{path.name} is already there")
         return
     job.step("notebook", "running", f"creating {path.name}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_EMPTY_NOTEBOOK, encoding="utf-8")
+    path.write_text(EMPTY_NOTEBOOK, encoding="utf-8")
     job.step("notebook", "ok", f"created an empty notebook at {path}")
-
-
-_EMPTY_NOTEBOOK = """import marimo
-
-__generated_with = "0.23.15"
-app = marimo.App(width="medium")
-
-
-@app.cell
-def _():
-    import marimo as mo
-
-    return (mo,)
-
-
-if __name__ == "__main__":
-    app.run()
-"""
-"""The smallest notebook marimo will open cleanly.
-
-Written only when there is nothing there. kedge's real cells come from an approved plan through
-``notebook/scaffold.py``, and an empty notebook is the honest state before one exists — better
-than refusing to open, and better than inventing cells nobody reviewed.
-"""
 
 
 async def _step_launch(workspace: Workspace, job: OpenJob, *, kedge_version: str) -> None:
@@ -1238,6 +1225,12 @@ async def _step_scaffold(
     ``plan_path`` is carried this far for one sentence. "No approved plan" is the wrong account of
     a run where the user named one and it was refused, and a step that misreports why it did
     nothing sends the reader looking in the wrong place -- the planning step above has the reason.
+
+    The step also reports how many of the plan's cells are **still unwritten**, because a
+    scaffolded notebook runs: the stage bodies are deliberate passthroughs so the hand-in
+    machinery can be exercised from the moment the plan is approved, and a page that opens,
+    renders and steps through looks exactly like a finished conversion. Until this counted them,
+    nothing anywhere said the arithmetic had not been written yet.
     """
     from kedge.notebook.driver import NotebookDriver
 
@@ -1259,7 +1252,7 @@ async def _step_scaffold(
         )
         return driver
 
-    from kedge.notebook.scaffold import sync_notebook
+    from kedge.notebook.scaffold import TODO_MARKER, sync_notebook
 
     try:
         result = await sync_notebook(
@@ -1276,8 +1269,54 @@ async def _step_scaffold(
     except (KedgeError, OSError) as exc:
         job.step("scaffolding", "failed", f"scaffolding plan v{plan.version} failed: {exc}")
         return driver
-    job.step("scaffolding", "ok", result.summary(plan.version))
+
+    detail = result.summary(plan.version)
+    total = len(result.cells)
+    unwritten = await _unwritten_count(driver, {cell.name for cell in result.cells})
+    if unwritten:
+        detail += (
+            f". {total} cells scaffolded, {unwritten} still to write — they carry a "
+            f"{TODO_MARKER} marker and pass their input straight through, so the notebook runs "
+            f"without doing the workbook's arithmetic. Ask kedge in the chat to write them."
+        )
+    elif unwritten == 0:
+        detail += f". All {total} scaffolded cells have been written."
+    job.step("scaffolding", "ok", detail)
     return driver
+
+
+async def _unwritten_count(driver: Any, names: set[str]) -> int | None:
+    """How many of ``names`` are still holes in the notebook as it stands right now.
+
+    Read back from the notebook rather than counted off the scaffold, because this step runs on
+    every open and only the first one finds an empty notebook. On a reopen the cells are already
+    there and some of them have been translated since, so a count taken from what a fresh scaffold
+    *would* contain reports the same six holes for ever — including on the open after the last one
+    was filled. Where the two disagree the notebook wins: it is the thing the user is looking at.
+
+    Listing with the source records a read against every cell, which is exactly what
+    :func:`~kedge.notebook.scaffold.sync_notebook` did on its way in a moment ago, so nothing is
+    disarmed that was armed when this step began.
+
+    Args:
+        driver: The notebook driver.
+        names: The cells the plan calls for. A hole outside that set is not counted -- a stage the
+            plan has dropped is reported as obsolete by :meth:`SyncResult.summary`, and it is not
+            work this conversion still owes.
+
+    Returns:
+        How many still carry the scaffolder's marker, or None when the notebook could not be read.
+        None is silence rather than a guess: on a step whose whole job is to say the conversion is
+        unfinished, a wrong number is worse than no number.
+    """
+    from kedge.notebook.scaffold import is_unwritten
+
+    try:
+        cells = await driver.list_cells(with_code=True)
+    except (KedgeError, OSError) as exc:
+        logger.debug("could not count the cells still to write: %s", exc)
+        return None
+    return sum(1 for cell in cells if cell.name in names and is_unwritten(cell.code or ""))
 
 
 async def _step_agent(

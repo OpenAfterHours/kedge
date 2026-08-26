@@ -75,6 +75,7 @@ from kedge.agent.validate import (
     violations_from_kernel_error,
 )
 from kedge.errors import KedgeError
+from kedge.notebook.scaffold import TODO_MARKER, is_unwritten
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -164,6 +165,24 @@ _BYTES_MARKER = (
     "[… truncated at the payload cap: the tail of this result is missing. Ask for a narrower "
     "slice, or use `probe` for an aggregate.]"
 )
+
+_HOLES_NEED_BODIES = (
+    "Drop `with_code: false`, or drop `unwritten: true` — they ask for opposite things and this "
+    "call cannot honour both.\n\n"
+    "`unwritten` finds the holes by the TODO(kedge) marker, which is in the source, so it has to "
+    "read every cell's code; reading a cell's code is exactly what records a read for marimo's "
+    "staleness guard, which is what stops a later `edit_cell` overwriting an edit the user made "
+    "while you were thinking. `with_code: false` exists to leave that guard armed. Doing both "
+    "would disarm it for the whole notebook and hand you a listing with no bodies in it.\n\n"
+    "`list_cells(unwritten=true)` gives the holes with their bodies, which is what you need — the "
+    "comment header in each one is the brief. `list_cells(with_code=false)` gives the cheap "
+    "structural listing of everything."
+)
+"""What ``list_cells`` says when asked to filter on the marker and not to read any source.
+
+Instruction first, reason after: a refusal that opens with why the rule exists tells a stuck
+caller nothing about what to type instead.
+"""
 
 _MAX_SAMPLE_COLUMNS = 40
 _PROBE_CODE_LIMIT = 4_000
@@ -469,15 +488,31 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
         description=(
             "The notebook as the kernel currently sees it: id, name, code, defs and refs. Call it "
             "before editing anything — the user edits cells directly, so what you remember is "
-            "stale. Reading a cell's code is also what allows a later edit_cell to replace it."
+            "stale. Reading a cell's code is also what allows a later edit_cell to replace it. "
+            "A whole scaffolded notebook does not fit under the payload cap, and most of it is "
+            "fixed machinery you never edit, so narrow the request: unwritten=true is the work "
+            "list, cell= is one body."
         ),
         properties={
-            "cell": _string("One cell id or name. Omitted, every cell is listed."),
+            "cell": _string(
+                "One cell id or name. Omitted, every cell is listed. Names one cell outright, so "
+                "unwritten is not applied alongside it."
+            ),
             "with_code": {
                 "type": "boolean",
                 "description": (
                     "Include each cell's source. Default true. False gives a structural listing "
-                    "and leaves marimo's staleness guard armed for every cell."
+                    "and leaves marimo's staleness guard armed for every cell, so it cannot be "
+                    "combined with unwritten=true."
+                ),
+            },
+            "unwritten": {
+                "type": "boolean",
+                "description": (
+                    "List only the cells the scaffolder left for you — the ones still carrying a "
+                    "TODO(kedge) marker. Default false. The marker is in the source, so this "
+                    "reads every cell's code and returns the holes' bodies: that is the read "
+                    "edit_cell requires, and it is why with_code=false is refused beside it."
                 ),
             },
         },
@@ -1301,9 +1336,42 @@ class ToolRegistry:
     # ── notebook tools ───────────────────────────────────────────────────────────────────
 
     async def _tool_list_cells(self, args: Mapping[str, Any]) -> ToolResult:
+        """List the notebook, or the part of it the model asked for.
+
+        The filter is not a convenience. A scaffolded runbook is twenty-odd cells and some
+        thirty thousand bytes of source, over half of it the fixed head, and the listing that
+        wraps it lands within a couple of thousand bytes of :data:`MAX_PAYLOAD_BYTES` either
+        way -- which side depends on how much of the graph is in hand, since the defs and refs
+        are added per cell from :attr:`_state`. So it is not reliably truncated and not reliably
+        under the cap either, which is the worst of both: the run that prompted this truncated at
+        exactly the cap with every hole in the severed tail, and a listing one stage smaller
+        would have fitted and told nobody anything. ``unwritten=true`` asks for the holes alone,
+        which is both the smaller payload and the actual work list.
+
+        ``with_code=false`` is refused beside it rather than quietly overridden. The marker is in
+        the source, so the filter has to read every cell -- and on both bridges reading a cell's
+        code is what records a read for marimo's staleness guard, which is the whole mechanism
+        stopping a later ``edit_cell`` from overwriting what the user typed in the pane while the
+        model was thinking. Honouring ``with_code=false`` while reading anyway would disarm that
+        for the entire notebook and return a listing with no bodies in it to show for the trade,
+        and there would be nothing in the result to say so. The combination is no loss: without
+        bodies the holes' comment headers do not come back either, and those are the brief.
+
+        ``cell`` names one cell outright and takes precedence -- a request for one body is not a
+        request for a filtered listing -- which the schema says so the model is not guessing.
+
+        There is no ``role`` filter to go with it, and there cannot honestly be one here:
+        :class:`~kedge.notebook.model.CellInfo` carries no role, and the scaffolder's
+        :data:`~kedge.notebook.scaffold.CellRole` is decided from the plan at build time and
+        persisted nowhere. Inferring it from cell names would put a second copy of the
+        scaffolder's naming rules in this module, to rot the first time either changes.
+        """
         driver = self._require_driver()
         target = args.get("cell")
         with_code = bool(args.get("with_code", True))
+        holes_only = bool(args.get("unwritten", False))
+        if holes_only and not target and "with_code" in args and not with_code:
+            return ToolResult.note(_HOLES_NEED_BODIES, ok=False, summary="conflicting arguments")
         if target:
             cell = await driver.get_cell(str(target))
             body = cell.code or "(no source was returned)"
@@ -1313,10 +1381,16 @@ class ToolRegistry:
             )
             return ToolResult.note(text, summary=f"read cell {cell.name or cell.id}")
 
+        # `holes_only` implies bodies, and the conflicting combination was refused above, so
+        # this never reads more than the caller was told it would.
         cells = await driver.list_cells(with_code=with_code)
         known = {cell.id: cell for cell in (self._state.cells if self._state else ())}
         lines: list[str] = []
+        shown = 0
         for position, cell in enumerate(cells, start=1):
+            if holes_only and not (cell.code and is_unwritten(cell.code)):
+                continue
+            shown += 1
             node = known.get(cell.id)
             defines = ", ".join(node.defs) if node and node.defs else "-"
             refs = ", ".join(node.refs) if node and node.refs else "-"
@@ -1326,7 +1400,22 @@ class ToolRegistry:
             )
             if with_code and cell.code:
                 lines.append(f"```python\n{cell.code}\n```")
-        text = "\n".join(lines) or "the notebook has no cells yet."
+
+        if not cells:
+            return ToolResult.note("the notebook has no cells yet.", summary="0 cell(s)")
+        if holes_only:
+            if not shown:
+                text = (
+                    f"no cell of the {len(cells)} in the notebook still carries a "
+                    f"{TODO_MARKER} marker: every hole the scaffolder left has been filled."
+                )
+                return ToolResult.note(text, summary="0 unwritten cell(s)")
+            heading = f"{shown} of {len(cells)} cells are still unwritten, in notebook order:"
+            text = "\n".join([heading, "", *lines])
+            return ToolResult.note(
+                text, summary=f"{shown} unwritten cell(s)", caps=self._context.caps
+            )
+        text = "\n".join(lines)
         return ToolResult.note(text, summary=f"{len(cells)} cell(s)", caps=self._context.caps)
 
     async def _refuse_without_an_approved_plan(self) -> ToolResult | None:

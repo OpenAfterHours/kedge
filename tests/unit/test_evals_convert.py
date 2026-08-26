@@ -212,7 +212,7 @@ could not reach, so they came back SKIP and FAIL for reasons that had nothing to
 model. They are graded now.
 """
 
-TIER_SCORES = {"deterministic": (42, 45), "structural": (18, 18)}
+TIER_SCORES = {"deterministic": (42, 45), "structural": (26, 26)}
 """Exactly what the reference bodies score, per tier: ``(earned, available)``.
 
 An exact pair rather than a bound on the failures. ``KNOWN_STRUCTURAL_GAPS`` bounds only what
@@ -220,6 +220,15 @@ goes red, so forcing ``does_not_drop_the_sql_column`` -- the sharpest discrimina
 has -- from PASS to SKIP took the score from 40/53 to 37/50 and left the suite green: nothing
 asserted the total. The structural tier had the same hole, ``earned == available`` being as true
 of 15/15 as of 18/18.
+
+The structural half moved from ``(18, 18)`` to ``(23, 23)`` when that tier stopped grading the
+presence of a field and started grading the shape the scaffolder consumes: two new items (the
+briefing, and ``mutates`` against the statement), one reweighted (the checkpoint's *position*
+relative to the mutating hand-off), and ``takes_two_handins`` re-grounded on the hand-in cells
+``build_cells`` actually emits. The reference plan passes all five, which is the point of
+asserting them here as well as in ``test_evals_harness.py``: this path scaffolds the plan rather
+than reading a committed notebook, so it is the one that would notice if a rubric item were true
+of the file on disk and false of what kedge builds from it.
 
 Moving these numbers is allowed. Moving them without saying so in the commit message is what this
 prevents.
@@ -996,6 +1005,232 @@ def test_stopped_is_decided_from_the_run_and_not_from_a_sentence_about_it() -> N
     assert _outcome_of(result, None) is ConversionOutcome.GRADED, (
         "a run nobody observed is not a run that stopped"
     )
+
+
+# =============================================================================
+# THE COMPOSED PATH
+# =============================================================================
+#
+# ``--convert MODEL --plan-from MODEL``: the model writes the plan, kedge scaffolds it, the model
+# fills the holes, and the whole thing is graded. It is the only path a hub user takes and it was
+# measured nowhere, because ``run.py`` refused ``--model`` with ``--convert`` and that refusal --
+# written about a model's plan graded beside a *human's* notebook -- caught the reverse
+# composition too.
+#
+# Nothing here calls a model. What is tested is the plumbing that keeps the composed score from
+# being read as the gold-plan score, and the outcome that stops a run which never got a plan being
+# filed as a model that writes bad cells.
+
+
+def _relabelled(report: Any, **changes: Any) -> Any:
+    from harness.convert import ConversionReport
+
+    return ConversionReport(
+        case=report.case,
+        result=report.result,
+        outcome=report.outcome,
+        report=report.report,
+        **changes,
+    )
+
+
+def test_both_convert_shapes_say_whose_plan_they_used(reference_conversion: Any) -> None:
+    """Neither total is a whole conversion's, and each is not-a-whole-conversion in its own way.
+
+    The composed one is every point the model's; the ordinary one is the model's cell bodies over
+    a *human's* plan, with a quarter of the board earned by whoever wrote that plan. The caveat
+    used to appear on the composed path only, and to describe a plain ``--convert`` figure as
+    measuring "the cell bodies alone" -- which it does not, and which is the same confound
+    ``--plan-from`` without ``--convert`` is refused for, only smaller.
+
+    Both lines sit above the score. A caveat under a total is a caveat nobody has read by the time
+    they have read the total.
+    """
+    assert "COMPOSED PATH" not in reference_conversion.headline(), (
+        "the library default must stay silent; the CLI is what knows the provenance"
+    )
+
+    composed = _relabelled(
+        reference_conversion, plan_origin="proposed by some-model", plan_is_the_models=True
+    )
+    gold = _relabelled(
+        reference_conversion, plan_origin="read from plan.yaml", plan_is_the_models=False
+    )
+
+    assert "COMPOSED PATH -- plan proposed by some-model" in composed.headline()
+    assert "Not comparable" in composed.headline()
+    assert "PLAN NOT THE MODEL'S -- read from plan.yaml" in gold.headline()
+    assert "cell bodies and nothing else" in gold.headline()
+
+    for report in (composed, gold):
+        headline = report.headline()
+        assert headline.index("points are structural") < headline.index(report.report.headline()), (
+            "the caveat must come before the number it qualifies"
+        )
+        # The share is stated rather than left to a reader who would have to add up the rubric.
+        structural = next(tier for tier in report.report.tiers if tier.name == "structural")
+        assert f"{structural.available} of {report.report.available}" in headline
+
+
+def test_a_run_that_never_got_a_plan_is_not_a_model_that_wrote_bad_cells() -> None:
+    """``INCOMPLETE`` reads "the gaps are the model's". A missing plan has no gaps; it has no cells.
+
+    Six outcomes became seven for the same reason ``INTERRUPTED`` was split off ``INCOMPLETE``:
+    an endpoint's bad afternoon must not be written down as a model's judgement, and a score
+    printed against a conversion nobody attempted is worse than no score.
+    """
+    from harness.convert import no_plan_proposed
+
+    report = no_plan_proposed(
+        adjustment_case,
+        plan_origin="proposed by some-model",
+        detail="no plan from some-model: timeout (a fact about the integration).",
+    )
+
+    assert report.outcome is ConversionOutcome.NO_PLAN
+    assert report.result is None, "there is no generation denominator for a run that never began"
+    assert report.report is None
+    assert not report.ok
+    assert report.exit_code() == 1
+    rendered = report.render()
+    assert "timeout" in rendered
+    assert "COMPOSED PATH" in rendered
+    assert "incomplete" not in rendered
+
+
+def test_a_plan_kedge_refuses_to_scaffold_ends_the_run_rather_than_the_process(
+    tmp_path: Path,
+) -> None:
+    """``build_cells`` raising used to be a traceback out of ``main()``, after the money.
+
+    On the composed path a plan proposal has already been billed by the time the scaffolder sees
+    it, and the user got no report, no outcome, and not even the line saying what the proposal
+    cost. A plan kedge will not build a notebook from is a result about whoever wrote the plan --
+    ``NO_PLAN``, with the refusal quoted -- and never a model writing bad cells, because no cell
+    was ever asked for.
+    """
+    from kedge.notebook.scaffold import ScaffoldError
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        msg = "cell 'post_adjustment_input' would not parse"
+        raise ScaffoldError(msg)
+
+    calls: list[int] = []
+
+    class _CountingCompleter:
+        def complete(self, request: CompletionRequest) -> str:
+            calls.append(1)
+            return "x = 1"
+
+    import harness.cellgen
+
+    original = harness.cellgen.build_cells
+    harness.cellgen.build_cells = refuse  # type: ignore[assignment]
+    try:
+        report = convert_and_grade(
+            adjustment_case,
+            plan(),
+            completer=_CountingCompleter(),
+            notebook=tmp_path / "converted.py",
+            model="scripted",
+            plan_origin="proposed by some-model",
+            plan_is_the_models=True,
+        )
+    finally:
+        harness.cellgen.build_cells = original  # type: ignore[assignment]
+
+    assert report.outcome is ConversionOutcome.NO_PLAN
+    assert report.result is None
+    assert calls == [], "a cell was requested for a plan that never scaffolded"
+    assert "will not scaffold" in report.detail
+    assert "would not parse" in report.detail
+    assert report.exit_code() == 1
+    assert "COMPOSED PATH" in report.render()
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("repairs_exhausted", "the model's own output never validated as a plan"),
+        ("timeout", "not the model's judgement"),
+        ("not_configured", "not the model's judgement"),
+        ("schema_refused", "the model's own output never validated as a plan"),
+        # Its own bucket, and neither of the other two: the model was never asked.
+        ("triage_refused", "kedge's own triage declined to plan this workbook"),
+    ],
+)
+def test_a_missing_plan_is_attributed_before_it_is_reported(failure: str, expected: str) -> None:
+    """``Failure.about_the_model`` decides it; ``run.py`` quotes the decision rather than guessing.
+
+    This is ``evals/README.md``'s "attribution is the point", one level up from where it was
+    written. A model replaced over a proxy's 404 is the mistake; a proxy blamed for prose that
+    never parsed is the other one.
+    """
+    import run
+    from harness.live import Failure, MeteredCall
+
+    detail = run.plan_failure_detail(
+        "some-model", MeteredCall(failure=Failure(failure), detail="the endpoint said so")
+    )
+
+    assert expected in detail
+    assert "some-model" in detail
+    assert "the endpoint said so" in detail, "a classification with no evidence is unactionable"
+
+
+def test_the_refusal_is_narrowed_to_the_confounded_composition() -> None:
+    """The composed path is allowed; the one that prints a human's marks under a model is not.
+
+    ``--plan-from`` without ``--convert`` *is* that composition -- the committed reference
+    conversion graded against a model's plan, with all 45 deterministic points a human earned
+    landing under the model's name. It is refused by name rather than by proxy, which is what
+    lets ``--convert M --plan-from M`` through.
+    """
+    import run
+
+    parser = run._parser()
+
+    def refuse(*argv: str) -> str:
+        args = parser.parse_args(["adjustment_signoff", *argv])
+        with pytest.raises(SystemExit) as raised:
+            run._refuse_confounded(parser, args)
+        assert raised.value.code == 2
+        return str(parser.format_usage())
+
+    refuse("--plan-from", "m")
+    refuse("--model", "m", "--convert", "m")
+    refuse("--convert", "m", "--plan-from", "m", "--plan", str(PLAN_PATH))
+
+    allowed = parser.parse_args(["adjustment_signoff", "--convert", "m", "--plan-from", "m"])
+    run._refuse_confounded(parser, allowed)  # must not raise
+    assert allowed.plan_from == "m"
+
+
+@pytest.mark.parametrize(
+    "ignored",
+    [
+        ["--repeats", "3"],
+        ["--notebook", "somewhere.py"],
+        ["--json"],
+    ],
+)
+def test_a_flag_the_convert_path_would_ignore_is_refused(ignored: list[str]) -> None:
+    """A flag a mode silently ignores is worse than one it refuses.
+
+    ``--convert m --plan-from m --repeats 3`` announced "2 model(s) x 3 repeat(s)" and then did
+    one proposal and one pass: a cost estimate a reader would act on, and a number that was never
+    true. ``--notebook`` names a notebook to *grade* where the conversion writes one (``--out``),
+    and ``--json`` is the sweep's. All three parsed cleanly and did nothing.
+    """
+    import run
+
+    parser = run._parser()
+    args = parser.parse_args(["adjustment_signoff", "--convert", "m", *ignored])
+
+    with pytest.raises(SystemExit) as raised:
+        run._refuse_confounded(parser, args)
+
+    assert raised.value.code == 2
 
 
 # =============================================================================

@@ -76,6 +76,7 @@ from kedge.agent.context import (
     build_plan_block,
 )
 from kedge.agent.prompts import SYSTEM_PARTS, build_system_prompt, load_prompt
+from kedge.notebook.scaffold import TODO_MARKER
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -97,8 +98,6 @@ __all__ = [
     "system_prompt",
 ]
 
-TODO_MARKER = "TODO(kedge)"
-"""What :func:`kedge.notebook.scaffold._stage_cell` writes above every body it left unwritten."""
 
 CELL_PROMPT_PARTS: tuple[str, ...] = tuple(part for part in SYSTEM_PARTS if part != "tools.md")
 """The product's system prompt parts, less the one describing tools this seam does not offer.

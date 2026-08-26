@@ -36,6 +36,26 @@ def _tables(text: str) -> list[list[list[str]]]:
     return tables
 
 
+def _bullets(text: str) -> list[str]:
+    """Every markdown bullet in a document, each flattened onto one line.
+
+    Flattened because these prompts wrap at 100 columns, so a claim and the thing it is a claim
+    *about* routinely land on different lines. An assertion made per line passes or fails on where
+    the wrapping happens to fall, which is not the property anyone wants to hold.
+    """
+    bullets: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("- "):
+            bullets.append(line[2:].strip())
+        elif line.startswith("  ") and bullets:
+            bullets[-1] += " " + line.strip()
+        elif not line.strip():
+            continue
+        elif bullets:
+            bullets.append("")
+    return [bullet for bullet in bullets if bullet]
+
+
 def test_every_declared_part_exists_on_disk() -> None:
     for name in SYSTEM_PARTS:
         assert (PROMPTS_DIR / name).is_file(), f"{name} is declared in SYSTEM_PARTS but missing"
@@ -66,6 +86,73 @@ def test_role_prompt_tells_the_model_to_show_the_query_behind_a_paste() -> None:
     assert 'r"""' in role and "f-string" in role
     # And none of it may become licence to write a query the workbook does not record.
     assert "never compose the query" in role
+
+
+def test_the_agent_is_told_the_scaffolder_leaves_holes_and_that_filling_them_is_the_job() -> None:
+    """`TODO(kedge)` appeared in no prompt at all while the scaffolder wrote six of them.
+
+    A real conversion left every arithmetic stage a passthrough and said nothing about it: the
+    agent had never been given the word for a hole, so an open-ended request had no work list and
+    no termination condition. The marker is imported rather than typed, because a prompt that
+    names a different string from the one the scaffolder writes is the same defect one step on.
+    """
+    from kedge.notebook.scaffold import TODO_MARKER
+
+    prompt = build_system_prompt()
+    assert TODO_MARKER in prompt
+
+    role = load_prompt("role.md")
+    assert TODO_MARKER in role
+    # The three things that make it a work list rather than a curiosity.
+    assert "list_cells(unwritten=true)" in role
+    assert "in order" in role
+    assert "_gate_" in role
+
+
+def test_the_tool_prompt_says_how_to_ask_for_less_than_the_whole_notebook() -> None:
+    """The whole-notebook listing does not fit under the cap, and the tail is where the holes are."""
+    tools = load_prompt("tools.md")
+    assert "list_cells(unwritten=true)" in tools
+    assert "with_code=false" in tools
+
+
+def test_every_list_cells_parameter_is_named_in_the_tool_prompt() -> None:
+    """A filter the schema offers and the prompt never mentions is one nobody will use.
+
+    `list_cells` is the tool the model reaches for first and the one whose result is capped
+    hardest, so its parameters are the ones worth holding to the same rule as the tool list
+    itself.
+
+    Matched as `name=` rather than as a bare substring, because a bare one is nearly vacuous
+    here: "cell" appears twenty-odd times in `tools.md` as an ordinary English word, so the
+    assertion passed whether or not the parameter was documented at all.
+    """
+    from kedge.agent.tools import TOOL_SPECS
+
+    spec = next(item for item in TOOL_SPECS if item.name == "list_cells")
+    tools = load_prompt("tools.md")
+
+    missing = [name for name in spec.properties if f"{name}=" not in tools]
+    assert not missing, f"list_cells parameters absent from tools.md: {missing}"
+
+
+def test_the_prompt_never_promises_the_guard_stays_armed_while_the_marker_is_filtered_on() -> None:
+    """The two promises used to sit in one paragraph with nothing saying which wins.
+
+    `unwritten=true` has to read every cell's source to find the markers, and reading source is
+    what records a read for marimo's staleness guard -- the mechanism that stops a later
+    `edit_cell` overwriting what the user typed in the pane. `with_code=false` exists to leave
+    that guard armed. A model told to narrow its request will combine them, so the prompt has to
+    say the combination is refused rather than leave it to be discovered.
+    """
+    bullets = _bullets(load_prompt("tools.md"))
+
+    armed = next(item for item in bullets if "leaves the staleness guard armed" in item)
+    assert "with_code=false" in armed
+    assert "unwritten" not in armed, "the armed-guard promise must not be attached to `unwritten`"
+
+    filtered = next(item for item in bullets if "unwritten=true" in item)
+    assert "`with_code=false` is refused" in filtered
 
 
 def test_system_prompt_states_the_marimo_single_definition_rule_and_the_escape_hatch() -> None:

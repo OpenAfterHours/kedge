@@ -74,6 +74,8 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
+from kedge.notebook.scaffold import TODO_MARKER, is_unwritten
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
@@ -361,6 +363,13 @@ class CellFacts:
     staleness guard (docs/marimo-api.md 4.1), so a per-turn rebuild that pulled every body
     would silently disarm the "the user edited this behind your back" protection for the whole
     notebook. Bodies come back through ``list_cells`` when the model actually needs one.
+
+    :attr:`unwritten` is the one fact *about* a body carried here, and it is three-valued for
+    that reason: the answer is a substring test
+    (:func:`kedge.notebook.scaffold.is_unwritten`) on source this record does not hold, so
+    whether it can be answered at all depends on what the caller had. ``None`` means nothing
+    could tell, and renders as nothing at all -- a state that cannot tell must not report a
+    scaffolder's hole as a finished cell.
     """
 
     id: str
@@ -368,6 +377,8 @@ class CellFacts:
     defs: tuple[str, ...] = ()
     refs: tuple[str, ...] = ()
     status: str | None = None
+    unwritten: bool | None = None
+    """Whether this cell is still a hole the scaffolder left. ``None`` where nothing could tell."""
 
     @property
     def label(self) -> str:
@@ -538,6 +549,52 @@ def _is(cell: CellFacts, target: str | None) -> bool:
     return target is not None and target in (cell.id, cell.name)
 
 
+def _usable(names: Iterable[str], bodies: Mapping[str, str] | None) -> Mapping[str, str] | None:
+    """``bodies`` if it accounts for every named cell the kernel has, else ``None``.
+
+    All or nothing, and the reason is a real failure mode rather than tidiness. marimo's autosave
+    is a bare ``write_text`` -- truncate, then write, with no temporary file and no rename -- so a
+    read that lands mid-save gets a *prefix* of the notebook, and a prefix of a marimo notebook is
+    very often still a valid marimo notebook: over the reference scaffold, 78 byte-prefixes parse
+    and 77 of them hold fewer holes than the whole file does. Nothing about that is an error, so
+    nothing raises; it is simply a smaller answer, and per-cell unknowns would let it through as
+    "2 of 24 cells are still unwritten placeholders" beside a file holding 11 cells.
+
+    Undercounting is the dangerous direction. The role prompt tells the model it is not finished
+    while the work list is non-empty, so a count that is too low ends the conversion early with
+    stages still passing their input through. The kernel's cell list is the authority on how many
+    cells there are, the file is the only thing that knows which are holes, and unless the second
+    covers the first there is no honest sentence to write -- so none is written.
+
+    The same rule catches the cases that are not races at all: a save that was skipped because the
+    generation had moved on, a name the file holds twice, a cell created since the last flush.
+
+    Args:
+        names: The cell names the kernel reports. Unnamed cells are ignored -- a file records no
+            cell ids, so they could never be matched and their absence proves nothing.
+        bodies: ``cell name -> source``, or ``None``.
+
+    Returns:
+        ``bodies`` when it covers every named cell, otherwise ``None``.
+    """
+    if not bodies:
+        return None
+    covered = all(name in bodies for name in names if name and name != "_")
+    return bodies if covered else None
+
+
+def _hole(name: str, bodies: Mapping[str, str] | None) -> bool | None:
+    """Whether the cell called ``name`` is still a scaffolder hole, or ``None`` if nothing knows.
+
+    Only ever asked of a mapping :func:`_usable` has already accepted, so a miss here is an
+    unnamed cell rather than a gap in the file.
+    """
+    if bodies is None or not name or name == "_":
+        return None
+    code = bodies.get(name)
+    return None if code is None else is_unwritten(code)
+
+
 # ── live notebook state ──────────────────────────────────────────────────────────────────────
 
 
@@ -548,10 +605,40 @@ class NotebookState:
     cells: tuple[CellFacts, ...] = ()
     cycles: tuple[tuple[str, ...], ...] = ()
     multiply_defined: tuple[str, ...] = ()
+    unwritten_from: Literal["kernel", "file"] | None = None
+    """Where :attr:`CellFacts.unwritten` was answered from, or ``None`` where it was not.
+
+    Carried because the two sources have different freshnesses and :meth:`render` has to say so:
+    the kernel's own listing is this turn, the notebook file is whenever it was last saved.
+    """
 
     @classmethod
-    def from_graph(cls, graph: GraphView) -> NotebookState:
-        """Build state from a live dataflow graph."""
+    def from_graph(
+        cls, graph: GraphView, *, bodies: Mapping[str, str] | None = None
+    ) -> NotebookState:
+        """Build state from a live dataflow graph, and optionally from bodies read elsewhere.
+
+        :class:`~kedge.notebook.model.GraphView` carries no source, on either driver, because
+        reading the graph is the cheap way to ask what depends on what *without* recording a
+        read against marimo's staleness guard. So the graph alone cannot say which cells are
+        scaffolder holes, and a caller that wants that has to bring the bodies from somewhere
+        that costs nothing -- :func:`kedge.notebook.codegen.read_notebook` over the notebook
+        file, which touches no kernel and records no read.
+
+        ``bodies`` is taken as a whole or not at all (:func:`_usable`): a file that does not
+        account for every named cell the graph has is a file that was read mid-save, and its
+        smaller answer would render as a confident undercount.
+
+        Args:
+            graph: The notebook's dataflow graph.
+            bodies: ``cell name -> source``. Only named cells can be matched, since a file
+                records no cell ids.
+
+        Returns:
+            The state, with :attr:`CellFacts.unwritten` answered from ``bodies`` where it covers
+            the graph, and left unknown throughout where it does not.
+        """
+        usable = _usable((node.name for node in graph.nodes), bodies)
         return cls(
             cells=tuple(
                 CellFacts(
@@ -560,24 +647,74 @@ class NotebookState:
                     defs=tuple(node.defs),
                     refs=tuple(node.refs),
                     status=node.status,
+                    unwritten=_hole(node.name, usable),
                 )
                 for node in graph.nodes
             ),
             cycles=tuple(tuple(cycle) for cycle in graph.cycles),
             multiply_defined=tuple(graph.multiply_defined),
+            unwritten_from=None if usable is None else "file",
         )
 
     @classmethod
-    def from_cells(cls, cells: Iterable[CellInfo]) -> NotebookState:
-        """Build state from a cell listing, where no graph is available."""
-        return cls(
-            cells=tuple(CellFacts(id=cell.id, name=cell.name, status=cell.status) for cell in cells)
+    def from_cells(
+        cls, cells: Iterable[CellInfo], *, bodies: Mapping[str, str] | None = None
+    ) -> NotebookState:
+        """Build state from a cell listing, where no graph is available.
+
+        A listing may or may not carry source -- ``with_code=False`` is the option that leaves
+        the staleness guard armed -- so a body on the listing answers
+        :attr:`CellFacts.unwritten` from the kernel directly, and ``bodies`` answers it, subject
+        to :func:`_usable`, for the rest.
+
+        The two have different freshnesses, so which one answered is recorded: a body from the
+        listing is this moment's kernel state, one from ``bodies`` is the notebook as last saved,
+        and :meth:`render` says which. Both shipped drivers return code for every cell or for
+        none, so in practice a listing is one or the other rather than a mixture; where it is a
+        mixture the kernel's claim wins, because it is the fresher of the two.
+
+        Args:
+            cells: The cells the kernel listed.
+            bodies: ``cell name -> source``, as for :meth:`from_graph`. Consulted only where the
+                listing itself carried no body.
+
+        Returns:
+            The state.
+        """
+        listed = tuple(cells)
+        usable = _usable((cell.name for cell in listed), bodies)
+        facts = tuple(
+            CellFacts(
+                id=cell.id,
+                name=cell.name,
+                status=cell.status,
+                unwritten=(
+                    _hole(cell.name, usable) if cell.code is None else is_unwritten(cell.code)
+                ),
+            )
+            for cell in listed
         )
+        from_kernel = any(cell.code is not None for cell in listed)
+        source: Literal["kernel", "file"] | None = None
+        if from_kernel:
+            source = "kernel"
+        elif usable is not None:
+            source = "file"
+        return cls(cells=facts, unwritten_from=source)
 
     @property
     def registry(self) -> NameRegistry:
         """The name registry for this state."""
         return NameRegistry(self.cells)
+
+    @property
+    def unwritten(self) -> tuple[CellFacts, ...]:
+        """The cells known to be scaffolder holes, in notebook order.
+
+        Known, not suspected: a cell whose body nothing could read is not counted, because a
+        work list that quietly omits half the work is worse than no work list.
+        """
+        return tuple(cell for cell in self.cells if cell.unwritten)
 
     def render(self) -> str:
         """Render the block injected into every turn.
@@ -589,9 +726,31 @@ class NotebookState:
         which can condition it on the user having saved from Excel; a frozen record of
         :class:`CellFacts` cannot, and stating it here unconditionally made it false in exactly
         the case kedge asks the user to create.
+
+        Being re-sent on every step of every turn -- up to ``[agent] max_steps`` of them, fifty
+        by default -- is also why the unwritten flag is a bare ``[unwritten]`` and one counting
+        sentence rather than a section. It costs a handful of tokens on a scaffolded notebook and
+        nothing at all on a finished one, since a cell that is written, or whose body nothing
+        could read, contributes no characters here.
+
+        The heading is the one thing in the block that has to change with the flag, and it earns
+        its extra clause. Everything else here is the kernel's answer this turn; the flag is a
+        substring test on the notebook *file*, which is the only place a body can be read without
+        recording a read against marimo's staleness guard. Those are two different sources with
+        two different freshnesses -- the file lags the kernel until the next flush -- and this
+        block's entire job is to be the one thing the model can trust about the notebook. It
+        costs nothing on a notebook with nothing left to write, because the clause is not
+        rendered when no flag is.
         """
+        holes = self.unwritten
+        heading = (
+            "## Live notebook state (cells from the kernel at the start of this turn; "
+            "[unwritten] from the notebook file as last saved)"
+            if holes and self.unwritten_from == "file"
+            else "## Live notebook state (read from the kernel at the start of this turn)"
+        )
         lines = [
-            "## Live notebook state (read from the kernel at the start of this turn)",
+            heading,
             "",
             "Cell bodies are not shown. The user edits cells directly, so a cell body you remember",
             "from earlier in the conversation is stale — call `list_cells` when you need one, and",
@@ -601,12 +760,24 @@ class NotebookState:
         ]
         if not self.cells:
             lines.append("(the notebook has no cells yet)")
+        if holes:
+            lines.extend(
+                [
+                    f"{len(holes)} of {len(self.cells)} cells are still unwritten placeholders, "
+                    "marked [unwritten] below. Filling them is the conversion; each carries its "
+                    f"own brief in a `{TODO_MARKER}` comment. `list_cells(unwritten=true)` lists "
+                    "just those.",
+                    "",
+                ]
+            )
         for position, cell in enumerate(self.cells, start=1):
             status = f" [{cell.status}]" if cell.status else ""
+            hole = " [unwritten]" if cell.unwritten else ""
             defines = ", ".join(cell.defs) or "-"
             refs = ", ".join(cell.refs) or "-"
             lines.append(
-                f"{position}. {cell.label} ({cell.id}){status} defines: {defines} | reads: {refs}"
+                f"{position}. {cell.label} ({cell.id}){status}{hole} "
+                f"defines: {defines} | reads: {refs}"
             )
         if self.multiply_defined:
             lines.append("")

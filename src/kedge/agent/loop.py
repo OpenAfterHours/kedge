@@ -80,6 +80,7 @@ from kedge.agent.prompts import build_system_prompt
 from kedge.agent.tools import ToolContext, ToolRegistry, Volatility, tool_schemas, volatility_of
 from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
 from kedge.errors import KedgeError
+from kedge.notebook.codegen import read_notebook
 from kedge.server.events import (
     AnyEvent,
     CellCreatedEvent,
@@ -1557,15 +1558,85 @@ class KedgeAgent:
         driver = self._context.driver
         if driver is None:
             return NotebookState()
+        bodies = await asyncio.to_thread(self._saved_bodies)
         try:
-            return NotebookState.from_graph(await driver.read_graph())
+            return NotebookState.from_graph(await driver.read_graph(), bodies=bodies)
         except KedgeError as exc:
             logger.warning("could not read the notebook graph (%s); falling back to a listing", exc)
         try:
-            return NotebookState.from_cells(await driver.list_cells(with_code=False))
+            return NotebookState.from_cells(await driver.list_cells(with_code=False), bodies=bodies)
         except KedgeError as exc:
             logger.warning("could not list the notebook's cells either (%s)", exc)
             return NotebookState()
+
+    def _saved_bodies(self) -> dict[str, str]:
+        """``cell name -> source``, read from the notebook file rather than from the kernel.
+
+        This exists for one fact -- which cells are still ``TODO(kedge)`` holes -- and the route
+        it takes is the whole point. Asking the kernel would mean ``list_cells(with_code=True)``,
+        and reading a cell's code is what records a read for marimo's staleness guard: doing it
+        once per turn would permanently disarm the check that stops ``edit_cell`` overwriting
+        what the user typed while the model was thinking. Reading the ``.py`` is outside that
+        mechanism entirely -- no kernel, no ``_code_mode``, no read recorded -- at the cost of
+        being the notebook as *last saved*, which is why the block labels where the flag came
+        from rather than presenting it as this turn's kernel state.
+
+        Every failure is the same answer: an empty map, so
+        :attr:`~kedge.agent.context.CellFacts.unwritten` stays unknown and the block says
+        nothing. A missing file, an unparseable one, one that is not a marimo notebook, one
+        written in some other encoding -- none of them is a reason to guess, and this is a
+        cosmetic flag on a block whose value is that it does not lie.
+
+        A name the file holds twice is dropped rather than resolved. marimo will not run such a
+        notebook, so one on disk means the file is being written or has been hand-edited into a
+        state the kernel has not accepted; picking either body would answer a question about a
+        cell nobody can say is *the* cell of that name. Dropping it also makes the map stop
+        covering the kernel's cell list, which is what
+        :func:`~kedge.agent.context._usable` reads as "do not use this file at all" -- the same
+        answer as for a half-written one, by the same rule.
+
+        Returns:
+            The named cells' bodies, or an empty map where none could be read.
+        """
+        workspace = self._context.workspace
+        if workspace is None:
+            return {}
+        path = workspace.notebook_path
+        if not path.exists():
+            # Not a fallback: every session before a plan is approved is this, and a warning a
+            # turn for the ordinary state of a new workspace is a warning nobody reads.
+            logger.debug("no unwritten flags: %s has not been scaffolded yet", path)
+            return {}
+        try:
+            document = read_notebook(path)
+        except (KedgeError, OSError, ValueError) as exc:
+            logger.warning(
+                "could not read %s (%s); the notebook block will not say which cells are still "
+                "unwritten",
+                path,
+                exc,
+            )
+            return {}
+        bodies: dict[str, str] = {}
+        repeated: set[str] = set()
+        for cell in document.cells:
+            if not cell.is_named:
+                continue
+            if cell.name in bodies:
+                repeated.add(cell.name)
+                continue
+            bodies[cell.name] = cell.code
+        for name in repeated:
+            del bodies[name]
+        if repeated:
+            logger.warning(
+                "%s holds %d cell name(s) more than once (%s); the notebook block will not say "
+                "which cells are still unwritten",
+                path,
+                len(repeated),
+                ", ".join(sorted(repeated)),
+            )
+        return bodies
 
     def _window_for(self, request: TurnRequest, state: NotebookState) -> ConversationWindow:
         config = self._config

@@ -15,6 +15,14 @@ reject. Each of those is a broken statement a user has to debug by hand at the p
 promised the process was under control. :func:`literal` renders every one of them properly, and
 the escaping it applies is the reason a value containing a quote is safe as well as correct.
 
+Two questions about a piece of text are answered here as well, and they are here for the same
+reason the rendering is: :func:`changes_data` says whether running it would change data, and
+:func:`reads_as_sql` says whether it is a statement at all or a sentence that happens to open
+with a SQL verb. Both are decided by one scanner over the text, and both belong in this module
+rather than wherever the text was found -- a second, weaker copy of "is this SQL" is exactly the
+drift non-negotiable 3 exists to prevent, and it is not machine-enforceable, so it holds only as
+long as it is kept in one place.
+
 **What this module does not do.** It does not connect, execute, transact, or validate that a
 statement means what its author intended. It does not know your dialect: the literal forms here
 (single-quoted strings with doubled internal quotes, ISO dates, unquoted numerics, ``NULL``) are
@@ -51,6 +59,7 @@ __all__ = [
     "changes_data",
     "literal",
     "placeholders",
+    "reads_as_sql",
     "render",
     "render_all",
     "script",
@@ -266,6 +275,163 @@ def changes_data(statement: str) -> bool:
             verb = next((word for word in words[1:] if word in _MAIN_VERBS), "")
         if verb in _WRITING_VERBS:
             return True
+    return False
+
+
+_OBJECT_KEYWORDS = frozenset(
+    {
+        "column",
+        "constraint",
+        "database",
+        "function",
+        "index",
+        "procedure",
+        "schema",
+        "sequence",
+        "table",
+        "trigger",
+        "type",
+        "view",
+    }
+)
+"""What a ``DROP``, ``ALTER`` or ``CREATE`` names before it names the thing."""
+
+_MUST_FOLLOW: dict[str, frozenset[str]] = {
+    "insert": frozenset({"into"}),
+    "replace": frozenset({"into"}),
+    "upsert": frozenset({"into"}),
+    "delete": frozenset({"from"}),
+    "truncate": frozenset({"table"}),
+}
+"""Verbs whose grammar fixes the **very next** word, which is what separates them from English.
+
+``INSERT INTO`` and ``DELETE FROM`` are one token apart in SQL and arbitrarily far apart in a
+sentence, so the position is the whole discrimination: ``Insert values from A1 into the tracker``
+does contain ``into``, and puts ``values`` where SQL requires it.
+
+Dialects that allow the keyword to be dropped -- T-SQL's ``INSERT tbl VALUES (...)``, ``DELETE
+tbl`` -- read as prose here. That is the direction to err in; see :func:`reads_as_sql`.
+"""
+
+_MUST_NAME_SOON: dict[str, frozenset[str]] = {
+    "drop": _OBJECT_KEYWORDS,
+    "alter": _OBJECT_KEYWORDS,
+    "create": _OBJECT_KEYWORDS,
+}
+"""Verbs that name what kind of object they act on, within a modifier or two of the verb.
+
+``DROP TABLE`` is adjacent; ``CREATE TEMP TABLE`` and ``CREATE OR REPLACE VIEW`` are not, which
+is why this is a short window rather than the next word alone.
+"""
+
+_MUST_NAME_SOON_WINDOW = 3
+"""How many words after the verb :data:`_MUST_NAME_SOON` looks in. Wide enough for ``OR REPLACE``,
+narrow enough that a sentence has to put a table keyword in its first four words."""
+
+_MUST_CONTAIN: dict[str, frozenset[str]] = {
+    "update": frozenset({"set"}),
+    "merge": frozenset({"using", "on"}),
+    "select": frozenset({"from"}),
+}
+"""Verbs whose mandatory keywords follow a target of unpredictable length. **All** must appear.
+
+``UPDATE fin.accruals SET`` and ``UPDATE t AS a SET`` put ``SET`` in different places, so these
+can only be checked by presence -- though never immediately after the verb, because ``UPDATE SET``
+names nothing to update. ``MERGE`` carries two, and both are load-bearing: ``USING`` alone lets
+``"Merge the two tabs before using this"`` through, where ``ON`` is a join condition no sentence
+supplies.
+
+``SELECT`` is here for completeness rather than for any caller. A bare ``SELECT 1`` is a legal
+statement and reads as prose under this rule, which is the cost of asking one question of every
+opener.
+
+**This is the weak half of the predicate and it is worth naming.** A presence test cannot tell
+``UPDATE fin.accruals SET x = 1`` from ``"Update the tracker and set the flag"``: both open with
+the verb and both contain the keyword, and no rule over bare words separates them without
+blocking real SQL -- an article test breaks on ``FROM fin.accruals AS a``, and a window on the
+target breaks on ``UPDATE t AS a SET``. The two confirmed prose cases from the conversion this
+predicate was written for are both :data:`_MUST_FOLLOW` verbs and are both rejected; an English
+sentence opening ``Update`` and containing ``set`` still reads as SQL. Callers should quote the
+text they judged rather than assert about it -- ``kedge.plan.review`` does.
+"""
+
+
+def reads_as_sql(text: str) -> bool:
+    """Whether this text is a SQL statement, or a sentence that happens to contain a SQL verb.
+
+    The question :func:`changes_data` does not ask, and must not: ``changes_data`` is given
+    statements -- a hand-off's own text, a command out of ``xl/connections.xml`` -- and answers
+    what running one would do. Point it at prose and it answers about the prose, correctly and
+    uselessly: ``"Delete row 4 from the tracker"`` opens with ``delete``, so it "writes".
+
+    That matters because one caller does not have a statement. A column of
+    ``="UPDATE ... "&F17&"..."`` is the step of a manual process that changes the data, and
+    finding it means reading the text an ordinary ``text_manipulation`` region concatenates --
+    where most of what turns up is labels, keys and instructions to a colleague. Asking
+    ``changes_data`` alone put a warning on the approval card for
+    ``="Delete row "&A1&" from the tracker"``. Asking a keyword-count question first, in the
+    module that happened to have the text, was worse: a second and weaker classifier for the
+    thing this module exists to own (non-negotiable 3).
+
+    So the judgement is here, on the same scanner :func:`changes_data` uses -- bare words at
+    bracket depth zero, comments and quoted runs skipped, grouped by top-level statement -- and
+    the test is **grammar, not vocabulary**. Every statement must open with a verb this module
+    recognises and carry that verb's mandatory keyword where the grammar puts it: immediately
+    after (:data:`_MUST_FOLLOW`) or somewhere past the target (:data:`_MUST_CONTAIN`). A ``WITH``
+    prefix is followed through to the statement it introduces, exactly as ``changes_data``
+    follows it.
+
+    **Conservative on purpose, in one direction.** A dialect-specific shape that omits a keyword
+    -- ``INSERT tbl VALUES``, ``DELETE tbl``, ``SELECT 1`` -- reads as prose, and an opener this
+    module has no rule for (``EXEC``, ``CALL``, ``GRANT``) reads as prose too. The two errors are
+    not equal: reading real SQL as prose costs a warning nobody sees, while reading prose as SQL
+    puts amber on the approval card of a correct plan, and a card that is always amber stops
+    being read.
+
+    **It is a reading, not a parse, and it is beatable.** Where the mandatory keyword follows a
+    target of unknown length the test can only be presence, so ``"Update the tracker and set the
+    flag"`` still reads as SQL; :data:`_MUST_CONTAIN` records why no rule over bare words fixes
+    that without rejecting real statements. Callers should quote the text they judged.
+
+    Args:
+        text: Statement text, a template with ``{placeholders}`` still in it, or arbitrary prose.
+
+    Returns:
+        Whether every top-level statement in ``text`` reads as SQL. Empty text is not a
+        statement, and returns ``False``.
+
+    Example:
+        >>> reads_as_sql("UPDATE fin.accruals SET accrual_gbp = 1 WHERE trade_id = 'A'")
+        True
+        >>> reads_as_sql("Delete row 4 from the tracker")
+        False
+    """
+    statements = _statement_words(text)
+    if not statements:
+        return False
+    return all(_reads_as_one_statement(words) for words in statements)
+
+
+def _reads_as_one_statement(words: list[str]) -> bool:
+    """Whether one top-level statement's bare words open the way its verb requires."""
+    start = 0
+    if words[0] == "with":
+        start = next(
+            (index for index, word in enumerate(words) if index and word in _MAIN_VERBS), -1
+        )
+        if start < 0:
+            return False
+    verb = words[start]
+    required = _MUST_FOLLOW.get(verb)
+    if required is not None:
+        return len(words) > start + 1 and words[start + 1] in required
+    soon = _MUST_NAME_SOON.get(verb)
+    if soon is not None:
+        window = words[start + 1 : start + 1 + _MUST_NAME_SOON_WINDOW]
+        return any(word in soon for word in window)
+    contains = _MUST_CONTAIN.get(verb)
+    if contains is not None:
+        return contains <= set(words[start + 2 :])
     return False
 
 

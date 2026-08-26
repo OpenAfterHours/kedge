@@ -283,11 +283,18 @@
      is not a worse outcome, because the server tears a turn down when its client disconnects. */
   const CANCEL_GRACE_MS = 4000;
 
+  /* The conversion, in the order it is actually done: decompose the workbook, find out what the
+     scaffold left unwritten, write it, check it against the workbook.
+
+     These are static strings shown for every workbook, so not one of them may name a sheet, a
+     range or a column. The list they replace opened with "Translate the haircut lookup on
+     Calc!H2:H50000" — a range from a fixture workbook, offered to every user who ever opened the
+     pane, none of whom had that sheet. */
   const SUGGESTIONS = [
-    "Summarise what this workbook actually does, stage by stage.",
-    "Translate the haircut lookup on Calc!H2:H50000 and reconcile it against the cached values.",
-    "Which stages of the plan are still unconverted, and why?",
-    "Check whether the join key in the hand-in is unique before we rely on it.",
+    "Propose a plan for converting this workbook, stage by stage.",
+    "Which cells are still unwritten, and what does each one have to do?",
+    "Write the stages that are still passthroughs, in the plan's order.",
+    "Reconcile the notebook against the values Excel last calculated.",
   ];
 
   // ── turn rendering ─────────────────────────────────────────────────────────────────
@@ -948,9 +955,11 @@
         el("p", {
           class: "decision-muted",
           text:
-            "No workbook analysis is loaded in this chat, so the coverage checks — operations " +
-            "claimed by no stage, and stage operation ids that are not in the analysis — did not " +
-            "run. The warnings above are the ones that need no analysis.",
+            "No workbook analysis is loaded in this chat, so the checks that read one did not " +
+            "run: operations claimed by no stage, stage operation ids that are not in the " +
+            "analysis, a write the workbook records that no stage hands over, and a briefing " +
+            "the workbook could have supplied. The warnings above are the ones that need no " +
+            "analysis.",
         }),
       );
     }
