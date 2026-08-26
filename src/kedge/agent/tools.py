@@ -278,7 +278,7 @@ class ToolResult:
 
     Never constructed with raw data by a handler: :meth:`from_rows` and :meth:`note` are the way
     in, and both cap. The notebook fields exist so the loop can raise the right
-    :mod:`kedge.server.events` without tools knowing about the event vocabulary.
+    :mod:`kedge.turn` event without tools knowing about the event vocabulary.
 
     Example:
         >>> ToolResult.note("6 cells", summary="6 cells").text

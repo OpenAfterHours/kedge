@@ -28,15 +28,27 @@ the ones that matter, and they are covered.
 
 The fourth rule is not in CONVENTIONS.md's numbered list, because it is not about a library
 boundary -- it is the layering `CLAUDE.md` states in one line: ``analysis/ -> plan/ -> notebook/
--> agent/ -> server/``. The agent reads and writes the notebook; the notebook knows nothing about
-the agent. A conversion driver was once built under `notebook/` and had to import
-``kedge.agent.context``, ``kedge.agent.prompts`` and ``kedge.agent.validate`` to work, and there
-was no runtime cycle only because `notebook/__init__.py` did not import it. Adding that one line
-reproduced ``ImportError: cannot import name 'CellFacts' from partially initialized module
-'kedge.agent.context'`` -- and the blast radius was the whole `agent` package rather than the one
-module, because `agent/__init__.py` eagerly aggregates `context`, so *every* import starting
-inside `kedge.agent` failed. An inversion that costs nothing until the day somebody adds an import
-is exactly the kind that comes back, so it is checked here rather than remembered.
+-> agent/ -> server/``. A layer may import what is below it and nothing above it. The agent reads
+and writes the notebook; the notebook knows nothing about the agent. A conversion driver was once
+built under `notebook/` and had to import ``kedge.agent.context``, ``kedge.agent.prompts`` and
+``kedge.agent.validate`` to work, and there was no runtime cycle only because
+`notebook/__init__.py` did not import it. Adding that one line reproduced ``ImportError: cannot
+import name 'CellFacts' from partially initialized module 'kedge.agent.context'`` -- and the blast
+radius was the whole `agent` package rather than the one module, because `agent/__init__.py`
+eagerly aggregates `context`, so *every* import starting inside `kedge.agent` failed. An inversion
+that costs nothing until the day somebody adds an import is exactly the kind that comes back, so it
+is checked here rather than remembered.
+
+For a while only that one edge was checked, because it was the only one that held. All four are
+checked now. The last to be cleared was `agent/ -> server/`, where the loop imported the server's
+event vocabulary at module scope: the deferred ``kedge.server.app`` imports below it were there to
+keep FastAPI out of ``import kedge.agent``, and did not, because ``from kedge.server.events import
+...`` executes ``kedge/server/__init__.py`` and that imports `app.py` anyway. The vocabulary moved
+to ``kedge.turn``, below both layers; the wiring moved to ``kedge.serve``, above both. A top-level
+module is not itself walked -- `kedge/turn.py`, `kedge/sql.py` and their neighbours sit below the
+ladder and are reachable from every rung, which is the point of putting a shared vocabulary there.
+`kedge/serve.py` is the exception that proves it: it sits *above* the ladder, importing an agent
+and a server in the same breath, so no rung may import it and :data:`ABOVE_LADDER` says so.
 
 Run directly, or via CI::
 
@@ -85,12 +97,24 @@ HTTPX_HOMES = (
 OPENAI_CLIENT_NAMES = ("OpenAI", "AsyncOpenAI")
 OPENAI_ROOTS = ("src",)
 
-# CLAUDE.md's layering: analysis/ -> plan/ -> notebook/ -> agent/ -> server/. Only the one edge
-# that has actually been inverted is checked, and it is checked in the direction it was inverted:
-# the agent reads the notebook, and nothing under `notebook/` may reach back. Stated as a pair so
-# that adding the next edge is a line rather than a function.
-LAYERING_ROOT = "src/kedge/notebook"
-LAYERING_BANNED = "kedge.agent"
+# CLAUDE.md's layering, bottom first: analysis/ -> plan/ -> notebook/ -> agent/ -> server/. Every
+# upward edge is refused, not just the one that was once inverted. A layer may import anything
+# below it and nothing above it. A top-level module that is *below* the ladder -- `kedge/sql.py`,
+# `kedge/errors.py`, `kedge/turn.py` -- is not on it and is reachable from every rung, which is the
+# whole point of putting a shared vocabulary there.
+LAYERS: tuple[str, ...] = ("analysis", "plan", "notebook", "agent", "server")
+LAYER_PARENT = "src/kedge"
+LAYER_PACKAGE = "kedge"
+
+# One top-level module is *above* the ladder rather than below it, and that is a different thing
+# entirely. `kedge/serve.py` composes an agent with a server, so it holds both ends of one arrow at
+# once; a layer importing it would inherit an edge to every layer with nothing to report it, since
+# the rungs above only bans modules under `src/kedge/<layer>/`. That is not hypothetical: with the
+# helpers in `agent/loop.py` a `notebook/` module reaching them had to write `from kedge.agent
+# import serve`, which this check caught. Moving them to a top-level module moved them out of its
+# reach, so the module is ranked here and every rung is refused it -- `server/` included, because
+# the server is a layer and the composition of it is not.
+ABOVE_LADDER: tuple[str, ...] = (f"{LAYER_PACKAGE}.serve",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,42 +327,96 @@ def _render_import(node: ast.AST, package: str) -> str:
     return f"from {_absolute_module(node, package)} import {names}"
 
 
-def _check_layering() -> list[Breach]:
-    """Collect every import that reaches back up the layering.
+def layers_above(layer: str) -> tuple[str, ...]:
+    """The dotted modules `layer` may not import, highest last.
 
-    Deliberately over-catches in one direction: an import guarded by ``if TYPE_CHECKING:`` cannot
-    create a runtime cycle, and this reports it all the same. That is the right default for now --
-    the inversion this exists for began as type-only references and grew runtime ones, and a rule
-    with an exemption is a rule people learn to phrase their way past. It will one day refuse a
-    legitimate type-only reference to an agent type, and the answer then is to exempt the
-    ``TYPE_CHECKING`` block here rather than to work around it there.
+    Args:
+        layer: One of :data:`LAYERS`.
+
+    Returns:
+        Every layer above it plus everything in :data:`ABOVE_LADDER`, as importable module names
+        -- ``("kedge.agent", "kedge.server", "kedge.serve")`` for ``notebook``. The top rung still
+        gets ``ABOVE_LADDER``: `server/` is a layer, and the module that composes a server with an
+        agent sits above it.
     """
-    rule = (
-        f"{LAYERING_ROOT}/ may not import {LAYERING_BANNED}: the layering is analysis/ -> plan/ "
-        "-> notebook/ -> agent/ -> server/, and the agent reads the notebook rather than the "
-        "other way round (CLAUDE.md, 'Architecture in one paragraph')"
-    )
-    breaches: list[Breach] = []
-    for path in _python_files((LAYERING_ROOT,)):
-        package = _package_of(path)
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except SyntaxError:
-            continue  # already reported by the import checks, which parse the same files
-        breaches.extend(
-            Breach(
-                path=path,
-                line=node.lineno,
-                statement=_render_import(node, package),
-                rule=rule,
-            )
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Import | ast.ImportFrom)
-            and any(
-                _is_or_is_under(target, LAYERING_BANNED)
-                for target in _import_targets(node, package)
-            )
+    rank = LAYERS.index(layer)
+    return (*(f"{LAYER_PACKAGE}.{name}" for name in LAYERS[rank + 1 :]), *ABOVE_LADDER)
+
+
+def _layering_rule(layer: str, banned: str) -> str:
+    """The sentence quoted when `layer` is caught importing `banned`."""
+    if banned in ABOVE_LADDER:
+        return (
+            f"{LAYER_PARENT}/{layer}/ may not import {banned}: it composes one layer with another "
+            "and so sits above the whole ladder, and a rung reaching it inherits an edge to every "
+            "layer that no rung-to-rung check can see (CLAUDE.md, 'Architecture in one paragraph')"
         )
+    return (
+        f"{LAYER_PARENT}/{layer}/ may not import {banned}: the layering is "
+        + " -> ".join(f"{name}/" for name in LAYERS)
+        + ", and a layer may import what is below it and nothing above it "
+        "(CLAUDE.md, 'Architecture in one paragraph')"
+    )
+
+
+def _check_layering() -> list[Breach]:
+    """Collect every import that reaches back up the layering, at every rung of it.
+
+    The ladder was once enforced one edge at a time -- ``notebook/`` may not import
+    ``kedge.agent`` -- because that was the edge somebody had actually inverted and the rest of
+    the ladder did not hold. It holds now, so all of it is checked: an invariant enforced where it
+    has already been broken catches the breach that has happened rather than the one that is
+    coming.
+
+    **There is no ``TYPE_CHECKING`` exemption, and the seam that would have wanted one no longer
+    does.** ``kedge.agent.loop`` implements :class:`kedge.server.agent_seam.AgentLoop`, a Protocol
+    declared one layer above it, and that is a legitimate inversion: an interface belongs to the
+    caller that needs it, and nothing under `agent/` imports it, because the loop satisfies it
+    structurally. What the loop *did* import from up there was the seam's data -- the turn request
+    and the cancellation token -- which are arguments rather than an interface, and they moved down
+    to ``kedge.turn`` where the events a turn yields back already sit. So the rule stays absolute:
+    an import guarded by ``if TYPE_CHECKING:`` cannot create a runtime cycle and is reported all
+    the same. The inversion this check exists for began as type-only references and grew runtime
+    ones, and a rule with an exemption is a rule people learn to phrase their way past.
+
+    **A composition module is refused from every rung, including the top one.** :data:`ABOVE_LADDER`
+    is checked alongside the rungs because a rule that only compares one layer against another has
+    a blind spot the width of a top-level module: `kedge/serve.py` imports an agent *and* a server,
+    so a rung importing it reaches both, and every rung-to-rung comparison reports clean. Planted
+    in a scratch tree, ``from kedge import serve`` inside `notebook/` reproduced exactly the
+    partial-initialisation ImportError quoted at the top of this file while both this check and a
+    test written to back it up said nothing.
+
+    What the check cannot see, stated rather than assumed: it reads ``import`` statements, so
+    ``importlib.import_module("kedge.server.app")``, ``__import__``, a name reached through
+    ``exec``, and a ``.pyi`` stub are all invisible to it. Nothing in the tree does any of those,
+    and a rule that catches every import somebody writes without thinking is the one worth having;
+    a rule that also catches the ones somebody wrote *on purpose* to get past it is a different
+    project.
+    """
+    breaches: list[Breach] = []
+    for layer in LAYERS:
+        banned_here = layers_above(layer)
+        for path in _python_files((f"{LAYER_PARENT}/{layer}",)):
+            package = _package_of(path)
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except SyntaxError:
+                continue  # already reported by the import checks, which parse the same files
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Import | ast.ImportFrom):
+                    continue
+                targets = _import_targets(node, package)
+                breaches.extend(
+                    Breach(
+                        path=path,
+                        line=node.lineno,
+                        statement=_render_import(node, package),
+                        rule=_layering_rule(layer, banned),
+                    )
+                    for banned in banned_here
+                    if any(_is_or_is_under(target, banned) for target in targets)
+                )
     return sorted(breaches, key=lambda breach: (breach.path, breach.line))
 
 
@@ -435,7 +513,9 @@ def main() -> int:
         f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}; "
         f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}; "
         f"outbound TLS trust decided in {HTTPX_HOMES[0]}; "
-        f"{LAYERING_ROOT}/ imports nothing from {LAYERING_BANNED}."
+        "no upward import anywhere in "
+        + " -> ".join(f"{name}/" for name in LAYERS)
+        + f", nor any import of {', '.join(ABOVE_LADDER)} from a rung of it."
     )
     return 0
 

@@ -223,6 +223,59 @@ def test_the_loop_satisfies_the_server_s_protocol() -> None:
     assert isinstance(build(ScriptedClient([])), AgentLoop)
 
 
+def test_the_loop_satisfies_it_without_naming_it_anywhere() -> None:
+    """The Protocol is the server's, and it stays there because satisfying it costs nothing.
+
+    The layering is ``analysis/ -> plan/ -> notebook/ -> agent/ -> server/``, so
+    :class:`kedge.server.agent_seam.AgentLoop` is declared one layer above its implementation.
+    That inversion is the legitimate kind -- an interface belongs to the caller that needs it --
+    and the test above proves it holds structurally, with no base class and no import. What the
+    loop genuinely could not do without were the seam's *arguments*, and those moved down to
+    :mod:`kedge.turn`, which is why ``kedge.server`` no longer appears in this module at all.
+
+    Asserted on the source text rather than on ``sys.modules``, because the edge that mattered was
+    a ``TYPE_CHECKING`` one and it leaves no trace at runtime.
+    """
+    source = (Path(__file__).resolve().parents[2] / "src/kedge/agent/loop.py").read_text("utf-8")
+    imports = [
+        line
+        for line in source.splitlines()
+        if line.lstrip().startswith(("import kedge.server", "from kedge.server"))
+    ]
+
+    assert imports == []
+
+
+def test_the_wiring_moved_out_of_the_agent_package_and_still_builds_an_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``build_agent_app`` and ``serve`` compose an agent with a server, which is neither's job.
+
+    They lived in ``agent/loop.py`` behind function-local imports whose comment said a
+    module-scope one "would invert the layering". True, and beside the point: the same file
+    imported ``kedge.server.events`` at module scope, and that executes
+    ``kedge/server/__init__.py``, which imports ``app.py``, which imports FastAPI. The deferral
+    bought nothing it claimed to buy.
+
+    Which is exactly why this runs the function rather than checking it is callable. That false
+    docstring stood for as long as it did because nothing here was ever executed: production
+    builds its :class:`KedgeAgent` directly in ``server/hub.py``, so the composition helpers have
+    no caller but a human at a shell. A stub client is all it takes to give them one.
+    """
+    import kedge.agent
+    from kedge.serve import build_agent_app, serve
+
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, None)
+    app = build_agent_app(workspace, client=ScriptedClient([]), version="9.9.9")
+
+    assert isinstance(app.state.kedge.agent, KedgeAgent)
+    assert not app.state.kedge.demo
+    assert app.state.kedge.version == "9.9.9"
+    assert callable(serve)
+    assert not hasattr(kedge.agent, "serve")
+    assert not hasattr(kedge.agent, "build_agent_app")
+
+
 async def test_the_tools_offered_are_the_ones_plan_m4_lists() -> None:
     client = ScriptedClient([[ChatDelta(text="Nothing to do.")]])
     await drive(build(client))

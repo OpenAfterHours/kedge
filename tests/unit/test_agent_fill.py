@@ -15,6 +15,7 @@ a report that renders the two the same sends whoever reads it to fix the wrong t
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 import subprocess
 import sys
@@ -26,12 +27,14 @@ from typer.testing import CliRunner
 
 from conftest import approved_plan_store, make_analysis, make_approved_plan, make_plan
 from kedge import cli
+from kedge.agent import fillhole
 from kedge.agent.fill import (
     FillOutcome,
     FillReport,
     convert_notebook,
     fill_holes,
 )
+from kedge.agent.fillhole import body_of
 from kedge.agent.fillprompt import (
     FILL_PROMPT_PARTS,
     PromptAssemblyError,
@@ -53,10 +56,10 @@ from kedge.notebook.scaffold import (
 )
 from kedge.plan.store import PlanStore
 from scripts.guardrails import (
-    LAYERING_BANNED,
     _check_layering,
     _import_targets,
     _is_or_is_under,
+    layers_above,
 )
 
 if TYPE_CHECKING:
@@ -1124,6 +1127,10 @@ def test_nothing_in_the_notebook_package_imports_the_agent() -> None:
     as the guardrail it was meant to back up -- ``from kedge import agent`` sailed past both.
     Asserted here as well as in CI because a red test in the ordinary suite is what a contributor
     meets first.
+
+    The check now covers every rung of the ladder rather than this one edge, so this passing means
+    rather more than it used to; ``tests/unit/test_layering.py`` is where the other rungs are
+    argued.
     """
     assert [breach.render() for breach in _check_layering()] == []
 
@@ -1153,9 +1160,10 @@ def test_every_spelling_of_the_inversion_is_caught(statement: str) -> None:
     """
     node = ast.parse(statement).body[0]
     targets = _import_targets(node, "kedge.notebook")
+    banned = layers_above("notebook")
 
-    assert any(_is_or_is_under(target, LAYERING_BANNED) for target in targets), (
-        f"{statement!r} resolved to {targets} and none of them is under {LAYERING_BANNED}"
+    assert any(_is_or_is_under(target, name) for target in targets for name in banned), (
+        f"{statement!r} resolved to {targets} and none of them is under any of {banned}"
     )
 
 
@@ -1182,7 +1190,9 @@ def test_the_layering_check_does_not_catch_what_it_has_no_business_catching(
     node = ast.parse(statement).body[0]
     targets = _import_targets(node, "kedge.notebook")
 
-    assert not any(_is_or_is_under(target, LAYERING_BANNED) for target in targets)
+    assert not any(
+        _is_or_is_under(target, name) for target in targets for name in layers_above("notebook")
+    )
 
 
 def test_the_import_that_used_to_break_the_whole_agent_package_is_now_harmless() -> None:
@@ -1192,12 +1202,21 @@ def test_the_import_that_used_to_break_the_whole_agent_package_is_now_harmless()
     ``kedge.agent`` the moment the package imported it. Each order is run in its own interpreter:
     a cycle shows itself from one end only, and a module already in ``sys.modules`` from an
     earlier test would hide it.
+
+    ``fillhole`` and ``fillreport`` are named here because splitting the driver put two new
+    modules into that graph, and this test is the only thing standing between it and the failure
+    above. Entering the package at ``kedge.agent.fillhole`` is the order that matters: it is the
+    one a re-export from ``fill.py`` back to a module that imports ``fill.py`` would break, and
+    it is invisible from every other entry point.
     """
     for program in (
         "import kedge.notebook; import kedge.agent.fill; "
         "from kedge.agent.context import CellFacts; assert CellFacts",
         "from kedge.agent.context import CellFacts; import kedge.notebook; assert CellFacts",
         "import kedge.agent; import kedge.notebook; import kedge.agent.fill",
+        "import kedge.agent.fillhole; import kedge.agent.fill; import kedge.agent",
+        "import kedge.agent.fillreport; import kedge.agent.fillhole; import kedge.agent.fill",
+        "import kedge.notebook; import kedge.agent.fillhole; import kedge.agent.fillreport",
     ):
         finished = subprocess.run(
             [sys.executable, "-c", program],
@@ -1206,3 +1225,66 @@ def test_the_import_that_used_to_break_the_whole_agent_package_is_now_harmless()
             text=True,
         )
         assert finished.returncode == 0, f"{program}\n{finished.stderr}"
+
+
+# ── what the split promised, and to whom ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "kedge.agent.fill",
+        "kedge.agent.fillhole",
+        "kedge.agent.fillreport",
+        "kedge.agent.fillprompt",
+    ],
+)
+def test_every_name_a_fill_module_promises_actually_exists(module: str) -> None:
+    """``__all__`` is a promise, and a split is where one quietly stops being kept.
+
+    Three of these four modules were carved out of one file, and the entries in their ``__all__``
+    were written by hand while the definitions moved. A name that is promised and absent is an
+    ``ImportError`` in whoever reads the promise -- ``from kedge.agent.fill import *`` is nobody's
+    style here, but ``kedge/agent/__init__.py`` aggregates by name and the eval harness aliases by
+    name, and both of them are downstream of this list being true.
+    """
+    imported = importlib.import_module(module)
+    missing = [name for name in imported.__all__ if not hasattr(imported, name)]
+
+    assert missing == [], f"{module}.__all__ promises {missing}, which it does not define"
+
+
+def test_the_public_surface_of_the_driver_survived_being_split_across_four_modules() -> None:
+    """Everything that imported ``kedge.agent.fill`` before still gets the same objects.
+
+    Asserted by identity against the modules the definitions now live in, not by import
+    succeeding: a name rebound to a second implementation imports perfectly well and is exactly
+    the failure a re-export is supposed to make impossible. ``cli.py`` takes ``FillReport`` and
+    ``convert_notebook`` from here, ``kedge/agent/__init__.py`` takes six names, and
+    ``evals/harness/cellgen.py`` aliases four types and the loop -- none of which was touched, and
+    all of which is downstream of these five identities.
+    """
+    from kedge.agent import fill, fillreport
+
+    assert fill.FillOutcome is fillreport.FillOutcome
+    assert fill.FillAttempt is fillreport.FillAttempt
+    assert fill.FilledCell is fillreport.FilledCell
+    assert fill.FillReport is fillreport.FillReport
+    assert fill.NO_PLACEHOLDER is fillhole.NO_PLACEHOLDER
+    assert callable(fill.fill_holes) and callable(fill.convert_notebook)
+
+
+def test_a_fenced_reply_is_unwrapped() -> None:
+    """The chat never needs this; without a tool surface a fence is how code arrives.
+
+    ``propose_cell`` takes a cell body as a tool argument, so the chat loop never meets a Markdown
+    fence. This seam has no tools, the body arrives as prose, and a model that wraps it in
+    backticks must not be recorded as having produced nothing -- that is a driver bug reported as
+    a model failure.
+    """
+    assert body_of("adjust = frame") == "adjust = frame"
+    assert body_of("```python\nadjust = frame\n```") == "adjust = frame"
+    assert (
+        body_of("Here you go:\n\n```\nadjust = frame\n```\n\nHope that helps.") == "adjust = frame"
+    )
+    assert body_of("") == ""

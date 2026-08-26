@@ -1437,22 +1437,6 @@ def test_a_gate_line_is_kept_out_of_the_hole() -> None:
     assert "# Stage 4 of 8: apply" in kept
 
 
-@pytest.mark.parametrize(
-    ("reply", "expected"),
-    [
-        ("adjust = frame", "adjust = frame"),
-        ("```python\nadjust = frame\n```", "adjust = frame"),
-        ("Here you go:\n\n```\nadjust = frame\n```\n\nHope that helps.", "adjust = frame"),
-        ("", ""),
-    ],
-)
-def test_a_fenced_reply_is_unwrapped(reply: str, expected: str) -> None:
-    """The chat never needs this; without a tool surface a fence is how code arrives."""
-    from kedge.agent.fill import _body_of
-
-    assert _body_of(reply) == expected
-
-
 def test_cells_are_written_in_an_order_the_linear_driver_and_marimo_agree_on() -> None:
     """And the forward reference that forced it is reported, because marimo lays out in file order."""
     names = ("setup", "panel", "statement")

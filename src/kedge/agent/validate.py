@@ -13,7 +13,7 @@ the house style when the cell does not parse; the first message it can act on is
 worth sending.
 
 Nothing here raises on a violation. The gate returns a :class:`ValidationReport`, the loop turns
-it into a :class:`~kedge.server.events.ValidationEvent` and a tool result, and the model gets to
+it into a :class:`~kedge.turn.ValidationEvent` and a tool result, and the model gets to
 try again — three times, then kedge stops and tells the user (:data:`MAX_VALIDATION_ATTEMPTS`).
 An exception would be the wrong shape entirely: a rejected cell is a normal event in a
 conversation, not an error in kedge.

@@ -6,8 +6,11 @@ than a thin wrapper around something else.
 
 The pieces:
 
-* :mod:`kedge.server.events` — the typed event vocabulary streamed to the browser, and the bus
-  that fans a turn's events out to the SSE response, the notebook mirror, and any monitor.
+* :mod:`kedge.server.events` — the bus that fans a turn's events out to the SSE response, the
+  notebook mirror and any monitor, the SSE framing, and the hub's own open-progress vocabulary.
+  The *turn* vocabulary it re-exports is :mod:`kedge.turn`, which sits below both this package and
+  the agent: the agent emits those events and the server serialises them, so neither owns them and
+  a module above either would put one layer above the other.
 * :mod:`kedge.server.sessions` — chat sessions and messages in SQLite, each session tied to a
   notebook path and a snapshot marker so it can be resumed honestly.
 * :mod:`kedge.server.agent_seam` — the :class:`~kedge.server.agent_seam.AgentLoop` protocol the

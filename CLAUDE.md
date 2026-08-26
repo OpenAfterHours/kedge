@@ -69,6 +69,15 @@ code is validated before it ever reaches the kernel (`agent/validate.py`).
 
 The layering that matters: `analysis/` → `plan/` → `notebook/` → `agent/` → `server/`.
 `reconcile/` is consumed by the CLI, the notebook and the agent, so it sits below all three.
+Every rung of that ladder is enforced by `scripts/guardrails.py`, in the only direction that
+matters: a layer may import what is below it and nothing above it. Two consequences worth knowing.
+The vocabulary of a turn — the typed events the agent emits, the request and the cancel token the
+server hands in — is `kedge/turn.py`, below both, for the same reason `reconcile/` is where it is.
+And composing an agent with a server needs both ends of one arrow at once, so
+`from kedge.serve import serve` is a top-level module above the ladder rather than anything inside
+it (it used to be `from kedge.agent import serve`). **No rung may import `kedge.serve`** — one that
+did would reach every layer through it, and a check that only compares one layer against another
+would report clean while it happened. The guardrail refuses it from all five, `server/` included.
 
 ## Commands
 
