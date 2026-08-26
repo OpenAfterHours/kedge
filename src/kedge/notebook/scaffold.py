@@ -101,6 +101,7 @@ __all__ = [
     "build_cells",
     "cell_name_for",
     "head_handin_is_read",
+    "head_handin_reader",
     "holes_in",
     "is_unwritten",
     "split_hole",
@@ -1114,7 +1115,22 @@ templates. It is the cell's name, which is the only thing about the head hand-in
 any one step of the process.
 """
 
-_HANDIN_CELL = f"""# All three entry points converge here, and kedge.ingest.receive does the whole job: a
+
+def _handin_cell_code(blocking: str) -> str:
+    """The head hand-in's body, with the message it renders when it is waiting.
+
+    A function rather than a constant for one interpolation, and that interpolation is the point.
+    This was the only ``mo.stop`` in the scaffold that did not name its step -- it said "Waiting
+    for a hand-in", full stop -- because the head hand-in belongs to the notebook rather than to
+    any one stage and there was no number to quote. But in app mode a stopped cell is the entire
+    user interface, and the rule the rest of the file follows exists precisely for that moment:
+    a page that says "waiting" and a page that has died look identical. The step it is waiting
+    *for* is knowable -- it is the first stage that reads the frame -- so it is quoted.
+    """
+    return _HANDIN_TEMPLATE.replace("{{BLOCKING}}", repr(blocking))
+
+
+_HANDIN_TEMPLATE = f"""# All three entry points converge here, and kedge.ingest.receive does the whole job: a
 # dropped file's bytes are written into the managed store, a selected path is copied into it,
 # pasted text is sniffed for its delimiter and normalised to CSV, every one of them is hashed
 # and deduplicated against what is already there, and a receipt is recorded. `handin` is a
@@ -1136,7 +1152,7 @@ mo.stop(
     and not handin_drop.value
     and not handin_pick.value
     and not _pasted,
-    mo.md("**Waiting for a hand-in.** Drop a file above, select one, or paste a grid."),
+    mo.md({{{{BLOCKING}}}}),
 )
 
 # Precedence is by reproducibility, most reproducible first. A selected path is a file that
@@ -1496,6 +1512,23 @@ def head_handin_is_read(
         Whether ``handin_frame`` -- or a stage source naming the notebook's own hand-in -- is
         read by anything the plan calls for.
     """
+    return head_handin_reader(plan, names, checkpoints) is not None
+
+
+def head_handin_reader(
+    plan: ProcessPlan, names: dict[str, str] | None = None, checkpoints: set[str] | None = None
+) -> Stage | None:
+    """The first stage that reads the notebook's own hand-in, or ``None`` when nothing does.
+
+    :func:`head_handin_is_read` is this question asked as a yes or no, and everything about *why*
+    is documented there. The stage itself is wanted for one reason: the head hand-in's ``mo.stop``
+    has to name the step it is waiting for, and this is the step.
+
+    Note what a caller must not read into the answer. A stage reaching the head hand-in is often
+    a **fall-through** rather than a declaration -- ``_upstream_name`` returns ``handin_frame``
+    when nothing else matched -- so this names the stage that will consume the file, not
+    necessarily one that asked for it.
+    """
     resolved = names if names is not None else _name_map(plan)
     gates = (
         checkpoints
@@ -1504,18 +1537,18 @@ def head_handin_is_read(
     )
     for stage in plan.ordered_stages():
         if any(source.origin is SourceOrigin.HANDIN and not source.ref for source in stage.sources):
-            return True
+            return stage
         if stage.is_checkpoint:
             continue
         if stage.is_handoff:
             handoff = stage.effective_handoff()
             # A generated hand-off with no resolvable `built_from` falls back to the head frame.
             if handoff.is_generated and (handoff.built_from or "") not in resolved:
-                return True
+                return stage
             continue
         if _upstream_name(stage, resolved, gates) == "handin_frame":
-            return True
-    return False
+            return stage
+    return None
 
 
 def _head_cells(
@@ -1543,16 +1576,38 @@ def _head_cells(
         ScaffoldCell(name="kedge_run_mode", role="setup", code=_RUN_MODE_CELL),
         ScaffoldCell(name="kedge_run", role="setup", code=_RUN_CELL),
     ]
-    if not head_handin_is_read(plan, names, checkpoints):
+    reader = head_handin_reader(plan, names, checkpoints)
+    if reader is None:
         logger.info(
             "plan v%d declares every hand-in on a stage, so the fixed head hand-in is not emitted",
             plan.version,
         )
         return cells
+    # Emitted, and said so. This used to happen silently, and it is most often a *fall-through*
+    # -- no stage declared `origin: handin`, so `_upstream_name` reached the head frame because
+    # nothing else matched. Six cells and a blocking `mo.stop` then arrived at the top of the
+    # notebook for an input no step of the plan names, and nothing anywhere reported it. The
+    # scaffold report is where a reader finds out.
+    ordered = list(plan.ordered_stages())
+    logger.info(
+        "plan v%d reaches the notebook's own hand-in at stage %r (step %d of %d), so the fixed "
+        "head hand-in is emitted",
+        plan.version,
+        reader.id,
+        ordered.index(reader) + 1,
+        len(ordered),
+    )
+    blocking = _waiting(
+        ordered.index(reader) + 1,
+        len(ordered),
+        _one_line(reader.id),
+        "Drop the file above, select one on this machine, or paste the grid. Nothing below "
+        "this runs until it arrives.",
+    )
     cells.extend(
         [
             ScaffoldCell(name="handin_source", role="handin", code=_SOURCE_CELL),
-            ScaffoldCell(name="handin", role="handin", code=_HANDIN_CELL),
+            ScaffoldCell(name="handin", role="handin", code=_handin_cell_code(blocking)),
             ScaffoldCell(name="handin_contract", role="handin", code=_CONTRACT_CELL),
             ScaffoldCell(name="handin_drift", role="handin", code=_DRIFT_CELL),
             ScaffoldCell(name="handin_check", role="handin", code=_CHECK_CELL),

@@ -74,6 +74,7 @@ __all__ = [
     "render_diff",
     "render_plan",
     "reorder_stages",
+    "repairable_warnings",
     "request_changes",
     "review_warnings",
     "split_stage",
@@ -1217,8 +1218,48 @@ def review_warnings(
                     f"analysis: {', '.join(sorted(invented)[:5])}"
                 )
 
-    # What the scaffolder will make of this. Each of these was observed on one real conversion,
-    # which produced a notebook that opened, ran, and was wrong.
+    warnings.extend(repairable_warnings(plan, analysis))
+    return warnings
+
+
+def repairable_warnings(plan: ProcessPlan, analysis: WorkbookAnalysis | None = None) -> list[str]:
+    """The subset a model can be asked to fix, and be expected to.
+
+    Everything :func:`review_warnings` raises is worth a reviewer's attention. Only some of it is
+    worth putting back to the model, and the line between the two is not severity -- it is
+    whether the warning names a **defect with a fix in the plan's own fields**.
+
+    These do. Each one names the field to change (``kind: handoff``, ``briefing``, a stage's
+    ``sources``), the thing in the workbook it is about (a range, a connection, the sheets a note
+    came from), and what the notebook loses without it. They are already written in the
+    imperative, so they need no rewriting to become a repair instruction. And every one describes
+    a plan that *validates perfectly* and scaffolds a notebook that opens, runs, and is wrong --
+    which is why nothing downstream catches them.
+
+    The rest are deliberately excluded, because a model must not be asked to make them go away:
+
+    - **Open questions outstanding.** A plan that asks the user four things is doing its job. Ask
+      a model to clear that warning and it deletes the questions.
+    - **An empty ``open_questions`` on a complex workbook.** The remedy is to have understood the
+      workbook, not to invent a question to satisfy a check.
+    - **Low confidence, operations claimed by no stage, convertibility.** Judgements and coverage
+      facts. A model told to clear them raises its own confidence and claims the operations.
+
+    Every one of those is a warning whose *only* honest audience is a person, and the failure mode
+    of automating them is a plan that looks better and is not.
+
+    Args:
+        plan: The plan under review.
+        analysis: The analysis it was written against. The two warnings that compare the plan
+            against the workbook -- the unhandled write and the dropped briefing -- need it and
+            are skipped without it.
+
+    Returns:
+        The repairable warnings, in the order :func:`review_warnings` renders them.
+    """
+    # Each of these was observed on one real conversion, which produced a notebook that opened,
+    # ran, and was wrong.
+    warnings: list[str] = []
     warnings.extend(_unhandled_write_warnings(plan, analysis))
     warnings.extend(_unapproved_write_warnings(plan))
     warnings.extend(_dropped_briefing_warning(plan, analysis))

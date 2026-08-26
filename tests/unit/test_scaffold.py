@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -774,7 +775,12 @@ def test_the_handin_cell_waits_rather_than_erroring_on_an_empty_selection() -> N
     code = named(cells_for(), "handin").code
     stop = code.index("mo.stop(")
     assert stop < code.index("kedge.ingest.receive(")
-    assert "Waiting for a hand-in" in code
+    # It names its step, like every other stop in the scaffold. This was the one that did not --
+    # it said "Waiting for a hand-in" and stopped there -- because the head hand-in belongs to
+    # the notebook rather than to a stage. In app mode a stopped cell is the whole user
+    # interface, and "waiting" without a position is indistinguishable from a page that died.
+    assert re.search(r"\*\*Step \d+ of \d+: .+\.\*\*", code), code
+    assert "Drop the file above" in code
 
 
 def test_the_drift_cell_calls_check_drift_and_degrades_to_a_message() -> None:
@@ -904,7 +910,7 @@ def test_a_selected_file_wins_over_a_paste_left_in_the_box(tmp_path: Path) -> No
 
 
 def test_the_head_waits_rather_than_erroring_when_nothing_is_selected(tmp_path: Path) -> None:
-    with pytest.raises(StoppedError, match="Waiting for a hand-in"):
+    with pytest.raises(StoppedError, match=r"Step \d+ of \d+"):
         run_head(cells_for(), store=tmp_path / "store")
 
 

@@ -1224,3 +1224,117 @@ def test_the_planner_is_asked_about_hand_offs_and_the_briefing() -> None:
     # The dead-region trap: a column of generated SQL has a person as its consumer. Asserted
     # on a fragment that does not straddle the prompt's line wrapping.
     assert "have a person as its consumer" in prompt
+
+
+# =============================================================================
+# THE AMENDMENT PASS
+# =============================================================================
+#
+# `review_warnings` has always found these. Nothing consumed them but the approval card, so the
+# model that wrote the plan never saw a word of it -- and on two real hub runs six days apart it
+# produced the same defects, against a prompt that already instructs all of them. The repair loop
+# sat ten lines above where the warnings were computed and fired only on schema errors.
+
+
+def _observed() -> tuple[Any, Any]:
+    from observed_conversion import observed_analysis, observed_plan
+
+    return observed_plan(), observed_analysis()
+
+
+def _briefed(plan: Any) -> Any:
+    """The same plan with the one finding about `briefing` answered, and no other change."""
+    from kedge.plan.model import Briefing
+
+    return plan.model_copy(
+        update={
+            "briefing": Briefing(
+                purpose="Records the quarterly uplift applied to statutory accruals.",
+                sources=["Sign-off!A3:A4 (Purpose)"],
+            )
+        }
+    )
+
+
+def test_a_plan_the_scaffolder_would_trip_over_is_put_back_to_the_model() -> None:
+    """The whole point: the findings reach the model, not only the approval card."""
+    defective, analysis = _observed()
+    completer = ScriptedCompleter(
+        [
+            defective.to_draft().model_dump_json(),
+            _briefed(defective).to_draft().model_dump_json(),
+        ]
+    )
+
+    plan = propose_plan(analysis, completer=completer, model="m")
+
+    assert len(completer.requests) == 2, "the findings were never put back to the model"
+    asked = completer.requests[-1].messages[-1]["content"]
+    # Quoted verbatim rather than summarised. Each already names the field and the range, which
+    # is why they need no rewriting to become an instruction.
+    assert "kind: handoff" in asked
+    assert "Adjustment!G17:G92" in asked
+    assert "Fill `briefing`" in asked
+    assert "Sign-off!A3:A4" in asked
+    # And the amended plan is the one that comes back, because it carries fewer findings.
+    assert plan.briefing is not None
+
+
+def test_the_amendment_happens_once_however_stubborn_the_model_is() -> None:
+    """A model that ignored deterministic findings once will ignore them five times.
+
+    Every further round is a whole proposal's tokens spent re-reading the same sentences, and the
+    user's review is what catches it: the card still renders every warning.
+    """
+    defective, analysis = _observed()
+    completer = ScriptedCompleter([defective.to_draft().model_dump_json()] * 3)
+
+    plan = propose_plan(analysis, completer=completer, model="m", max_attempts=3)
+
+    assert len(completer.requests) == 2, "more than one amendment was attempted"
+    assert plan.briefing is None, "a tie keeps the first plan rather than churning"
+
+
+def test_an_amendment_that_will_not_load_loses_to_the_plan_already_in_hand() -> None:
+    """A valid plan is never thrown away for a failed repair of it.
+
+    Before the amendment pass a malformed response could only ever cost a *retry*. Now it can
+    arrive after something good, and losing the good one would make asking for the amendment a
+    worse move than never asking.
+    """
+    defective, analysis = _observed()
+    completer = ScriptedCompleter([defective.to_draft().model_dump_json(), "not json at all"])
+
+    plan = propose_plan(analysis, completer=completer, model="m", max_attempts=3)
+
+    assert plan.stages, "the valid plan was lost to a malformed amendment"
+    assert [stage.id for stage in plan.stages] == [stage.id for stage in defective.stages]
+
+
+def test_an_amendment_that_comes_back_worse_loses_too() -> None:
+    """Fewer findings wins, so the pass cannot make a plan worse than not running it."""
+    defective, analysis = _observed()
+    briefed = _briefed(defective)
+    completer = ScriptedCompleter(
+        [briefed.to_draft().model_dump_json(), defective.to_draft().model_dump_json()]
+    )
+
+    plan = propose_plan(analysis, completer=completer, model="m", max_attempts=3)
+
+    assert plan.briefing is not None, "the worse amendment was returned"
+
+
+def test_a_plan_with_nothing_to_repair_is_never_put_back_to_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cost is one extra call on a plan that needs it and nothing at all on a plan that does
+    not, which is what makes this affordable enough to leave on by default."""
+    import kedge.plan.propose as propose_module
+
+    defective, analysis = _observed()
+    monkeypatch.setattr(propose_module, "repairable_warnings", lambda *_args, **_kwargs: [])
+    completer = ScriptedCompleter([defective.to_draft().model_dump_json()])
+
+    propose_plan(analysis, completer=completer, model="m")
+
+    assert len(completer.requests) == 1
