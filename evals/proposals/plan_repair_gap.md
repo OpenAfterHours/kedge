@@ -213,9 +213,23 @@ it was given, and it should not be asked to.
 
 Ordered by rubric points per line of code.
 
-### A. Feed the warnings back to the proposer, before the card is drawn
+### A. Feed the warnings back to the proposer, before the card is drawn — **built**
 
 The single change this document is about.
+
+Built as `kedge.plan.review.repairable_warnings` plus an amendment pass inside `propose_plan`,
+through the retry loop and a new `propose_amend.md`. Four guarantees, each with a test:
+
+- the findings reach the model **verbatim**, field and range intact, because they were already
+  written in the imperative;
+- **one** amendment, never more -- the findings are deterministic, so a model that ignored them
+  once will ignore them five times, and the card still renders every warning;
+- a valid plan is **never thrown away**: an amendment that comes back malformed, or with more
+  findings than it started with, loses to the plan already in hand;
+- **nothing at all** is spent on a plan with no repairable findings.
+
+Not yet measured live: the yield needs a model call, so section 7's expectation stands until
+`--convert M --plan-from M` runs.
 
 Split `review_warnings` into two classes and act on one of them:
 
@@ -238,7 +252,18 @@ lost, and — because 4.2 is what stops the page — most of the 36 points curre
 Do it inside `propose_plan` rather than at the `plan/__init__.py` call site, so `kedge plan propose`,
 the hub and the eval sweep all get it without three copies of the decision.
 
-### B. Stop the head hand-in being a silent default
+### B. Stop the head hand-in being a silent default — **1 and 3 built, 2 open**
+
+Items 1 and 3 are built. A hub plan scaffolded with them scores **7/71 against 5/71 before**,
+with `a_blocked_step_says_which_step_it_is` going green; the reference is unchanged at 71/71.
+
+Item 2, the ordering, is not done. It is worth knowing why the obvious way to check it does not
+work yet: `progressive_disclosure` reads `STEPS_BEFORE_ANY_INPUT`, a hardcoded tuple of the
+*reference conversion's* cell names, so it can only pass for a notebook that happens to use them
+— the same coupling as the driving script, and part of the role-keyed work rather than of this
+item. Note also which way it fails: `MUST_BE_HIDDEN_AT_THE_START` names cells a hub notebook does
+not have, so the dangerous half of that grader passes **vacuously**. A hub conversion that really
+did render its re-extract before the update would not be caught today.
 
 Three separate things, all small:
 
