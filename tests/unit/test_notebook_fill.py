@@ -24,11 +24,14 @@ from conftest import approved_plan_store, make_analysis, make_approved_plan, mak
 from kedge import cli
 from kedge.agent.prompts import SYSTEM_PARTS, load_prompt
 from kedge.cli import app
+from kedge.errors import KedgeError
+from kedge.notebook.codegen import BUILTIN_NAMES, analyse_document, read_notebook
 from kedge.notebook.filedriver import FileNotebookDriver
 from kedge.notebook.fill import (
     FILL_PROMPT_PARTS,
     FillOutcome,
     FillReport,
+    PromptAssemblyError,
     convert_notebook,
     fill_holes,
     policy_rules,
@@ -393,6 +396,164 @@ def test_the_report_renders_every_attempt_rather_than_a_verdict() -> None:
     assert payload["cells"][0]["name"] == "alpha"
 
 
+# ── what may be filled, and what may never be touched ────────────────────────────────────────
+
+
+def test_a_finished_translation_carrying_a_reviewers_note_is_left_entirely_alone() -> None:
+    """The defect that cost a user their work: a note mentioning the marker read as a hole.
+
+    Everything above the note became the header, ``strip_marker`` deleted the note, and the
+    model's answer was appended under a translation that was now dead code -- with the name bound
+    twice in one cell, which the gate does not check for.
+    """
+    translated = ScaffoldCell(
+        name="apply_uplift",
+        code=(
+            "# Stage 2 of 8: apply_uplift\n"
+            "# Intent: apply the flat 4.5% uplift\n"
+            "apply_uplift = scope.with_columns(pl.col('accrual').xl.mul(1.045))\n"
+            "# TODO(kedge): E-12 still needs the statutory-only filter -- Phil, 2026-08\n"
+            "apply_uplift"
+        ),
+        stage_id="apply_uplift",
+    )
+    completer = Obliging()
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=completer,
+        cells=[translated],
+        analysis=make_analysis(),
+    )
+
+    assert completer.requests == [], "nobody should have been asked to write this cell"
+    assert report.holes == 0
+    assert report.codes == (translated.code,)
+    assert "Phil, 2026-08" in report.codes[0]
+
+
+def test_an_unnamed_cell_carrying_the_marker_is_never_asked_about() -> None:
+    """``_`` is cell-local to marimo, so no body can ever define it and every attempt is wasted.
+
+    Three completions burned per run, ``- _: rejected`` in the report naming nothing anybody can
+    act on, and the exit code pinned at 1 for ever.
+    """
+    completer = Obliging()
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=completer,
+        cells=[ScaffoldCell(name="_", code=one_hole("alpha")[0].code)],
+        analysis=make_analysis(),
+    )
+
+    assert completer.requests == []
+    assert report.holes == 0
+    assert report.complete
+
+
+def test_two_unnamed_cells_do_not_overwrite_one_anothers_bodies() -> None:
+    """Positions, not names. Every cell a user creates in marimo answers to ``_``.
+
+    A ``{name: index}`` map collapsed them onto one slot, so the body written for the ``_`` cell
+    at position 0 landed on the ``_`` cell at position 1 -- destroying ``second_name = 2``. The
+    name then vanished from the registry, and the gate accepted ``alpha = second_name`` against a
+    notebook that no longer defined it: a multiply-defined breach written to the file, past the
+    one check whose whole job is catching it.
+    """
+    cells = [
+        ScaffoldCell(name="_", code=one_hole("_")[0].code),
+        ScaffoldCell(name="_", code="second_name = 2"),
+        *one_hole("alpha"),
+    ]
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=Scripted("alpha = second_name"),
+        cells=cells,
+        analysis=make_analysis(),
+        max_attempts=1,
+    )
+
+    assert report.codes[1] == "second_name = 2", "the user's cell must survive untouched"
+    assert report.holes == 1, "only the named hole may be asked about"
+    assert report.cells[0].name == "alpha"
+    assert filled(report, "alpha").endswith("alpha = second_name")
+
+
+def test_a_body_that_leaves_the_marker_in_the_file_is_rejected() -> None:
+    """Accepted, reported FILLED, marker still on disk -- and truncated by the next run.
+
+    ``_without_echoed_header`` only strips a *leading* comment run, and ``FILL_TASK`` itself uses
+    the words "marked ``TODO(kedge)``", so a model mentioning it further down is entirely likely.
+    """
+    completer = Scripted(
+        'alpha = "TODO(kedge): ask Phil which entities are statutory-only"',
+        "alpha = 1  # eager on purpose: the frame is three rows",
+    )
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=completer,
+        cells=one_hole(),
+        analysis=make_analysis(),
+    )
+
+    cell = report.cells[0]
+    assert cell.attempts[0].stage == "marker"
+    assert cell.outcome is FillOutcome.FILLED
+    assert cell.tries == 2
+    assert not is_unwritten(filled(report, "alpha"))
+    assert "still carries a 'TODO(kedge)' marker" in completer.requests[1].messages[-1]["content"]
+
+
+def test_a_hole_that_never_passes_because_of_the_marker_keeps_the_placeholder() -> None:
+    marker_body = 'alpha = "TODO(kedge): come back to this"'
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=Scripted(marker_body),
+        cells=one_hole(),
+        analysis=make_analysis(),
+        max_attempts=2,
+    )
+
+    assert report.cells[0].outcome is FillOutcome.REJECTED
+    assert not report.complete
+
+
+# ── the small print ──────────────────────────────────────────────────────────────────────────
+
+
+def test_the_detail_line_does_not_claim_no_reply_held_a_body_when_one_did() -> None:
+    """It read the last attempt only, and printed a claim its own violation list contradicts."""
+    report = fill_holes(
+        make_approved_plan(),
+        completer=Scripted(PANDAS, ""),
+        cells=one_hole(),
+        analysis=make_analysis(),
+        max_attempts=2,
+    )
+
+    cell = report.cells[0]
+    assert cell.outcome is FillOutcome.EMPTY
+    assert "no cell body in any of" not in cell.detail
+    assert "1 rejected by the gate" in cell.detail
+    assert "polars, never pandas" in cell.detail
+
+
+def test_max_attempts_below_one_is_refused_rather_than_clamped() -> None:
+    """Zero would report every hole as having produced nothing, with no model ever asked."""
+    with pytest.raises(KedgeError, match="at least 1"):
+        fill_holes(
+            make_approved_plan(),
+            completer=Obliging(),
+            cells=one_hole(),
+            analysis=make_analysis(),
+            max_attempts=0,
+        )
+
+
 # ── the prompt ───────────────────────────────────────────────────────────────────────────────
 
 
@@ -422,9 +583,15 @@ def test_dropping_tools_does_not_drop_the_rules_the_gate_still_enforces() -> Non
 
 
 def test_policy_rules_refuses_to_invent_the_rules_when_the_heading_moves() -> None:
-    """Silently sending no rules is the exact failure the check exists to prevent."""
-    with pytest.raises(LookupError, match="POLICY_SOURCE"):
+    """Silently sending no rules is the exact failure the check exists to prevent.
+
+    A ``KedgeError`` as well as a ``LookupError``: the command line catches the first and nothing
+    else, so a bare ``LookupError`` reached the user as a traceback (CONVENTIONS "Errors").
+    """
+    with pytest.raises(PromptAssemblyError, match="POLICY_SOURCE"):
         policy_rules(("tools.md", "## Somewhere Else"))
+    assert issubclass(PromptAssemblyError, KedgeError)
+    assert issubclass(PromptAssemblyError, LookupError)
 
 
 def test_the_task_block_says_there_are_no_tools_after_every_shipped_part() -> None:
@@ -471,7 +638,17 @@ def test_a_missing_analysis_is_said_rather_than_guessed_at() -> None:
 # ── onto a notebook file ─────────────────────────────────────────────────────────────────────
 
 
-NOTEBOOK = """import marimo
+BARE_NOTEBOOK = """import marimo
+
+app = marimo.App(width="medium")
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+"""An app and not one cell: what ``kedge convert`` creates when there is no notebook yet."""
+
+NOTEBOOK_WITH_MO = """import marimo
 
 app = marimo.App(width="medium")
 
@@ -486,16 +663,35 @@ def _():
 if __name__ == "__main__":
     app.run()
 """
+"""A notebook that already binds ``mo`` -- the state ``kedge open`` leaves, and the state any user
+who has typed one line into marimo is in. ``kedge_setup`` imports ``mo`` too, so scaffolding onto
+this is refused. Used **only** by the test that asserts that refusal is not reported as a pass:
+using it as the general fixture is what let the defect ship."""
 
 
 @pytest.fixture
 def notebook(tmp_path: Path) -> Path:
     path = tmp_path / "process.py"
-    path.write_text(NOTEBOOK, encoding="utf-8")
+    path.write_text(BARE_NOTEBOOK, encoding="utf-8")
     return path
 
 
-async def test_convert_notebook_scaffolds_then_fills_and_writes_the_bodies(
+def undefined_names(path: Path) -> set[str]:
+    """Names the notebook's cells read and no cell defines.
+
+    The mechanism, rather than a proxy for it. "No ``TODO(kedge)`` and ``load_handin = 1`` is in
+    the file" was true of a notebook whose ``kedge_setup`` had been refused -- nothing imported,
+    every stage referencing a name that was never bound, and a test reporting success. A notebook
+    that cannot resolve its own references cannot run, whatever else is true of it.
+    """
+    document = read_notebook(path)
+    analyses, toplevel = analyse_document(document)
+    defined = set(toplevel) | {name for analysis in analyses for name in analysis.defs}
+    referenced = {name for analysis in analyses for name in analysis.refs}
+    return referenced - defined - BUILTIN_NAMES
+
+
+async def test_the_notebook_a_conversion_produces_defines_every_name_it_reads(
     notebook: Path,
 ) -> None:
     """The headless path end to end: no kernel, no marimo process, one file on disk."""
@@ -505,11 +701,41 @@ async def test_convert_notebook_scaffolds_then_fills_and_writes_the_bodies(
     report = await convert_notebook(plan, driver, completer=Obliging(), analysis=make_analysis())
 
     assert report.complete
+    assert report.refused == ()
     assert report.holes > 0
     assert set(report.written) == {cell.name for cell in report.cells}
+    assert undefined_names(notebook) == set()
     source = notebook.read_text(encoding="utf-8")
     assert TODO_MARKER not in source
-    assert "load_handin = 1" in source
+    assert "import polars as pl" in source
+
+
+async def test_a_cell_the_notebook_refuses_is_not_reported_as_a_finished_conversion(
+    tmp_path: Path,
+) -> None:
+    """The most dangerous failure mode in the project: a pass that was not earned.
+
+    ``complete`` used to be ``filled == holes`` -- a statement about holes, reported as a statement
+    about the notebook. A refused cell is not a hole and never becomes one, so every hole could be
+    filled perfectly over a notebook with nothing imported in it.
+    """
+    path = tmp_path / "process.py"
+    path.write_text(NOTEBOOK_WITH_MO, encoding="utf-8")
+
+    report = await convert_notebook(
+        make_approved_plan(),
+        FileNotebookDriver(path),
+        completer=Obliging(),
+        analysis=make_analysis(),
+    )
+
+    assert report.refused == ("kedge_setup",)
+    assert report.filled == report.holes, "every hole was filled; that is the point"
+    assert not report.complete
+    assert "kedge_setup" in report.summary_line()
+    missing = undefined_names(path)
+    assert "HANDIN_DIR" in missing, "kedge_setup defines it and kedge_setup was refused"
+    assert {"kedge", "datetime"} <= missing, "nothing the notebook needs is imported"
 
 
 async def test_a_cell_already_translated_is_never_asked_about_again(notebook: Path) -> None:
@@ -647,6 +873,30 @@ def test_convert_exits_non_zero_and_names_what_it_could_not_write(
     assert "cell(s) still to write" in flattened
     assert "load_handin: rejected" in flattened
     assert TODO_MARKER in cli._workspace_for(converting).notebook_path.read_text(encoding="utf-8")
+
+
+def test_convert_does_not_claim_success_over_a_notebook_that_refused_a_cell(
+    converting: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 1, the refusal named, and never "nothing is left unwritten".
+
+    ``_ensure_notebook`` only writes its own template when there is no file, so every user who
+    has opened their notebook once is on this path -- and one unnamed cell doing
+    ``import marimo as mo`` is the most likely thing in it.
+    """
+    notebook = cli._workspace_for(converting).notebook_path
+    notebook.parent.mkdir(parents=True, exist_ok=True)
+    notebook.write_text(NOTEBOOK_WITH_MO, encoding="utf-8")
+    pretend_endpoint(monkeypatch, Obliging())
+
+    result = CliRunner().invoke(app, ["-q", "convert", str(converting)])
+
+    flattened = " ".join(result.output.split())
+    assert result.exit_code == 1, result.output
+    assert "nothing is left unwritten" not in flattened
+    assert "cell(s) the notebook would not accept" in flattened
+    assert "kedge_setup" in flattened
+    assert "will not run as written" in flattened
 
 
 def test_convert_reports_a_dead_endpoint_as_a_dead_endpoint(

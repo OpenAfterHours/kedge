@@ -549,14 +549,47 @@ def _is(cell: CellFacts, target: str | None) -> bool:
     return target is not None and target in (cell.id, cell.name)
 
 
+def _usable(names: Iterable[str], bodies: Mapping[str, str] | None) -> Mapping[str, str] | None:
+    """``bodies`` if it accounts for every named cell the kernel has, else ``None``.
+
+    All or nothing, and the reason is a real failure mode rather than tidiness. marimo's autosave
+    is a bare ``write_text`` -- truncate, then write, with no temporary file and no rename -- so a
+    read that lands mid-save gets a *prefix* of the notebook, and a prefix of a marimo notebook is
+    very often still a valid marimo notebook: over the reference scaffold, 78 byte-prefixes parse
+    and 77 of them hold fewer holes than the whole file does. Nothing about that is an error, so
+    nothing raises; it is simply a smaller answer, and per-cell unknowns would let it through as
+    "2 of 24 cells are still unwritten placeholders" beside a file holding 11 cells.
+
+    Undercounting is the dangerous direction. The role prompt tells the model it is not finished
+    while the work list is non-empty, so a count that is too low ends the conversion early with
+    stages still passing their input through. The kernel's cell list is the authority on how many
+    cells there are, the file is the only thing that knows which are holes, and unless the second
+    covers the first there is no honest sentence to write -- so none is written.
+
+    The same rule catches the cases that are not races at all: a save that was skipped because the
+    generation had moved on, a name the file holds twice, a cell created since the last flush.
+
+    Args:
+        names: The cell names the kernel reports. Unnamed cells are ignored -- a file records no
+            cell ids, so they could never be matched and their absence proves nothing.
+        bodies: ``cell name -> source``, or ``None``.
+
+    Returns:
+        ``bodies`` when it covers every named cell, otherwise ``None``.
+    """
+    if not bodies:
+        return None
+    covered = all(name in bodies for name in names if name and name != "_")
+    return bodies if covered else None
+
+
 def _hole(name: str, bodies: Mapping[str, str] | None) -> bool | None:
     """Whether the cell called ``name`` is still a scaffolder hole, or ``None`` if nothing knows.
 
-    A miss is unknown rather than written, and the miss that matters is a cell the kernel has and
-    the file does not: one just created, whose body has not reached disk. Calling that finished
-    would be a guess in the direction that loses work.
+    Only ever asked of a mapping :func:`_usable` has already accepted, so a miss here is an
+    unnamed cell rather than a gap in the file.
     """
-    if not bodies or not name or name == "_":
+    if bodies is None or not name or name == "_":
         return None
     code = bodies.get(name)
     return None if code is None else is_unwritten(code)
@@ -572,6 +605,12 @@ class NotebookState:
     cells: tuple[CellFacts, ...] = ()
     cycles: tuple[tuple[str, ...], ...] = ()
     multiply_defined: tuple[str, ...] = ()
+    unwritten_from: Literal["kernel", "file"] | None = None
+    """Where :attr:`CellFacts.unwritten` was answered from, or ``None`` where it was not.
+
+    Carried because the two sources have different freshnesses and :meth:`render` has to say so:
+    the kernel's own listing is this turn, the notebook file is whenever it was last saved.
+    """
 
     @classmethod
     def from_graph(
@@ -586,15 +625,20 @@ class NotebookState:
         that costs nothing -- :func:`kedge.notebook.codegen.read_notebook` over the notebook
         file, which touches no kernel and records no read.
 
+        ``bodies`` is taken as a whole or not at all (:func:`_usable`): a file that does not
+        account for every named cell the graph has is a file that was read mid-save, and its
+        smaller answer would render as a confident undercount.
+
         Args:
             graph: The notebook's dataflow graph.
             bodies: ``cell name -> source``. Only named cells can be matched, since a file
                 records no cell ids.
 
         Returns:
-            The state, with :attr:`CellFacts.unwritten` answered for the cells ``bodies`` names
-            and left unknown for the rest.
+            The state, with :attr:`CellFacts.unwritten` answered from ``bodies`` where it covers
+            the graph, and left unknown throughout where it does not.
         """
+        usable = _usable((node.name for node in graph.nodes), bodies)
         return cls(
             cells=tuple(
                 CellFacts(
@@ -603,12 +647,13 @@ class NotebookState:
                     defs=tuple(node.defs),
                     refs=tuple(node.refs),
                     status=node.status,
-                    unwritten=_hole(node.name, bodies),
+                    unwritten=_hole(node.name, usable),
                 )
                 for node in graph.nodes
             ),
             cycles=tuple(tuple(cycle) for cycle in graph.cycles),
             multiply_defined=tuple(graph.multiply_defined),
+            unwritten_from=None if usable is None else "file",
         )
 
     @classmethod
@@ -619,7 +664,14 @@ class NotebookState:
 
         A listing may or may not carry source -- ``with_code=False`` is the option that leaves
         the staleness guard armed -- so a body on the listing answers
-        :attr:`CellFacts.unwritten` directly, and ``bodies`` answers it for the rest.
+        :attr:`CellFacts.unwritten` from the kernel directly, and ``bodies`` answers it, subject
+        to :func:`_usable`, for the rest.
+
+        The two have different freshnesses, so which one answered is recorded: a body from the
+        listing is this moment's kernel state, one from ``bodies`` is the notebook as last saved,
+        and :meth:`render` says which. Both shipped drivers return code for every cell or for
+        none, so in practice a listing is one or the other rather than a mixture; where it is a
+        mixture the kernel's claim wins, because it is the fresher of the two.
 
         Args:
             cells: The cells the kernel listed.
@@ -629,19 +681,26 @@ class NotebookState:
         Returns:
             The state.
         """
-        return cls(
-            cells=tuple(
-                CellFacts(
-                    id=cell.id,
-                    name=cell.name,
-                    status=cell.status,
-                    unwritten=(
-                        _hole(cell.name, bodies) if cell.code is None else is_unwritten(cell.code)
-                    ),
-                )
-                for cell in cells
+        listed = tuple(cells)
+        usable = _usable((cell.name for cell in listed), bodies)
+        facts = tuple(
+            CellFacts(
+                id=cell.id,
+                name=cell.name,
+                status=cell.status,
+                unwritten=(
+                    _hole(cell.name, usable) if cell.code is None else is_unwritten(cell.code)
+                ),
             )
+            for cell in listed
         )
+        from_kernel = any(cell.code is not None for cell in listed)
+        source: Literal["kernel", "file"] | None = None
+        if from_kernel:
+            source = "kernel"
+        elif usable is not None:
+            source = "file"
+        return cls(cells=facts, unwritten_from=source)
 
     @property
     def registry(self) -> NameRegistry:
@@ -687,7 +746,7 @@ class NotebookState:
         heading = (
             "## Live notebook state (cells from the kernel at the start of this turn; "
             "[unwritten] from the notebook file as last saved)"
-            if holes
+            if holes and self.unwritten_from == "file"
             else "## Live notebook state (read from the kernel at the start of this turn)"
         )
         lines = [

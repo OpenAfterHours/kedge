@@ -955,9 +955,11 @@
         el("p", {
           class: "decision-muted",
           text:
-            "No workbook analysis is loaded in this chat, so the coverage checks — operations " +
-            "claimed by no stage, and stage operation ids that are not in the analysis — did not " +
-            "run. The warnings above are the ones that need no analysis.",
+            "No workbook analysis is loaded in this chat, so the checks that read one did not " +
+            "run: operations claimed by no stage, stage operation ids that are not in the " +
+            "analysis, a write the workbook records that no stage hands over, and a briefing " +
+            "the workbook could have supplied. The warnings above are the ones that need no " +
+            "analysis.",
         }),
       );
     }

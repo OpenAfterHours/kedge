@@ -245,17 +245,26 @@ def test_every_scored_item_declares_a_weight(rubric: dict[str, Any]) -> None:
 def test_the_weights_still_lean_on_the_deterministic_tier(rubric: dict[str, Any]) -> None:
     """A plan that reads well and produces the wrong pennies has failed, and the weights say so.
 
-    The structural tier grew when it stopped grading the presence of a field and started grading
-    the shape the scaffolder consumes, which is a good reason to move a balance and a bad reason
-    to lose track of it. Asserted as a share rather than as a pair of totals, so adding an item is
-    allowed and tipping the rubric over is not.
+    The structural tier has grown twice -- once when it stopped grading the presence of a field
+    and started grading the shape the scaffolder consumes, and again for the item that grades
+    where a hand-in is emitted. Both were good reasons to move the balance and neither is a reason
+    to lose track of it.
+
+    Asserted as a **band**, because the bound this replaced (``deterministic > structural * 1.5``)
+    permitted anything from 60% to 100% and the README quotes one figure out of that range. A
+    range nobody can drift out of unnoticed is the point; the width is there so that adding a
+    two-point item does not fail a test for no reason.
     """
     weights = {
         tier: sum(int(item["weight"]) for item in rubric[tier])
         for tier in ("deterministic", "structural")
     }
+    share = weights["deterministic"] / sum(weights.values())
 
-    assert weights["deterministic"] > weights["structural"] * 1.5, weights
+    assert 0.60 <= share <= 0.66, (
+        f"the deterministic tier is {share:.1%} of the declared points ({weights}). The README "
+        f"quotes 62.5%; move both together or neither."
+    )
 
 
 def test_the_workbook_still_explains_itself_where_the_briefing_item_looks(cached: Any) -> None:

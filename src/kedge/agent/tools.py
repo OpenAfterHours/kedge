@@ -166,6 +166,24 @@ _BYTES_MARKER = (
     "slice, or use `probe` for an aggregate.]"
 )
 
+_HOLES_NEED_BODIES = (
+    "Drop `with_code: false`, or drop `unwritten: true` — they ask for opposite things and this "
+    "call cannot honour both.\n\n"
+    "`unwritten` finds the holes by the TODO(kedge) marker, which is in the source, so it has to "
+    "read every cell's code; reading a cell's code is exactly what records a read for marimo's "
+    "staleness guard, which is what stops a later `edit_cell` overwriting an edit the user made "
+    "while you were thinking. `with_code: false` exists to leave that guard armed. Doing both "
+    "would disarm it for the whole notebook and hand you a listing with no bodies in it.\n\n"
+    "`list_cells(unwritten=true)` gives the holes with their bodies, which is what you need — the "
+    "comment header in each one is the brief. `list_cells(with_code=false)` gives the cheap "
+    "structural listing of everything."
+)
+"""What ``list_cells`` says when asked to filter on the marker and not to read any source.
+
+Instruction first, reason after: a refusal that opens with why the rule exists tells a stuck
+caller nothing about what to type instead.
+"""
+
 _MAX_SAMPLE_COLUMNS = 40
 _PROBE_CODE_LIMIT = 4_000
 _DEFAULT_HEADER_ROW = 1
@@ -476,20 +494,25 @@ TOOL_SPECS: tuple[ToolSpec, ...] = (
             "list, cell= is one body."
         ),
         properties={
-            "cell": _string("One cell id or name. Omitted, every cell is listed."),
+            "cell": _string(
+                "One cell id or name. Omitted, every cell is listed. Names one cell outright, so "
+                "unwritten is not applied alongside it."
+            ),
             "with_code": {
                 "type": "boolean",
                 "description": (
                     "Include each cell's source. Default true. False gives a structural listing "
-                    "and leaves marimo's staleness guard armed for every cell."
+                    "and leaves marimo's staleness guard armed for every cell, so it cannot be "
+                    "combined with unwritten=true."
                 ),
             },
             "unwritten": {
                 "type": "boolean",
                 "description": (
                     "List only the cells the scaffolder left for you — the ones still carrying a "
-                    "TODO(kedge) marker. Default false. Finding them reads every cell's source, "
-                    "so the listing that comes back is also the read edit_cell requires."
+                    "TODO(kedge) marker. Default false. The marker is in the source, so this "
+                    "reads every cell's code and returns the holes' bodies: that is the read "
+                    "edit_cell requires, and it is why with_code=false is refused beside it."
                 ),
             },
         },
@@ -1316,10 +1339,26 @@ class ToolRegistry:
         """List the notebook, or the part of it the model asked for.
 
         The filter is not a convenience. A scaffolded runbook is twenty-odd cells and some
-        thirty thousand bytes of source, over half of it the fixed head, so the whole-notebook
-        listing arrives truncated at :data:`MAX_PAYLOAD_BYTES` -- and the tail it loses is
-        exactly where the untranslated stages sit. ``unwritten=true`` asks for those alone,
+        thirty thousand bytes of source, over half of it the fixed head, and the listing that
+        wraps it lands within a couple of thousand bytes of :data:`MAX_PAYLOAD_BYTES` either
+        way -- which side depends on how much of the graph is in hand, since the defs and refs
+        are added per cell from :attr:`_state`. So it is not reliably truncated and not reliably
+        under the cap either, which is the worst of both: the run that prompted this truncated at
+        exactly the cap with every hole in the severed tail, and a listing one stage smaller
+        would have fitted and told nobody anything. ``unwritten=true`` asks for the holes alone,
         which is both the smaller payload and the actual work list.
+
+        ``with_code=false`` is refused beside it rather than quietly overridden. The marker is in
+        the source, so the filter has to read every cell -- and on both bridges reading a cell's
+        code is what records a read for marimo's staleness guard, which is the whole mechanism
+        stopping a later ``edit_cell`` from overwriting what the user typed in the pane while the
+        model was thinking. Honouring ``with_code=false`` while reading anyway would disarm that
+        for the entire notebook and return a listing with no bodies in it to show for the trade,
+        and there would be nothing in the result to say so. The combination is no loss: without
+        bodies the holes' comment headers do not come back either, and those are the brief.
+
+        ``cell`` names one cell outright and takes precedence -- a request for one body is not a
+        request for a filtered listing -- which the schema says so the model is not guessing.
 
         There is no ``role`` filter to go with it, and there cannot honestly be one here:
         :class:`~kedge.notebook.model.CellInfo` carries no role, and the scaffolder's
@@ -1331,6 +1370,8 @@ class ToolRegistry:
         target = args.get("cell")
         with_code = bool(args.get("with_code", True))
         holes_only = bool(args.get("unwritten", False))
+        if holes_only and not target and "with_code" in args and not with_code:
+            return ToolResult.note(_HOLES_NEED_BODIES, ok=False, summary="conflicting arguments")
         if target:
             cell = await driver.get_cell(str(target))
             body = cell.code or "(no source was returned)"
@@ -1340,9 +1381,9 @@ class ToolRegistry:
             )
             return ToolResult.note(text, summary=f"read cell {cell.name or cell.id}")
 
-        # The marker is in the source, so selecting on it needs the source whatever the caller
-        # said about showing it.
-        cells = await driver.list_cells(with_code=with_code or holes_only)
+        # `holes_only` implies bodies, and the conflicting combination was refused above, so
+        # this never reads more than the caller was told it would.
+        cells = await driver.list_cells(with_code=with_code)
         known = {cell.id: cell for cell in (self._state.cells if self._state else ())}
         lines: list[str] = []
         shown = 0

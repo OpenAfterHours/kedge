@@ -684,18 +684,106 @@ async def test_the_hole_listing_is_a_fraction_of_the_whole_notebook(tmp_path: Pa
     assert holes.byte_count * 4 < everything.byte_count
 
 
-async def test_asking_for_the_holes_reads_the_source_even_when_bodies_are_not_wanted(
+_GUARDED_NOTEBOOK = """import marimo
+
+__generated_with = "0.23.15"
+app = marimo.App()
+
+
+@app.cell
+def seeded():
+    seeded_value = 1
+    return
+
+
+@app.cell
+def hole():
+    # TODO(kedge): translate this stage.
+    hole_value = seeded_value
+    return
+
+
+if __name__ == "__main__":
+    app.run()
+"""
+
+
+def _file_backed_tools(tmp_path: Path) -> tuple[ToolRegistry, Any]:
+    """A registry over a real file bridge, so the staleness guard is the real one."""
+    from kedge.notebook.filedriver import FileNotebookDriver
+
+    notebook = tmp_path / "notebook.py"
+    notebook.write_text(_GUARDED_NOTEBOOK, encoding="utf-8")
+    driver = FileNotebookDriver(notebook)
+    return _notebook_tools(NotebookState(), tmp_path / "plans", driver=driver), driver
+
+
+async def test_filtering_on_the_marker_without_bodies_is_refused_rather_than_overridden(
     tmp_path: Path,
 ) -> None:
-    """The marker is in the source, so selecting on it needs the source whatever else was asked."""
-    driver = ScaffoldedDriver()
-    tools = _notebook_tools(NotebookState(), tmp_path, driver=driver)
+    """The combination disarmed the guard for the whole notebook and showed nothing for it.
+
+    The marker is in the source, so `unwritten` has to read every cell's code -- and on both
+    bridges reading a cell's code is what records a read, which is what lets a later `edit_cell`
+    replace that cell. Honouring `with_code=false` while reading anyway meant the model was told
+    the guard was still armed, got no bodies back to show for the read, and could then overwrite
+    an edit the user had made in the pane while it was thinking. Asserted on the guard's actual
+    state, because asserting on the call is what pinned the defect as intended behaviour.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
 
     result = await tools.dispatch("list_cells", {"unwritten": True, "with_code": False})
 
-    assert driver.with_code_calls == [True]
-    assert "apply_uplift" in result.text
-    assert "```python" not in result.text
+    assert not result.ok
+    assert result.summary == "conflicting arguments"
+    # Instruction first: a stuck caller needs to know what to type, not only why.
+    assert result.text.startswith("Drop `with_code: false`")
+    # And the guard is exactly where `with_code=false` promised to leave it.
+    with pytest.raises(StaleCellError):
+        await driver.edit_cell("seeded", "seeded_value = 404")
+
+
+async def test_a_structural_listing_still_leaves_the_guard_armed(tmp_path: Path) -> None:
+    """The promise `with_code=false` makes, asserted at the tool rather than at the driver.
+
+    `test_filedriver.py` holds this for the bridge; nothing held it for the tool the model
+    actually calls, which is how the tool came to break it while that test stayed green.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
+
+    assert (await tools.dispatch("list_cells", {"with_code": False})).ok
+    with pytest.raises(StaleCellError):
+        await driver.edit_cell("seeded", "seeded_value = 404")
+
+
+async def test_the_hole_listing_returns_bodies_and_so_arms_the_edit_that_follows(
+    tmp_path: Path,
+) -> None:
+    """The other half of the trade, and the reason the combination above is no loss.
+
+    `unwritten=true` on its own returns the holes with their bodies -- the comment header in each
+    is the brief the model works from -- and that read is what `edit_cell` requires next.
+    """
+    tools, driver = _file_backed_tools(tmp_path)
+
+    result = await tools.dispatch("list_cells", {"unwritten": True})
+
+    assert result.ok
+    assert "TODO(kedge)" in result.text
+    assert "```python" in result.text
+    assert result.summary == "1 unwritten cell(s)"
+    assert "1. seeded" not in result.text, "the written cell is not part of the work list"
+    assert (await driver.edit_cell("hole", "hole_value = 2")).ok
+
+
+async def test_naming_one_cell_takes_precedence_over_the_filter(tmp_path: Path) -> None:
+    """Documented precedence rather than a silently ignored argument."""
+    tools, _ = _file_backed_tools(tmp_path)
+
+    result = await tools.dispatch("list_cells", {"cell": "seeded", "unwritten": True})
+
+    assert result.ok
+    assert "seeded_value = 1" in result.text
 
 
 async def test_a_notebook_with_no_holes_left_says_so_rather_than_returning_nothing(

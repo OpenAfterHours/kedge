@@ -139,6 +139,21 @@ def _refuse_confounded(parser: argparse.ArgumentParser, args: argparse.Namespace
             "--plan reads a plan off disk and --plan-from asks a model for one; pick one. The "
             "conversion is scaffolded from exactly one plan and the report has to say which."
         )
+    # A flag a mode silently ignores is worse than one it refuses. `--convert m --plan-from m
+    # --repeats 3` announced "2 model(s) x 3 repeat(s)" and then did one proposal and one pass,
+    # which is a cost estimate a reader would act on and a number that was never true.
+    if args.convert:
+        for flag, value, instead in (
+            ("--repeats", args.repeats != 1, "run the command again; a conversion is one pass"),
+            (
+                "--notebook",
+                args.notebook is not None,
+                "--out names where the conversion is written",
+            ),
+            ("--json", args.json, "the conversion report is text only; --json is the sweep's"),
+        ):
+            if value:
+                parser.error(f"{flag} does nothing with --convert. {instead.capitalize()}.")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -303,48 +318,78 @@ def _convert(args: argparse.Namespace, case: Any) -> int:
         print(f"{spec.name}: {resolved.failure.value} -- {resolved.detail}")
         return 1
 
-    plan_origin = ""
     planner_cost = ""
-    if planner is None:
-        plan = load_plan(args.plan or _reference_plan(case))
-        if plan is None:
-            msg = (
-                "no plan to convert: pass --plan, or put a plan.yaml beside the case's reference "
-                "conversion"
-            )
-            raise SystemExit(msg)
-    else:
-        _announce(f"one plan proposal with {planner.name}, before any cell is asked for")
-        plan, plan_origin, planner_cost, failure = _propose(args, planner)
-        if plan is None:
-            report = no_plan_proposed(case, plan_origin=plan_origin, detail=failure)
-            print(report.render())
-            if planner_cost:
-                print(f"\nplan seam cost: {planner_cost}")
-            return report.exit_code()
-        _keep_plan(args, plan)
+    completer = None
+    # Every exit below this point states what has already been billed, which is why the printing
+    # sits in a `finally` rather than after the conversion. A plan proposal costs money before a
+    # single cell is asked for, and a run that ended between the two -- refused, unreachable, or
+    # proposing something kedge will not scaffold -- used to report neither the reason nor the
+    # bill.
+    try:
+        if planner is None:
+            source = args.plan or _reference_plan(case)
+            plan = load_plan(source)
+            if plan is None:
+                msg = (
+                    "no plan to convert: pass --plan, or put a plan.yaml beside the case's "
+                    "reference conversion"
+                )
+                raise SystemExit(msg)
+            # Named on this path too. The structural tier is graded against *the plan*, so a
+            # plain --convert total is the model's cell bodies over a human's plan and a quarter
+            # of its points are the human's. That is the same confound --plan-from without
+            # --convert is refused for, only smaller, and a reader is owed the sentence either
+            # way rather than a caveat that appears on one mode and not the other.
+            plan_origin, plan_is_the_models = f"read from {source}", False
+        else:
+            _announce(f"one plan proposal with {planner.name}, before any cell is asked for")
+            plan, plan_origin, planner_cost, failure = _propose(args, planner)
+            plan_is_the_models = True
+            if plan is None:
+                report = no_plan_proposed(
+                    case, plan_origin=plan_origin, detail=failure, plan_is_the_models=True
+                )
+                print(report.render())
+                return report.exit_code()
+            _keep_plan(args, plan)
 
-    _announce(
-        f"one conversion with {spec.name}: a completion per scaffolded hole, plus a retry per "
-        f"validation failure"
-    )
-    completer = resolved.metered()
-    notebook = args.out or (EVAL_ROOT / args.case / f"converted-{_slug(args.convert)}.py")
-    report = convert_and_grade(
-        case,
-        plan,
-        completer=completer,
-        notebook=notebook,
-        model=args.convert,
-        temperature=args.temperature,
-        plan_origin=plan_origin,
-    )
-    print(report.render())
+        _announce(
+            f"one conversion with {spec.name}: a completion per scaffolded hole, plus a retry "
+            f"per validation failure"
+        )
+        completer = resolved.metered()
+        notebook = args.out or (EVAL_ROOT / args.case / f"converted-{_slug(args.convert)}.py")
+        report = convert_and_grade(
+            case,
+            plan,
+            completer=completer,
+            notebook=notebook,
+            model=args.convert,
+            temperature=args.temperature,
+            plan_origin=plan_origin,
+            plan_is_the_models=plan_is_the_models,
+        )
+        print(report.render())
+        return report.exit_code()
+    finally:
+        _report_cost(planner_cost, completer)
+
+
+def _report_cost(planner_cost: str, completer: Any) -> None:
+    """State what was billed, whatever the run did next.
+
+    Called from a ``finally``, so a conversion that ends at the plan still says what the proposal
+    cost. The bill arrives whether or not the run produced a report, and a mode that spends money
+    owes the reader that number on every path out of it -- including the ones that end in a
+    ``SystemExit``.
+    """
+    lines = []
     if planner_cost:
-        print(f"\nplan seam cost: {planner_cost}")
+        lines.append(f"plan seam cost: {planner_cost}")
     if completer is not None:
-        print(f"cell seam cost: {completer.usage.describe()} over {completer.seconds:.1f}s")
-    return report.exit_code()
+        lines.append(f"cell seam cost: {completer.usage.describe()} over {completer.seconds:.1f}s")
+    if lines:
+        print("\n" + "\n".join(lines))
 
 
 def plan_failure_detail(model: str, call: MeteredCall) -> str:
@@ -365,12 +410,22 @@ def plan_failure_detail(model: str, call: MeteredCall) -> str:
     Returns:
         One sentence for :attr:`~harness.convert.ConversionReport.detail`.
     """
-    blame = (
-        "the model's own output never validated as a plan"
-        if call.failure.about_the_model
-        else "a fact about the integration, the account or the endpoint -- not the model's "
-        "judgement, and not a conversion that graded badly"
-    )
+    from harness.live import Failure
+
+    if call.failure is Failure.TRIAGE_REFUSED:
+        # Its own bucket, and neither of the other two. The model was never asked: kedge read the
+        # workbook, decided it was not convertible, and declined to propose. Filing that under
+        # "the integration, the account or the endpoint" sends a reader to a proxy that answered
+        # nothing, and filing it under the model's judgement blames a model that never saw the
+        # question. The finding is about the workbook, or about triage.
+        blame = "kedge's own triage declined to plan this workbook; the model was never asked"
+    elif call.failure.about_the_model:
+        blame = "the model's own output never validated as a plan"
+    else:
+        blame = (
+            "a fact about the integration, the account or the endpoint -- not the model's "
+            "judgement, and not a conversion that graded badly"
+        )
     return f"no plan from {model}: {call.failure.value} ({blame}). {call.detail}".rstrip()
 
 

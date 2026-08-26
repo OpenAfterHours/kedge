@@ -36,6 +36,26 @@ def _tables(text: str) -> list[list[list[str]]]:
     return tables
 
 
+def _bullets(text: str) -> list[str]:
+    """Every markdown bullet in a document, each flattened onto one line.
+
+    Flattened because these prompts wrap at 100 columns, so a claim and the thing it is a claim
+    *about* routinely land on different lines. An assertion made per line passes or fails on where
+    the wrapping happens to fall, which is not the property anyone wants to hold.
+    """
+    bullets: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("- "):
+            bullets.append(line[2:].strip())
+        elif line.startswith("  ") and bullets:
+            bullets[-1] += " " + line.strip()
+        elif not line.strip():
+            continue
+        elif bullets:
+            bullets.append("")
+    return [bullet for bullet in bullets if bullet]
+
+
 def test_every_declared_part_exists_on_disk() -> None:
     for name in SYSTEM_PARTS:
         assert (PROMPTS_DIR / name).is_file(), f"{name} is declared in SYSTEM_PARTS but missing"
@@ -102,14 +122,37 @@ def test_every_list_cells_parameter_is_named_in_the_tool_prompt() -> None:
     `list_cells` is the tool the model reaches for first and the one whose result is capped
     hardest, so its parameters are the ones worth holding to the same rule as the tool list
     itself.
+
+    Matched as `name=` rather than as a bare substring, because a bare one is nearly vacuous
+    here: "cell" appears twenty-odd times in `tools.md` as an ordinary English word, so the
+    assertion passed whether or not the parameter was documented at all.
     """
     from kedge.agent.tools import TOOL_SPECS
 
     spec = next(item for item in TOOL_SPECS if item.name == "list_cells")
     tools = load_prompt("tools.md")
 
-    missing = [name for name in spec.properties if name not in tools]
+    missing = [name for name in spec.properties if f"{name}=" not in tools]
     assert not missing, f"list_cells parameters absent from tools.md: {missing}"
+
+
+def test_the_prompt_never_promises_the_guard_stays_armed_while_the_marker_is_filtered_on() -> None:
+    """The two promises used to sit in one paragraph with nothing saying which wins.
+
+    `unwritten=true` has to read every cell's source to find the markers, and reading source is
+    what records a read for marimo's staleness guard -- the mechanism that stops a later
+    `edit_cell` overwriting what the user typed in the pane. `with_code=false` exists to leave
+    that guard armed. A model told to narrow its request will combine them, so the prompt has to
+    say the combination is refused rather than leave it to be discovered.
+    """
+    bullets = _bullets(load_prompt("tools.md"))
+
+    armed = next(item for item in bullets if "leaves the staleness guard armed" in item)
+    assert "with_code=false" in armed
+    assert "unwritten" not in armed, "the armed-guard promise must not be attached to `unwritten`"
+
+    filtered = next(item for item in bullets if "unwritten=true" in item)
+    assert "`with_code=false` is refused" in filtered
 
 
 def test_system_prompt_states_the_marimo_single_definition_rule_and_the_escape_hatch() -> None:

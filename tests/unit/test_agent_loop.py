@@ -1003,13 +1003,19 @@ async def test_a_file_that_cannot_be_read_leaves_the_flag_silent(
     assert "unwritten" not in rendered
 
 
-async def test_a_cell_the_kernel_has_and_the_file_does_not_is_left_unknown(
+async def test_a_file_that_does_not_account_for_every_cell_silences_the_whole_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The worst case to guess on: a cell just created, whose body has not reached disk.
+    """A file the kernel has outgrown is not a partial answer, it is an untrustworthy one.
 
-    Read as written it drops off the work list; read as a hole it invites the model to overwrite
-    a cell it has just finished. Unknown is the only honest answer.
+    Two ways to reach it and the same rule serves both. A cell the kernel has and the file does
+    not is one just created, whose body has not reached disk. A file read mid-save is a *prefix*
+    -- marimo's autosave truncates and writes with no temporary file -- and a prefix of a marimo
+    notebook usually still parses as one, so it comes back short with nothing raised. Flagging
+    per cell would let the second through as a confident undercount, and the role prompt tells
+    the model it is not finished while the work list is non-empty: a short count ends the
+    conversion with stages still passing their input through. So coverage is all or nothing, and
+    the block says nothing at all.
     """
     renamed = _SCAFFOLDED.replace("def imports():", "def imports_only():")
     workspace = _workspace_with_notebook(tmp_path, monkeypatch, renamed)
@@ -1017,8 +1023,25 @@ async def test_a_cell_the_kernel_has_and_the_file_does_not_is_left_unknown(
 
     state = await agent._notebook_state()
 
-    assert [cell.unwritten for cell in state.cells] == [None, True]
-    assert "1 of 2 cells are still unwritten" in state.render()
+    assert [cell.unwritten for cell in state.cells] == [None, None]
+    assert state.render() == NotebookState.from_graph(await FakeDriver().read_graph()).render()
+
+
+async def test_a_name_the_file_holds_twice_is_dropped_rather_than_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ambiguity is unknown, never a coin toss.
+
+    Building the map last-wins answered a question about a cell nobody can say is *the* cell of
+    that name -- and answered it ``False`` as often as not, which is the direction that loses
+    work. Dropping the name also stops the map covering the kernel's cell list, so the same rule
+    that catches a half-written file catches this one.
+    """
+    duplicated = _SCAFFOLDED.replace("def imports():", "def load_handin():", 1)
+    workspace = _workspace_with_notebook(tmp_path, monkeypatch, duplicated)
+    agent = build(ScriptedClient([]), context=ToolContext(driver=FakeDriver(), workspace=workspace))
+
+    assert "unwritten" not in (await agent._notebook_state()).render()
 
 
 async def test_reading_the_bodies_never_asks_the_kernel_for_them(

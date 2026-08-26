@@ -69,12 +69,13 @@ from kedge.agent.validate import (
     ValidationReport,
     validate_cell,
 )
+from kedge.errors import NotebookError
 from kedge.notebook.codegen import analyse_cells
 from kedge.notebook.scaffold import (
     TODO_MARKER,
     ScaffoldCell,
     build_cells,
-    holes_in,
+    is_unwritten,
     split_hole,
     strip_marker,
     sync_notebook,
@@ -101,6 +102,7 @@ __all__ = [
     "FillOutcome",
     "FillReport",
     "FilledCell",
+    "PromptAssemblyError",
     "cell_messages",
     "convert_notebook",
     "fill_holes",
@@ -109,6 +111,17 @@ __all__ = [
 ]
 
 _FENCE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
+
+
+class PromptAssemblyError(NotebookError, LookupError):
+    """The prompt cannot be assembled from the shipped parts, so nothing is sent.
+
+    Both bases earn their place. :class:`~kedge.errors.NotebookError` is what CONVENTIONS asks
+    for and what makes this reach the command line as a message rather than a traceback --
+    ``kedge convert`` catches ``KedgeError`` and nothing else. ``LookupError`` is what it
+    actually is: a heading that is no longer in the file. Callers written against either one
+    keep working.
+    """
 
 
 # =============================================================================
@@ -146,9 +159,9 @@ def policy_rules(source: tuple[str, str] = POLICY_SOURCE) -> str:
         The section, heading line included, exactly as the shipped file holds it.
 
     Raises:
-        LookupError: when the heading is not in the file. A prompt assembled without the rules
-            would run and would refuse cells it never warned about; refusing to build one is the
-            whole point of checking.
+        PromptAssemblyError: when the heading is not in the file. A prompt assembled without the
+            rules would run and would refuse cells it never warned about; refusing to build one is
+            the whole point of checking.
     """
     name, heading = source
     text = load_prompt(name)
@@ -161,7 +174,7 @@ def policy_rules(source: tuple[str, str] = POLICY_SOURCE) -> str:
             f"rules live now -- do not restate them here, or `kedge convert` will start rejecting "
             f"cells it never warned about."
         )
-        raise LookupError(msg)
+        raise PromptAssemblyError(msg)
     end = next(
         (index for index in range(start + 1, len(lines)) if lines[index].startswith(("## ", "# "))),
         len(lines),
@@ -216,7 +229,8 @@ def system_prompt(*, parts: Sequence[str] = FILL_PROMPT_PARTS, extra: Sequence[s
         :func:`~kedge.agent.prompts.build_system_prompt`.
 
     Raises:
-        LookupError: when the policy rules can no longer be quoted. See :func:`policy_rules`.
+        PromptAssemblyError: when the policy rules can no longer be quoted. See
+            :func:`policy_rules`.
     """
     return build_system_prompt(parts=parts, extra=(FILL_TASK, policy_rules(), *extra))
 
@@ -418,6 +432,16 @@ class FillReport:
     Carried rather than logged because a cell the scaffolder could not write is not a hole and
     never reaches the loop below -- so a conversion that reports only on holes reports nothing
     at all about the one part of the notebook it silently failed to produce."""
+    refused: tuple[str, ...] = ()
+    """Cells the notebook would not accept when the plan was scaffolded into it.
+
+    A refusal is not a hole and never becomes one, which is exactly why it has to be carried
+    here. ``kedge_setup`` is refused whenever the notebook already binds ``mo`` -- one unnamed
+    cell doing ``import marimo as mo``, the single most likely thing a user types -- and it is
+    the cell that imports ``pl``, ``kedge.xl``, ``kedge.sql`` and every path constant below it.
+    Every hole can then be filled perfectly and the notebook still not run. :attr:`complete`
+    reads this for that reason: "nothing is left unwritten" over a notebook that cannot execute
+    is a pass it has not earned."""
 
     @property
     def holes(self) -> int:
@@ -456,13 +480,21 @@ class FillReport:
 
     @property
     def complete(self) -> bool:
-        """Whether every hole was filled. Not the same question as whether it converted well.
+        """Whether the notebook now holds the whole plan. Not whether it converted *well*.
+
+        Two conditions, and the second was missing: every hole filled, **and** no cell the
+        scaffolder could not write. A refused cell is not a hole -- it never reaches the loop --
+        so ``filled == holes`` was a statement about holes reported as a statement about the
+        notebook, and a conversion whose ``kedge_setup`` was refused exited 0 saying "nothing is
+        left unwritten" over a file where nothing was imported and every stage referenced a name
+        that was never bound. Reconciliation's rule, one layer up: never report a pass that was
+        not earned.
 
         True for a plan with no holes at all, which is honest -- there was nothing to leave
         unwritten -- and is why a caller reporting a conversion checks :attr:`holes` separately. A
         conversion that asked the model nothing has measured nothing.
         """
-        return self.filled == self.holes
+        return self.filled == self.holes and not self.refused
 
     def counts(self) -> dict[str, int]:
         """One count per :class:`FillOutcome`, every member present even at zero.
@@ -475,13 +507,22 @@ class FillReport:
         return tally
 
     def summary_line(self) -> str:
-        """The one line a caller prints when it prints nothing else."""
+        """The one line a caller prints when it prints nothing else.
+
+        A refusal is named here rather than only in :attr:`scaffolded_summary`, because this is
+        the line that gets quoted and that one is the line that gets skipped.
+        """
         tally = ", ".join(f"{count} {name}" for name, count in self.counts().items() if count)
         detail = f" ({tally})" if tally else ""
+        refused = (
+            f"; {len(self.refused)} cell(s) the notebook refused: " + ", ".join(self.refused)
+            if self.refused
+            else ""
+        )
         return (
             f"{self.filled}/{self.holes} hole(s) filled{detail}; "
             f"{self.first_time} first time, {self.after_retries} after retries, "
-            f"{self.completions} completion(s) over {self.seconds:.1f}s"
+            f"{self.completions} completion(s) over {self.seconds:.1f}s{refused}"
         )
 
     def render(self) -> str:
@@ -500,7 +541,8 @@ class FillReport:
             "seconds": round(self.seconds, 3),
             "counts": self.counts(),
             "written": list(self.written),
-            "scaffolded": self.scaffolded_summary,
+            "scaffold_summary": self.scaffolded_summary,
+            "refused": list(self.refused),
             "cells": [
                 {
                     "name": cell.name,
@@ -590,16 +632,126 @@ def _undefined_name(report: ValidationReport, hole: ScaffoldCell) -> tuple[str, 
     )
 
 
-def _missing_name_verdict(hole: ScaffoldCell, violations: tuple[str, ...]) -> str:
+_SURVIVING_MARKER_STAGE = "marker"
+"""The second check this driver makes that the shipped gate does not. See :func:`_surviving_marker`."""
+
+
+def _surviving_marker(code: str) -> tuple[str, ...]:
+    """Refuse an otherwise-acceptable body that leaves the marker in the file.
+
+    The driver's own invariant, and the cheapest one it has: **nothing it writes may read as
+    unwritten**. A cell that did was accepted, reported FILLED, and then counted as a hole for
+    ever -- and truncated at the marker by the next conversion, with the accepted body written
+    over. ``FILL_TASK`` says "marked ``TODO(kedge)``" in as many words, so a model repeating those
+    characters back is not a remote possibility.
+
+    Most shapes are caught before this: :func:`_without_echoed_header` drops a header the model
+    repeated back, and the seam no longer reads a trailing ``#`` comment mentioning the marker as
+    a hole at all. What is left is the marker reaching the file *outside* a Python comment --
+    ``alpha = "TODO(kedge): ask Phil which entities"`` -- which is the one shape
+    :func:`~kedge.notebook.scaffold.is_unwritten` must keep treating as unwritten, because it is
+    how a hand-off with no statement is written.
+
+    Checked on the spliced cell rather than on the reply, because the header kedge keeps is part
+    of what lands on disk.
+
+    Args:
+        code: The cell as it would be written, header included.
+
+    Returns:
+        One violation, or nothing when the marker is gone.
+    """
+    if not is_unwritten(code):
+        return ()
+    return (
+        f"marker: the cell still carries a '{TODO_MARKER}' marker, which is how kedge counts what "
+        f"a notebook has left to write -- a finished cell that keeps one reads as unfinished for "
+        f"ever and is truncated at it by the next run. Say what you mean without those characters.",
+    )
+
+
+def _rejection(hole: ScaffoldCell, violations: tuple[str, ...]) -> str:
     """The block returned to the model, matching ``ValidationReport.render``'s shape."""
     return "\n".join(
         [
-            f"The cell was rejected: it does not define '{hole.name}'. Fix the cause and "
-            f"resubmit; you have a limited number of attempts.",
+            f"The cell '{hole.name}' was rejected. Fix the cause and resubmit; you have a limited "
+            f"number of attempts.",
             "",
             *(f"  - {message}" for message in violations),
         ]
     )
+
+
+def _unfilled_detail(attempts: Sequence[FillAttempt], last: FillOutcome) -> str:
+    """Why a hole was left unfilled, in terms of what actually happened to it.
+
+    It used to read the last attempt only, so a hole whose first reply was rejected and whose
+    second was blank was reported as "no cell body in any of 2 reply(ies)" -- a false statement
+    about the run, printed next to a violation list that contradicts it. Both counts are given
+    now, and the "any of" claim is made only when it is true.
+    """
+    total = len(attempts)
+    rejected = [attempt for attempt in attempts if attempt.violations]
+    blank = [
+        attempt
+        for attempt in attempts
+        if attempt.error is None and not attempt.violations and not attempt.code.strip()
+    ]
+    if last is FillOutcome.REJECTED:
+        return f"the gate rejected {len(rejected)} of {total} attempt(s); last: " + "; ".join(
+            attempts[-1].violations[:3]
+        )
+    if rejected:
+        return (
+            f"{total} attempt(s): {len(rejected)} rejected by the gate, {len(blank)} holding no "
+            f"cell body, the last of them blank; last rejection: "
+            + "; ".join(rejected[-1].violations[:3])
+        )
+    return f"no cell body in any of {total} reply(ies)"
+
+
+def _fillable(cells: Sequence[ScaffoldCell]) -> tuple[tuple[int, ScaffoldCell], ...]:
+    """The holes this driver can actually write, each with its **position** in the notebook.
+
+    Positions, not names. Keying anything by cell name assumes names are unique and they are not:
+    every cell a user creates in marimo is ``def _()``, and the file bridge reports that name as
+    ``"_"`` rather than as blank. Two such cells collapsed a ``{name: index}`` map to one entry,
+    so the second cell's filled body was written over the first's slot -- a name vanished from the
+    registry, and the gate then accepted a later cell redefining it. A multiply-defined breach
+    written to the file, past the one check whose whole job is catching it.
+
+    Two kinds of hole are skipped, both because there is nothing safe to write:
+
+    * **A cell with no public name of its own.** ``_`` and anything underscore-prefixed is
+      cell-local to marimo, so :func:`~kedge.agent.validate.validate_cell` can never see it
+      defined and the driver would spend every attempt rejecting a body for not defining a name
+      it is not allowed to define -- then report ``- _: rejected``, which names nothing anybody
+      can act on, and repeat it on every later run. kedge emits no unnamed cell, so a marker in
+      one came from somewhere else.
+    * **A hole :func:`~kedge.notebook.scaffold.split_hole` will not split.** A hand-off whose
+      statement is itself the marker has no placeholder body; asking a model to replace "the rest
+      of the cell" would take the display block with it.
+
+    Args:
+        cells: The notebook's cells, in order.
+
+    Returns:
+        ``(position, cell)`` for each fillable hole, in the scaffolder's own order.
+    """
+    fillable: list[tuple[int, ScaffoldCell]] = []
+    for position, cell in enumerate(cells):
+        # `holes_in`'s own predicate, applied positionally. Calling it and then looking the
+        # results back up by name is what created the collision this function exists to avoid.
+        if not is_unwritten(cell.code):
+            continue
+        if not cell.name or cell.name.startswith("_") or not cell.name.isidentifier():
+            logger.info("cell %r carries the marker but has no public name to fill", cell.name)
+            continue
+        if not split_hole(cell.code)[0]:
+            logger.info("cell %s carries the marker but has no placeholder to replace", cell.name)
+            continue
+        fillable.append((position, cell))
+    return tuple(fillable)
 
 
 def _registry_for(names: Sequence[str], codes: Sequence[str]) -> NameRegistry:
@@ -653,8 +805,10 @@ def fill_holes(
             The plan is scaffolded afresh when this is omitted.
         model: The model name put on the request. The completer may override it.
         temperature: Sent on every request, subject to the completer's own negotiation.
-        max_attempts: How many times one hole may be resubmitted after a rejection. Defaults to
-            :data:`~kedge.agent.validate.MAX_VALIDATION_ATTEMPTS`.
+        max_attempts: How many times one hole may be put to the model in **total**, the first ask
+            included -- not how many retries follow a rejection. Defaults to
+            :data:`~kedge.agent.validate.MAX_VALIDATION_ATTEMPTS`. Below 1 is refused rather than
+            clamped: it would report every hole as unfilled with no model ever asked.
         policy: What generated code may reach for. Defaults to the shipped default -- no network,
             no database, no writes outside the working directory. Whatever is passed, the model is
             told what it refuses: see :func:`policy_rules`.
@@ -683,9 +837,16 @@ def fill_holes(
             contract_path=contract_path,
         )
     )
+    if max_attempts < 1:
+        msg = (
+            f"max_attempts is {max_attempts}; it is the total number of times one hole may be put "
+            f"to the model, so it has to be at least 1. Zero would report every hole as having "
+            f"produced no cell body without a model ever having been asked."
+        )
+        raise NotebookError(msg)
+
     names = [cell.name for cell in scaffolded]
     codes = [cell.code for cell in scaffolded]
-    positions = {cell.name: index for index, cell in enumerate(scaffolded)}
     rounding = RoundingContext.from_analysis(analysis)
     resolved_policy = policy or Policy()
 
@@ -693,7 +854,7 @@ def fill_holes(
     started = time.perf_counter()
     completions = 0
     abandoned = False
-    for hole in holes_in(scaffolded):
+    for position, hole in _fillable(scaffolded):
         if abandoned:
             results.append(
                 FilledCell(
@@ -720,7 +881,7 @@ def fill_holes(
         )
         results.append(result)
         completions += result.tries
-        codes[positions[hole.name]] = result.code
+        codes[position] = result.code
         abandoned = stop_on_error and result.outcome is FillOutcome.ERROR
 
     seconds = time.perf_counter() - started
@@ -819,11 +980,14 @@ def _fill_one(
             frame_names=registry.frame_names(),
         )
         missing = _undefined_name(report, hole)
-        violations = report.messages or missing
+        surviving = _surviving_marker(code)
+        violations = report.messages or missing or surviving
         if report.stage is not None:
             stage: str | None = report.stage.value
         elif missing:
             stage = _MISSING_NAME_STAGE
+        elif surviving:
+            stage = _SURVIVING_MARKER_STAGE
         else:
             stage = None
         attempts.append(
@@ -844,15 +1008,10 @@ def _fill_one(
                 attempts=tuple(attempts),
             )
         last = FillOutcome.REJECTED
-        verdict = report.render() if report.messages else _missing_name_verdict(hole, missing)
+        verdict = report.render() if report.messages else _rejection(hole, violations)
         history.extend([("assistant", body), ("user", verdict)])
 
-    detail = (
-        f"the gate rejected every one of {len(attempts)} attempt(s); last: "
-        + "; ".join(attempts[-1].violations[:3])
-        if last is FillOutcome.REJECTED
-        else f"no cell body in any of {len(attempts)} reply(ies)"
-    )
+    detail = _unfilled_detail(attempts, last)
     logger.info("cell %s left unfilled: %s", hole.name, detail)
     return FilledCell(
         name=hole.name,
@@ -906,7 +1065,7 @@ async def convert_notebook(
         analysis: The workbook analysis, pinned into every request.
         model: The model name put on each request.
         temperature: Sent on every request.
-        max_attempts: Attempts per hole, including validation repairs.
+        max_attempts: Total attempts per hole, the first ask included. See :func:`fill_holes`.
         policy: What generated code may reach for.
         stop_on_error: Abandon the run the first time the endpoint fails. See :func:`fill_holes`.
         sync: Scaffold the plan into the notebook first. Off leaves the file exactly as it is and
@@ -916,12 +1075,14 @@ async def convert_notebook(
         contract_path: Where the hand-in contract lives.
 
     Returns:
-        The :class:`FillReport`, with :attr:`FillReport.written` naming the cells spliced back in.
+        The :class:`FillReport`, with :attr:`FillReport.written` naming the cells spliced back in
+        and :attr:`FillReport.refused` naming any the notebook would not accept at all.
 
     Raises:
         PlanNotApprovedError: when the plan is not approved.
     """
     summary = ""
+    refused: tuple[str, ...] = ()
     if sync:
         result = await sync_notebook(
             plan,
@@ -931,6 +1092,17 @@ async def convert_notebook(
             contract_path=contract_path,
         )
         summary = result.summary(plan.version)
+        # A refusal is carried out of here rather than logged and forgotten. It is not a hole and
+        # never becomes one, so nothing the loop below reports can mention it -- and the cell most
+        # likely to be refused is the one that imports everything the rest of the notebook uses.
+        refused = tuple(cell.name for cell in result.cells if cell.outcome == "refused")
+        if refused:
+            logger.warning(
+                "the notebook refused %d cell(s) of plan v%d: %s",
+                len(refused),
+                plan.version,
+                ", ".join(refused),
+            )
         logger.info("scaffolded before filling: %s", summary)
 
     # `with_code=True` deliberately: the bodies are what a hole is found in, and reading them
@@ -986,4 +1158,5 @@ async def convert_notebook(
         completions=report.completions,
         written=tuple(written),
         scaffolded_summary=summary,
+        refused=refused,
     )

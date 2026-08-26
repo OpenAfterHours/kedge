@@ -17,7 +17,9 @@ count of what is left is wrong.
 
 from __future__ import annotations
 
-from conftest import make_approved_plan
+import ast
+
+from conftest import make_approved_plan, make_draft
 from kedge.notebook.scaffold import (
     TODO_MARKER,
     ScaffoldCell,
@@ -27,6 +29,7 @@ from kedge.notebook.scaffold import (
     split_hole,
     strip_marker,
 )
+from kedge.plan.model import SourceOrigin, Stage, StageKind, StageSource
 
 
 def scaffolded() -> list[ScaffoldCell]:
@@ -49,9 +52,44 @@ def test_a_body_with_no_marker_is_written() -> None:
     assert not is_unwritten("# Stage 1 of 4: load\nload = handin_frame")
 
 
-def test_the_marker_is_found_anywhere_in_the_body_not_only_at_the_top() -> None:
-    """Found by the marker rather than by position, so a fourth emitter is counted for free."""
-    assert is_unwritten(f"x = 1\n# {TODO_MARKER}: finish this off\n")
+def test_a_humans_note_below_a_finished_translation_is_not_a_hole() -> None:
+    """The defect a substring test caused, and it cost a user their work.
+
+    A finished translation carrying a reviewer's note read as a hole: everything above the note
+    became the header, ``strip_marker`` deleted the note, and a model's answer was appended below
+    a translation that was now dead code.
+    """
+    translated = (
+        "# Stage 2 of 8: apply_uplift\n"
+        "apply_uplift = scope.with_columns(pl.col('accrual').xl.mul(1.045))\n"
+        f"# {TODO_MARKER}: E-12 still needs the statutory-only filter -- Phil, 2026-08\n"
+        "apply_uplift"
+    )
+
+    assert not is_unwritten(translated)
+    assert split_hole(translated) == ("", translated)
+
+
+def test_a_trailing_comment_mentioning_the_marker_is_not_a_hole() -> None:
+    assert not is_unwritten(
+        f"alpha = 1  # {TODO_MARKER} asked for a LazyFrame; this one is eager on purpose"
+    )
+
+
+def test_the_marker_embedded_in_a_statement_is_still_a_hole_but_cannot_be_split() -> None:
+    """The third emitter: a hand-off the plan gave no statement writes it into the literal.
+
+    Still unwritten -- there is no statement to hand anybody -- but there is no placeholder a
+    splice could replace, so ``split_hole`` refuses and nothing may overwrite it.
+    """
+    handoff = (
+        "update_statement = "
+        f"'-- {TODO_MARKER}: the plan marked this stage a hand-off but supplied no statement.'\n"
+        "mo.vstack([])"
+    )
+
+    assert is_unwritten(handoff)
+    assert split_hole(handoff) == ("", handoff)
 
 
 # ── holes_in ─────────────────────────────────────────────────────────────────────────────────
@@ -154,3 +192,57 @@ def test_a_filled_cell_stops_reading_as_a_hole() -> None:
 
     assert not is_unwritten(spliced)
     assert holes_in([ScaffoldCell(name=hole.name, code=spliced)]) == ()
+
+
+# ── plan text reaching generated code ────────────────────────────────────────────────────────
+
+
+def test_a_handin_ref_with_a_quote_a_newline_and_a_backslash_still_scaffolds() -> None:
+    """Plan text interpolated into a quoted literal is the same bug as SQL by concatenation.
+
+    ``label="Drop {label} here"`` closed its own literal the moment somebody called a re-extract
+    ``the "after" extract`` -- an entirely ordinary thing to write -- and the whole scaffold died
+    with ``cell 'post_adjustment_input' would not parse``. Non-negotiable 3, with Python in the
+    place of SQL.
+    """
+    hostile = 'the "after" extract\nfrom \\\\server\\share'
+    plan = make_approved_plan(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_handin",
+                    intent="Read the first extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN)],
+                ),
+                Stage(
+                    id="reextract",
+                    intent="Read the extract taken after the update",
+                    kind=StageKind.LOAD,
+                    depends_on=["load_handin"],
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref=hostile)],
+                ),
+            ],
+            dropped=[],
+        )
+    )
+
+    cells = build_cells(plan)
+
+    for cell in cells:
+        ast.parse(cell.code)  # `build_cells` checks this too; assert it rather than trust it
+    selector = next(cell for cell in cells if cell.name == "reextract_input")
+    assert f"Drop {hostile} here" in string_literals(selector.code), (
+        "the label has to survive intact, not merely fail to break the parse"
+    )
+    receipt = next(cell for cell in cells if cell.name == "reextract_handin")
+    assert f"**{hostile}**" in string_literals(receipt.code)
+
+
+def string_literals(code: str) -> set[str]:
+    """Every string constant in a cell, read out of its AST rather than off its text."""
+    return {
+        node.value
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }

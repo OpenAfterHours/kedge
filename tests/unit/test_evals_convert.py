@@ -212,7 +212,7 @@ could not reach, so they came back SKIP and FAIL for reasons that had nothing to
 model. They are graded now.
 """
 
-TIER_SCORES = {"deterministic": (42, 45), "structural": (23, 23)}
+TIER_SCORES = {"deterministic": (42, 45), "structural": (26, 26)}
 """Exactly what the reference bodies score, per tier: ``(earned, available)``.
 
 An exact pair rather than a bound on the failures. ``KNOWN_STRUCTURAL_GAPS`` bounds only what
@@ -1022,33 +1022,54 @@ def test_stopped_is_decided_from_the_run_and_not_from_a_sentence_about_it() -> N
 # filed as a model that writes bad cells.
 
 
-def test_a_composed_score_says_so_where_the_score_is(reference_conversion: Any) -> None:
-    """The gold-plan report says nothing extra; the composed one cannot be read as it.
-
-    Both totals are out of the same rubric and they measure different things -- one the cell
-    bodies against a human's plan, the other a whole conversion -- so the only thing between a
-    reader and treating them as comparable is a line that says they are not. It sits above the
-    score rather than in a footnote for that reason.
-    """
+def _relabelled(report: Any, **changes: Any) -> Any:
     from harness.convert import ConversionReport
 
-    assert "COMPOSED PATH" not in reference_conversion.headline()
-
-    composed = ConversionReport(
-        case=reference_conversion.case,
-        result=reference_conversion.result,
-        outcome=reference_conversion.outcome,
-        report=reference_conversion.report,
-        plan_origin="proposed by some-model",
+    return ConversionReport(
+        case=report.case,
+        result=report.result,
+        outcome=report.outcome,
+        report=report.report,
+        **changes,
     )
-    headline = composed.headline()
 
-    assert "COMPOSED PATH -- plan: proposed by some-model" in headline
-    assert "Not comparable" in headline
-    assert headline.index("COMPOSED PATH") < headline.index(composed.report.headline()), (
-        "the caveat must come before the number it qualifies"
+
+def test_both_convert_shapes_say_whose_plan_they_used(reference_conversion: Any) -> None:
+    """Neither total is a whole conversion's, and each is not-a-whole-conversion in its own way.
+
+    The composed one is every point the model's; the ordinary one is the model's cell bodies over
+    a *human's* plan, with a quarter of the board earned by whoever wrote that plan. The caveat
+    used to appear on the composed path only, and to describe a plain ``--convert`` figure as
+    measuring "the cell bodies alone" -- which it does not, and which is the same confound
+    ``--plan-from`` without ``--convert`` is refused for, only smaller.
+
+    Both lines sit above the score. A caveat under a total is a caveat nobody has read by the time
+    they have read the total.
+    """
+    assert "COMPOSED PATH" not in reference_conversion.headline(), (
+        "the library default must stay silent; the CLI is what knows the provenance"
     )
-    assert "COMPOSED PATH" in composed.render()
+
+    composed = _relabelled(
+        reference_conversion, plan_origin="proposed by some-model", plan_is_the_models=True
+    )
+    gold = _relabelled(
+        reference_conversion, plan_origin="read from plan.yaml", plan_is_the_models=False
+    )
+
+    assert "COMPOSED PATH -- plan proposed by some-model" in composed.headline()
+    assert "Not comparable" in composed.headline()
+    assert "PLAN NOT THE MODEL'S -- read from plan.yaml" in gold.headline()
+    assert "cell bodies and nothing else" in gold.headline()
+
+    for report in (composed, gold):
+        headline = report.headline()
+        assert headline.index("points are structural") < headline.index(report.report.headline()), (
+            "the caveat must come before the number it qualifies"
+        )
+        # The share is stated rather than left to a reader who would have to add up the rubric.
+        structural = next(tier for tier in report.report.tiers if tier.name == "structural")
+        assert f"{structural.available} of {report.report.available}" in headline
 
 
 def test_a_run_that_never_got_a_plan_is_not_a_model_that_wrote_bad_cells() -> None:
@@ -1077,6 +1098,56 @@ def test_a_run_that_never_got_a_plan_is_not_a_model_that_wrote_bad_cells() -> No
     assert "incomplete" not in rendered
 
 
+def test_a_plan_kedge_refuses_to_scaffold_ends_the_run_rather_than_the_process(
+    tmp_path: Path,
+) -> None:
+    """``build_cells`` raising used to be a traceback out of ``main()``, after the money.
+
+    On the composed path a plan proposal has already been billed by the time the scaffolder sees
+    it, and the user got no report, no outcome, and not even the line saying what the proposal
+    cost. A plan kedge will not build a notebook from is a result about whoever wrote the plan --
+    ``NO_PLAN``, with the refusal quoted -- and never a model writing bad cells, because no cell
+    was ever asked for.
+    """
+    from kedge.notebook.scaffold import ScaffoldError
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        msg = "cell 'post_adjustment_input' would not parse"
+        raise ScaffoldError(msg)
+
+    calls: list[int] = []
+
+    class _CountingCompleter:
+        def complete(self, request: CompletionRequest) -> str:
+            calls.append(1)
+            return "x = 1"
+
+    import harness.cellgen
+
+    original = harness.cellgen.build_cells
+    harness.cellgen.build_cells = refuse  # type: ignore[assignment]
+    try:
+        report = convert_and_grade(
+            adjustment_case,
+            plan(),
+            completer=_CountingCompleter(),
+            notebook=tmp_path / "converted.py",
+            model="scripted",
+            plan_origin="proposed by some-model",
+            plan_is_the_models=True,
+        )
+    finally:
+        harness.cellgen.build_cells = original  # type: ignore[assignment]
+
+    assert report.outcome is ConversionOutcome.NO_PLAN
+    assert report.result is None
+    assert calls == [], "a cell was requested for a plan that never scaffolded"
+    assert "will not scaffold" in report.detail
+    assert "would not parse" in report.detail
+    assert report.exit_code() == 1
+    assert "COMPOSED PATH" in report.render()
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [
@@ -1084,6 +1155,8 @@ def test_a_run_that_never_got_a_plan_is_not_a_model_that_wrote_bad_cells() -> No
         ("timeout", "not the model's judgement"),
         ("not_configured", "not the model's judgement"),
         ("schema_refused", "the model's own output never validated as a plan"),
+        # Its own bucket, and neither of the other two: the model was never asked.
+        ("triage_refused", "kedge's own triage declined to plan this workbook"),
     ],
 )
 def test_a_missing_plan_is_attributed_before_it_is_reported(failure: str, expected: str) -> None:
@@ -1131,6 +1204,33 @@ def test_the_refusal_is_narrowed_to_the_confounded_composition() -> None:
     allowed = parser.parse_args(["adjustment_signoff", "--convert", "m", "--plan-from", "m"])
     run._refuse_confounded(parser, allowed)  # must not raise
     assert allowed.plan_from == "m"
+
+
+@pytest.mark.parametrize(
+    "ignored",
+    [
+        ["--repeats", "3"],
+        ["--notebook", "somewhere.py"],
+        ["--json"],
+    ],
+)
+def test_a_flag_the_convert_path_would_ignore_is_refused(ignored: list[str]) -> None:
+    """A flag a mode silently ignores is worse than one it refuses.
+
+    ``--convert m --plan-from m --repeats 3`` announced "2 model(s) x 3 repeat(s)" and then did
+    one proposal and one pass: a cost estimate a reader would act on, and a number that was never
+    true. ``--notebook`` names a notebook to *grade* where the conversion writes one (``--out``),
+    and ``--json`` is the sweep's. All three parsed cleanly and did nothing.
+    """
+    import run
+
+    parser = run._parser()
+    args = parser.parse_args(["adjustment_signoff", "--convert", "m", *ignored])
+
+    with pytest.raises(SystemExit) as raised:
+        run._refuse_confounded(parser, args)
+
+    assert raised.value.code == 2
 
 
 # =============================================================================

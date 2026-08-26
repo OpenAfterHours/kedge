@@ -1362,6 +1362,11 @@ def convert(
     Exit codes: 0 when every hole was filled, or when there were none, and 1 when anything is
     still unwritten -- so a script can tell a finished conversion from one that needs a person.
     """
+    if max_attempts is not None and max_attempts < 1:
+        raise _fail(
+            f"--max-attempts is {max_attempts}. It is the total number of times one cell may be "
+            f"put to the model, the first ask included, so it has to be at least 1."
+        )
     workspace = _plan_workspace(workbook)
     store = _plan_store(workspace)
     plan = _plan_in_force(store)
@@ -1476,13 +1481,29 @@ def _ensure_notebook(workspace: Workspace, *, announce: bool = True) -> None:
 
 
 def _print_conversion(report: FillReport, notebook: Path) -> None:
-    """Draw a conversion: what was scaffolded, every hole and its attempts, what is still owed."""
+    """Draw a conversion: what was scaffolded, every hole and its attempts, what is still owed.
+
+    A refused cell is drawn at least as loudly as a filled one. It used to print in ``[dim]``
+    above a ``[green]`` success line, which is the wrong way round twice: the refusal is the more
+    important fact, and the cell most often refused is ``kedge_setup`` -- the one that imports
+    everything below it.
+    """
     console = _console()
-    if report.scaffolded_summary:
+    if report.refused:
+        console.print(
+            f"[bold red]{len(report.refused)} cell(s) the notebook would not accept[/bold red] "
+            f"{_plain(', '.join(report.refused))}"
+        )
+        console.print(
+            "[yellow]the plan is not fully in the notebook, so it will not run as written.[/yellow]"
+            " [dim]Usually a name the notebook already defines -- open it and look for a cell of "
+            "your own importing or assigning the same thing.[/dim]"
+        )
+    elif report.scaffolded_summary:
         console.print(f"[dim]{_plain(report.scaffolded_summary)}[/dim]")
     typer.echo(report.render())
     console.print(f"\n[green]notebook[/green] {_plain(notebook)}")
-    if report.holes == 0:
+    if report.holes == 0 and not report.refused:
         console.print(
             "[dim]the notebook had no unwritten cells; nothing was asked of a model[/dim]"
         )
@@ -1494,14 +1515,16 @@ def _print_conversion(report: FillReport, notebook: Path) -> None:
             f"nothing is left unwritten[/dim]"
         )
         return
-    console.print(f"[yellow]{len(report.unfilled)} cell(s) still to write[/yellow]")
-    for cell in report.unfilled:
-        detail = f" -- {cell.detail}" if cell.detail else ""
-        typer.echo(f"  - {cell.name}: {cell.outcome.value}{detail}")
-    console.print(
-        "[dim]each of these keeps the scaffolder's passthrough, so the notebook still runs and "
-        "still carries its TODO(kedge) marker. Run this again, or write them in the chat.[/dim]"
-    )
+    if report.unfilled:
+        console.print(f"[yellow]{len(report.unfilled)} cell(s) still to write[/yellow]")
+        for cell in report.unfilled:
+            detail = f" -- {cell.detail}" if cell.detail else ""
+            typer.echo(f"  - {cell.name}: {cell.outcome.value}{detail}")
+        console.print(
+            "[dim]each of these keeps the scaffolder's passthrough, so the notebook still runs "
+            "and still carries its TODO(kedge) marker. Run this again, or write them in the "
+            "chat.[/dim]"
+        )
 
 
 # ── reconcile ────────────────────────────────────────────────────────────────────────────────

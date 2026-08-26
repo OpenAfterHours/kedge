@@ -134,40 +134,62 @@ be found — it is the genuine downstream consequence of discrimination 6.
   from the prediction, the statements run against it, the result compared — rather than by string
   comparison, which would have to know what correct escaping looks like.
 - **structural** — properties of the plan that survive the model saying it differently on a
-  second run, in the style of `tests/llm/test_plan_judgement.py`. Ten items and 24 of the 69
+  second run, in the style of `tests/llm/test_plan_judgement.py`. Eleven items and 27 of the 72
   points the rubric declares — one of which, `consults_the_knowledge_pack`, always skips, so a
-  full run scores out of 68 and the deterministic tier is 45 of them. Still a third of the board
-  against two thirds, which is the lopsidedness this list exists to declare: a plan that reads
-  well and produces the wrong pennies has failed.
+  full run scores out of 71 and the deterministic tier is 45 of them, or **62.5%** of what is
+  declared. Still the lopsidedness this list exists to declare: a plan that reads well and
+  produces the wrong pennies has failed. The share is asserted in
+  `tests/unit/test_evals_adjustment_signoff.py`, because a bound of the form "deterministic is
+  bigger" lets it drift a tier at a time without anything going red.
 - **judgement** — recorded to be read, not scored.
 
 **The structural tier grades shape, not presence.** It used to grade presence, and a real
 model-written plan passed four of the seven items it could be graded on — 10 of 18 — while
 scaffolding into a notebook with no briefing, no hand-off, a checkpoint below the update rather
-than above it, and one place to put a grid in a process that brings back two. Four items were
-rewritten around what the scaffolder actually consumes:
+than above it, and one place to put a grid in a process that brings back two. Five items were
+rewritten or added around what the scaffolder actually consumes:
 
 | Item | Was | Is |
 |---|---|---|
 | `takes_two_handins` | at least one stage declares a hand-in with a `ref` | the hand-in cells `build_cells` *emits*. A re-extract declared on a `checkpoint` stage is read by the schema, shown on the approval card, and emitted as nothing |
 | `has_a_checkpoint_before_the_update` | some hand-off names a checkpoint in `depends_on` | a checkpoint reachable through the whole `depends_on` closure of the hand-off whose statement **writes** |
-| `mutates_agrees_with_the_statement` | — | no hand-off declares `mutates: false` over a statement `kedge.sql.changes_data` reads as a write |
-| `the_briefing_survives_the_workbook` | — | a non-empty `briefing`, with a purpose, a background, and citations |
+| `mutates_agrees_with_the_statement` | — | `changes_data` over the text, whatever `medium` and `mutates` claim; and a `handoff` stage must carry a statement at all |
+| `the_briefing_survives_the_workbook` | — | a non-empty `briefing`, with a purpose, a background, and a citation that names a sheet the workbook has |
+| `the_re_extract_waits_for_the_update` | — | **where**, not whether: a hand-in emitted below the writing hand-off, reading its confirmation token |
 
-The last is worth the extra sentence. `Briefing` refuses prose with no sources, so an *invented*
-briefing cannot reach a plan at all — and nothing anywhere noticed one that never arrived. The
-asymmetry was the bug, and the notebook it produced opened by telling its reader the workbook
-carried no description of what the process was for, which four cited notes on the `Sign-off` tab
-flatly contradict.
+Two of those are worth the extra sentence.
 
-That plan is committed verbatim as `tests/unit/observed_conversion.py`, and
-`test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one` grades it item by item:
-**7 of 21**, where the loose tier gave it 10 of 18. It is a better input than any mutation of the
-reference — a mistyped `kind` on a re-extract is not a mistake a test author makes. Note what
-`mutates_agrees_with_the_statement` does on it: it **skips**. A plan with no hand-off at all has
-no statement for the flag to contradict, and reporting "the `mutates` flag is wrong" about a plan
-that has none would name the wrong defect. `hands_over_rather_than_pretends` is the item about
-that, and it is red.
+`Briefing` refuses prose with no sources, so an *invented* briefing cannot reach a plan at all —
+and nothing anywhere noticed one that never arrived. The asymmetry was the bug, and the notebook
+it produced opened by telling its reader the workbook carried no description of what the process
+was for, which four cited notes on the `Sign-off` tab flatly contradict. The item asks that a
+citation point somewhere, too: `sources: ["nowhere in particular"]` satisfies the schema, and an
+unfollowable citation is the appearance of attribution rather than attribution.
+
+`the_re_extract_waits_for_the_update` is the only item here that grades **where** rather than
+whether, and it exists because every other item can pass on a notebook that invites the one
+mistake nobody can detect afterwards. Point the re-extract stage at the extract instead of at the
+update — one edge — and `build_cells` emits the re-extract selector seven cells *above* the
+UPDATE with no gate token in it, so marimo has no dataflow edge to hide it on and the box is on
+screen from the moment the notebook opens. That plan scored full structural marks, and the same
+total as the correct one when the reference cell bodies were replayed through it -- 65/68, at the
+rubric state before this item existed. A re-extract
+taken before the statement ran looks exactly like one taken after; the verification passes either
+way. It is the defect `Handoff.needs_confirmation` was changed to prevent, and nothing measured
+whether the prevention worked.
+
+That model-written plan is committed verbatim as `tests/unit/observed_conversion.py`, and
+`test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one` grades it item by item.
+**5 of 19** on the plan-only measurement — the one a sweep takes, and the only honest one for a
+plan, since `does_not_trust_the_impact_summary` is graded against a *notebook* the plan had no
+hand in. The loose tier gave it 10 of 18. It is a better input than any mutation of the reference
+— a mistyped `kind` on a re-extract is not a mistake a test author makes.
+
+Note what two items do on it rather than failing: `mutates_agrees_with_the_statement` and
+`the_re_extract_waits_for_the_update` both **skip**. A plan that hands nothing over has no
+statement for a flag to contradict and no update for a re-extract to wait for, and reporting
+either as a failure would name the wrong defect. `hands_over_rather_than_pretends` is the item
+about that, and it is red.
 
 Money is compared at half a penny, never with `==`. polars' vectorised execution of the rounding
 chain lands a few parts in 1e11 from the scalar path — far inside the penny that matters and far
@@ -247,7 +269,13 @@ a time, and asserting the right item goes red and nothing else falls over:
 | move the checkpoint below the update | `has_a_checkpoint_before_the_update` |
 | gate only the read-only extract | `has_a_checkpoint_before_the_update` |
 | a checkpoint two stages upstream | **nothing** — reachability, not one edge |
+| `mutates: true` on the read-only extract | **nothing** — over-declaring is the safe direction |
 | retype the re-extract's stage as `checkpoint` | `takes_two_handins` |
+| both hand-ins declare the same `ref` | `takes_two_handins` — one grid asked for twice |
+| the `UPDATE` retyped `medium: text`, `mutates: false` | `mutates_agrees_with_the_statement` |
+| strip the `handoff` block off the update stage | `mutates_agrees_with_the_statement` |
+| `sources: ["nowhere in particular"]` | `the_briefing_survives_the_workbook` |
+| point the re-extract at the extract, not the update | `the_re_extract_waits_for_the_update` |
 
 The last two rows of the first block are the ones worth keeping. A notebook that stops has one problem, and
 reporting it eight times buries it — so items about cells that never ran are skips. And a plan
@@ -266,7 +294,7 @@ rubric of sixteen items is not a pass, and the headline will not render it as on
 
 ## Measuring a model
 
-Everything above grades committed artifacts, and scores 68/68 with no model anywhere in the loop.
+Everything above grades committed artifacts, and scores 71/71 with no model anywhere in the loop.
 That proves the graders work. It says nothing about whether the model a user has configured can
 do the job — which matters, because this workbook is one of the *simplest* processes a user will
 bring. Three modes answer that, at three different seams and three very different prices.
@@ -296,7 +324,7 @@ model's plan graded alongside a notebook the model did not write.** That prints 
 total made mostly of points a human earned, under a model's name — the exact false confidence
 this apparatus exists to remove, and almost invisible in a tidy table. `--plan-from` without
 `--convert` is that composition exactly, since the notebook graded would be the committed
-reference conversion and 45 of the rubric's 68 points are its deterministic tier. It is refused
+reference conversion and 45 of the rubric's 71 points are its deterministic tier. It is refused
 by name.
 
 `--model` with `--convert` is refused too, for a duller reason: a sweep tabulates several models
@@ -305,24 +333,43 @@ other. The refusal used to stand in for the confound as well, which is how it ca
 *reverse* composition — the model's own plan, filled by the same model — where every point on the
 board is the model's and there is nothing to confound.
 
-The composed score is reported under a line that says so, above the number rather than below it:
+**Both convert modes say whose plan they used, above the number rather than below it.** Not only
+the composed one — a plain `--convert` figure is *not* "the cell bodies alone", which is what that
+line used to claim. The structural tier is graded against the plan whoever wrote it, so 26 of a
+`--convert` run's 71 points are a human's:
 
 ```
 adjustment_signoff: graded, N/N hole(s) filled ...
-COMPOSED PATH -- plan: proposed by MODEL. Not comparable with a --convert figure, which starts
-from the case's own approved plan and measures the cell bodies alone.
-q2_accrual_adjustment.xlsx: N/68 (N%)
+PLAN NOT THE MODEL'S -- read from evals/adjustment_signoff/plan.yaml. The model wrote the cell
+bodies and nothing else; 26 of 71 points are structural, so this total is not a whole
+conversion's.
+q2_accrual_adjustment.xlsx: N/71 (N%)
+
+adjustment_signoff: graded, N/N hole(s) filled ...
+COMPOSED PATH -- plan proposed by MODEL, and the cell bodies are the same model's. Every point on
+the board is the model's; 26 of 71 points are structural. Not comparable with a plain --convert
+figure, whose structural tier is a human's plan.
+q2_accrual_adjustment.xlsx: N/71 (N%)
 ```
 
-(No figure is quoted here, deliberately: nobody has run it against a live model yet, and a number
-written into a README before it was measured is the kind of thing people cite.) Two totals over
-one rubric, measuring different things. A reader who takes one for the other has been handed
+(No figure is quoted here, deliberately: nobody has run either against a live model yet, and a
+number written into a README before it was measured is the kind of thing people cite.) Two totals
+over one rubric, measuring different things. A reader who takes one for the other has been handed
 exactly what this file exists to prevent, and that line is the only thing between them.
 
-A composed run has one more way to end than a `--convert` run: `ConversionOutcome.NO_PLAN`, when
-no plan ever arrived. It is a member of its own rather than an `INCOMPLETE` — whose docstring
-reads *"the gaps are the model's"* — because a run that never scaffolded a cell has no gaps, and
-filing an unreachable endpoint as a model that writes bad code is the misattribution the next
+**Flags a mode would ignore are refused rather than accepted.** `--repeats`, `--notebook` and
+`--json` all belong to other modes, and `--convert m --plan-from m --repeats 3` used to announce
+"2 model(s) x 3 repeat(s)" before doing one proposal and one pass. A cost estimate a reader would
+act on, and never true.
+
+A composed run has one more way to end than a `--convert` run: `ConversionOutcome.NO_PLAN`. Two
+ways in, and both mean the same thing — no plan the pipeline could use. Either none arrived, or
+one arrived that `build_cells` refuses, which used to be a traceback out of `main()` with no
+report, no outcome and no statement of what the proposal had already cost. (The cost is printed
+from a `finally` now, so every path out of a mode that spends money says what it spent.) It is a
+member of its own rather than an `INCOMPLETE` — whose docstring reads *"the gaps are the model's"*
+— because a run that never scaffolded a cell has no gaps, and filing an unreachable endpoint as a
+model that writes bad code is the misattribution the next
 section is about.
 
 ### Attribution is the point
@@ -343,11 +390,25 @@ a setting. This project has already had one live run where misattribution produc
 requests and the wrong diagnosis (`tests/llm/README.md`).
 
 The composed path inherits all of it one level up. A `--plan-from` run that gets no plan reports
-`NO_PLAN`, and the sentence beside it quotes `Failure.about_the_model` rather than re-deciding it:
-"the model's own output never validated as a plan", or "a fact about the integration, the account
-or the endpoint". A plan that arrives but that kedge will not scaffold — a blocker
-`acknowledge_all_drops` does not clear — is `NO_PLAN` as well, with the blocker quoted, because a
-plan the product would refuse is a result about the model and not a run to fudge past.
+`NO_PLAN`, and the sentence beside it quotes `Failure.about_the_model` rather than re-deciding it,
+in **three** buckets rather than two: "the model's own output never validated as a plan"; "a fact
+about the integration, the account or the endpoint"; and `triage_refused`, which is neither —
+kedge read the workbook, decided it was not convertible, and never asked. Filing that under the
+endpoint sends a reader to a proxy that answered nothing, and filing it under the model blames one
+that never saw the question.
+
+A plan that arrives but that kedge will not scaffold — a blocker `acknowledge_all_drops` does not
+clear, or anything `build_cells` refuses — is `NO_PLAN` as well, with the reason quoted, because a
+plan the product would refuse is a result about whoever wrote it and not a run to fudge past.
+
+**A leg the sweep could not grade in full does not print full marks.** A plan the scaffolder
+refuses makes items skip that every other leg was graded on, and the leg used to render `18/18
+PASS` directly beneath a header saying legs are scored out of a larger number — with the skip that caused it
+named nowhere. Three changes: the score cell renders against the *sweep's* denominator and says
+how many points went unmeasured; `SweepReport.ungradeable` is taken from the best-measured leg
+rather than the first one, so the preamble cannot announce one plan's skip as everybody's; and a
+short leg lists its skips under "Why". A skip is a measurement nobody took, and the reader has to
+be told which one.
 
 Cost is reported in tokens and seconds. Currency is opt-in via `--prices`, because a price table
 committed here would be wrong within a month and wrong invisibly. An endpoint that volunteers no
@@ -372,7 +433,7 @@ could ever have shown:
 All are fixed. `EXPECTED_DEFECTS` in `tests/unit/test_evals_convert.py` is now an exact **empty**
 set, and each defect has a test pinning the *mechanism* rather than the absence of a string, so one
 returning by another route is still caught. The reference bodies replayed through the pipeline score
-**65/68** — 60/63 before the structural tier was tightened, and 47/63 before the scaffolder was
+**65/71** — 65/68 and 60/63 at the two earlier states of the structural tier, and 47/63 before the scaffolder was
 fixed, so 13 of those points came from fixing kedge rather than from touching a grader. That figure
 is the ceiling for the composed path, and it is measured with a human's plan and a human's cell
 bodies: a model's number on `--convert MODEL --plan-from MODEL` is the first honest reading of what

@@ -287,14 +287,18 @@ structural:
   - id: takes_two_handins
     weight: 3
     check: >
-      The notebook the scaffolder builds from this plan asks for two grids, and at least one of
-      them arrives mid-process. That means a stage declaring a hand-in with a `ref` -- the head
-      hand-in alone cannot express a re-extract, because the re-extract does not exist when the
-      notebook is opened -- *and* the scaffolder actually emitting the cells for it.
+      The notebook the scaffolder builds from this plan asks for two *distinct* grids, and at
+      least one of them arrives mid-process. That means a stage declaring a hand-in with a `ref`
+      -- the head hand-in alone cannot express a re-extract, because the re-extract does not exist
+      when the notebook is opened -- the scaffolder actually emitting the cells for it, and that
+      stage waiting on an earlier one.
     fails_if: >
       A declared hand-in produces no cells. `build_cells` returns early for a `checkpoint` stage
       before it looks for a hand-in source, so a re-extract declared on a checkpoint is read by
-      the schema, rendered on the approval card, and then silently emitted as nothing.
+      the schema, rendered on the approval card, and then silently emitted as nothing. Also fails
+      when two stages declare the same `ref` -- two selectors asking for one grid twice is not two
+      grids -- or when every hand-in sits on a stage that waits for nothing, which makes them all
+      opening inputs and none of them a re-extract.
     note: >
       Graded by scaffolding the plan and counting what came out, not by re-deriving the rule. The
       weak version of this item asked only that some stage declare a hand-in with a `ref`, and a
@@ -357,20 +361,50 @@ structural:
       closure, so a plan that puts the approval before the computation the statement is rendered
       from is not marked down for its decomposition.
     note: >
-      Which hand-off is "the update" is decided by kedge.sql.changes_data through
-      `Handoff.needs_confirmation`, never by the `mutates` flag -- otherwise a plan could escape
-      this item by under-declaring, which is the defect the next item is about.
+      Which hand-off is "the update" is decided by kedge.sql.changes_data over the statement
+      itself, and by nothing else -- not by `mutates`, so a plan cannot escape this item by
+      under-declaring; and not through `Handoff.needs_confirmation`, which is
+      `mutates or statement_writes` and therefore failed a plan for declaring the read-only
+      extract query `mutates: true`. Over-declaring is the safe direction and the sibling item
+      below explicitly accepts it.
+
+  - id: the_re_extract_waits_for_the_update
+    weight: 3
+    check: >
+      At least one hand-in cell is emitted *below* the hand-off whose statement writes, and its
+      selector reads that hand-off's confirmation token.
+    fails_if: >
+      Every hand-in is emitted above the UPDATE, or one below it reads no confirmation token.
+      Both put the re-extract box on screen before the statement it is meant to follow. Position
+      in the file is not the gate: marimo hides a cell on a dataflow edge, and a cell that builds
+      `mo.ui` elements and references no upstream name has none, so it renders from the moment
+      the notebook opens wherever it sits.
+    note: >
+      The only item here that grades *where* rather than *whether*, and the reason it exists is
+      that a plan can satisfy every other item and still scaffold this defect. One edge does it --
+      point the re-extract stage at the extract instead of at the update -- and the resulting plan
+      scored full structural marks, and the same 65/68 as the correct one when the reference cell
+      bodies were replayed through it. What it costs is not a mark: a re-extract taken before the
+      statement ran looks exactly like one taken after, there is no way to tell afterwards, and
+      the verification passes either way. It is the defect `needs_confirmation` was changed to
+      prevent, and until now nothing measured whether the prevention worked.
 
   - id: mutates_agrees_with_the_statement
     weight: 2
     check: >
-      No hand-off declares `mutates: false` over a statement that writes. `kedge.sql.changes_data`
-      is the fact; the flag is a claim.
+      Every hand-off carries a statement of its own, and none declares `mutates: false` over one
+      that writes. `kedge.sql.changes_data` over the text is the fact; the flag is a claim, and
+      so is the medium.
     fails_if: >
-      An `UPDATE`, `INSERT`, `DELETE` or `MERGE` is handed over as read-only.
+      An `UPDATE`, `INSERT`, `DELETE` or `MERGE` is handed over as read-only -- including under
+      `medium: text`, which stops `Handoff.statement_writes` reading the text at all and is
+      therefore a one-field way to silence the product's own check without changing a character
+      of what the user is asked to run. Also fails when a `handoff` stage supplies no statement:
+      the scaffolder's `-- TODO(kedge)` placeholder goes in its place, reads as read-only, and
+      `mutates` becomes a claim about text that is not there.
     accepts_alternative: >
       `mutates: true` over a statement that only reads. Over-declaring costs a tick-box; the
-      failure this grades is the other direction.
+      failure this grades is the other direction, and it is reported in the pass detail.
     note: >
       The notebook now errs the safe way on its own -- `needs_confirmation` is
       `mutates or statement_writes`, so an UPDATE declared read-only still gets a confirmation --
@@ -382,13 +416,17 @@ structural:
   - id: the_briefing_survives_the_workbook
     weight: 2
     check: >
-      The plan carries a non-empty `briefing` with a purpose, a background and a non-empty
-      `sources`.
+      The plan carries a non-empty `briefing` with a purpose, a background, and at least one
+      source naming a sheet the workbook actually has.
     fails_if: >
       `briefing` is null or empty. The Sign-off tab holds Purpose, Background, Scope and Known
       issues, and the analyser recovers all eight notes with the sheet and cells each came from,
       so a plan that drops them scaffolds a notebook that opens by telling its reader the workbook
-      explained nothing. That is false, and it is confidently false.
+      explained nothing. That is false, and it is confidently false. Also fails when nothing in
+      `sources` points anywhere: the schema asks only that the list be non-empty, so
+      `sources: ["nowhere in particular"]` validates, and a citation the next reader cannot follow
+      is the appearance of attribution rather than attribution. The other sources may be anything
+      -- a procedure document, or the person who said so, neither checkable from here.
     note: >
       The asymmetry is what makes this worth an item. `Briefing` refuses prose with no citations,
       so an *invented* briefing cannot be written down; nothing anywhere notices one that never

@@ -21,14 +21,29 @@ Two halves, and they are copied to different standards:
 
 - :data:`OBSERVED_PLAN_YAML` is **verbatim**, byte for byte, including the curly apostrophes the
   model wrote. It is the thing under test and paraphrasing it would defeat the point.
-- :func:`observed_analysis` is **trimmed**. The full ``analysis.json`` is 50KB, most of it column
-  profiles that no warning reads. What is kept is everything the review pass touches -- the
-  connection and its command, the eight process notes with their sheets and cells, all seven
-  formula regions including the one that concatenates SQL, and enough of the sheets and findings
-  that :func:`kedge.plan.triage.complexity` still scores it exactly what it scored the whole
-  file, which is what the existing open-questions warning is measured against. ``role_signals``,
-  ``profiles`` and the findings' ``detail`` prose are dropped; a test asserts the score, so a
-  trim that took something load-bearing would have failed rather than gone unnoticed.
+- :func:`observed_analysis` is **transcribed and trimmed**, which is a weaker claim and worth
+  stating plainly. The full ``analysis.json`` is 50KB, most of it column profiles no warning
+  reads. What is kept is everything the review pass touches -- the connection and its command,
+  the eight process notes with their sheets and cells, all seven formula regions including the
+  one that concatenates SQL -- plus enough of the sheets and findings that
+  :func:`kedge.plan.triage.complexity` scores it what it scored the whole file. ``role_signals``,
+  ``profiles`` and the findings' ``detail`` prose are dropped.
+
+  A test asserts that complexity score, and it is worth knowing exactly how much that proves:
+  complexity reads five numbers -- operation count, sheet count, cross-sheet reach, pattern
+  variety, finding count -- so it catches a section going missing and catches nothing inside one.
+  A transcription slip in a field it does not read is invisible to it, and one got through: this
+  file claimed VLOOKUP column 4 for ``adjustment_d17_d92`` where the artifact says 5, and every
+  test stayed green. The values that carry a warning -- the notes' sheets and locations, the
+  connection command, the ``G17:G92`` formula -- are the ones to check against
+  ``analysis.json`` if the live artifact is ever regenerated.
+
+:func:`corrected_plan` is the other side: a plan for the same workbook with the same four
+defects put right. It exists so "does this fire on a correct plan?" can be asked without a unit
+test reading a file out of ``evals/``, which would be I/O outside ``tests/fixtures`` and a
+coupling from ``tests/unit`` to a directory it has no business knowing about. It is written to
+the shape of ``evals/adjustment_signoff/plan.yaml`` rather than copied from it -- the shape is
+what is under test, and a second copy of that file would rot against the first.
 """
 
 from __future__ import annotations
@@ -52,7 +67,19 @@ from kedge.analysis.model import (
     WorkbookAnalysis,
     WorkbookIdentity,
 )
-from kedge.plan.model import ProcessPlan
+from kedge.plan.model import (
+    Assessment,
+    Briefing,
+    Confidence,
+    Handoff,
+    OpenQuestion,
+    PlanDraft,
+    ProcessPlan,
+    SourceOrigin,
+    Stage,
+    StageKind,
+    StageSource,
+)
 from kedge.plan.store import plan_from_yaml
 
 WORKBOOK_SHA256 = "8f3cee46fd4774314e2220026106eaa5a72e4bfc5e4fe00e2bc9ab52014eeccc"
@@ -242,16 +269,24 @@ _EXTRACT_QUERY = (
 )
 
 
-def _lookup(op_id: str, anchor: str, column: str, index: int, fan_out: int) -> LogicalOperation:
-    """One of the two VLOOKUPs into the pre-adjustment tab, which is what makes this cross-sheet."""
+def _lookup(
+    op_id: str, anchor: str, column: str, offset: int, taken: int, fan_out: int
+) -> LogicalOperation:
+    """One of the two VLOOKUPs into the pre-adjustment tab, which is what makes this cross-sheet.
+
+    ``offset`` is how far left the key sits; ``taken`` is the column of the lookup table returned.
+    They are separate arguments because in the real workbook they are separate numbers, and
+    deriving one from the other is how this fixture came to claim column 4 where the artifact
+    says 5.
+    """
     return LogicalOperation(
         id=op_id,
         sheet="Adjustment",
         anchor=anchor,
         ranges=[f"Adjustment!{column}17:{column}92"],
         cell_count=76,
-        r1c1=f"=VLOOKUP(RC[-{index}],'Pre-Adjustment'!R19C1:R138C7,{index + 1},FALSE)",
-        sample_a1=f"=VLOOKUP(A17,'Pre-Adjustment'!$A$19:$G$138,{index + 1},FALSE)",
+        r1c1=f"=VLOOKUP(RC[-{offset}],'Pre-Adjustment'!R19C1:R138C7,{taken},FALSE)",
+        sample_a1=f"=VLOOKUP(A17,'Pre-Adjustment'!$A$19:$G$138,{taken},FALSE)",
         functions=["VLOOKUP"],
         references=[
             Reference(raw="A17", a1="A17"),
@@ -320,6 +355,129 @@ _OPERATION_IDS = [
     "adjustment_d94_f94",
     "adjustment_d95",
 ]
+
+
+def corrected_plan() -> ProcessPlan:
+    """The same process, planned correctly. Nothing added for the observed run fires on it.
+
+    Written to the shape of the reference conversion: the extract query and the UPDATE are
+    hand-offs rather than ``output`` stages, the checkpoint sits *above* the write, each hand-in
+    is declared on the stage that reads it, and the briefing carries the Sign-off tab's own words
+    with citations. Every one of the five checks has something here it could fire on and must not.
+    """
+    return ProcessPlan.from_draft(
+        PlanDraft(
+            assessment=Assessment(convertible=0.85),
+            stages=[
+                Stage(
+                    id="extract_query",
+                    intent="Hand the user the query that produces the pre-adjustment position",
+                    kind=StageKind.HANDOFF,
+                    sources=[StageSource(origin=SourceOrigin.QUERY, ref="AccrualExtract")],
+                    handoff=Handoff(
+                        instruction="Run this against FinanceWarehouse and bring the grid back.",
+                        statement=_EXTRACT_QUERY,
+                        connection="FinanceWarehouse",
+                    ),
+                ),
+                Stage(
+                    id="pre_adjustment",
+                    intent="The statutory accrual position before any adjustment",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="pre-adjustment extract")],
+                    depends_on=["extract_query"],
+                    confidence=Confidence.HIGH,
+                ),
+                Stage(
+                    id="adjust",
+                    intent="Apply the agreed 4.5% Q2 uplift to in-scope statutory accruals",
+                    sources=[StageSource(origin=SourceOrigin.STAGE, ref="pre_adjustment")],
+                    depends_on=["pre_adjustment"],
+                    confidence=Confidence.HIGH,
+                    operations=[
+                        "adjustment_c17_c92",
+                        "adjustment_d17_d92",
+                        "adjustment_e17_e92",
+                        "adjustment_f17_f92",
+                        "adjustment_d94_f94",
+                        "adjustment_d95",
+                    ],
+                ),
+                Stage(
+                    id="approve_adjustment",
+                    intent="Record the decision to apply the adjustment before it is applied",
+                    kind=StageKind.CHECKPOINT,
+                    depends_on=["adjust"],
+                ),
+                Stage(
+                    id="update_statement",
+                    intent="Hand the user the UPDATE that applies the approved adjustment",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["approve_adjustment", "adjust"],
+                    operations=["adjustment_g17_g92"],
+                    handoff=Handoff(
+                        instruction="Run this in one transaction, then re-extract.",
+                        built_from="adjust",
+                        template=(
+                            "UPDATE fin.accruals SET accrual_gbp = {accrual_gbp_after} "
+                            "WHERE trade_id = {trade_id}"
+                        ),
+                        connection="FinanceWarehouse",
+                        mutates=True,
+                    ),
+                ),
+                Stage(
+                    id="post_adjustment",
+                    intent="The re-extract, as evidence the update did what was intended",
+                    kind=StageKind.LOAD,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    depends_on=["update_statement"],
+                    confidence=Confidence.HIGH,
+                ),
+                Stage(
+                    id="verification",
+                    intent="Compare the re-extract against what the notebook predicted, row by row",
+                    sources=[
+                        StageSource(origin=SourceOrigin.STAGE, ref="adjust"),
+                        StageSource(origin=SourceOrigin.STAGE, ref="post_adjustment"),
+                    ],
+                    depends_on=["adjust", "post_adjustment"],
+                    confidence=Confidence.HIGH,
+                ),
+                Stage(
+                    id="signoff",
+                    intent="The impact statement, recomputed, saying what was verified",
+                    kind=StageKind.OUTPUT,
+                    sources=[StageSource(origin=SourceOrigin.STAGE, ref="verification")],
+                    depends_on=["verification"],
+                    confidence=Confidence.HIGH,
+                ),
+            ],
+            open_questions=[
+                OpenQuestion(
+                    question="The Sign-off tab says three entities; the UPDATE names four. Which?",
+                    answer="Four. The statement is what ran.",
+                )
+            ],
+            briefing=Briefing(
+                purpose="Records the quarterly uplift applied to statutory accruals.",
+                background="The June reforecast moved the accrual basis to the 2026 rate card.",
+                cadence="Quarterly, once the reforecast has been agreed.",
+                watch_for=["One trade carries no accrual value and is shown at nil."],
+                sources=[
+                    "Sign-off!A3:A4 (Purpose)",
+                    "Sign-off!A6:A7 (Background)",
+                    "Sign-off!A15:A16 (Known issues)",
+                ],
+            ),
+        ),
+        workbook="q2_accrual_adjustment.xlsx",
+        workbook_sha256=WORKBOOK_SHA256,
+        created_at=datetime(2026, 8, 23, 9, 0, tzinfo=UTC),
+        generated_by="human",
+    )
 
 
 def observed_plan() -> ProcessPlan:
@@ -397,8 +555,8 @@ def observed_analysis() -> WorkbookAnalysis:
             ),
         ],
         operations=[
-            _lookup("adjustment_c17_c92", "C17", "C", 2, 1),
-            _lookup("adjustment_d17_d92", "D17", "D", 3, 4),
+            _lookup("adjustment_c17_c92", "C17", "C", offset=2, taken=3, fan_out=1),
+            _lookup("adjustment_d17_d92", "D17", "D", offset=3, taken=5, fan_out=4),
             _rounded("adjustment_e17_e92", "E17", "E", "=ROUND(RC[-1]*uplift_rate,2)", 1),
             _rounded("adjustment_f17_f92", "F17", "F", "=ROUND(RC[-2]*(1+uplift_rate),2)", 2),
             LogicalOperation(

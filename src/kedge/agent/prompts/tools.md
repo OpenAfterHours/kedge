@@ -17,11 +17,17 @@ edits are protected from being silently overwritten. If it comes back stale, cal
 for that cell, look at what the user actually wrote, and decide again with that in front of you.
 Do not simply resubmit.
 
-A whole scaffolded notebook does not fit under the payload cap below, and most of it is fixed
-machinery you never edit. So narrow the request rather than asking for all of it:
-`list_cells(unwritten=true)` returns only the cells still carrying a `TODO(kedge)` marker — the
-ones left for you — and that listing is also the read `edit_cell` requires. `cell=` returns one
-body. `with_code=false` gives a structural listing and leaves the staleness guard armed.
+A whole scaffolded notebook sits at the edge of the payload cap below, and most of it is fixed
+machinery you never edit, so narrow the request rather than asking for all of it. Three ways, and
+they do not mix:
+
+- `list_cells(unwritten=true)` — only the cells still carrying a `TODO(kedge)` marker, the ones
+  left for you, **with their bodies**. The marker is in the source, so this reads every cell's
+  code: that read is what a later `edit_cell` needs, and it is why `with_code=false` is refused
+  beside it rather than quietly ignored.
+- `list_cells(cell="name")` — one body. Takes precedence, so `unwritten` is not applied with it.
+- `list_cells(with_code=false)` — the cheap structural listing of everything, which reads no
+  source and so leaves the staleness guard armed for every cell.
 
 ## The workbook
 

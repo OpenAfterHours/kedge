@@ -218,7 +218,7 @@ def test_the_block_flags_each_hole_and_counts_them_once() -> None:
     cells = tuple(
         CellFacts(id=f"c{index}", name=f"stage_{index}", unwritten=index >= 3) for index in range(5)
     )
-    rendered = NotebookState(cells=cells).render()
+    rendered = NotebookState(cells=cells, unwritten_from="file").render()
 
     assert "2 of 5 cells are still unwritten placeholders" in rendered
     assert "stage_3 (c3) [unwritten]" in rendered
@@ -229,6 +229,73 @@ def test_the_block_flags_each_hole_and_counts_them_once() -> None:
     # that counts them, and one flag per hole.
     assert rendered.count("[unwritten]") == 4
     assert "[unwritten] from the notebook file as last saved" in rendered
+
+
+def test_a_file_that_does_not_cover_every_cell_is_not_used_at_all(graph: GraphView) -> None:
+    """A half-written file is a wrong answer, not an error, and it undercounts.
+
+    marimo's autosave is a bare ``write_text`` -- truncate, then write, no temporary file and no
+    rename -- so a read that lands mid-save gets a prefix of the notebook, and a prefix of a
+    marimo notebook is very often still a valid marimo notebook. Nothing raises; the file simply
+    holds fewer cells, and every one it is missing looks written. Undercounting is the dangerous
+    direction, because the role prompt tells the model it is not finished while the work list is
+    non-empty, so a short count ends the conversion with stages still passing their input
+    through. Coverage is therefore all or nothing.
+    """
+    complete = {"imports": "import polars as pl", "load_handin": "# TODO(kedge): translate"}
+    truncated = {"imports": "import polars as pl"}
+
+    assert (
+        "1 of 3 cells are still unwritten"
+        in NotebookState.from_graph(
+            graph, bodies={**complete, "reconcile_panel": "panel = 1"}
+        ).render()
+    )
+
+    for partial in (complete, truncated, {}):
+        state = NotebookState.from_graph(graph, bodies=partial)
+        assert state.unwritten == ()
+        assert all(cell.unwritten is None for cell in state.cells)
+        assert state.render() == NotebookState.from_graph(graph).render()
+
+
+def test_an_unnamed_cell_does_not_count_against_coverage() -> None:
+    """A file records no cell ids, so an unnamed cell could never be matched by name.
+
+    Letting it veto the whole file would silence the flag on any notebook holding one, and its
+    absence from the file proves nothing either way.
+    """
+    graph = GraphView(
+        nodes=(
+            GraphNode(id="A", name="stage_one"),
+            GraphNode(id="B", name="_"),
+        )
+    )
+    state = NotebookState.from_graph(graph, bodies={"stage_one": "# TODO(kedge): translate"})
+
+    assert [cell.unwritten for cell in state.cells] == [True, None]
+
+
+def test_the_heading_names_the_kernel_when_the_kernel_is_what_answered() -> None:
+    """The flag has two possible sources and the block must not misattribute either.
+
+    A listing that carried code answers from the kernel, this turn. A file answers from whenever
+    it was last saved. Claiming the file for a kernel answer is the same class of defect as the
+    unconditional sentence this clause replaced.
+    """
+    from_kernel = NotebookState.from_cells(
+        [CellInfo(id="A", name="stage_one", code="# TODO(kedge): translate")]
+    )
+    from_file = NotebookState.from_graph(
+        GraphView(nodes=(GraphNode(id="A", name="stage_one"),)),
+        bodies={"stage_one": "# TODO(kedge): translate"},
+    )
+
+    assert from_kernel.unwritten_from == "kernel"
+    assert from_file.unwritten_from == "file"
+    assert "[unwritten]" in from_kernel.render()
+    assert "notebook file" not in from_kernel.render()
+    assert "[unwritten] from the notebook file as last saved" in from_file.render()
 
 
 def test_a_notebook_with_nothing_left_to_write_costs_the_block_nothing() -> None:

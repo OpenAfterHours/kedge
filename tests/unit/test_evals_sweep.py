@@ -13,8 +13,8 @@ supply skip with a reason rather than passing quietly.
 
 Every mark below is **derived from ``expected.yaml``**, never typed -- see
 :data:`NEEDS_MORE_THAN_A_PLAN`, which also reconciles the two structural totals this repo now
-prints. A sweep grades a plan and reports the tier out of 21; an offline run drives the notebook
-as well and reports it out of 23. Both are right, the gap is one named item, and the reason to
+prints. A sweep grades a plan and reports the tier out of 24; an offline run drives the notebook
+as well and reports it out of 26. Both are right, the gap is one named item, and the reason to
 write that down is that two different totals for the same tier is exactly how a number goes wrong
 quietly.
 
@@ -89,8 +89,9 @@ def _weights(tier: str) -> dict[str, int]:
 
     The rubric is the only place these figures exist, and a test that retypes one is a second copy
     of it. Not hypothetical: the structural tier grew from 19 points to 24 when it stopped grading
-    the presence of a plan's fields and started grading the shape the scaffolder consumes, and six
-    tests in this file went red on their literals rather than on anything about a sweep.
+    the presence of a plan's fields and started grading the shape the scaffolder consumes, then to
+    27 for the item that grades *where* a hand-in is emitted. Six tests in this file went red on
+    their literals the first time, rather than on anything about a sweep.
     """
     rubric = yaml.safe_load(adjustment_case.RUBRIC.read_text(encoding="utf-8"))
     return {str(entry["id"]): int(entry.get("weight", 1)) for entry in rubric[tier]}
@@ -112,8 +113,8 @@ are either carried into the output or they are not, and a plan cannot say which.
 
 Naming them is also the answer to a figure that would otherwise disagree with itself across the
 repo. A full offline run -- ``evals/run.py adjustment_signoff --plan ...``, which drives the
-notebook -- reports the structural tier out of **23**: everything declared, less the knowledge
-pack. A sweep reports **21**, because the notebook-reading item skips as well. Two different
+notebook -- reports the structural tier out of **26**: everything declared, less the knowledge
+pack. A sweep reports **24**, because the notebook-reading item skips as well. Two different
 structural totals, both correct, and the difference is exactly these two entries.
 
 Both halves are pinned. This tuple is asserted to be the *whole* skip set by
@@ -354,6 +355,73 @@ def test_a_grader_reaching_for_a_notebook_skips_rather_than_reading_an_empty_one
     assert item.outcome is Outcome.SKIP
     assert "driven notebook" in item.detail
     assert tier.available == FULL_MARKS
+
+
+def test_a_leg_the_sweep_could_not_grade_in_full_never_prints_full_marks(
+    bench: Bench,
+    good: str,
+    reference_plan: ProcessPlan,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip must not arrive as a PASS at a denominator only one leg has.
+
+    A plan the scaffolder refuses makes items skip that every other leg was graded on. The leg
+    then earned everything that was left and rendered, verbatim, ``PASS 18/18`` -- directly under
+    a header saying legs are scored out of 21, with the line saying kedge could not build a
+    notebook from that plan appearing nowhere in the report. That is the reconciliation sin in a
+    table: a measurement nobody took, printed as a result somebody got.
+
+    Three things have to be true, and none of them is "call it a failure": the score renders
+    against the *sweep's* denominator, the preamble's list of what nobody can be graded on is not
+    taken from the short leg, and the leg's own missing measurement is named under "Why".
+    """
+    from kedge.notebook import scaffold
+
+    # The mechanism, provoked rather than hunted for. Every plan shape that once made
+    # `build_cells` raise has since been made to build -- unbalanced quotes and newlines in a
+    # hand-in `ref`, ids colliding with head cells and with reserved satellites -- which is good
+    # news for the scaffolder and useless as a fixture: a control that skips because its input
+    # stopped being defective proves nothing. So the refusal is injected at the seam the graders
+    # actually call, for the second leg only, and the plan itself stays a perfectly good one.
+    marked = reference_plan.model_copy(update={"summary": f"{reference_plan.summary} [refuse]"})
+    original = scaffold.build_cells
+
+    def build_cells(plan: Any, **kwargs: Any) -> Any:
+        if "[refuse]" in (plan.summary or ""):
+            msg = "cell 'post_adjustment_input' would not parse"
+            raise scaffold.ScaffoldError(msg)
+        return original(plan, **kwargs)
+
+    monkeypatch.setattr(scaffold, "build_cells", build_cells)
+    report = sweep(
+        [ModelSpec(model="good-model"), ModelSpec(model="unscaffoldable")],
+        bench=bench,
+        repeats=1,
+        resolve=_legs(
+            {
+                "good-model": ScriptedCompleter([good]),
+                "unscaffoldable": ScriptedCompleter([marked.to_draft().model_dump_json()]),
+            }
+        ),
+    )
+
+    healthy, short = report.legs
+    assert short.available is not None and short.available < FULL_MARKS, (
+        "the injected refusal did not reach a grader, so this control measures nothing"
+    )
+    assert report.available == FULL_MARKS
+    assert healthy.score_cell(report.available) == f"{FULL_MARKS}/{FULL_MARKS}"
+    cell = short.score_cell(report.available)
+    assert cell.endswith(f"/{FULL_MARKS}") or "unmeasured" in cell, cell
+    assert f"/{short.available}" not in cell.split()[0], (
+        f"the short leg printed its own denominator: {cell}"
+    )
+
+    table = render(report)
+    assert f"{short.available}/{short.available}" not in table, table
+    assert "could not be measured on this plan" in table
+    # And the preamble must not adopt the short leg's skips as everybody's.
+    assert {item.id for item in report.ungradeable} == set(NEEDS_MORE_THAN_A_PLAN)
 
 
 def test_the_stand_in_notebook_refuses_every_read() -> None:

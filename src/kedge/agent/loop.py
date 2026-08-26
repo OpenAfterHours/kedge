@@ -1587,6 +1587,14 @@ class KedgeAgent:
         written in some other encoding -- none of them is a reason to guess, and this is a
         cosmetic flag on a block whose value is that it does not lie.
 
+        A name the file holds twice is dropped rather than resolved. marimo will not run such a
+        notebook, so one on disk means the file is being written or has been hand-edited into a
+        state the kernel has not accepted; picking either body would answer a question about a
+        cell nobody can say is *the* cell of that name. Dropping it also makes the map stop
+        covering the kernel's cell list, which is what
+        :func:`~kedge.agent.context._usable` reads as "do not use this file at all" -- the same
+        answer as for a half-written one, by the same rule.
+
         Returns:
             The named cells' bodies, or an empty map where none could be read.
         """
@@ -1594,12 +1602,41 @@ class KedgeAgent:
         if workspace is None:
             return {}
         path = workspace.notebook_path
+        if not path.exists():
+            # Not a fallback: every session before a plan is approved is this, and a warning a
+            # turn for the ordinary state of a new workspace is a warning nobody reads.
+            logger.debug("no unwritten flags: %s has not been scaffolded yet", path)
+            return {}
         try:
             document = read_notebook(path)
         except (KedgeError, OSError, ValueError) as exc:
-            logger.debug("no unwritten flags: could not read %s (%s)", path, exc)
+            logger.warning(
+                "could not read %s (%s); the notebook block will not say which cells are still "
+                "unwritten",
+                path,
+                exc,
+            )
             return {}
-        return {cell.name: cell.code for cell in document.cells if cell.is_named}
+        bodies: dict[str, str] = {}
+        repeated: set[str] = set()
+        for cell in document.cells:
+            if not cell.is_named:
+                continue
+            if cell.name in bodies:
+                repeated.add(cell.name)
+                continue
+            bodies[cell.name] = cell.code
+        for name in repeated:
+            del bodies[name]
+        if repeated:
+            logger.warning(
+                "%s holds %d cell name(s) more than once (%s); the notebook block will not say "
+                "which cells are still unwritten",
+                path,
+                len(repeated),
+                ", ".join(sorted(repeated)),
+            )
+        return bodies
 
     def _window_for(self, request: TurnRequest, state: NotebookState) -> ConversationWindow:
         config = self._config

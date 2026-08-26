@@ -1,6 +1,16 @@
 # Proposal: the hub does not finish a conversion, and nothing in the tree says so
 
-Status: proposal. Nothing here is built.
+Status: **built**, on `worktree-hub-conversion-gap-proposal`. The diagnosis below is left as it was
+written, including the three places adversarial review proved it wrong -- those corrections are
+marked in place, and they are the most useful part of the document. Section 7 records what the
+numbers actually came out as.
+
+One finding arrived from outside this plan entirely and is worth more than most of what is in it:
+`server/hub.py`'s seeded notebook declared a cell doing `import marimo as mo`, and `kedge_setup`
+imports `mo` too, so on **every fresh workbook** the two collided under marimo's single-definition
+rule and the cell binding `pl`, `kedge.xl`, `kedge.sql` and every path constant was refused whole
+-- while the conversion reported success. Confirmed on the notebook the observed session produced
+(`multiply defined: {'mo': (0, 1)}`) and fixed at the source.
 
 `evals/README.md` ends its scope section with one line that turns out to have been the whole
 answer: **"Nothing about the chat loop. This is workbook in, notebook out."** The eval measures
@@ -261,8 +271,8 @@ and until it has a number it will keep being rediscovered by hand.
   same way.
 - **Do not reach for `excel_pattern`.** It looks like a lever -- the run's plan set `unknown` on
   all seven stages, which renders `# Excel pattern: unknown -> ` with an empty hint. But the
-  reference plan sets it to `None` on all eight and scores 63/63, so the hint mechanism carries
-  no weight in either direction here. Worth tidying; not worth counting.
+  reference plan sets it to `None` on all eight and still scores full marks, so the hint mechanism
+  carries no weight in either direction here. Worth tidying; not worth counting.
 
 ---
 
@@ -270,11 +280,54 @@ and until it has a number it will keep being rediscovered by hand.
 
 Three numbers, in order of how much they prove.
 
-1. **`--convert MODEL --plan-from MODEL` on `adjustment_signoff`**, against the 60/63 the
+1. **`--convert MODEL --plan-from MODEL` on `adjustment_signoff`**, against the figure the
    reference bodies score when replayed through the same pipeline on the gold plan. The gap
    between the two is this proposal's subject, and closing it is the goal. Note that the second
    number is itself a ceiling measured with a human's plan and a human's cell bodies -- so a
    model's figure on the composed path is the first honest reading of what a user gets.
+
+---
+
+## 7. What it came out as
+
+The rubric moved twice while this was built, both times because a grader was found to be
+measuring less than it claimed. Quote the ratio, never the numerator alone.
+
+| Measurement | Before | After |
+|---|---|---|
+| Rubric, driven over the reference | 63/63 | **71/71** |
+| Structural tier, items / weight | 8 / 19 | **11 / 27** |
+| Deterministic share of the total | 70% | 62.5%, now guarded as a band |
+| The observed model plan, on the structural tier | 10/18 | **5/19** |
+| Reference bodies replayed through the pipeline | 60/63 | 68/71 |
+
+The row that matters is the fourth. The plan that produced the notebook this document was written
+about scored better than half marks on the tier that was supposed to catch it, and now scores a
+quarter. Nothing about that plan changed.
+
+**Three items were added because review broke the ones already written**, not because the plan
+called for them: `the_re_extract_waits_for_the_update` exists because the tightened rubric still
+could not tell a correct runbook from one that invites a re-extract taken *before* the update --
+both scored 65/68. `takes_two_handins` was green on a plan whose second hand-in scaffolded to no
+cells at all. `mutates_agrees_with_the_statement` passed vacuously on a hand-off carrying no
+statement, and was evadable by writing `medium: text` over a production `UPDATE`.
+
+**What review cost and returned.** Four adversarial reviewers produced twenty confirmed defects
+across the five workstreams, every one reproduced by running code and none caught by a suite that
+was green at the time. The three sharpest: `kedge convert` reported success over a notebook whose
+`kedge_setup` had been refused; `list_cells(unwritten=true, with_code=false)` silently disarmed the
+staleness guard that protects a user's own edits, two sentences after the prompt promised it would
+not; and the briefing warning fired on **every one of the eight fixture workbooks**, printing 900
+characters of absolute filesystem paths -- the permanently-amber signal this project already knows
+how to name.
+
+**Still open, deliberately.** `notebook/fill.py` is 989 lines against CONVENTIONS' ~400 and inverts
+the documented layering, with no runtime cycle only because `notebook/__init__.py` does not import
+it -- and the blast radius of adding that import is the whole `agent` package, not one module. The
+eval harness is still a near-identical *copy* of the driver rather than a caller of it, and the two
+prompts have already diverged by six bytes, which is precisely the thing `cellprompt.py`'s own
+docstring exists to forbid. Both are follow-ups, and both should be done before the next eval is
+written.
 2. **Holes filled per conversion**, reported by the driver. The run above scored 0/6 and said
    nothing about it.
 3. **Warnings raised on a plan later found defective.** A cheap regression: replay
