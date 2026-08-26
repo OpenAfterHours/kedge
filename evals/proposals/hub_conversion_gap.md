@@ -332,9 +332,10 @@ document proposed.
 was written -- and imported `kedge.agent.*`, inverting the layering. The obvious repair --
 split it into a prompt half and a loop half -- would have left *both* halves in the wrong package.
 A model-driving loop owns reply parsing, retry history and a `Completer`; that is `agent/`'s job,
-and it was written under `notebook/` only because somebody put it there. It is now
-`agent/fill.py` + `agent/fillprompt.py`, with the gate extension beside the gate in
-`agent/validate.py`, and `notebook/fill.py` deleted. **Nothing under `notebook/` imports
+and it was written under `notebook/` only because somebody put it there. It moved to
+`agent/fill.py` + `agent/fillprompt.py` -- and then to four modules; see below -- with the gate
+extension beside the gate in `agent/validate.py`, and `notebook/fill.py` deleted. **Nothing under
+`notebook/` imports
 `kedge.agent` any more, and `scripts/guardrails.py` fails if that comes back** -- proved by adding
 the import and watching the guardrail exit 1, both new tests go red, and the reviewer's original
 `ImportError: cannot import name 'CellFacts' from partially initialized module` reproduce exactly.
@@ -352,11 +353,51 @@ never was. `ConversionOutcome.NO_MODEL` is kept and made reachable through a new
 as measured -- is exactly what a reader needs, and testing "every hole errored" would never have
 fired again.
 
-**What is still open.** `agent/fill.py` is 964 lines, of which 493 are code; the natural third seam
-is the four report types. And `agent/loop.py` imports `kedge.server.events`, which inverts the same
-ladder one rung further up -- pre-existing, which is why the guardrail enforces the
-`notebook/ -> agent/` edge rather than the whole ladder. Enforcing the ladder would fail on `main`
-today, and that is worth knowing.
+**Both of those are now closed too.**
+
+The module split first, because it had already been refused once and the refusal was right at the
+time: the proposed cut -- report types and `convert_notebook` out -- was measured to leave ~600
+lines, missing the guideline on the measure the guideline is worded in. What that proposal had not
+confronted is where the mass actually is. `fill_holes` (140) and `_fill_one` (118) are 258 lines
+between them, **65% of a 400-line budget before a single import**, so any split leaving both
+together cannot land under it whatever else it removes. The cut therefore runs between *the run*
+and *the attempt*: `fill.py` 385, `fillhole.py` 381, `fillreport.py` 357, `fillprompt.py` 325 --
+none over 400, verified at 25 of 26 top-level AST nodes byte-identical with docstrings stripped.
+
+It also closed a leak nobody had named. `fillprompt.py` exists on the argument that every word sent
+to the model is assembled in one place, and two of them were not: the rejection block and an inline
+empty-reply nudge were being composed in the loop. Both moved, so that docstring can now make the
+claim it was always making.
+
+The split's cost is real and worth recording: **+150 lines** (module headers and docstrings, of
+which only +29 is code), and nine names that were private became public -- four more than the cut
+needed, which review caught and sent back.
+
+The ladder is enforced whole rather than at one edge:
+`scripts/guardrails.py` walks every rung of `analysis/ -> plan/ -> notebook/ -> agent/ -> server/`
+and refuses any upward import, `TYPE_CHECKING` ones included.
+
+What made that possible was measuring rather than assuming. An AST walk over all five layers found
+the entire ladder clean **except one file** -- `agent/loop.py`, in three ways: a module-scope import
+of twelve turn-event types, two function-local imports of `server.app` inside the composition
+helpers, and a type-only import of the request and cancel token. So `server/events.py` had been
+holding two unrelated things, and the turn's own vocabulary -- the events the agent emits, and the
+request and token the server hands it -- is now `kedge/turn.py`, below both, for the same reason
+`reconcile/` sits below the three things that consume it. `build_agent_app` and `serve` compose an
+agent with a server, which needs both ends of one arrow at once, so they are `kedge/serve.py`,
+above the ladder rather than inside it.
+
+The `AgentLoop` protocol stayed in the server, and the measurement is why: `loop.py` never imported
+it. An interface belongs to the caller that needs it, `KedgeAgent` satisfies it structurally, and it
+costs nothing because there is no import to cost anything. What the loop *did* import were
+arguments, not an interface. So the ladder needs no exemption, and the guardrail can refuse a
+type-only upward import absolutely -- which matters, because the `notebook/ -> agent/` inversion
+this document started with began as exactly that.
+
+One thing found on the way: the deferred imports in the composition helpers never bought what their
+comment claimed. `import kedge.agent` was **1.251s with FastAPI loaded**, because the module-scope
+event import ran `kedge/server/__init__.py` anyway. It is now **0.742s with neither `kedge.server`
+nor `fastapi` imported at all**, and that is a regression test.
 2. **Holes filled per conversion**, reported by the driver. The run above scored 0/6 and said
    nothing about it.
 3. **Warnings raised on a plan later found defective.** A cheap regression: replay

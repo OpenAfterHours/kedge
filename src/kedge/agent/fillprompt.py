@@ -63,11 +63,20 @@ here.
 
 Three honest differences from the chat remain. A cell body reaches ``propose_cell`` as a tool
 argument, so the chat never has to strip a Markdown fence off one; here it arrives as prose and
-:func:`kedge.agent.fill._body_of` strips it. The chat's retry rides on a tool result rather than a
-user turn. And ``role.md`` names ``propose_cell``, ``probe`` and ``inspect_workbook`` in passing,
-which no subtraction short of editing a copy of a shipped file removes -- so :data:`FILL_TASK`
-says there are no tools in as many words, and is appended *after* every shipped part, where a
-model reading in order meets it last.
+:func:`kedge.agent.fillhole.body_of` strips it. The chat's retry rides on a tool result rather
+than a user turn. And ``role.md`` names ``propose_cell``, ``probe`` and ``inspect_workbook`` in
+passing, which no subtraction short of editing a copy of a shipped file removes -- so
+:data:`FILL_TASK` says there are no tools in as many words, and is appended *after* every shipped
+part, where a model reading in order meets it last.
+
+## Every word this seam sends is in this file
+
+The retry text included. :func:`rejection_block` and :data:`EMPTY_REPLY_NUDGE` are what the model
+is told when the gate refuses a body and when a reply holds none, and they were written inline in
+the driving loop -- which meant a prompt whose whole argument is that it is assembled from one
+place had a second place, three functions away, where kedge spoke to the same model in the same
+turn. What comes *back* is read next door in :mod:`kedge.agent.fillhole`; the direction is the
+line between the two modules.
 """
 
 from __future__ import annotations
@@ -91,6 +100,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EMPTY_REPLY_NUDGE",
     "FILL_PROMPT_PARTS",
     "FILL_TASK",
     "POLICY_SOURCE",
@@ -98,6 +108,7 @@ __all__ = [
     "PromptAssemblyError",
     "cell_messages",
     "policy_rules",
+    "rejection_block",
     "system_prompt",
 ]
 
@@ -269,3 +280,46 @@ def cell_messages(
     ]
     messages.extend({"role": role, "content": content} for role, content in history)
     return messages
+
+
+# =============================================================================
+# WHAT IS SAID WHEN AN ANSWER COMES BACK WRONG
+# =============================================================================
+
+
+EMPTY_REPLY_NUDGE = (
+    "That reply held no cell body. Reply with Python only -- the lines that "
+    "replace the placeholder, at zero indentation, no fence and no prose."
+)
+"""What the model is told when its reply held nothing a cell body could be read out of.
+
+Instruction first, and it repeats the shape rather than the rules. A model that answered with
+prose either did not read :data:`FILL_TASK`'s "Python only" or ignored it, and either way what is
+worth sending back is that same sentence again rather than a longer one.
+"""
+
+
+def rejection_block(hole: ScaffoldCell, violations: tuple[str, ...]) -> str:
+    """The block returned to the model, matching ``ValidationReport.render``'s shape.
+
+    Sent for the violations the gate does not raise itself -- the name the cells below read and
+    the ``TODO(kedge)`` marker that survived into the body. A gate rejection sends
+    ``ValidationReport.render()`` instead, and this matches its shape so that the two read
+    identically at the other end.
+
+    Args:
+        hole: The cell that was refused. Named in the first line, because a model filling a
+            notebook one cell at a time has to be told which one this is about.
+        violations: What was wrong with it, one bullet each.
+
+    Returns:
+        The block, ready to send as a user turn.
+    """
+    return "\n".join(
+        [
+            f"The cell '{hole.name}' was rejected. Fix the cause and resubmit; you have a limited "
+            f"number of attempts.",
+            "",
+            *(f"  - {message}" for message in violations),
+        ]
+    )
