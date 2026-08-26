@@ -28,6 +28,8 @@ Run it::
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 from kedge.notebook.codegen import (
@@ -841,7 +843,59 @@ def build(path: Path) -> None:
 
     source = render_notebook(document, analyses, toplevel=frozenset())
     path.write_text(source, encoding="utf-8")
-    print(f"wrote {path.name}: {len(cells)} cells, {len(source.splitlines())} lines")
+    _ruff_format(path)
+    written = path.read_text(encoding="utf-8")
+    print(f"wrote {path.name}: {len(cells)} cells, {len(written.splitlines())} lines")
+
+
+def _ruff_format(path: Path) -> None:
+    """Format the rendered notebook the way the repository formats everything else.
+
+    Without this, running the generator leaves the tree failing ``ruff format --check``, and the
+    committed file is only correct because somebody formatted it by hand afterwards. The two
+    disagree because they wrap at different widths: ``render_notebook`` goes through marimo's own
+    formatter, which is black at black's 88 columns, and this repository is ruff at 100 -- so two
+    ``kedge.runs.record_decision`` calls came out split and ``ruff format`` joins them straight
+    back up. Neither tool is wrong; the generator just has to have the last word.
+
+    Regenerating has to be a genuine no-op, because the reference conversion is the gold answer
+    the deterministic graders are proved against. A generator whose output nobody can reproduce
+    byte for byte is one nobody can tell has drifted.
+
+    Args:
+        path: The notebook just written.
+
+    Raises:
+        SystemExit: ``ruff`` could not be found, or refused the file. Either way the notebook on
+            disk is not what a regeneration should produce, and saying so is better than leaving
+            a diff for the next person to find.
+    """
+    try:
+        from ruff import find_ruff_bin
+
+        binary = find_ruff_bin()
+    except (ImportError, FileNotFoundError):
+        # `uv run` puts the venv's scripts on PATH, so this covers an environment where ruff is
+        # installed but not importable as a package.
+        binary = shutil.which("ruff")
+    if binary is None:
+        msg = (
+            f"ruff is not available, so {path.name} cannot be formatted and regenerating it "
+            f"would leave the tree failing `ruff format --check`. Run this through "
+            f"`uv run python`, or install the dev dependencies."
+        )
+        raise SystemExit(msg)
+
+    result = subprocess.run(
+        [binary, "format", "--quiet", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        msg = f"ruff format refused {path.name}: {detail}"
+        raise SystemExit(msg)
 
 
 def main() -> int:

@@ -304,10 +304,21 @@ def read_notebook(path: Path) -> NotebookDocument:
 
     Raises:
         NotebookFormatError: The file is missing, unreadable, or not a marimo notebook.
+
+    Note:
+        ``UnicodeDecodeError`` is caught alongside ``OSError`` because it is neither an ``OSError``
+        nor something a caller expects from a function documented to raise one error. It is a
+        ``ValueError``, so it used to escape this function *and* every caller catching what the
+        docstring promised -- and it is reachable in normal use: marimo's autosave is a
+        truncate-and-write in place (``docs/marimo-api.md`` 4.3), so a read that lands mid-write
+        can end part-way through a multi-byte character. Converted notebooks carry the workbook's
+        own prose verbatim through ``_briefing_cell``, so non-ASCII is ordinary rather than exotic.
+        A file kedge cannot decode is unreadable in exactly the sense this docstring already
+        promised to report.
     """
     try:
         source = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         msg = (
             f"cannot read the notebook at {path}: {exc}. The file bridge edits the notebook on "
             f"disk, so the file has to exist and be readable before any operation."
