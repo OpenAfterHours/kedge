@@ -22,10 +22,12 @@ import pytest
 from kedge.agent.context import CellFacts, NameRegistry
 from kedge.agent.validate import (
     MAX_VALIDATION_ATTEMPTS,
+    MISSING_NAME_STAGE,
     Policy,
     RoundingContext,
     ValidationStage,
     extract_names,
+    undefined_name,
     validate_cell,
     violations_from_conflicts,
     violations_from_kernel_error,
@@ -830,3 +832,52 @@ def test_violations_from_conflicts_names_the_owner() -> None:
 
 def test_the_retry_cap_is_three() -> None:
     assert MAX_VALIDATION_ATTEMPTS == 3
+
+
+# ── the check a kernel would otherwise have made ─────────────────────────────────────────────
+#
+# `undefined_name` is not one of the five stages and `validate_cell` does not run it. It lives
+# beside the gate because it extends the gate: `kedge convert` has no kernel, so nobody else will
+# say that a cell failed to bind the name the cells below it read. It was written twice -- once in
+# the driver and once in the eval's copy of the driver -- which is what one check kept beside its
+# caller reliably becomes.
+
+
+def test_a_body_that_does_not_define_the_cells_name_is_named_at_the_point_it_happened(
+    registry: NameRegistry,
+) -> None:
+    """Three cells later, blaming a cell that was written correctly, is the alternative."""
+    report = validate_cell("_working = 1", registry=registry, cell="adjust")
+    violations = undefined_name(report, "adjust")
+
+    assert report.ok, "the gate itself has no objection; that is the whole point"
+    assert len(violations) == 1
+    assert "must define 'adjust'" in violations[0]
+    assert violations[0].startswith(f"{MISSING_NAME_STAGE}:")
+
+
+def test_a_body_that_defines_the_name_raises_no_violation(registry: NameRegistry) -> None:
+    report = validate_cell("adjust = 1", registry=registry, cell="adjust")
+
+    assert undefined_name(report, "adjust") == ()
+
+
+def test_the_violation_says_what_the_body_did_define(registry: NameRegistry) -> None:
+    """A rejection a model can act on names the alternative it offered instead."""
+    report = validate_cell("uplift = 1", registry=registry, cell="adjust")
+
+    assert "It defines uplift." in undefined_name(report, "adjust")[0]
+
+
+def test_a_body_that_defines_nothing_public_says_nothing_rather_than_an_empty_list(
+    registry: NameRegistry,
+) -> None:
+    """``_working`` is cell-local to marimo, so there is genuinely no public name to report."""
+    report = validate_cell("_working = 1", registry=registry, cell="adjust")
+
+    assert "It defines nothing." in undefined_name(report, "adjust")[0]
+
+
+def test_the_definition_check_is_not_one_of_the_five_stages() -> None:
+    """A sixth ``ValidationStage`` member would say the gate runs it. It does not."""
+    assert MISSING_NAME_STAGE not in {stage.value for stage in ValidationStage}

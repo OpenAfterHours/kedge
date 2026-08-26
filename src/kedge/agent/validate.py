@@ -23,6 +23,13 @@ resolution kernel-side; this module over-collects bindings and under-collects re
 pre-flight check produces false *passes* rather than false rejections. A false pass costs one
 round trip and marimo reports it precisely; a false rejection would make the gate something the
 model learns to fight.
+
+One check sits beside the five rather than among them. :func:`undefined_name` asks whether a body
+defines the name the cells below it read, which the kernel would otherwise say -- three cells
+later, blaming a cell that was written correctly. ``kedge convert`` has no kernel, so it asks
+here. It is not a :class:`ValidationStage` and :func:`validate_cell` does not run it; the caller
+that needs it composes it, and it lives here so the next caller that needs it finds it rather than
+writing a third copy.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MAX_VALIDATION_ATTEMPTS",
+    "MISSING_NAME_STAGE",
     "CellNames",
     "Policy",
     "RoundingContext",
@@ -57,6 +65,7 @@ __all__ = [
     "ValidationStage",
     "Violation",
     "extract_names",
+    "undefined_name",
     "validate_cell",
     "violations_from_conflicts",
     "violations_from_kernel_error",
@@ -1460,6 +1469,49 @@ def validate_cell(
             return ValidationReport(violations=tuple(violations), names=names, stage=stage)
 
     return ValidationReport(names=names)
+
+
+# ── the check a kernel would otherwise have made ─────────────────────────────────────────────
+
+
+MISSING_NAME_STAGE = "definition"
+"""The stage name a caller records for a :func:`undefined_name` violation.
+
+Not a :class:`ValidationStage`: this is not one of PLAN M4's five stages and adding a sixth member
+would say it is. It is a stand-in for the kernel, so it is named alongside the stages rather than
+among them.
+"""
+
+
+def undefined_name(report: ValidationReport, name: str) -> tuple[str, ...]:
+    """Refuse a body that does not define the name the cells below it read.
+
+    The one thing worth checking that :func:`validate_cell` does not, and it is a stand-in rather
+    than an addition. In the chat the kernel catches this: the cell is accepted, flushed, and the
+    cells downstream of it fail on a name that was never bound, which marimo reports precisely.
+    ``kedge convert`` runs no kernel at all -- it writes through
+    :class:`~kedge.notebook.filedriver.FileNotebookDriver` -- so without this check the failure
+    surfaces the next time somebody opens the notebook, three cells below the one that caused it,
+    and the blame lands on a cell that was written correctly.
+
+    It lives here rather than in the driver that calls it because it is an extension of the gate,
+    and a check kept beside its caller is a check the next caller copies.
+
+    Args:
+        report: The gate's verdict, whose ``names`` hold what the body defines.
+        name: The name the body has to bind -- the cell's own.
+
+    Returns:
+        One violation naming the cell that failed to define the name, or nothing when the body
+        defines it.
+    """
+    if name in report.names.public_defs:
+        return ()
+    defined = ", ".join(report.names.public_defs) or "nothing"
+    return (
+        f"definition: this cell must define '{name}' -- the cells below read it by that "
+        f"name. It defines {defined}.",
+    )
 
 
 # ── kernel-side rejections ───────────────────────────────────────────────────────────────────

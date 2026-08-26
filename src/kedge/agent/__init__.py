@@ -17,6 +17,18 @@ Four modules, four jobs:
   :class:`kedge.server.agent_seam.AgentLoop` and is a drop-in replacement for the server's
   ``ScriptedAgent``.
 
+There are two model-driving seams here, not one. The chat loop above is the interactive one; the
+other is headless and runs to a termination condition:
+
+* :mod:`kedge.agent.fill` — the conversion driver behind ``kedge convert``. It reads the
+  ``TODO(kedge)`` holes the scaffolder left, asks for one cell body per hole in the scaffolder's
+  own order, and puts every answer through the same gate ``propose_cell`` uses. No kernel, no tool
+  surface, no chat.
+* :mod:`kedge.agent.fillprompt` — what that seam sends: the shipped system prompt minus
+  ``tools.md``, subtracted by name, with the gate's own rules quoted back out of the file that was
+  dropped. ``evals/harness`` calls it rather than copying it, so the eval cannot measure a prompt
+  that ships nowhere.
+
 Plus :mod:`kedge.agent.audit`, which records what left the machine — tool, sheet, columns, row
 count, byte count — and structurally cannot record the values themselves.
 
@@ -37,6 +49,15 @@ from kedge.agent.context import (
     build_analysis_block,
     build_plan_block,
 )
+from kedge.agent.fill import (
+    FillAttempt,
+    FilledCell,
+    FillOutcome,
+    FillReport,
+    convert_notebook,
+    fill_holes,
+)
+from kedge.agent.fillprompt import PromptAssemblyError
 from kedge.agent.loop import (
     AgentError,
     ChatDelta,
@@ -62,11 +83,13 @@ from kedge.agent.tools import (
 )
 from kedge.agent.validate import (
     MAX_VALIDATION_ATTEMPTS,
+    MISSING_NAME_STAGE,
     Policy,
     RoundingContext,
     ValidationReport,
     ValidationStage,
     Violation,
+    undefined_name,
     validate_cell,
 )
 
@@ -74,6 +97,7 @@ __all__ = [
     "MAX_PAYLOAD_BYTES",
     "MAX_ROWS",
     "MAX_VALIDATION_ATTEMPTS",
+    "MISSING_NAME_STAGE",
     "OMISSION_TEMPLATE",
     "TOOL_SPECS",
     "AgentError",
@@ -81,6 +105,10 @@ __all__ = [
     "CellFacts",
     "ChatDelta",
     "ConversationWindow",
+    "FillAttempt",
+    "FillOutcome",
+    "FillReport",
+    "FilledCell",
     "KedgeAgent",
     "ModelClient",
     "NameRegistry",
@@ -89,6 +117,7 @@ __all__ = [
     "OutboundLog",
     "OutboundRecord",
     "Policy",
+    "PromptAssemblyError",
     "RoundingContext",
     "TokenCounter",
     "ToolContext",
@@ -102,9 +131,12 @@ __all__ = [
     "build_analysis_block",
     "build_plan_block",
     "build_system_prompt",
+    "convert_notebook",
+    "fill_holes",
     "outbound_log_for",
     "serve",
     "tool_names",
     "tool_schemas",
+    "undefined_name",
     "validate_cell",
 ]

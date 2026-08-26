@@ -22,6 +22,16 @@ withdraws ``_code_mode`` costs kedge a swap rather than a rewrite:
 Process lifecycle — spawning, health polling, session bootstrap, teardown — belongs to
 :mod:`kedge.lifecycle`, not here. A driver is handed a url, a token and a session id that already
 work.
+
+**Nothing in this package may import :mod:`kedge.agent`**, and ``scripts/guardrails.py`` fails the
+build if anything does. The layering is ``analysis/ → plan/ → notebook/ → agent/ → server/``, so
+the agent reads the notebook and never the other way round. The rule was written after a
+conversion driver was built here and had to import ``agent.context``, ``agent.prompts`` and
+``agent.validate`` to work: there was no runtime cycle only because this file did not import it,
+and adding that one line broke the whole ``agent`` package rather than one module, because
+``agent/__init__.py`` eagerly aggregates ``context``. That driver is now
+:mod:`kedge.agent.fill`, where a loop that drives a model belongs; what it needed from here is the
+``TODO(kedge)`` seam in :mod:`kedge.notebook.scaffold`, which it calls.
 """
 
 from __future__ import annotations

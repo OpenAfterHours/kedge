@@ -22,7 +22,8 @@ right: the corpus is *supposed* to have exactly one positive reconciliation path
 | `harness/` | The runner: drives a runbook headlessly, grades it, renders the report. Case-independent. |
 | `harness/live.py` | What a model call cost and, when it failed, why. The one place a failure is attributed. |
 | `harness/sweep.py` | Phase 1: propose a plan per model, grade the structural tier, tabulate cost. |
-| `harness/cellprompt.py`, `cellgen.py`, `render.py`, `align.py`, `findings.py`, `convert.py` | Phase 2: scaffold a plan, have a model fill every hole, render, drive, grade. |
+| `harness/render.py`, `align.py`, `findings.py`, `convert.py` | Phase 2: scaffold a plan, have a model fill every hole, render, drive, grade. |
+| `harness/cellprompt.py`, `cellgen.py` | Name maps onto `kedge.agent.fillprompt` and `kedge.agent.fill`. **The product fills the holes; this eval calls it.** They were copies once, and the two prompts had already drifted apart by six bytes -- which is the thing `cellprompt.py` was written to forbid. Aliases rather than wrappers, so there is nothing to keep in step. |
 | `run.py` | The CLI. Also where the two phases are *composed*: `--plan-from` proposes the plan with a model, approves it, and hands it to Phase 2. |
 | `adjustment_signoff/` | A four-tab manual process — extract, adjust, re-extract, sign off — and whether kedge turns it back into the runbook it came from. |
 

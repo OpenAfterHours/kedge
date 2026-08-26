@@ -1,4 +1,4 @@
-"""Tests for the conversion driver: ``kedge.notebook.fill``.
+"""Tests for the conversion driver: ``kedge.agent.fill`` and ``kedge.agent.fillprompt``.
 
 Every completer here is a fake. Nothing in this module reaches a model endpoint, spawns a marimo
 process or opens a kernel -- which is the point of the seam as much as it is the point of the
@@ -14,7 +14,11 @@ a report that renders the two the same sends whoever reads it to fix the wrong t
 
 from __future__ import annotations
 
+import ast
 import json
+import subprocess
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -22,21 +26,23 @@ from typer.testing import CliRunner
 
 from conftest import approved_plan_store, make_analysis, make_approved_plan, make_plan
 from kedge import cli
+from kedge.agent.fill import (
+    FillOutcome,
+    FillReport,
+    convert_notebook,
+    fill_holes,
+)
+from kedge.agent.fillprompt import (
+    FILL_PROMPT_PARTS,
+    PromptAssemblyError,
+    policy_rules,
+    system_prompt,
+)
 from kedge.agent.prompts import SYSTEM_PARTS, load_prompt
 from kedge.cli import app
 from kedge.errors import KedgeError
 from kedge.notebook.codegen import BUILTIN_NAMES, analyse_document, read_notebook
 from kedge.notebook.filedriver import FileNotebookDriver
-from kedge.notebook.fill import (
-    FILL_PROMPT_PARTS,
-    FillOutcome,
-    FillReport,
-    PromptAssemblyError,
-    convert_notebook,
-    fill_holes,
-    policy_rules,
-    system_prompt,
-)
 from kedge.notebook.scaffold import (
     TODO_MARKER,
     PlanNotApprovedError,
@@ -46,10 +52,14 @@ from kedge.notebook.scaffold import (
     is_unwritten,
 )
 from kedge.plan.store import PlanStore
+from scripts.guardrails import (
+    LAYERING_BANNED,
+    _check_layering,
+    _import_targets,
+    _is_or_is_under,
+)
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from kedge.plan.propose import CompletionRequest
 
 
@@ -336,6 +346,74 @@ def test_keep_going_puts_every_hole_to_the_endpoint_even_after_one_fails() -> No
     assert report.skipped == 0
 
 
+class AnswersOnceThenDies:
+    """Answers the first request and raises on every one after it.
+
+    The ordinary shape of a rate limit or a dropped connection, and the shape that catches a
+    predicate written as "every hole errored": the hole ends ``ERROR`` because the *retry* was
+    what the endpoint dropped, and the reply it did give is still sitting in ``attempts[0]``.
+    """
+
+    def __init__(self, first: str) -> None:
+        self.first = first
+        self.calls = 0
+
+    def complete(self, request: CompletionRequest) -> str:
+        del request
+        self.calls += 1
+        if self.calls == 1:
+            return self.first
+        msg = "502 Bad Gateway"
+        raise ConnectionError(msg)
+
+
+def test_a_model_that_answered_once_badly_is_not_reported_as_never_having_answered() -> None:
+    """``unmeasured`` runs towards blame, never towards exoneration.
+
+    "Not one hole came back with a body the gate could have an opinion about" was the claim, and
+    it is false here: the gate had an opinion, it is in ``attempts[0].violations``, and the model
+    wrote pandas. Reporting that as "nothing was measured" clears a model that breached the house
+    style on the one request it answered -- and a caller then prints "no request to the model was
+    answered", which is a false sentence about the run.
+    """
+    report = fill_holes(
+        make_approved_plan(),
+        completer=AnswersOnceThenDies(PANDAS),
+        cells=one_hole(),
+        analysis=make_analysis(),
+        max_attempts=2,
+    )
+
+    cell = report.cells[0]
+    assert cell.outcome is FillOutcome.ERROR
+    assert cell.attempts[0].violations, "the gate did have an opinion on the answer it got"
+    assert any("pandas" in message for message in cell.attempts[0].violations)
+    assert not report.unmeasured
+
+
+def test_a_run_where_nothing_came_back_at_all_is_unmeasured() -> None:
+    """The one thing the property does claim, and the whole reason it exists."""
+    report = fill_holes(
+        make_approved_plan(), completer=Broken(), cells=one_hole(), analysis=make_analysis()
+    )
+
+    assert report.unmeasured
+    assert all(attempt.error is not None for attempt in report.cells[0].attempts)
+
+
+def test_a_conversion_with_no_holes_at_all_is_not_unmeasured() -> None:
+    """That is a statement about the plan, and a caller that wants it asks ``holes``."""
+    report = fill_holes(
+        make_approved_plan(),
+        completer=Obliging(),
+        cells=[ScaffoldCell(name="alpha", code="alpha = 1")],
+        analysis=make_analysis(),
+    )
+
+    assert report.holes == 0
+    assert not report.unmeasured
+
+
 def test_counts_names_every_outcome_even_at_zero() -> None:
     """A missing key is how a category quietly stops being reported."""
     report = fill_holes(
@@ -351,6 +429,7 @@ def test_counts_names_every_outcome_even_at_zero() -> None:
         "empty": 0,
         "error": 0,
         "skipped": 0,
+        "unfillable": 0,
     }
 
 
@@ -430,6 +509,113 @@ def test_a_finished_translation_carrying_a_reviewers_note_is_left_entirely_alone
     assert report.holes == 0
     assert report.codes == (translated.code,)
     assert "Phil, 2026-08" in report.codes[0]
+
+
+STATEMENTLESS_HANDOFF = ScaffoldCell(
+    name="update_statement",
+    code=(
+        "# Stage 7 of 8: update_statement  [handoff]\n"
+        "# Intent: hand the UPDATE to whoever runs it\n"
+        f"update_statement = '{TODO_MARKER}: the plan marked this stage a hand-off but supplied "
+        "no statement.\\n-- Paste the query or command this step runs, then re-approve.'\n"
+        "mo.vstack(\n"
+        "    [\n"
+        "        mo.md('### Run this: update_statement'),\n"
+        '        mo.md(f"```sql\\n{update_statement}\\n```"),\n'
+        "    ]\n"
+        ")"
+    ),
+    role="handoff",
+    stage_id="update_statement",
+)
+"""A hand-off whose statement *is* the marker, copied from what the scaffolder really emits.
+
+``Stage.effective_handoff()`` cannot guess a statement, so for a plan declaring ``kind: handoff``
+and supplying none it synthesises one whose text begins ``-- TODO(kedge): the plan marked this
+stage a hand-off but supplied no statement`` -- which is exactly what a model writes when it types
+``kind: handoff`` and stops. The marker therefore lands in a **string literal on an executable
+line**, not in the leading comment run, so ``split_hole`` returns ``("", code)``: there is nothing
+to replace short of the display block. ``is_unwritten`` still says True, and correctly -- the
+notebook owes this cell.
+"""
+
+
+def test_a_hole_nothing_can_be_asked_to_fill_is_still_a_hole() -> None:
+    """The shrinking denominator, pinned. It was dropped where it was found.
+
+    Not in ``cells``, not in ``holes``, not in ``unfilled``, not in ``complete`` -- so a
+    conversion that left a ``TODO(kedge)`` on disk exited 0 saying "nothing is left unwritten",
+    and a model that wrote the statement-less hand-off had that stage taken out of its own
+    generation denominator and was printed as filling every hole it was given.
+    """
+    completer = Obliging()
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=completer,
+        cells=[STATEMENTLESS_HANDOFF, *one_hole("alpha")],
+        analysis=make_analysis(),
+    )
+
+    asked = [request.messages[1]["content"].split("`")[1] for request in completer.requests]
+    assert asked == ["alpha"], "there is nothing to ask about the hand-off"
+    assert report.holes == 2, "the hand-off is a hole the notebook still owes"
+    assert report.filled == 1
+    assert not report.complete
+    blocked = report.cells[0]
+    assert blocked.name == "update_statement"
+    assert blocked.outcome is FillOutcome.UNFILLABLE
+    assert blocked.tries == 0
+    assert "no placeholder" in blocked.detail
+    assert blocked in report.unfilled
+    assert report.counts()["unfillable"] == 1
+    # The cell is left exactly as it was: nothing was written, so nothing may be overwritten.
+    assert report.codes[0] == STATEMENTLESS_HANDOFF.code
+    assert is_unwritten(report.codes[0])
+
+
+def test_the_denominator_is_every_hole_the_scaffolder_left() -> None:
+    """``holes_in`` and the report's own count must agree, or the report is flattering.
+
+    They are two answers to one question -- what does this notebook still owe -- and the driver's
+    used to be the smaller of the two whenever a hole could not be put to a model.
+    """
+    cells = [STATEMENTLESS_HANDOFF, *one_hole("alpha"), *one_hole("beta")]
+
+    report = fill_holes(
+        make_approved_plan(),
+        completer=Obliging(),
+        cells=cells,
+        analysis=make_analysis(),
+    )
+
+    assert report.holes == len(holes_in(cells))
+    assert {cell.name for cell in report.cells} == {cell.name for cell in holes_in(cells)}
+
+
+async def test_a_conversion_leaving_a_marker_on_disk_never_reports_itself_complete(
+    notebook: Path,
+) -> None:
+    """The product half of the same defect: exit 0 over a file that still says TODO(kedge).
+
+    ``complete``'s own docstring is what this enforces -- "never report a pass that was not
+    earned" -- and the check is the mechanism rather than a count: the marker is either in the
+    file or it is not.
+    """
+    driver = FileNotebookDriver(notebook)
+    await driver.create_cell(STATEMENTLESS_HANDOFF.code, name=STATEMENTLESS_HANDOFF.name, run=False)
+
+    report = await convert_notebook(
+        make_approved_plan(),
+        driver,
+        completer=Obliging(),
+        analysis=make_analysis(),
+        sync=False,
+    )
+
+    assert TODO_MARKER in notebook.read_text(encoding="utf-8")
+    assert not report.complete, "a marker is still on disk; this conversion is not finished"
+    assert report.counts()["unfillable"] == 1
 
 
 def test_an_unnamed_cell_carrying_the_marker_is_never_asked_about() -> None:
@@ -916,3 +1102,107 @@ def test_convert_reports_a_dead_endpoint_as_a_dead_endpoint(
     assert payload["counts"]["skipped"] == payload["holes"] - 1
     assert payload["counts"]["rejected"] == 0
     assert payload["written"] == []
+
+
+# ── where the driver lives, and why it may not move back ─────────────────────────────────────
+
+
+def test_nothing_in_the_notebook_package_imports_the_agent() -> None:
+    """The layering, machine-checked: ``notebook/`` sits below ``agent/`` and may not reach up.
+
+    This module's own subject is why. The conversion driver was built under ``notebook/`` and had
+    to import ``agent.context``, ``agent.prompts`` and ``agent.validate`` to work. There was no
+    runtime cycle only because ``notebook/__init__.py`` did not import it, and the cost of adding
+    that one line was not one module but the whole ``agent`` package -- ``agent/__init__.py``
+    eagerly aggregates ``context``, so every import starting inside ``kedge.agent`` failed with
+    ``cannot import name 'CellFacts' from partially initialized module``.
+
+    ``scripts/guardrails.py`` is the enforcement and CI runs it; this calls **that** function
+    rather than walking the tree again, because a refactor whose whole argument is that a copy of
+    a rule drifts out of step with the original must not land a second copy of its own
+    enforcement. The first draft of this test did exactly that, and inherited the same blind spot
+    as the guardrail it was meant to back up -- ``from kedge import agent`` sailed past both.
+    Asserted here as well as in CI because a red test in the ordinary suite is what a contributor
+    meets first.
+    """
+    assert [breach.render() for breach in _check_layering()] == []
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import kedge.agent",
+        "import kedge.agent.fill",
+        "from kedge.agent import fill_holes",
+        "from kedge.agent.context import CellFacts",
+        "from kedge import agent",
+        "from .. import agent",
+        "from ..agent.validate import validate_cell",
+        "from ..agent import validate",
+    ],
+)
+def test_every_spelling_of_the_inversion_is_caught(statement: str) -> None:
+    """Eight ways to write one runtime edge, and the guardrail has to know all of them.
+
+    Two of these are the reason this test exists. ``from kedge import agent`` names the module
+    ``kedge`` and completes the dotted path in the *alias*, so a check that reads the module alone
+    passes it through -- and the guardrail then prints "src/kedge/notebook/ imports nothing from
+    kedge.agent" over a tree where ``import kedge.notebook.scaffold`` raises ``cannot import name
+    'TODO_MARKER' from partially initialized module``. ``from .. import agent`` is the same
+    statement spelled relatively.
+    """
+    node = ast.parse(statement).body[0]
+    targets = _import_targets(node, "kedge.notebook")
+
+    assert any(_is_or_is_under(target, LAYERING_BANNED) for target in targets), (
+        f"{statement!r} resolved to {targets} and none of them is under {LAYERING_BANNED}"
+    )
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "import kedge.notebook.scaffold",
+        "from kedge.notebook.scaffold import TODO_MARKER",
+        "from kedge import notebook",
+        "from . import scaffold",
+        "from kedge.plan.model import ProcessPlan",
+        "import agentic_thing",
+    ],
+)
+def test_the_layering_check_does_not_catch_what_it_has_no_business_catching(
+    statement: str,
+) -> None:
+    """Appending the alias widens the net, so the net is checked for what it must let through.
+
+    ``from kedge import notebook`` resolves to ``kedge.notebook``, and ``import agentic_thing``
+    starts with the same six letters as ``agent`` -- which is why the match is on dotted segments
+    rather than on a prefix of the string.
+    """
+    node = ast.parse(statement).body[0]
+    targets = _import_targets(node, "kedge.notebook")
+
+    assert not any(_is_or_is_under(target, LAYERING_BANNED) for target in targets)
+
+
+def test_the_import_that_used_to_break_the_whole_agent_package_is_now_harmless() -> None:
+    """The reproduction, run rather than remembered, and in both orders.
+
+    A driver under ``notebook/`` made ``import kedge.notebook`` fatal to every module in
+    ``kedge.agent`` the moment the package imported it. Each order is run in its own interpreter:
+    a cycle shows itself from one end only, and a module already in ``sys.modules`` from an
+    earlier test would hide it.
+    """
+    for program in (
+        "import kedge.notebook; import kedge.agent.fill; "
+        "from kedge.agent.context import CellFacts; assert CellFacts",
+        "from kedge.agent.context import CellFacts; import kedge.notebook; assert CellFacts",
+        "import kedge.agent; import kedge.notebook; import kedge.agent.fill",
+    ):
+        finished = subprocess.run(
+            [sys.executable, "-c", program],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert finished.returncode == 0, f"{program}\n{finished.stderr}"

@@ -61,8 +61,8 @@ from kedge.observability import configure_logging
 from kedge.workspace import Workspace, iter_markers
 
 if TYPE_CHECKING:
+    from kedge.agent.fill import FillReport
     from kedge.analysis.model import WorkbookAnalysis
-    from kedge.notebook.fill import FillReport
     from kedge.plan import PlanRun, PlanStore, ProcessPlan
 
 logger = logging.getLogger(__name__)
@@ -1352,12 +1352,13 @@ def convert(
     gate. A stage somebody has already translated carries no marker, is not a hole, and is never
     asked about or overwritten.
 
-    Six outcomes are reported, not two. A hole nobody asked about, one filled first time, one
-    filled after the gate sent it back, one the gate refused every time, one answered with prose,
-    and one the endpoint never answered are six different things to do next -- and the last is not
-    the model's judgement, so it is never counted as one. A model-endpoint failure abandons the
-    run by default rather than putting the same dead endpoint five more questions; `--keep-going`
-    presses on.
+    Seven outcomes are reported, not two. One filled first time, one filled after the gate sent it
+    back, one the gate refused every time, one answered with prose, one the endpoint never
+    answered, one nobody asked about because an earlier failure ended the run, and one nothing can
+    be asked about at all are seven different things to do next -- and only four are the model's
+    judgement, so the rest are never counted as such. A model-endpoint failure abandons the run by
+    default rather than putting the same dead endpoint five more questions; `--keep-going` presses
+    on.
 
     Exit codes: 0 when every hole was filled, or when there were none, and 1 when anything is
     still unwritten -- so a script can tell a finished conversion from one that needs a person.
@@ -1393,9 +1394,9 @@ def convert(
     # gate and the notebook bridge are several hundred milliseconds that `kedge --help` must not
     # pay for. The attempt cap is kedge's own rather than a literal three repeated here, which is
     # also why the flag defaults to None instead of to a number.
+    from kedge.agent.fill import convert_notebook
     from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
     from kedge.notebook.filedriver import FileNotebookDriver
-    from kedge.notebook.fill import convert_notebook
     from kedge.plan.propose import completer_from_config
 
     try:
@@ -1523,7 +1524,8 @@ def _print_conversion(report: FillReport, notebook: Path) -> None:
         console.print(
             "[dim]each of these keeps the scaffolder's passthrough, so the notebook still runs "
             "and still carries its TODO(kedge) marker. Run this again, or write them in the "
-            "chat.[/dim]"
+            "chat -- except any marked 'unfillable', which no model can be asked to write: read "
+            "the reason beside it, because those need the plan changing or a hand edit.[/dim]"
         )
 
 
