@@ -32,6 +32,7 @@ uv sync --group evals                                 # duckdb, for executing ge
 uv run python evals/run.py adjustment_signoff         # grade the reference conversion
 uv run python evals/run.py adjustment_signoff \
     --notebook path/to/converted.py --plan path/to/plan.yaml
+uv run python evals/run.py adjustment_signoff --project path/to/workbook.kedge  # both, resolved
 uv run python evals/run.py adjustment_signoff --json  # for a CI step
 
 uv run python evals/run.py adjustment_signoff --model MODEL --repeats 3   # plan, per model
@@ -187,10 +188,12 @@ hand in. The loose tier gave it 10 of 18. It is a better input than any mutation
 — a mistyped `kind` on a re-extract is not a mistake a test author makes.
 
 Note what two items do on it rather than failing: `mutates_agrees_with_the_statement` and
-`the_re_extract_waits_for_the_update` both **skip**. A plan that hands nothing over has no
+`the_re_extract_waits_for_the_update` are both **blocked**. A plan that hands nothing over has no
 statement for a flag to contradict and no update for a re-extract to wait for, and reporting
 either as a failure would name the wrong defect. `hands_over_rather_than_pretends` is the item
-about that, and it is red.
+about that, and it is red. They are blocked rather than skipped, so their five points stay in the
+denominator: the plan scored 5/19 while the very defect that cost it those points also removed
+them from what it was scored out of. It now scores 5/24.
 
 Money is compared at half a penny, never with `==`. polars' vectorised execution of the rounding
 chain lands a few parts in 1e11 from the scalar path — far inside the penny that matters and far
@@ -262,7 +265,7 @@ a time, and asserting the right item goes red and nothing else falls over:
 | build the SQL by concatenation | `generated_sql_is_valid` |
 | verify a frame against itself | `verification_finds_exactly_one_break` |
 | carry the memo's stale movement | `does_not_trust_the_impact_summary` |
-| rename a widget so the run stops | `ran_to_completion` (the rest **skip**, not fail) |
+| rename a widget so the run stops | `ran_to_completion` (the rest **block**, not fail — and stay in the denominator) |
 | add `Adjustment!G` to `dropped` | `does_not_drop_the_sql_column` |
 | clear the plan's `briefing` | `the_briefing_survives_the_workbook` |
 | a briefing with cadence and audience and no `sources` | `the_briefing_survives_the_workbook` |
@@ -278,20 +281,56 @@ a time, and asserting the right item goes red and nothing else falls over:
 | `sources: ["nowhere in particular"]` | `the_briefing_survives_the_workbook` |
 | point the re-extract at the extract, not the update | `the_re_extract_waits_for_the_update` |
 
-The last two rows of the first block are the ones worth keeping. A notebook that stops has one problem, and
-reporting it eight times buries it — so items about cells that never ran are skips. And a plan
-that drops the SQL column is the sharpest failure the eval has: plausible, well-reasoned, and it
-deletes the step that changes the data.
+The last two rows of the first block are the ones worth keeping. A notebook that stops has one
+problem, and reporting it eight times buries it — so items about cells that never ran are not
+failures. And a plan that drops the SQL column is the sharpest failure the eval has: plausible,
+well-reasoned, and it deletes the step that changes the data.
 
 ### The denominator
 
-Three outcomes per item, not two. `SKIP` exists because an item can be ungradeable through
-nobody's fault — duckdb not installed, no plan supplied, the notebook stopped before the cell
-this item is about ever ran. Folding those into `FAIL` makes a missing dependency look like a
-broken conversion; folding them into `PASS` is the reconciliation sin.
+Four outcomes per item, and the fourth is the one with a story.
+
+`SKIP` is for an item nobody could grade **through nobody's fault** — duckdb not installed, no
+plan supplied, no knowledge pack describing `fin.accruals`. It leaves the denominator, because an
+item the case cannot pose is not one the conversion failed.
+
+`BLOCKED` is for an item nobody could grade **because the conversion under test broke first** —
+the notebook stopped in an earlier cell, or the plan omitted the hand-off this item asks about. It
+stays in the denominator and earns nothing.
+
+Those two were the same outcome once, and the conflation ran the wrong way. A stopped notebook was
+scored out of only the part of the rubric it survived long enough to be asked about, so the
+denominator shrank in proportion to how early the thing broke. Measured on a real hub conversion:
+**6/33 (18%) as reported, 6/69 (9%) once the items its own stop had removed were counted back in.**
+Repairing only the cell that stopped it, and nothing else, would have *lowered* the printed figure
+from 18% to 9%. A rubric that pays a conversion for breaking early is not a rubric.
+
+What `BLOCKED` does not do is diagnose. Fifteen red lines that are all one bug bury the bug, which
+is why these are not `FAIL`: they are counted in the score, named in one line, and explained once
+by the `FAIL` that caused them.
 
 So a report always carries **two numbers**: the score and what it was taken over. `20/20` over a
 rubric of sixteen items is not a pass, and the headline will not render it as one.
+
+### Grading what the hub actually produced
+
+```bash
+uv run python evals/run.py adjustment_signoff --project path/to/q2_accrual_adjustment.kedge
+```
+
+`--project` reads a hub project directory as the hub leaves it and resolves both halves: the
+notebook, and the **latest approved** plan — approved, because an unapproved plan was never
+scaffolded, so grading a notebook against it reports a shape the notebook was never asked to have.
+
+It exists because the two-flag form was the step nobody took. The composed path had never been
+graded once, and the first time it was, by hand, it came back at 6 of the rubric's 72 points.
+
+**`--plan` on its own is refused.** `--notebook` defaults to the committed reference conversion, so
+`--plan a-model-plan.yaml` alone grades a model's plan alongside a human's cell bodies: measured on
+a real hub plan, **49/66 (74%)**, of which 45 points are the reference notebook's deterministic
+tier. That is the same confound `--plan-from` is refused for, reached offline and by accident
+rather than by asking for it. Name the notebook that plan produced, or point `--project` at the
+directory holding both.
 
 ## Measuring a model
 
@@ -403,13 +442,19 @@ clear, or anything `build_cells` refuses — is `NO_PLAN` as well, with the reas
 plan the product would refuse is a result about whoever wrote it and not a run to fudge past.
 
 **A leg the sweep could not grade in full does not print full marks.** A plan the scaffolder
-refuses makes items skip that every other leg was graded on, and the leg used to render `18/18
-PASS` directly beneath a header saying legs are scored out of a larger number — with the skip that caused it
-named nowhere. Three changes: the score cell renders against the *sweep's* denominator and says
-how many points went unmeasured; `SweepReport.ungradeable` is taken from the best-measured leg
-rather than the first one, so the preamble cannot announce one plan's skip as everybody's; and a
-short leg lists its skips under "Why". A skip is a measurement nobody took, and the reader has to
-be told which one.
+refuses used to make items skip that every other leg was graded on, and the leg then rendered
+`18/18 PASS` directly beneath a header saying legs are scored out of a larger number — with the
+skip that caused it named nowhere. Three changes: the score cell renders against the *sweep's*
+denominator and says how many points went unmeasured; `SweepReport.ungradeable` is taken from the
+best-measured leg rather than the first one, so the preamble cannot announce one plan's skip as
+everybody's; and a short leg lists its skips under "Why". A skip is a measurement nobody took, and
+the reader has to be told which one.
+
+That particular route is closed at the source now: a plan the scaffolder refuses is the *plan's*
+defect, so its items are `BLOCKED` and keep their weight. The leg is scored out of the whole tier
+like everybody else and simply earns less of it, and the reason is listed under "Why" beside the
+failures. The short-leg machinery above still stands for the case that genuinely shortens a
+denominator — a real `SKIP` one leg hits and the others do not.
 
 Cost is reported in tokens and seconds. Currency is opt-in via `--prices`, because a price table
 committed here would be wrong within a month and wrong invisibly. An endpoint that volunteers no

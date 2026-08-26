@@ -24,22 +24,31 @@ already wired to a prompt, and fires only on pydantic schema errors.
 Three gradings, all deterministic, all repeatable:
 
 ```bash
-uv run python evals/run.py adjustment_signoff --plan evals/adjustment_signoff/plan.yaml
 uv run python evals/run.py adjustment_signoff \
-    --notebook <project>.kedge/q2_accrual_adjustment.py --plan <project>.kedge/plans/plan-v001.yaml
+    --notebook evals/adjustment_signoff/notebook.py --plan evals/adjustment_signoff/plan.yaml
+uv run python evals/run.py adjustment_signoff --project <project>.kedge
 ```
 
 | Conversion | Deterministic | Structural | Total | Warnings on its plan |
 |---|---|---|---|---|
 | Reference (`notebook.py` + `plan.yaml`) | 45/45 | 26/26 | **71/71** | 2 |
-| Hub, 26 Aug, holes filled by the chat agent | 1/14 | 5/19 | **6/33** | 5 |
-| Hub, 26 Aug, fresh scaffold under current code | 3/16 | 5/19 | **5/35** | 6 |
+| Hub, 26 Aug, holes filled by the chat agent | 1/43 | 5/26 | **6/69** | 5 |
+| Hub, 26 Aug, fresh scaffold under current code | 3/45 | 2/26 | **5/71** | 6 |
 
-The denominators move because an item that cannot be measured is skipped rather than failed, which
-is the harness behaving correctly and is also the most alarming line in the table. Read against the
-rubric's full 72 points: the hub conversion **earned 6**, lost 27 on items that were graded, and
-lost the remaining 39 on **16 items that could not be graded at all**, because the notebook stops on
-its second cell.
+The hub conversion **earned 6**, lost 27 on items that were graded, and lost the remaining 36 on
+**14 items that could not be graded at all**, because the notebook stops on its second cell.
+
+**These are not the figures the eval printed when this was first measured, and the difference is
+itself a finding.** It reported 6/33 (18%) and 5/35 (14%). An item nobody could grade was skipped,
+and a skipped item left the denominator -- so a notebook that stopped was scored out of only the
+part of the rubric it survived long enough to be asked about, and the denominator shrank in
+proportion to how early it broke. Repairing the one cell that stopped this notebook, and nothing
+else, would have *lowered* its printed score from 18% to 9%.
+
+`harness.model.Outcome.BLOCKED` is the fix: an item the *case* cannot pose still leaves the
+denominator, an item the *conversion* prevented does not. The rows above are what the eval reports
+now, and the third one is scored out of the same 71 as the reference -- which is the point. Two
+numbers that were never comparable now are.
 
 Two independent hub runs six days apart, on the same workbook, produced plans with the same three
 defects. This is not one bad sample.
@@ -169,9 +178,9 @@ interface."* The head hand-in is the one stop in the scaffold that names no step
 a step.
 
 Costs `ran_to_completion` (2), `progressive_disclosure` (3), `a_blocked_step_says_which_step_it_is`
-(2) and `a_paste_out_of_excel_works` (3), and takes **12 further deterministic items out of
-measurement entirely** — the rounding, the null-as-zero break, the row-level verification, the SQL
-escaping. Every discriminating thing this eval was built to test is downstream of a cell that stops.
+(2) and `a_paste_out_of_excel_works` (3), and blocks **11 further deterministic items worth 29
+points** — the rounding, the null-as-zero break, the row-level verification, the SQL escaping.
+Every discriminating thing this eval was built to test is downstream of a cell that stops.
 
 Meanwhile the second hand-in, the re-extract the whole process exists to check against, has nowhere
 to arrive: `load_post_adjustment` resolves to `render_update_statement`.
@@ -223,8 +232,8 @@ already exist. `propose_repair.md` needs one more opening line to distinguish "t
 from "this loaded and will scaffold badly"; the warning strings need no rewriting whatever.
 
 Cost: one extra model call on a plan that needs it, none on a plan that does not. Expected return:
-the hand-off, both hand-ins and the briefing, which is 14 of the 19 structural points now being lost,
-and — because 4.2 is what stops the page — most of the 39 points currently unmeasurable.
+the hand-off, both hand-ins and the briefing, which is 14 of the 21 structural points now being
+lost, and — because 4.2 is what stops the page — most of the 36 points currently blocked.
 
 Do it inside `propose_plan` rather than at the `plan/__init__.py` call site, so `kedge plan propose`,
 the hub and the eval sweep all get it without three copies of the decision.
@@ -260,7 +269,30 @@ Still not blocking; the amber-signal argument holds.
 path with the weaker gate, and is what the 26 August run took. One tool or one button, and the
 approved-state suggestion becomes the driver it was written for.
 
-### E. Put a number on the composed path and keep it
+### E. Make the eval able to confirm any of this — **built**
+
+Everything above was measured by hand, with two long paths, on an eval that had three ways to
+score the same conversion and printed the most flattering one by default. That is its own defect
+and it is fixed:
+
+1. **`Outcome.BLOCKED`.** A skip leaves the denominator; an item the conversion prevented no longer
+   does. 6/33 becomes 6/69, and the fresh scaffold is scored out of the same 71 as the reference.
+   Section 1 has the arithmetic and `evals/README.md` has the reasoning.
+2. **`--project <dir>.kedge`** resolves the notebook and the latest *approved* plan out of a hub
+   project. The two-flag form was the step nobody took, which is most of why the composed path had
+   never been graded once.
+3. **`--plan` without `--notebook` is refused.** It silently graded a model's plan alongside the
+   committed reference conversion — 49/66, 74%, of which 45 points are a human's cell bodies. The
+   same confound `--plan-from` is already refused for, reached by accident instead of on purpose.
+4. **The reason survives.** A sweep leg's blocked items are listed under "Why", because the points
+   now come off the score and the sentence explaining them must not disappear with the old
+   short-leg line.
+
+What is still not built is the regression that would have caught the *plan* defect on its own:
+replay `plan-v001.yaml` through `review_warnings` and assert the repairable set is non-empty.
+`tests/unit/observed_conversion.py` already carries the plan.
+
+### F. Put a number on the composed path and keep it
 
 `--convert MODEL --plan-from MODEL` was built by the previous proposal and, as far as the tree
 records, has never been run. The figure in section 1 is that measurement taken by hand, once, on one
@@ -295,11 +327,11 @@ least one `handoff`, a second hand-in and a briefing.
 
 1. **The composed path**, `--convert M --plan-from M` on `adjustment_signoff`, against 71. This
    document's 6 is the pre-change reading.
-2. **Structural tier on a repaired plan**: 5/19 today. A repair that lands the hand-off, the second
-   hand-in and the briefing should put it above 20/26 — and the denominator should stop shrinking,
-   which is the better signal of the two.
-3. **Items that could be graded at all**: 16 skipped today, 1 on the reference. This is the number
-   that says the notebook runs.
+2. **Structural tier on a repaired plan**: 5/26 today. A repair that lands the hand-off, the second
+   hand-in and the briefing should put it above 20/26.
+3. **Points blocked**: 36 today, 0 on the reference. This is the number that says the notebook
+   runs, and it is the one to watch first — while it is non-zero the deterministic tier is not
+   really being measured at all.
 
 ---
 
@@ -316,7 +348,7 @@ Said plainly, because the previous document's most useful pages were its correct
   cell with the same unnumbered message, above the same `pre_adjustment_query`. The defect is live.
 - **The repair loop's yield is an expectation, not a measurement.** It is a strong one — the model is
   being handed a specific field, a specific range and a specific consequence, which is a much easier
-  request than the original — but until A is built and E is run, 14 points is arithmetic on the
+  request than the original — but until A is built and F is run, 14 points is arithmetic on the
   rubric rather than an observation.
 - **`consults_the_knowledge_pack` was skipped in all three runs.** No knowledge pack describes
   `fin.accruals`. One point, and it is unmeasured on the reference too.

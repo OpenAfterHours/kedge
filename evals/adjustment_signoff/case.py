@@ -184,22 +184,30 @@ class Context:
         return self.run.definitions
 
     def need(self, *names: str) -> ItemResult | None:
-        """A skip naming what is missing, or ``None`` when everything is there.
+        """A skip or a block naming what is missing, or ``None`` when everything is there.
 
         A notebook that stopped early has not *failed* the items about cells it never reached --
         it failed the item about stopping. Marking the rest as failures would report one problem
-        five times and bury it.
+        five times and bury it. That is why these are not ``FAIL``.
+
+        It is not why they used to be ``SKIP``. A skip leaves the denominator, so a notebook that
+        stopped early was scored out of only the part of the rubric it survived long enough to be
+        asked about -- and the earlier it broke, the smaller and kinder that part was. ``BLOCKED``
+        is the outcome that reports one problem once *and* keeps the points it cost.
+
+        A run that completed and simply named its cells differently is a genuine ``SKIP``: the
+        rubric could not pose the question, and nothing the conversion did prevented it.
         """
         absent = [name for name in names if name not in self.defs]
         if not absent:
             return None
-        return _skip(
-            f"the notebook defines no {', '.join(absent)}. "
-            + (
-                f"It {self.run.summary_line()}."
-                if not self.run.completed
-                else "It ran to completion, so this is a naming difference rather than a stop."
+        if not self.run.completed:
+            return _blocked(
+                f"the notebook defines no {', '.join(absent)}. It {self.run.summary_line()}."
             )
+        return _skip(
+            f"the notebook defines no {', '.join(absent)}. It ran to completion, so this is a "
+            f"naming difference rather than a stop."
         )
 
 
@@ -213,6 +221,16 @@ def _fail(detail: str) -> ItemResult:
 
 def _skip(detail: str) -> ItemResult:
     return ItemResult(id="", outcome=Outcome.SKIP, detail=detail)
+
+
+def _blocked(detail: str) -> ItemResult:
+    """Ungradeable because the conversion broke first. Counted, but not diagnosed again.
+
+    Use this wherever the reason an item cannot be graded is something the conversion under test
+    did -- a run that stopped, a plan that omitted the step this item asks about. Use
+    :func:`_skip` only where the *case* cannot pose the question at all.
+    """
+    return ItemResult(id="", outcome=Outcome.BLOCKED, detail=detail)
 
 
 def _close(actual: float, expected: float) -> bool:
@@ -624,7 +642,7 @@ def a_declared_exception_does_not_read_as_a_defect(ctx: Context) -> ItemResult:
         None,
     )
     if region is None:
-        return _skip("the report has no region for Adjustment!G, so there is nothing to judge")
+        return _blocked("the report has no region for Adjustment!G, so there is nothing to judge")
     if region.status.value == "passed":
         return _fail(
             "Adjustment!G is reported as passed. Nothing was compared against it -- an "
@@ -668,7 +686,7 @@ def the_period_is_an_input(ctx: Context) -> ItemResult:
 
     statement = str(run.definitions.get("extract_query", ""))
     if not statement:
-        return _skip("the notebook defines no extract_query under a changed period")
+        return _blocked("the notebook defines no extract_query under a changed period")
     if chosen.isoformat() not in statement:
         return _fail(
             f"the period was set to {chosen}, and the extract query does not mention it:\n"
@@ -742,7 +760,7 @@ def the_run_resumes_after_the_kernel_dies(ctx: Context) -> ItemResult:
         pre, post = write_handins(root / "handins-in")
         first = _drive(ctx, script_for(pre, post), root)
         if not first.completed:
-            return _skip(
+            return _blocked(
                 f"the first pass did not complete, so resuming cannot be graded: {first.summary_line()}"
             )
         # A new kernel: no widget values at all, only what is on disk.
@@ -773,7 +791,7 @@ def starting_fresh_keeps_the_old_run(ctx: Context) -> ItemResult:
         pre, post = write_handins(root / "handins-in")
         first = _drive(ctx, script_for(pre, post), root)
         if not first.completed:
-            return _skip("the first pass did not complete, so starting fresh cannot be graded")
+            return _blocked("the first pass did not complete, so starting fresh cannot be graded")
         original = str(first.definitions.get("KEDGE_RUN_ID", ""))
 
         second = _drive(
@@ -817,7 +835,7 @@ def reconciliation_does_not_rot_on_a_later_period(ctx: Context) -> ItemResult:
         pre, post = write_handins(root / "handins-in")
         first = _drive(ctx, script_for(pre, post), root)
         if not first.completed:
-            return _skip(f"the conversion run did not complete: {first.summary_line()}")
+            return _blocked(f"the conversion run did not complete: {first.summary_line()}")
         accepted = first.definitions.get("reconciliation")
         if accepted is None or not getattr(accepted, "translation_accepted", False):
             return _fail(
@@ -1057,7 +1075,7 @@ def takes_two_handins(ctx: Context) -> ItemResult:
 
     cells, unscaffoldable = _scaffold(ctx.plan)
     if unscaffoldable:
-        return _skip(
+        return _blocked(
             f"the plan declares hand-ins on {', '.join(sorted(declared))} but would not "
             f"scaffold, so what the notebook asks for could not be counted -- {unscaffoldable}"
         )
@@ -1312,14 +1330,14 @@ def the_re_extract_waits_for_the_update(ctx: Context) -> ItemResult:
         return _no_plan()
     mutating = _mutating_handoffs(ctx.plan)
     if not mutating:
-        return _skip(
+        return _blocked(
             "the plan hands over no statement that writes, so there is no update for a "
             "re-extract to wait for. `hands_over_rather_than_pretends` is the item about that."
         )
 
     cells, unscaffoldable = _scaffold(ctx.plan)
     if unscaffoldable:
-        return _skip(
+        return _blocked(
             f"the plan would not scaffold, so cell order could not be read -- {unscaffoldable}"
         )
 
@@ -1334,7 +1352,7 @@ def the_re_extract_waits_for_the_update(ctx: Context) -> ItemResult:
         for stage in mutating
     }
     if not selectors:
-        return _skip(
+        return _blocked(
             "the notebook asks for no hand-in of its own, so there is no re-extract to place. "
             "`takes_two_handins` is the item about that."
         )
@@ -1396,7 +1414,7 @@ def mutates_agrees_with_the_statement(ctx: Context) -> ItemResult:
         return _no_plan()
     claiming = [stage for stage in ctx.plan.stages if stage.is_handoff or stage.handoff is not None]
     if not claiming:
-        return _skip(
+        return _blocked(
             "the plan hands nothing over, so there is no statement for `mutates` to agree or "
             "disagree with. `hands_over_rather_than_pretends` is the item about that."
         )
@@ -1519,7 +1537,7 @@ def does_not_trust_the_impact_summary(ctx: Context) -> ItemResult:
     stale_rows = int(ctx.facts["stale_rows_adjusted"])
     signoff = ctx.defs["signoff"]
     if not isinstance(signoff, dict):
-        return _skip("the notebook's `signoff` is not a mapping, so its figures cannot be read")
+        return _blocked("the notebook's `signoff` is not a mapping, so its figures cannot be read")
     if _close(float(signoff.get("movement", 0.0)), stale_movement):
         return _fail(
             f"the notebook reports a movement of {stale_movement:,.2f}, which is the Sign-off "

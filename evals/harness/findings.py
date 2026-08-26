@@ -283,7 +283,7 @@ def coverage_for(report: EvalReport, log: ReDriveLog | None = None) -> Coverage:
                 undriven.append(
                     Ungraded(id=item.id, weight=item.weight, outcome=item.outcome.value, why=why)
                 )
-            elif item.outcome is Outcome.SKIP:
+            elif item.outcome in (Outcome.SKIP, Outcome.BLOCKED):
                 ungradeable.append(
                     Ungraded(
                         id=item.id,

@@ -255,7 +255,13 @@ def test_carrying_the_memos_stale_figures_forward_fails(tmp_path: Path) -> None:
 
 
 def test_a_notebook_that_stops_fails_completion_and_skips_the_rest(tmp_path: Path) -> None:
-    """One problem reported once. The items about cells that never ran are skips, not failures."""
+    """One problem reported once, and still paid for.
+
+    The items about cells that never ran are not failures -- fifteen red lines that are all one
+    bug bury the bug. They are not skips either: a skip leaves the denominator, so a notebook that
+    stopped early used to be scored out of only the part of the rubric it survived long enough to
+    be asked about. ``BLOCKED`` is counted and not diagnosed.
+    """
     target = tmp_path / "stops.py"
     source = adjustment_case.REFERENCE_NOTEBOOK.read_text(encoding="utf-8")
     target.write_text(
@@ -268,10 +274,18 @@ def test_a_notebook_that_stops_fails_completion_and_skips_the_rest(tmp_path: Pat
     report = grade_mutant(target)
 
     assert outcome_of(report, "ran_to_completion") is Outcome.FAIL
-    assert outcome_of(report, "totals_to_the_penny") is Outcome.SKIP
-    assert outcome_of(report, "verification_finds_exactly_one_break") is Outcome.SKIP
+    assert outcome_of(report, "totals_to_the_penny") is Outcome.BLOCKED
+    assert outcome_of(report, "verification_finds_exactly_one_break") is Outcome.BLOCKED
     # The structural tier grades the plan, which is unaffected by the notebook stopping.
     assert outcome_of(report, "hands_over_rather_than_pretends") is Outcome.PASS
+    # The point of the outcome: a stop must not shrink the denominator. Only a SKIP leaves it, so
+    # a conversion cannot buy a better percentage by breaking earlier -- which is what SKIP did,
+    # in proportion to how early it broke.
+    declared = sum(item.weight for tier in report.tiers for item in tier.items)
+    lost_to_skips = sum(item.weight for item in report.skipped)
+    assert report.available == declared - lost_to_skips
+    assert report.blocked, "a notebook that stopped blocked nothing"
+    assert not report.ok
 
 
 # ── negative controls on the plan ────────────────────────────────────────────
@@ -710,10 +724,15 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
     The item-by-item outcome is asserted as well as the total, because the total moves whenever a
     weight does and what is pinned here is *which* items see the defect. Three are worth reading
     twice. ``takes_two_handins`` was **green** on this plan while the notebook it scaffolded had
-    one place to put a grid. And two items **skip** rather than failing: a plan that hands nothing
-    over has no statement for ``mutates`` to contradict and no update for a re-extract to wait
-    for, so reporting either as a failure would name the wrong defect.
+    one place to put a grid. And two items are **blocked** rather than failing: a plan that hands
+    nothing over has no statement for ``mutates`` to contradict and no update for a re-extract to
+    wait for, so reporting either as a failure would name the wrong defect.
     ``hands_over_rather_than_pretends`` is the item about that, and it is red.
+
+    Blocked, though, and no longer skipped -- so their five points stay in the denominator. This
+    plan scored 5/19 while the defect that cost it those points also removed them from what it
+    was scored out of; it now scores 5/24. The one thing a plan must not gain by omitting a
+    hand-off is a smaller rubric.
     """
     from harness.sweep import Bench, grade_structural
     from observed_conversion import observed_plan
@@ -729,12 +748,12 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
         "raises_the_memo_discrepancy": Outcome.PASS,
         "does_not_trust_the_impact_summary": Outcome.SKIP,
         "has_a_checkpoint_before_the_update": Outcome.FAIL,
-        "the_re_extract_waits_for_the_update": Outcome.SKIP,
-        "mutates_agrees_with_the_statement": Outcome.SKIP,
+        "the_re_extract_waits_for_the_update": Outcome.BLOCKED,
+        "mutates_agrees_with_the_statement": Outcome.BLOCKED,
         "the_briefing_survives_the_workbook": Outcome.FAIL,
         "consults_the_knowledge_pack": Outcome.SKIP,
     }, tier.render()
-    assert (tier.earned, tier.available) == (5, 19), tier.render()
+    assert (tier.earned, tier.available) == (5, 24), tier.render()
     details = {item.id: item.detail for item in tier.items}
     assert "nowhere to arrive" in details["takes_two_handins"]
     assert "Sign-off" in details["the_briefing_survives_the_workbook"]

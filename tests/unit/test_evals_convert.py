@@ -1116,11 +1116,13 @@ def test_a_notebook_that_stops_is_told_apart_from_one_that_graded_badly(tmp_path
     assert report.outcome is ConversionOutcome.STOPPED
     assert report.report is not None
     assert outcome_of(report.report, "ran_to_completion") is Outcome.FAIL
-    assert outcome_of(report.report, "verification_finds_exactly_one_break") is Outcome.SKIP, (
-        "items about cells that never ran must skip, not fail -- one problem reported once"
+    assert outcome_of(report.report, "verification_finds_exactly_one_break") is Outcome.BLOCKED, (
+        "items about cells that never ran must be blocked, not failed -- one problem reported "
+        "once, and still counted against the conversion that caused it"
     )
     # The cells above the failure still ran, and what they got right is still graded. Reporting
-    # one broken cell as eleven failures is what the skip exists to prevent.
+    # one broken cell as eleven failures is what the blocked outcome exists to prevent -- and
+    # keeping it in the denominator is what stops the stop being worth points.
     assert outcome_of(report.report, "totals_to_the_penny") is Outcome.PASS
 
 
