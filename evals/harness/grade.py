@@ -18,6 +18,7 @@ from typing import Any
 
 import yaml
 
+from harness.align import align_inputs
 from harness.drive import run_notebook, unused_inputs, workspace_overrides
 from harness.model import EvalReport, ItemResult, Outcome, TierResult
 
@@ -60,16 +61,28 @@ def grade(
         root = Path(workspace)
         pre, post = case.write_handins(root / "handins-in")
         script = case.script_for(pre, post)
+        # Re-keyed onto the widgets *this* notebook has. The script's names come from the
+        # reference conversion, and the scaffolder derives every widget name from the plan's
+        # stage ids -- so a conversion built from anybody else's plan was driven by nothing at
+        # all, stopped at the first step waiting for a human, and had everything below it
+        # reported as blocked. Measured on a real hub conversion: not one of the eight scripted
+        # actions named a widget it had. `harness.align` already existed for this and the live
+        # `--convert` path already used it; this path did not, so the only route a hub user takes
+        # was the one route that could not be graded.
+        alignment = align_inputs(notebook, tuple(script))
+        inputs, unplayed = alignment.bind(script)
         run = run_notebook(
             notebook,
-            inputs=script,
+            inputs=inputs,
             overrides=workspace_overrides(root, case.WORKBOOK),
         )
         context = case.Context(
             run=run,
             facts=facts,
             notebook=notebook,
-            unused_inputs=unused_inputs(run, script) if run.completed else (),
+            unused_inputs=tuple(sorted({*unplayed, *unused_inputs(run, inputs)}))
+            if run.completed
+            else (),
             plan=plan,
         )
         tiers = (
@@ -81,6 +94,7 @@ def grade(
         f"notebook: {notebook}",
         f"workbook: {case.WORKBOOK.name}",
         f"run: {run.summary_line()}",
+        *alignment.notes(),
     ]
     if plan is None:
         notes.append("no plan supplied, so the structural tier was skipped in full")
