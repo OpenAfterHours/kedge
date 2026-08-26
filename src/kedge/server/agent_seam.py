@@ -5,14 +5,30 @@ the interface it needs as a :class:`Protocol` and ships a fake that satisfies it
 can be built, exercised and judged with no model endpoint and no marimo process. The real loop
 then builds to the Protocol rather than to whatever the server happened to call first.
 
-The interface is deliberately narrow. The server hands over a :class:`TurnRequest` — one user
-message, the conversation so far, and an optional model override — and receives an async iterator
-of typed events. Everything else the loop needs (config, the analysis, the marimo session, the
-notebook driver) it gets from the :class:`~kedge.workspace.Workspace` it was constructed with;
+**The Protocol stays here, above the thing that implements it, and that is not an oversight.**
+An interface belongs to the side that *needs* it, not the side that satisfies it: the server is
+the caller, so the server says what a caller requires. The proof that this costs nothing is that
+``kedge.agent.loop`` never imports :class:`AgentLoop` -- :class:`~kedge.agent.loop.KedgeAgent`
+satisfies it structurally, having been written against this file's prose. So there is no edge
+back up the layering, no exemption in ``scripts/guardrails.py``, and no reason for one.
+
+The *data* crossing the seam is a different question, and it got the other answer. A
+:class:`~kedge.turn.TurnRequest` is not an interface, it is an argument, and the loop reads its
+fields; a :class:`~kedge.turn.CancelToken` is a primitive the loop polls. Those the loop does have
+to name, and while they lived here it named them -- which was the whole of the ``agent/ ->
+server/`` type-only edge the guardrail used to have to argue about. They now live in
+:mod:`kedge.turn` alongside the events a turn yields back, below both layers, and are re-exported
+here so that the server-side vocabulary reads as one thing. What goes in and what comes out live
+together; the interface between them stays with its caller.
+
+The interface is deliberately narrow. The server hands over a :class:`~kedge.turn.TurnRequest` —
+one user message, the conversation so far, and an optional model override — and receives an async
+iterator of typed events. Everything else the loop needs (config, the analysis, the marimo session,
+the notebook driver) it gets from the :class:`~kedge.workspace.Workspace` it was constructed with;
 none of it belongs in a per-turn request, and none of it belongs to the server.
 
-Cancellation is cooperative, via :class:`CancelToken`. There is no way to interrupt a blocking
-call from outside it, so the loop is expected to check the token between steps and, in
+Cancellation is cooperative, via :class:`~kedge.turn.CancelToken`. There is no way to interrupt a
+blocking call from outside it, so the loop is expected to check the token between steps and, in
 particular, around anything that takes time: model calls, cell runs, tool dispatch. The server
 also closes the iterator when the client disconnects, which covers the "user shut the tab" case.
 """
@@ -23,7 +39,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from kedge.server.events import (
     AnyEvent,
@@ -38,6 +54,7 @@ from kedge.server.events import (
     ToolResultEvent,
     ValidationEvent,
 )
+from kedge.turn import CancelToken, TurnMessage, TurnRequest
 
 logger = logging.getLogger(__name__)
 
@@ -56,64 +73,6 @@ class AgentUnavailableError(RuntimeError):
     """No agent loop is wired up, and the server was not started in demo mode."""
 
 
-@dataclass(frozen=True, slots=True)
-class TurnMessage:
-    """One prior message, as the loop sees it when assembling context."""
-
-    role: Literal["user", "assistant"]
-    content: str
-
-
-@dataclass(frozen=True, slots=True)
-class TurnRequest:
-    """Everything the loop is told about one turn.
-
-    Notebook state is deliberately absent. PLAN M4 is emphatic that the loop must rebuild it
-    from the live kernel every turn rather than trusting anything carried in history, because the
-    user edits cells directly between turns and history goes stale immediately.
-    """
-
-    turn_id: str
-    session_id: str
-    message: str
-    model: str | None = None
-    history: tuple[TurnMessage, ...] = ()
-
-
-class CancelToken:
-    """A cooperative stop signal for one turn.
-
-    Example:
-        >>> token = CancelToken()
-        >>> token.cancelled
-        False
-        >>> token.cancel()
-        >>> token.cancelled
-        True
-    """
-
-    def __init__(self) -> None:
-        self._event = asyncio.Event()
-
-    @property
-    def cancelled(self) -> bool:
-        """Whether the user has asked for this turn to stop."""
-        return self._event.is_set()
-
-    def cancel(self) -> None:
-        """Ask for the turn to stop at the next opportunity."""
-        self._event.set()
-
-    async def wait(self) -> None:
-        """Block until cancellation is requested, for racing against a pending call."""
-        await self._event.wait()
-
-    def raise_if_cancelled(self) -> None:
-        """Raise :class:`asyncio.CancelledError` if cancellation has been requested."""
-        if self.cancelled:
-            raise asyncio.CancelledError
-
-
 @runtime_checkable
 class AgentLoop(Protocol):
     """What the server requires of ``kedge.agent.loop``.
@@ -125,14 +84,14 @@ class AgentLoop(Protocol):
     ``run`` is an async generator function: calling it returns the iterator without awaiting,
     and each yielded event is streamed to the browser as it arrives. Implementations should:
 
-    * emit a :class:`~kedge.server.events.StatusEvent` before any slow step, so the UI can say
-      what is happening rather than showing a spinner;
-    * emit :class:`~kedge.server.events.TokenEvent` fragments as prose arrives from the model,
-      not in one block at the end;
-    * build :class:`~kedge.server.events.ToolCallEvent` via ``ToolCallEvent.summarising``, which
-      keeps raw arguments out of the stream by construction;
+    * emit a :class:`~kedge.turn.StatusEvent` before any slow step, so the UI can say what is
+      happening rather than showing a spinner;
+    * emit :class:`~kedge.turn.TokenEvent` fragments as prose arrives from the model, not in one
+      block at the end;
+    * build :class:`~kedge.turn.ToolCallEvent` via ``ToolCallEvent.summarising``, which keeps raw
+      arguments out of the stream by construction;
     * check ``cancel.cancelled`` between steps and finish promptly when it is set;
-    * finish with exactly one :class:`~kedge.server.events.DoneEvent`, including after an error.
+    * finish with exactly one :class:`~kedge.turn.DoneEvent`, including after an error.
 
     The server publishes everything yielded to the event bus, mirrors the notebook-relevant
     events into the notebook pane, and persists the trail against the assistant message, so an

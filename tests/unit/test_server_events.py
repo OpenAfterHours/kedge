@@ -8,6 +8,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from kedge import turn as turn_module
+from kedge.server import events as events_module
 from kedge.server.events import (
     MAX_ARGS_SUMMARY_CHARS,
     CellCreatedEvent,
@@ -175,6 +177,64 @@ def test_parse_event_dispatches_on_the_discriminator() -> None:
     parsed = parse_event({"type": "cell_running", "cell_id": "Hbol"})
     assert parsed.type == "cell_running"
     assert parsed.cell_id == "Hbol"
+
+
+# ── the turn vocabulary is re-exported, not re-declared ──────────────────────────────────────
+
+
+def test_the_turn_vocabulary_here_is_the_same_object_as_in_kedge_turn() -> None:
+    """The events a turn streams live in :mod:`kedge.turn`, below both the agent and the server.
+
+    They are re-exported from here so that every existing import site is undisturbed, and the
+    re-export is only sound if it hands back the *same* classes. A parallel declaration would pass
+    an equality assertion and fail everything that matters: :func:`notification_for` and the
+    notebook mirror dispatch on ``isinstance``, ``parse_event`` resolves the union by identity of
+    the model class, and the agent building a ``kedge.turn.DoneEvent`` while the server watches
+    for a ``kedge.server.events.DoneEvent`` would end every turn with a trail written against
+    nothing.
+    """
+    names = [
+        "MAX_ARGS_SUMMARY_CHARS",
+        "AnyEvent",
+        "CellCreatedEvent",
+        "CellResultEvent",
+        "CellRunningEvent",
+        "DoneEvent",
+        "ErrorEvent",
+        "Event",
+        "PausedEvent",
+        "Phase",
+        "StatusEvent",
+        "TokenEvent",
+        "ToolCallEvent",
+        "ToolResultEvent",
+        "ValidationEvent",
+        "parse_event",
+        "summarise_args",
+    ]
+    for name in names:
+        assert getattr(events_module, name) is getattr(turn_module, name), name
+
+
+def test_an_event_built_by_the_agent_parses_and_encodes_on_the_server_side() -> None:
+    """The path the re-export exists for, end to end: the agent's class, the server's functions."""
+    built = turn_module.DoneEvent(turn_id="t1", tokens_used=42)
+
+    frame = encode_sse(built)
+    parsed = parse_event(frame.split("data: ", 1)[1].strip())
+
+    assert frame.startswith("event: done\n")
+    assert isinstance(parsed, DoneEvent)
+    assert parsed == built
+    assert notification_for(turn_module.ErrorEvent(message="nope")) is not None
+
+
+def test_the_hub_vocabulary_stayed_behind_and_is_not_part_of_a_turn() -> None:
+    """``open_progress`` frames share the encoder and nothing else; a turn's accumulator must not
+    be able to receive one, so they are deliberately outside ``AnyEvent``."""
+    assert not hasattr(turn_module, "OpenProgressEvent")
+    with pytest.raises(ValidationError):
+        parse_event({"type": "open_progress", "step": "bridge", "state": "ok"})
 
 
 # ── the bus ──────────────────────────────────────────────────────────────────────────────────

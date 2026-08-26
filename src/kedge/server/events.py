@@ -1,29 +1,25 @@
-"""The typed event vocabulary the server streams, and the bus that fans it out.
+"""The wire format for kedge's events, the hub's own vocabulary, and the bus that fans them out.
 
-"The user is not sat there wondering what is happening" is a stated requirement, and PLAN M3 is
-explicit that an afterthought spinner will not satisfy it. So progress is a *vocabulary* rather
-than a boolean: eleven event types covering prose, tool activity, cell operations, validation,
-pausing and completion, each carrying enough detail for the UI to say which tool ran, which cell
-was created, and what validation actually said.
+This module used to hold two unrelated things. The first was the vocabulary of a *turn* -- the
+eleven typed events an agent emits while running one -- which the agent produces and the server
+merely consumes; that now lives in :mod:`kedge.turn`, below both layers, and is re-exported here so
+that every import site, every ``isinstance`` check and every discriminated-union parse keeps
+referring to the same objects. Importing :class:`~kedge.turn.DoneEvent` from here and from
+:mod:`kedge.turn` gets you one class, not two.
 
-Every event is a pydantic model with a literal ``type``, gathered into a discriminated union so
-that serialising to SSE and parsing back are both total and typed. The wire form is one SSE
-frame per event: ``event: <type>`` naming the variant, ``data:`` carrying the model's JSON.
+What is left is genuinely the server's:
 
-One event carries a deliberate data-handling decision. ``tool_call`` reports an *args summary*,
-never the raw arguments — a ``propose_cell`` call carries a whole cell body and a ``read_range``
-call carries a workbook range, and neither belongs in a UI trail or in the log that trail is
-reconstructed from. That is enforced structurally rather than by asking callers to remember:
-:class:`ToolCallEvent` forbids extra fields (so an ``args=`` keyword is a validation error, not a
-silently accepted one), rejects a summary that is multi-line, over-long, or shaped like
-serialised JSON, and offers :meth:`ToolCallEvent.summarising` as the blessed constructor which
-derives a compliant summary from the arguments itself.
-
-The bus exists because a turn's events have more than one consumer. The SSE response is the
-obvious one; the notebook mirror (PLAN M3: "mirror the important ones into the notebook itself")
-and any attached monitor stream are the others. Publishing is fan-out to bounded per-subscriber
-queues plus a list of observers, and neither a slow subscriber nor a raising observer is allowed
-to disturb the turn that produced the event.
+* the SSE wire format (:func:`encode_sse`, :func:`sse_comment`) -- one frame per event, ``event:
+  <type>`` naming the variant and ``data:`` carrying the model's JSON;
+* the hub's own progress vocabulary for opening a workbook, which shares the encoder with a turn's
+  events and nothing else;
+* the notebook mirror -- which of a turn's events are worth pushing into the marimo pane, and what
+  they should say there;
+* :class:`EventBus`, because a turn's events have more than one consumer. The SSE response is the
+  obvious one; the notebook mirror (PLAN M3: "mirror the important ones into the notebook itself")
+  and any attached monitor stream are the others. Publishing is fan-out to bounded per-subscriber
+  queues plus a list of observers, and neither a slow subscriber nor a raising observer is allowed
+  to disturb the turn that produced the event.
 """
 
 from __future__ import annotations
@@ -32,11 +28,30 @@ import asyncio
 import contextlib
 import inspect
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Protocol
+from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+from kedge.turn import (
+    MAX_ARGS_SUMMARY_CHARS,
+    AnyEvent,
+    BaseEvent,
+    CellCreatedEvent,
+    CellResultEvent,
+    CellRunningEvent,
+    DoneEvent,
+    ErrorEvent,
+    Event,
+    PausedEvent,
+    Phase,
+    StatusEvent,
+    TokenEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    ValidationEvent,
+    parse_event,
+    summarise_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,232 +88,6 @@ __all__ = [
     "sse_comment",
     "summarise_args",
 ]
-
-Phase = Literal["analysing", "thinking", "editing", "running"]
-"""The coarse phase of a turn, shown as a live chip at the head of the assistant message."""
-
-MAX_ARGS_SUMMARY_CHARS = 200
-"""Ceiling on ``tool_call.args_summary``. A summary that needs more than this is not a summary."""
-
-MAX_SCALAR_CHARS = 60
-"""Longest argument value reproduced verbatim; anything longer is described by size instead."""
-
-
-# ── argument summarising ─────────────────────────────────────────────────────────────────────
-
-
-def _describe(value: object) -> str:
-    """Describe one argument value: short scalars verbatim, everything else by shape."""
-    if value is None:
-        return "none"
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int | float):
-        return str(value)
-    if isinstance(value, str):
-        collapsed = " ".join(value.split())
-        if len(collapsed) <= MAX_SCALAR_CHARS and len(collapsed) == len(value.strip()):
-            return collapsed
-        return f"<{len(value)} chars>"
-    if isinstance(value, Mapping):
-        return f"<{len(value)} keys>"
-    if isinstance(value, list | tuple | set | frozenset):
-        return f"<{len(value)} items>"
-    return f"<{type(value).__name__}>"
-
-
-def summarise_args(args: Mapping[str, object]) -> str:
-    """Return a one-line, size-capped summary of a tool call's arguments.
-
-    Short scalars survive intact, because "cell=load_handin" is exactly the specific detail the
-    activity trail exists to show. Anything long or structured collapses to a shape descriptor
-    such as ``<214 chars>``, so a cell body or a sampled frame cannot ride out inside a summary.
-
-    Args:
-        args: The arguments as the tool dispatcher received them.
-
-    Returns:
-        A single line of at most :data:`MAX_ARGS_SUMMARY_CHARS` characters.
-    """
-    summary = ", ".join(f"{key}={_describe(value)}" for key, value in args.items())
-    if len(summary) > MAX_ARGS_SUMMARY_CHARS:
-        summary = summary[: MAX_ARGS_SUMMARY_CHARS - 1].rstrip() + "…"
-    return summary
-
-
-# ── event models ─────────────────────────────────────────────────────────────────────────────
-
-
-class _BaseEvent(BaseModel):
-    """Shared configuration for every event.
-
-    ``extra="forbid"`` is load-bearing rather than tidiness: it is what makes an accidental
-    ``ToolCallEvent(name=..., args={...})`` a validation error instead of a field nobody notices
-    until the raw arguments turn up in a log.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
-
-
-class StatusEvent(_BaseEvent):
-    """The turn moved into a new coarse phase."""
-
-    type: Literal["status"] = "status"
-    phase: Phase
-
-
-class TokenEvent(_BaseEvent):
-    """A fragment of streamed assistant prose."""
-
-    type: Literal["token"] = "token"
-    text: str
-
-
-class ToolCallEvent(_BaseEvent):
-    """A tool is about to run, described by name and a summary of its arguments.
-
-    The raw arguments never appear here. Build one with :meth:`summarising` and the summary is
-    derived for you; build one by hand and the summary is validated on the way in.
-
-    Example:
-        >>> ToolCallEvent.summarising("propose_cell", {"name": "load_handin", "code": "x = 1"})
-        ToolCallEvent(type='tool_call', name='propose_cell', args_summary='name=load_handin, code=x = 1')
-    """
-
-    type: Literal["tool_call"] = "tool_call"
-    name: str
-    args_summary: str = ""
-
-    @field_validator("args_summary")
-    @classmethod
-    def _reject_raw_arguments(cls, value: str) -> str:
-        if "\n" in value or "\r" in value:
-            msg = (
-                "args_summary must be a single line; it looked like a dump of the raw arguments. "
-                "Build the event with ToolCallEvent.summarising(name, args) instead."
-            )
-            raise ValueError(msg)
-        if len(value) > MAX_ARGS_SUMMARY_CHARS:
-            msg = (
-                f"args_summary must be at most {MAX_ARGS_SUMMARY_CHARS} characters, got "
-                f"{len(value)}. Build the event with ToolCallEvent.summarising(name, args) "
-                f"instead of passing the arguments through."
-            )
-            raise ValueError(msg)
-        if value.lstrip().startswith(("{", "[")):
-            msg = (
-                "args_summary looks like serialised arguments rather than a summary. Build the "
-                "event with ToolCallEvent.summarising(name, args) instead."
-            )
-            raise ValueError(msg)
-        return value
-
-    @classmethod
-    def summarising(cls, name: str, args: Mapping[str, object] | None = None) -> ToolCallEvent:
-        """Return an event for ``name``, summarising ``args`` rather than carrying them."""
-        return cls(name=name, args_summary=summarise_args(args or {}))
-
-
-class ToolResultEvent(_BaseEvent):
-    """A tool finished, with a short human-readable account of what it produced."""
-
-    type: Literal["tool_result"] = "tool_result"
-    name: str
-    ok: bool
-    summary: str = ""
-
-
-class CellCreatedEvent(_BaseEvent):
-    """A notebook cell was created, with the opening of its body for context."""
-
-    type: Literal["cell_created"] = "cell_created"
-    cell_id: str
-    name: str
-    preview: str = ""
-
-
-class CellRunningEvent(_BaseEvent):
-    """A notebook cell started executing."""
-
-    type: Literal["cell_running"] = "cell_running"
-    cell_id: str
-
-
-class CellResultEvent(_BaseEvent):
-    """A notebook cell finished executing, successfully or not."""
-
-    type: Literal["cell_result"] = "cell_result"
-    cell_id: str
-    ok: bool
-    error: str | None = None
-
-
-class ValidationEvent(_BaseEvent):
-    """The pre-commit validation gate ran (PLAN M4), listing whatever it rejected."""
-
-    type: Literal["validation"] = "validation"
-    ok: bool
-    violations: tuple[str, ...] = ()
-
-
-class PausedEvent(_BaseEvent):
-    """The turn used its step budget and is asking whether to carry on.
-
-    Deliberately not an :class:`ErrorEvent`. Nothing went wrong, nothing was lost, and the loop
-    holds the turn's tool traffic so the next message resumes with everything it had learnt. A
-    turn that ends this way is waiting for a word, not reporting a failure, and the UI should say
-    so — telling a user their work has hit a problem when it has not is how people stop trusting
-    the trail.
-
-    ``steps`` is how many model round trips were spent getting here.
-    """
-
-    type: Literal["paused"] = "paused"
-    message: str
-    steps: int = 0
-
-
-class DoneEvent(_BaseEvent):
-    """The turn finished. Always the last event of a turn."""
-
-    type: Literal["done"] = "done"
-    turn_id: str
-    tokens_used: int = 0
-
-
-class ErrorEvent(_BaseEvent):
-    """Something went wrong. ``recoverable`` says whether the session can carry on."""
-
-    type: Literal["error"] = "error"
-    message: str
-    recoverable: bool = True
-
-
-AnyEvent = (
-    StatusEvent
-    | TokenEvent
-    | ToolCallEvent
-    | ToolResultEvent
-    | CellCreatedEvent
-    | CellRunningEvent
-    | CellResultEvent
-    | ValidationEvent
-    | PausedEvent
-    | DoneEvent
-    | ErrorEvent
-)
-
-Event = Annotated[AnyEvent, Field(discriminator="type")]
-"""The discriminated union of every event a *turn* streams."""
-
-_ADAPTER: TypeAdapter[AnyEvent] = TypeAdapter(Event)
-
-
-def parse_event(raw: Mapping[str, Any] | str | bytes) -> AnyEvent:
-    """Rebuild an event from its serialised form, dispatching on ``type``."""
-    if isinstance(raw, str | bytes):
-        return _ADAPTER.validate_json(raw)
-    return _ADAPTER.validate_python(raw)
 
 
 # ── opening a workbook ───────────────────────────────────────────────────────────────────────
@@ -340,7 +129,7 @@ StepState = Literal["running", "ok", "skipped", "failed"]
 genuinely has nothing to scaffold, and saying so is more useful than a silent gap."""
 
 
-class OpenProgressEvent(_BaseEvent):
+class OpenProgressEvent(BaseEvent):
     """One step of opening a workbook changed state."""
 
     type: Literal["open_progress"] = "open_progress"
@@ -349,7 +138,7 @@ class OpenProgressEvent(_BaseEvent):
     detail: str = ""
 
 
-class OpenReadyEvent(_BaseEvent):
+class OpenReadyEvent(BaseEvent):
     """The workbook is open and attached; the browser can move to the chat view."""
 
     type: Literal["open_ready"] = "open_ready"

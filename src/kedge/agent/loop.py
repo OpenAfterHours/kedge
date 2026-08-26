@@ -3,7 +3,13 @@
 This is the real implementation of :class:`kedge.server.agent_seam.AgentLoop` — a drop-in
 replacement for ``ScriptedAgent``, built to the Protocol the server already states rather than to
 whatever the server happened to call first. The event choreography is deliberately the same as the
-fake's, because the fake is what the UI was judged against.
+fake's, because the fake is what the UI was judged against. Note that the Protocol is *not*
+imported here, and cannot be: the server sits above the agent in the layering, and satisfying an
+interface structurally is what lets the caller own it. The vocabulary a turn is conducted in --
+:class:`~kedge.turn.TurnRequest` in, typed events out -- lives in :mod:`kedge.turn`, below both.
+
+Wiring this loop into the server is composition rather than agent work, so it is neither here nor
+under ``server/``: see :mod:`kedge.serve`.
 
 **The model endpoint is behind a seam of its own.** :class:`ModelClient` is a two-field protocol
 that yields :class:`ChatDelta` fragments, and :class:`OpenAIClient` is the only thing in kedge that
@@ -81,7 +87,7 @@ from kedge.agent.tools import ToolContext, ToolRegistry, Volatility, tool_schema
 from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS
 from kedge.errors import KedgeError
 from kedge.notebook.codegen import read_notebook
-from kedge.server.events import (
+from kedge.turn import (
     AnyEvent,
     CellCreatedEvent,
     CellResultEvent,
@@ -100,14 +106,12 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Mapping, Sequence
     from pathlib import Path
 
-    from fastapi import FastAPI
-
     from kedge.agent.tools import ToolResult
     from kedge.analysis.model import WorkbookAnalysis
     from kedge.config import ContextConfig
     from kedge.notebook.model import NotebookBridge
     from kedge.plan.model import ProcessPlan
-    from kedge.server.agent_seam import CancelToken, TurnRequest
+    from kedge.turn import CancelToken, TurnRequest
     from kedge.workspace import Workspace
 
 logger = logging.getLogger(__name__)
@@ -121,12 +125,10 @@ __all__ = [
     "ModelClient",
     "OpenAIClient",
     "PendingToolCall",
-    "build_agent_app",
     "chat_deltas",
     "responses_delta",
     "responses_input",
     "responses_tools",
-    "serve",
 ]
 
 DEFAULT_MAX_STEPS = 50
@@ -195,7 +197,7 @@ the rule :func:`_cut_short` follows for the same reason, and a rule that holds f
 lines is not a rule at all: a reader has to be able to tell whose words they are without being told.
 
 Prose alone, with no chip of its own — and :func:`_pause_message` is precedent for only half of
-that. It emits a :class:`~kedge.server.events.PausedEvent` *and* records its prose in the window,
+that. It emits a :class:`~kedge.turn.PausedEvent` *and* records its prose in the window,
 so a chip plainly need not cost the window record. What it is precedent for is the record, which is
 the half that matters here: the next turn has to read this as the last thing the assistant said, or
 "summarise what you found" answers nothing. The chip is left out because it would want a new event
@@ -1062,13 +1064,20 @@ class KedgeAgent:
     outbound audit log, and the compaction digest — is keyed by session id, because the audit log
     is per session by design (PLAN 2.3) and a shared one would be useless for tracing.
 
+    The conformance is structural, so this file never imports the Protocol -- which is also why
+    the example below does not either. A doctest is source that runs, and
+    ``scripts/guardrails.py`` parses import *statements*: an upward import inside an ``Example:``
+    is invisible to it, and would become a real one the day ``--doctest-modules`` is switched on.
+    ``tests/unit/test_agent_loop.py`` holds the ``isinstance`` against ``AgentLoop`` instead, where
+    a test module may import from any layer it likes.
+
     Example:
-        >>> from kedge.server.agent_seam import AgentLoop
         >>> class _Silent:
         ...     async def stream(self, **_kwargs):
         ...         return
         ...         yield  # pragma: no cover
-        >>> isinstance(KedgeAgent(client=_Silent(), context=ToolContext()), AgentLoop)
+        >>> agent = KedgeAgent(client=_Silent(), context=ToolContext())
+        >>> callable(agent.run)
         True
     """
 
@@ -1147,7 +1156,7 @@ class KedgeAgent:
     async def run(self, request: TurnRequest, *, cancel: CancelToken) -> AsyncIterator[AnyEvent]:
         """Run one turn, yielding events as they happen.
 
-        Ends with exactly one :class:`~kedge.server.events.DoneEvent` on every path that this loop
+        Ends with exactly one :class:`~kedge.turn.DoneEvent` on every path that this loop
         owns. A :class:`asyncio.CancelledError` that did *not* come from the user's cancel token is
         re-raised untouched — that is the task being torn down, and converting it into a tidy
         finish would be lying about what happened.
@@ -1358,7 +1367,7 @@ class KedgeAgent:
         attempt at the shape it has got wrong three times. Withheld, the only move left is prose,
         which is the move that was wanted.
 
-        The :class:`~kedge.server.events.ErrorEvent` has already been emitted by the time this
+        The :class:`~kedge.turn.ErrorEvent` has already been emitted by the time this
         runs, and the order is load-bearing rather than incidental: the user reads why the turn
         stopped and then reads the account, so the account arrives as an explanation of a stop they
         have already been told about rather than as prose that trails off for no stated reason.
@@ -1460,7 +1469,7 @@ class KedgeAgent:
         validation gate rejecting a cell is counted per cell name, because a model fixing one cell
         while another stays broken is making progress. A tool rejecting the model's own *draft* is
         counted per tool, because there is only one draft in play. Both stop the turn at three
-        with an :class:`~kedge.server.events.ErrorEvent`, which the step loop treats as a reason
+        with an :class:`~kedge.turn.ErrorEvent`, which the step loop treats as a reason
         to stop spending the budget — and then to spend one last completion on prose
         (:meth:`_final_word`).
 
@@ -2096,64 +2105,3 @@ def _load_analysis(workspace: Workspace) -> WorkbookAnalysis | None:
     except (OSError, ValueError) as exc:
         logger.warning("could not load the analysis at %s: %s", path, exc)
         return None
-
-
-# ── running the real server ──────────────────────────────────────────────────────────────────
-
-
-def build_agent_app(
-    workspace: Workspace,
-    *,
-    driver: NotebookBridge | None = None,
-    analysis: WorkbookAnalysis | None = None,
-    client: ModelClient | None = None,
-    version: str = "0.1.0",
-) -> FastAPI:
-    """Build the kedge server driven by this loop rather than by ``ScriptedAgent``.
-
-    The import of :mod:`kedge.server.app` is function-local on purpose. The layering is
-    ``analysis -> plan -> notebook -> agent -> server``, and a module-level import here would
-    invert it; deferring it keeps ``kedge.agent`` importable by the CLI with no FastAPI in the way.
-
-    Args:
-        workspace: The workbook's workspace, with directories already ensured.
-        driver: A live notebook bridge, where marimo is up.
-        analysis: The workbook analysis; loaded from disk when omitted.
-        client: The model endpoint; built from config and the keyring when omitted.
-        version: Reported by ``/api/context``.
-
-    Returns:
-        The application, ready for :func:`kedge.server.app.run_server`.
-    """
-    from kedge.server.app import create_app
-
-    agent = KedgeAgent.for_workspace(workspace, driver=driver, analysis=analysis, client=client)
-    return create_app(workspace, agent=agent, demo=False, version=version)
-
-
-def serve(
-    workbook: Path | str,
-    *,
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    driver: NotebookBridge | None = None,
-    log_level: str = "warning",
-) -> None:
-    """Run the kedge server against the real agent loop, blocking until it stops.
-
-    The one-liner the server's own ``--demo`` flag has no equivalent for, because
-    ``kedge.server.app.main`` refuses to start without a wired-up loop and this is the wiring::
-
-        uv run python -c "from kedge.agent import serve; serve('book.xlsx', port=8731)"
-
-    Requires an API key in the OS keyring for ``model.api_key_ref``. Without a live marimo the
-    notebook tools degrade to saying so; everything that reads the workbook still works.
-    """
-    from kedge.server.app import run_server
-    from kedge.workspace import Workspace as _Workspace
-
-    workspace = _Workspace.for_workbook(workbook)
-    workspace.ensure_dirs()
-    app = build_agent_app(workspace, driver=driver)
-    logger.warning("kedge on http://%s:%d against %s", host, port, workspace.workbook_path)
-    run_server(app, host=host, port=port, log_level=log_level)
