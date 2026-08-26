@@ -26,6 +26,18 @@ endpoints in order to explain the boundary. It is deliberately narrower than the
 new module could still health-poll marimo without tripping this. The two authenticated POSTs are
 the ones that matter, and they are covered.
 
+The fourth rule is not in CONVENTIONS.md's numbered list, because it is not about a library
+boundary -- it is the layering `CLAUDE.md` states in one line: ``analysis/ -> plan/ -> notebook/
+-> agent/ -> server/``. The agent reads and writes the notebook; the notebook knows nothing about
+the agent. A conversion driver was once built under `notebook/` and had to import
+``kedge.agent.context``, ``kedge.agent.prompts`` and ``kedge.agent.validate`` to work, and there
+was no runtime cycle only because `notebook/__init__.py` did not import it. Adding that one line
+reproduced ``ImportError: cannot import name 'CellFacts' from partially initialized module
+'kedge.agent.context'`` -- and the blast radius was the whole `agent` package rather than the one
+module, because `agent/__init__.py` eagerly aggregates `context`, so *every* import starting
+inside `kedge.agent` failed. An inversion that costs nothing until the day somebody adds an import
+is exactly the kind that comes back, so it is checked here rather than remembered.
+
 Run directly, or via CI::
 
     uv run python scripts/guardrails.py
@@ -72,6 +84,13 @@ HTTPX_HOMES = (
 )
 OPENAI_CLIENT_NAMES = ("OpenAI", "AsyncOpenAI")
 OPENAI_ROOTS = ("src",)
+
+# CLAUDE.md's layering: analysis/ -> plan/ -> notebook/ -> agent/ -> server/. Only the one edge
+# that has actually been inverted is checked, and it is checked in the direction it was inverted:
+# the agent reads the notebook, and nothing under `notebook/` may reach back. Stated as a pair so
+# that adding the next edge is a line rather than a function.
+LAYERING_ROOT = "src/kedge/notebook"
+LAYERING_BANNED = "kedge.agent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +233,115 @@ def _check_kernel_api() -> list[Breach]:
     return breaches
 
 
+def _package_of(path: Path) -> str:
+    """The dotted package a module lives in, so a relative import can be resolved against it."""
+    relative = path.relative_to(REPO_ROOT / "src")
+    # The last part is the module file either way: `kedge/notebook/scaffold.py` is in package
+    # `kedge.notebook`, and so is `kedge/notebook/__init__.py`, which *is* that package.
+    return ".".join(relative.parts[:-1])
+
+
+def _absolute_module(node: ast.ImportFrom, package: str) -> str | None:
+    """What ``from ... import x`` actually names, relative imports resolved.
+
+    The other checks skip relative imports on the stated ground that one cannot reach pandas or
+    marimo. A relative import *can* reach `kedge.agent` from `kedge.notebook` -- ``from ..agent
+    .validate import validate_cell`` is two dots away -- so this rule resolves them rather than
+    trusting the house style to keep using absolute ones.
+    """
+    if not node.level:
+        return node.module
+    parts = package.split(".")
+    climbed = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+    if not climbed:
+        return None
+    return ".".join([*climbed, node.module]) if node.module else ".".join(climbed)
+
+
+def _import_targets(node: ast.AST, package: str) -> tuple[str, ...]:
+    """Every dotted path one import statement could be naming, in full.
+
+    Two shapes reach `kedge.agent` from `kedge.notebook` without the string ``kedge.agent`` ever
+    appearing as an import's *module*, and both are ordinary Python somebody writes without
+    thinking:
+
+    * ``from kedge import agent``. The module is ``kedge``; the dotted path is only complete once
+      the alias is appended. Reading the module alone -- which `_imported_names` does, correctly,
+      for a rule about `pandas` -- lets this straight through, and the guardrail then prints its
+      guarantee over a tree where the guarantee is false.
+    * ``from .. import agent``, the same statement spelled relatively.
+
+    So every alias contributes ``module.alias`` as well as the module itself. That means
+    ``from kedge.agent.context import CellFacts`` also offers ``kedge.agent.context.CellFacts``,
+    which is a class rather than a module -- harmless, because a candidate that is not under the
+    banned root never matches, and this one was already caught by its module.
+
+    Args:
+        node: Any AST node. Anything that is not an import contributes nothing.
+        package: The dotted package the file lives in, for resolving a relative import.
+
+    Returns:
+        Every candidate, the module first.
+    """
+    if isinstance(node, ast.Import):
+        return tuple(alias.name for alias in node.names)
+    if not isinstance(node, ast.ImportFrom):
+        return ()
+    module = _absolute_module(node, package)
+    if module is None:
+        return ()
+    return (module, *(f"{module}.{alias.name}" for alias in node.names))
+
+
+def _render_import(node: ast.AST, package: str) -> str:
+    """One import statement as a line an editor can jump to, the relative form resolved."""
+    if isinstance(node, ast.Import):
+        return "import " + ", ".join(alias.name for alias in node.names)
+    if not isinstance(node, ast.ImportFrom):
+        return "import"
+    names = ", ".join(alias.name for alias in node.names)
+    return f"from {_absolute_module(node, package)} import {names}"
+
+
+def _check_layering() -> list[Breach]:
+    """Collect every import that reaches back up the layering.
+
+    Deliberately over-catches in one direction: an import guarded by ``if TYPE_CHECKING:`` cannot
+    create a runtime cycle, and this reports it all the same. That is the right default for now --
+    the inversion this exists for began as type-only references and grew runtime ones, and a rule
+    with an exemption is a rule people learn to phrase their way past. It will one day refuse a
+    legitimate type-only reference to an agent type, and the answer then is to exempt the
+    ``TYPE_CHECKING`` block here rather than to work around it there.
+    """
+    rule = (
+        f"{LAYERING_ROOT}/ may not import {LAYERING_BANNED}: the layering is analysis/ -> plan/ "
+        "-> notebook/ -> agent/ -> server/, and the agent reads the notebook rather than the "
+        "other way round (CLAUDE.md, 'Architecture in one paragraph')"
+    )
+    breaches: list[Breach] = []
+    for path in _python_files((LAYERING_ROOT,)):
+        package = _package_of(path)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except SyntaxError:
+            continue  # already reported by the import checks, which parse the same files
+        breaches.extend(
+            Breach(
+                path=path,
+                line=node.lineno,
+                statement=_render_import(node, package),
+                rule=rule,
+            )
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import | ast.ImportFrom)
+            and any(
+                _is_or_is_under(target, LAYERING_BANNED)
+                for target in _import_targets(node, package)
+            )
+        )
+    return sorted(breaches, key=lambda breach: (breach.path, breach.line))
+
+
 def _outbound_trust() -> list[Breach]:
     """Collect every outbound client built somewhere that cannot have decided what it trusts.
 
@@ -293,6 +421,7 @@ def main() -> int:
         ),
         *_check_kernel_api(),
         *_outbound_trust(),
+        *_check_layering(),
     ]
 
     if breaches:
@@ -305,7 +434,8 @@ def main() -> int:
     print(
         f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}; "
         f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}; "
-        f"outbound TLS trust decided in {HTTPX_HOMES[0]}."
+        f"outbound TLS trust decided in {HTTPX_HOMES[0]}; "
+        f"{LAYERING_ROOT}/ imports nothing from {LAYERING_BANNED}."
     )
     return 0
 

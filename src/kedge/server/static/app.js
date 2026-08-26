@@ -283,19 +283,86 @@
      is not a worse outcome, because the server tears a turn down when its client disconnects. */
   const CANCEL_GRACE_MS = 4000;
 
-  /* The conversion, in the order it is actually done: decompose the workbook, find out what the
-     scaffold left unwritten, write it, check it against the workbook.
+  /* What to offer somebody staring at an empty chat, keyed to where the conversion has actually
+     got to. The first entry of the chosen set is the lead: it is the one thing that, clicked and
+     sent, moves this workbook forward, and it sits at the top because a vertical stack has no
+     other way to say so.
 
-     These are static strings shown for every workbook, so not one of them may name a sheet, a
-     range or a column. The list they replace opened with "Translate the haircut lookup on
-     Calc!H2:H50000" — a range from a fixture workbook, offered to every user who ever opened the
-     pane, none of whom had that sheet. */
-  const SUGGESTIONS = [
-    "Propose a plan for converting this workbook, stage by stage.",
-    "Which cells are still unwritten, and what does each one have to do?",
-    "Write the stages that are still passthroughs, in the plan's order.",
-    "Reconcile the notebook against the values Excel last calculated.",
-  ];
+     A fixed list is wrong at least half the time. "Propose a plan" is the whole job on a workbook
+     that has none and noise on one whose plan was approved an hour ago; "write the stages that
+     are still passthroughs" is an instruction to write nothing when there is no plan to write
+     them against. One set per state `/api/context` reports, keyed by that state's own name --
+     the server decides which situation this is, because it is a fact about the workbook and it
+     can be tested there. All this end does is look the wording up.
+
+     Two rules hold across every string. None may name a sheet, a range or a column — they are
+     shown for every workbook, and the list they replaced opened with "Translate the haircut
+     lookup on Calc!H2:H50000", a range from a fixture workbook offered to every user who ever
+     opened the pane, none of whom had that sheet. And each has to *work* when sent unedited: the
+     lead of the first set names the whole job and then asks for the one tool call that starts it,
+     because `propose_plan` refuses until the model has read the workbook and `propose_cell` is
+     refused until the user has approved a plan. */
+  const SUGGESTION_SETS = {
+    /* Nothing has happened yet. This is the click the whole hub exists for. */
+    none: [
+      "Convert this workbook into a marimo notebook. Read it, then propose a plan I can approve.",
+      "Walk me through what this workbook does, stage by stage, before you plan anything.",
+      "Which steps here have no formula behind them, and would need a checkpoint or a hand-off?",
+    ],
+    /* A plan is on the table and unapproved. Nothing can be written until it is. */
+    proposed: [
+      "Talk me through the plan you have proposed, stage by stage.",
+      "Which stages would you change before I approve this, and why?",
+      "Revise the plan where it does not match the workbook, and say what you changed.",
+    ],
+    /* Changes were asked for. Not terminal: this plan can still be approved once revised. */
+    revise: [
+      "Revise the plan with the changes I asked for, and say what you changed.",
+      "Talk me through the revised plan, stage by stage.",
+      "Is there anything I asked for that the workbook will not support?",
+    ],
+    /* Rejected, which `approve` refuses outright: the only way on is a new plan. So the kickoff
+       comes back here, in the words it needs at this point, rather than vanishing. */
+    rejected: [
+      "Convert this workbook into a marimo notebook: read it, then propose a new plan.",
+      "What was wrong with the plan I rejected, and what would you do differently?",
+      "Walk me through what this workbook does, stage by stage, before you plan anything.",
+    ],
+    /* Approved, and the scaffold still has holes in it. */
+    approved: [
+      "Write the stages that are still passthroughs, in the plan's order.",
+      "Which cells are still unwritten, and what does each one have to do?",
+      "Reconcile the notebook against the values Excel last calculated.",
+    ],
+    /* Approved and nothing is unwritten. Whether the translation is right is now the question. */
+    written: [
+      "Reconcile the notebook against the values Excel last calculated.",
+      "Check each stage against the workbook's own formulas and tell me what does not agree.",
+      "What is still unproven in this conversion, and how would I check it myself?",
+    ],
+    /* The pane does not know, and says so rather than guessing. Every one of these works in any
+       state, which is the only thing that can be asked of them. */
+    unknown: [
+      "Where has this conversion got to, and what is the next thing to do?",
+      "Which cells are still unwritten, and what does each one have to do?",
+      "Is there a plan for this workbook, and has it been approved?",
+    ],
+  };
+
+  /* The set to show, from the context the pane was last drawn with.
+
+     A lookup and a fallback, deliberately: there is no branch here to get subtly wrong, and the
+     decision it used to make now lives in `_conversion_state` where the route's own tests drive
+     it. `unknown` catches a state this script has no wording for as well as a payload that is
+     missing, null, or not the shape it claims — all of which reach here as `undefined` and none
+     of which is worth a broken welcome screen. */
+  function suggestionsFor(context) {
+    const conversion = (context && context.conversion) || {};
+    // `Array.isArray` rather than a truthiness test: a state of "constructor" or "toString" finds
+    // something up the prototype chain, and it is not a list of suggestions.
+    const chosen = SUGGESTION_SETS[conversion.state];
+    return Array.isArray(chosen) ? chosen : SUGGESTION_SETS.unknown;
+  }
 
   // ── turn rendering ─────────────────────────────────────────────────────────────────
 
@@ -566,7 +633,12 @@
     maybeScroll();
   }
 
+  /* The set the welcome currently on screen was drawn from, so `applyContext` can tell a redraw
+     that would change something from one that would only steal the focus. */
+  let shownSuggestions = null;
+
   function showWelcome() {
+    shownSuggestions = suggestionsFor(state.context);
     transcript.replaceChildren(
       el(
         "div",
@@ -581,7 +653,7 @@
         el(
           "div",
           { class: "suggestions" },
-          SUGGESTIONS.map((suggestion) =>
+          shownSuggestions.map((suggestion) =>
             el("button", {
               class: "suggestion",
               type: "button",
@@ -661,6 +733,9 @@
     state.sessionId = data.session.id;
     localStorage.setItem("kedge.session", state.sessionId);
     showWelcome();
+    // Drawn from the context this tab last read, which may be from before the plan it is now
+    // offering to propose. Re-read it; `applyContext` redraws a welcome that is still on screen.
+    void refreshContext();
     $("drift-notice").hidden = true;
     await refreshSessions();
     promptBox.focus();
@@ -685,6 +760,7 @@
     transcript.replaceChildren();
     if (!data.messages.length) {
       showWelcome();
+      void refreshContext();
     } else {
       for (const message of data.messages) {
         if (message.role === "user") {
@@ -1396,6 +1472,18 @@
       $("open-notebook").hidden = true;
       $("reload-notebook").hidden = true;
     }
+
+    // The welcome's suggestions are chosen from `context.conversion`, so one already on screen was
+    // chosen from an older reading of it — and the reading that matters changes exactly when the
+    // user approves a plan or the agent fills the last hole. Redraw it rather than leave the pane
+    // offering to propose a plan that now exists.
+    //
+    // Only when the set actually changed. This runs on every context read, and while no kernel is
+    // attached the health poll takes one every five seconds — so an unconditional redraw is a
+    // `replaceChildren` that drops the focus off a suggestion button four times a minute.
+    if (transcript.querySelector(".welcome") && suggestionsFor(context) !== shownSuggestions) {
+      showWelcome();
+    }
   }
 
   /* Re-read the context and redraw the pane from it.
@@ -1561,8 +1649,23 @@
           { class: "welcome" },
           el("h2", { text: "The kedge server is not answering" }),
           el("p", { text: String(error.message) }),
+          el("p", { text: "kedge will keep trying, and this page will come back on its own." }),
         ),
       );
+      /* This return skips the health poll, the sessions and the composer's session, so without
+         what follows a single failed context leaves the pane dead until somebody reloads it by
+         hand — including when the server itself is perfectly healthy and one route threw. Keep
+         asking, and reload once it answers: a reload re-runs boot from the top, which is the only
+         way to pick up from here without wiring every listener a second time. */
+      const retry = setInterval(async () => {
+        try {
+          await api("/api/context");
+          clearInterval(retry);
+          window.location.reload();
+        } catch (_) {
+          /* still down; the message on screen already says so */
+        }
+      }, 5000);
       return;
     }
     await loadModels();

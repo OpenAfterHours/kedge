@@ -185,7 +185,11 @@ per hole carrying the analysis, the plan and the registry of names filled *above
 answer through `kedge.agent.validate`, retry on the gate's own violations, and report per-hole
 outcomes that distinguish "never asked" from "never passed".
 
-Move that shape into `src/kedge/notebook/fill.py` and expose it twice:
+Move that shape into the product and expose it twice. **Note the location this originally named --
+`src/kedge/notebook/fill.py` -- was wrong**, and section 7 records why: a model-driving loop belongs
+in `agent/`, and putting it under `notebook/` is what forced the layering inversion. It lives in
+`src/kedge/agent/fill.py`, and `scripts/guardrails.py` now refuses the import that would put it
+back.
 
 - **`kedge convert <workbook>`** -- headless, fills every hole, reports what it could not.
   There is no `convert` verb in the CLI today (`open`, `hub`, `inspect`, `plan *`, `reconcile`,
@@ -321,13 +325,38 @@ not; and the briefing warning fired on **every one of the eight fixture workbook
 characters of absolute filesystem paths -- the permanently-amber signal this project already knows
 how to name.
 
-**Still open, deliberately.** `notebook/fill.py` is 989 lines against CONVENTIONS' ~400 and inverts
-the documented layering, with no runtime cycle only because `notebook/__init__.py` does not import
-it -- and the blast radius of adding that import is the whole `agent` package, not one module. The
-eval harness is still a near-identical *copy* of the driver rather than a caller of it, and the two
-prompts have already diverged by six bytes, which is precisely the thing `cellprompt.py`'s own
-docstring exists to forbid. Both are follow-ups, and both should be done before the next eval is
-written.
+**The follow-ups are closed.** Both were about the same mistake, and the fix was not the one this
+document proposed.
+
+`fill.py` was 1,162 lines by the time review had finished with it -- 989 when the paragraph above
+was written -- and imported `kedge.agent.*`, inverting the layering. The obvious repair --
+split it into a prompt half and a loop half -- would have left *both* halves in the wrong package.
+A model-driving loop owns reply parsing, retry history and a `Completer`; that is `agent/`'s job,
+and it was written under `notebook/` only because somebody put it there. It is now
+`agent/fill.py` + `agent/fillprompt.py`, with the gate extension beside the gate in
+`agent/validate.py`, and `notebook/fill.py` deleted. **Nothing under `notebook/` imports
+`kedge.agent` any more, and `scripts/guardrails.py` fails if that comes back** -- proved by adding
+the import and watching the guardrail exit 1, both new tests go red, and the reviewer's original
+`ImportError: cannot import name 'CellFacts' from partially initialized module` reproduce exactly.
+
+The eval harness is now a **caller**. `cellprompt.py` went 262 lines to 62 and `cellgen.py` 542 to
+96, both pure name maps over the product's own module -- aliases rather than wrappers, so there is
+nothing left to keep in step. The six-byte prompt drift is gone by construction: both sides return
+the same object.
+
+One deliberate behaviour change came with it. The product stops on a transport error and records
+the rest as never asked; the eval used to record every hole as an error. A dead endpoint is **one**
+fact, and writing it down *n* times also claims *n-1* times that a hole was put to a model when it
+never was. `ConversionOutcome.NO_MODEL` is kept and made reachable through a new
+`FillReport.unmeasured`, because the state it names -- nothing was measured, so nothing is reported
+as measured -- is exactly what a reader needs, and testing "every hole errored" would never have
+fired again.
+
+**What is still open.** `agent/fill.py` is 964 lines, of which 493 are code; the natural third seam
+is the four report types. And `agent/loop.py` imports `kedge.server.events`, which inverts the same
+ladder one rung further up -- pre-existing, which is why the guardrail enforces the
+`notebook/ -> agent/` edge rather than the whole ladder. Enforcing the ladder would fail on `main`
+today, and that is worth knowing.
 2. **Holes filled per conversion**, reported by the driver. The run above scored 0/6 and said
    nothing about it.
 3. **Warnings raised on a plan later found defective.** A cheap regression: replay

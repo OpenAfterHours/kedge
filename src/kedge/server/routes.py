@@ -179,6 +179,10 @@ def context(request: Request, response: Response) -> dict[str, Any]:
     process holds right now -- whether a workbook is attached, whether marimo has answered -- and
     all of it can change while a tab sits open. A stale copy of this is a pane that says there is
     no notebook when there is one.
+
+    ``conversion`` says how far this workbook has actually got, so the pane can offer the next
+    thing to do rather than the same four things for ever. See :func:`_conversion_state` for the
+    states it names, what it costs, and why it can never fail.
     """
     response.headers.update(SHELL_HEADERS)
     state = get_state(request)
@@ -211,7 +215,254 @@ def context(request: Request, response: Response) -> dict[str, Any]:
             "base_url": None if session is None else session.base_url,
             "session_id": None if session is None else session.session_id,
         },
+        "conversion": _conversion_state(workspace),
     }
+
+
+_NOTEBOOK_READ_CAP = 256 * 1024
+"""How large a notebook this route will parse before it gives up and says nothing.
+
+``ast.parse`` is superlinear: the 35KB the reference conversion produces costs about five
+milliseconds, 338KB costs 129, and a 1.35MB file costs two seconds -- on a route the pane polls
+every five seconds whenever the kernel is absent. Seven times the largest notebook kedge has ever
+written is headroom; past it the answer is silence, which the pane already knows what to do with.
+"""
+
+
+def _conversion_state(workspace: Workspace) -> dict[str, Any]:
+    """How far this workbook's conversion has got, as one state name and one count.
+
+    The pane keys its suggestion list off ``state`` directly. That is deliberate: which situation
+    a workbook is in is a fact about the workbook rather than a presentation choice, and deciding
+    it here means the branch is exercised by this route's own tests instead of being copied into
+    a JavaScript the test suite cannot execute. The pane owns the wording; this owns the state.
+
+    **This must never raise and must never be slow.** It is on the pane's load path and, whenever
+    marimo is absent, on a five-second poll -- so it is answered at moments the user did not ask
+    for. Every branch degrades to a state the pane has a list for, because a suggestion is a
+    convenience and nothing here is worth a 500. It is worth being concrete about what a 500 would
+    cost: ``boot()`` in ``app.js`` catches a failed context, prints "The kedge server is not
+    answering" and returns *before* it installs the health poll, so one exception here would leave
+    the pane dead until somebody reloaded the page by hand.
+
+    ``unwritten`` is only ever counted for an approved plan. In every other state the number is
+    not used, and reading a 35KB file to answer a question nobody asked is not free.
+
+    Args:
+        workspace: The attached workspace.
+
+    Returns:
+        ``state`` -- one of ``none``, ``proposed``, ``revise``, ``rejected``, ``approved``,
+        ``written`` or ``unknown`` -- and ``unwritten``, the number of cells still carrying the
+        scaffolder's marker, or ``None`` where it is not known or was not asked.
+    """
+    state, plan = _plan_status(workspace)
+    if plan is None:
+        return {"state": state, "unwritten": None}
+    unwritten = _unwritten_cells(workspace, plan)
+    if unwritten == 0:
+        return {"state": "written", "unwritten": 0}
+    return {"state": state, "unwritten": unwritten}
+
+
+def _plan_status(workspace: Workspace) -> tuple[str, Any]:
+    """Where this workbook's plan history has got to, and the approved plan if there is one.
+
+    Four review states collapse to four answers rather than two, because the right thing to
+    suggest differs at each. A **rejected** plan is terminal -- :func:`kedge.plan.review.approve`
+    refuses it outright and says to propose a new one -- so reporting it as merely "proposed"
+    offers "talk me through the plan you have proposed" for ever, and takes the conversion
+    kickoff off the screen at the one moment it is the only useful thing to say. **Changes
+    requested** is not terminal and wants a revision rather than a fresh plan. A **draft** wants
+    reviewing.
+
+    ``approved`` is asked the way the scaffolder asks it -- walking back from the newest version,
+    so a plan approved at v2 and superseded by an unapproved v3 still reads as approved. That is
+    the state the notebook was built from, and the one work should be offered against.
+
+    Only the approved version is loaded through pydantic; the rest are probed with
+    :func:`_approval_state`, which reads one key out of the YAML. That matters because the worst
+    case is a history where *nothing* is approved -- every version has to be looked at, and at
+    roughly ten milliseconds each a ten-version history cost a tenth of a second on a five-second
+    poll. Measured over ten drafts it is now around five milliseconds; a workbook with no plan at
+    all, which is where the pane spends its first minutes, is a directory scan and nothing else.
+
+    Args:
+        workspace: The attached workspace.
+
+    Returns:
+        The state, and the approved :class:`~kedge.plan.model.ProcessPlan` where there is one.
+        ``"unknown"`` is silence rather than a guess: offering "propose a plan" over a plan that
+        exists but will not parse sends the user round a loop that cannot end.
+    """
+    from kedge.plan.model import ApprovalState
+    from kedge.plan.store import PlanStore
+
+    seen: list[str] = []
+    try:
+        store = PlanStore.for_workspace(workspace)
+        versions = store.versions()
+        if not versions:
+            return "none", None
+        for version in reversed(versions):
+            recorded = _approval_state(store.path_for(version))
+            if recorded is None:
+                return "unknown", None
+            if recorded == ApprovalState.APPROVED:
+                return "approved", store.load(version)
+            seen.append(recorded)
+    except (KedgeError, OSError, ValueError, RecursionError) as exc:
+        logger.debug("could not read the plan history for the pane: %s", exc)
+        return "unknown", None
+
+    latest = seen[0]
+    if latest == ApprovalState.REJECTED:
+        return "rejected", None
+    if latest == ApprovalState.CHANGES_REQUESTED:
+        return "revise", None
+    return "proposed", None
+
+
+def _approval_state(path: Path) -> str | None:
+    """The ``approval.state`` recorded in one plan file, without building the model.
+
+    A :class:`~kedge.plan.model.ProcessPlan` is a large pydantic model and validating one costs
+    about ten milliseconds; this question is one string. The default is reproduced rather than
+    inferred: :class:`~kedge.plan.model.Approval` defaults to ``draft``, so a file recording no
+    approval block at all is a draft, not an unreadable file.
+
+    Args:
+        path: The plan file.
+
+    Returns:
+        The state as written, or ``None`` when the file will not load or is not a mapping -- which
+        the caller reports as "not known" rather than guessing at a default.
+    """
+    import yaml
+
+    from kedge.plan.model import ApprovalState
+
+    # ``CSafeLoader`` constructs exactly what ``SafeLoader`` does and is eight times faster on a
+    # 2KB plan -- 0.43ms against 3.6. It is absent from a PyYAML built without libyaml, which is
+    # the only reason for the fallback.
+    loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+    try:
+        raw = yaml.load(path.read_text(encoding="utf-8"), Loader=loader)
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        logger.debug("could not read the approval state from %s: %s", path, exc)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    approval = raw.get("approval")
+    if approval is None:
+        return str(ApprovalState.DRAFT)
+    if not isinstance(approval, dict):
+        return None
+    recorded = approval.get("state", str(ApprovalState.DRAFT))
+    return recorded if isinstance(recorded, str) else None
+
+
+def _unwritten_cells(workspace: Workspace, plan: Any) -> int | None:
+    """How many cells in the notebook are still the scaffolder's passthroughs.
+
+    **Counted off the file on disk, never off the kernel, and that is the whole design.** The
+    obvious source is ``driver.list_cells(with_code=True)``, which is what
+    :func:`kedge.server.hub._unwritten_count` uses -- but reading a cell's code records a read
+    against it for marimo's staleness guard, and that guard is the only thing standing between a
+    user's own edit and an ``edit_cell`` that silently overwrites it. hub.py can afford it because
+    it runs once, immediately after ``sync_notebook`` has just read every cell anyway, so it
+    disarms nothing that was armed when it started. This route has no such cover: it is answered
+    on every page load and again whenever the health poll finds the frame missing, at moments the
+    user did not ask for and may well be typing a cell through. A convenience feature must not
+    re-arm the guard behind them.
+
+    **The file lies in one direction, so a zero has to be corroborated.** The file is not a
+    mirror of the kernel: ``--watch`` makes marimo *re-read* the notebook, and what writes it is
+    a best-effort autosave whose failures the driver never sees -- so the file is not "a save or
+    two behind" so much as arbitrarily stale. Worse, that autosave truncates and rewrites in
+    place, with no temp file and no rename, which is the hazard ``codegen.write_atomically``
+    exists to avoid. A read taken mid-write returns a prefix of the notebook; a prefix parses
+    perfectly and is indistinguishable from a shorter notebook, and every cell it lost is a cell
+    that cannot be counted. The error is therefore always an *undercount*, and an undercount of
+    zero tells the user the conversion is finished. Sampled over a real 36KB scaffold with six
+    holes, one truncation point in eight reports zero. Nor does it need a race: a plan whose
+    scaffolding step failed leaves an empty notebook, which parses cleanly to no cells at all.
+
+    Two checks, both cheap, and between them a zero is worth saying. Every stage in the approved
+    plan must have its cell in the file -- which a prefix cannot satisfy, because the cells it
+    lost are the last ones, and which an empty or unscaffolded notebook cannot satisfy either.
+    And a count of zero is read a second time and must come back identical, which closes the
+    window on a write still in flight. The second read is paid for only in the case that matters.
+
+    A stage whose cell name the scaffolder had to disambiguate -- two stage ids cleaning to the
+    same identifier -- will not be found by this, and the answer degrades to ``None``. That is the
+    correct direction to be wrong in.
+
+    Note this counts every hole in the *notebook*, where ``hub._unwritten_count`` counts only
+    those the current plan still calls for. On a plan that has since dropped a stage the two
+    disagree, and the file's answer is the honest one for a pane: the marker is in the notebook
+    the user is looking at.
+
+    Args:
+        workspace: The attached workspace.
+        plan: The approved plan, whose stages are what the file is corroborated against.
+
+    Returns:
+        The number of cells still carrying the marker, or ``None`` -- absent, unreadable, larger
+        than :data:`_NOTEBOOK_READ_CAP`, not a marimo file yet, or a zero that could not be
+        corroborated. ``hub._unwritten_count`` puts it best: on a question whose whole job is to
+        say the conversion is unfinished, a wrong number is worse than no number.
+    """
+    from kedge.notebook.scaffold import cell_name_for, is_unwritten
+
+    path = workspace.notebook_path
+    try:
+        if path.stat().st_size > _NOTEBOOK_READ_CAP:
+            logger.debug("the notebook at %s is past the read cap; not counting its holes", path)
+            return None
+    except OSError:
+        return None
+
+    document = _read_notebook_quietly(path)
+    if document is None:
+        return None
+    present = {cell.name for cell in document.cells}
+    wanted = {cell_name_for(stage.id) for stage in plan.stages}
+    if not present or not wanted <= present:
+        logger.debug("the notebook at %s does not hold every stage the plan names", path)
+        return None
+
+    count = sum(1 for cell in document.cells if is_unwritten(cell.code))
+    if count:
+        return count
+    again = _read_notebook_quietly(path)
+    if again is None or again.cells != document.cells:
+        return None
+    return 0
+
+
+def _read_notebook_quietly(path: Path) -> Any:
+    """Parse the notebook at ``path``, or return ``None`` for any reason it could not be.
+
+    The exception list is wider than it looks like it needs to be, and every addition is a route
+    that reached the user as a 500. ``read_notebook`` catches ``OSError`` around its own read and
+    turns a ``SyntaxError`` into a ``NotebookFormatError``, but a file truncated part-way through
+    a multi-byte character raises ``UnicodeDecodeError`` -- a ``ValueError``, past both -- and
+    non-ASCII in a converted notebook is routine, since the briefing cell renders the workbook's
+    own prose and model-written markdown carries pound signs and em dashes. ``ast.parse`` adds
+    ``RecursionError`` on a deeply nested expression, and its own ``ValueError`` on a null byte.
+    None of those is an ``OSError`` and none of them is a ``KedgeError``.
+
+    Better still would be for ``codegen.read_notebook`` to raise ``NotebookFormatError`` for a
+    bad encoding the way it already does for bad syntax; that module is not this change's to edit.
+    """
+    from kedge.notebook.codegen import read_notebook
+
+    try:
+        return read_notebook(path)
+    except (KedgeError, OSError, ValueError, RecursionError) as exc:
+        logger.debug("could not read the notebook at %s: %s", path, exc)
+        return None
 
 
 @router.get("/api/health")

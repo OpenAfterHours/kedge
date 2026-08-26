@@ -7,10 +7,13 @@ chat loop, and without any tool surface at all.
 
 The pipeline is five steps, and every one of them is machinery that already exists:
 
-1. **Scaffold the approved plan and fill its holes.** :mod:`harness.cellgen` owns that half:
-   :func:`kedge.notebook.scaffold.build_cells` decides the notebook's structure, the model is
-   asked only for what sits under each ``TODO(kedge)`` marker, and every answer goes through
-   :func:`kedge.agent.validate.validate_cell`.
+1. **Scaffold the approved plan and fill its holes.** That is :func:`kedge.agent.fill.fill_holes`
+   -- the driver ``kedge convert`` runs, called rather than reimplemented, reached through the
+   eval's own names in :mod:`harness.cellgen`. :func:`kedge.notebook.scaffold.build_cells` decides
+   the notebook's structure, the model is asked only for what sits under each ``TODO(kedge)``
+   marker, and every answer goes through :func:`kedge.agent.validate.validate_cell`. The
+   measurement is worth only as much as that identity: a model's score here is a score on the
+   thing a user runs.
 2. **Lay the cells out and render the file** -- :mod:`harness.render`, which also reports every
    place the scaffolder's own order would not have worked.
 3. **Re-key the case's script** onto the scaffolder's widget names -- :mod:`harness.align`.
@@ -22,12 +25,21 @@ The pipeline is five steps, and every one of them is machinery that already exis
 ## Seven outcomes, not two
 
 A model that scores nothing must be distinguishable from a harness that could not measure it, so
-a hole ends in one of four states (:class:`~harness.cellgen.CellOutcome`) and a whole conversion
+a hole ends in one of six states (:class:`~harness.cellgen.CellOutcome`) and a whole conversion
 in one of seven (:class:`ConversionOutcome`). "No plan was ever proposed", "nothing was ever
 asked", "the endpoint failed part way through", "the model never satisfied the validation gate",
 "the notebook would not render", "the notebook rendered and then stopped halfway" and "the
 notebook ran and graded badly" are seven different things to tell somebody choosing a model, and
 only the last of them is about the model's judgement.
+
+Two per-hole states arrived with the product's driver. ``SKIPPED`` is what a run abandoned after a
+transport failure records for the holes it never reached; :func:`~harness.cellgen.convert` does
+not abandon, so it does not arise here -- see that module for why the eval presses on where
+``kedge convert`` stops. ``UNFILLABLE`` is a hole nothing can be asked to fill, and it matters
+here more than anywhere: a stage whose hand-off declares no statement scaffolds to a cell with no
+placeholder, that cell used to be dropped where it was found, and on ``--convert M --plan-from M``
+the model that wrote the statement-less hand-off had the consequence taken out of **its own**
+generation denominator and was printed as filling every hole it was given.
 
 :attr:`ConversionOutcome.NO_PLAN` exists for the composed path, where the plan is asked of a model
 rather than read off disk (``--convert MODEL --plan-from MODEL``). A run that never got a plan
@@ -39,7 +51,9 @@ answers the first hole and then raises on every request used to come back as ``I
 whose docstring reads "the notebook is a scaffold with gaps in it", which sounds like the model's
 fault -- with a score of ``22/37`` printed beside it and no word about where the other sixteen
 rubric points went. Only the all-errors case reached ``NO_MODEL``. A partial transport failure is
-now its own outcome, and :class:`~harness.findings.Coverage` states the denominator it moved.
+now its own outcome, and :class:`~harness.findings.Coverage` states the denominator it moved. Its
+own docstring is now literally rather than approximately true: the holes after the failure really
+were never asked for, and say so.
 
 ## What this does not measure
 
@@ -58,7 +72,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from harness.align import align_inputs
-from harness.cellgen import CellOutcome, convert
+from harness.cellgen import convert
 from harness.drive import run_notebook, unused_inputs, workspace_overrides
 from harness.findings import ReDriveLog, aligned_drives, coverage_for, scaffold_defects
 from harness.grade import grade
@@ -107,7 +121,9 @@ class ConversionOutcome(StrEnum):
 
     INCOMPLETE = "incomplete"
     """At least one hole was never filled: the model wrote bodies the gate would not accept, or
-    wrote nothing. The notebook is a scaffold with gaps in it, and the gaps are the model's."""
+    wrote nothing, or wrote a plan whose hand-off left a cell nothing could be asked to fill. The
+    notebook is a scaffold with gaps in it, and the gaps are the model's -- on the composed path
+    that is true of the last case too, since the plan is the same model's."""
 
     INTERRUPTED = "interrupted"
     """Some -- not all -- requests to the model failed outright, so part of the notebook was
@@ -117,8 +133,16 @@ class ConversionOutcome(StrEnum):
     an endpoint's bad afternoon gets written down as a model's."""
 
     NO_MODEL = "no_model"
-    """Every hole ended in :attr:`~harness.cellgen.CellOutcome.ERROR`, or there were no holes.
-    Nothing was measured about the model."""
+    """No request to the model was ever answered, or there were no holes. Nothing was measured.
+
+    Asked as :attr:`kedge.agent.fill.FillReport.unmeasured` rather than by counting
+    :attr:`~harness.cellgen.CellOutcome.ERROR`, and the two differ twice. A run abandoned at the
+    first transport failure leaves the tail ``SKIPPED``, so an all-errors test never fires -- this
+    member would be unreachable for any caller that stops, and a dead endpoint would come back as
+    ``INTERRUPTED``, whose docstring says *some, not all* of the requests failed. And a hole whose
+    first attempt was rejected and whose retry was the one the endpoint dropped ends ``ERROR``
+    with the gate's verdict sitting in its first attempt: counting outcomes calls that "nothing
+    was measured" and clears a model that wrote pandas."""
 
     NO_PLAN = "no_plan"
     """No plan the pipeline could use, so nothing was ever scaffolded and no cell was ever asked for.
@@ -412,7 +436,12 @@ def convert_and_grade(
                 "the plan, not about the model."
             ),
         )
-    if all(cell.outcome is CellOutcome.ERROR for cell in result.generated):
+    if result.unmeasured:
+        # Not "every hole errored": the driver abandons a run after the first transport failure,
+        # so the rest are SKIPPED and that test would never fire again. `unmeasured` asks the
+        # question the outcome is named for -- did any hole come back with a body at all. The
+        # first hole is the one that failed: nothing is skipped until something has errored.
+        first = result.cells[0]
         return ConversionReport(
             case=_case_name(case),
             result=result,
@@ -420,8 +449,8 @@ def convert_and_grade(
             plan_origin=plan_origin,
             plan_is_the_models=plan_is_the_models,
             detail=(
-                "every request to the model failed, so nothing about the model was measured. "
-                f"First failure: {result.generated[0].detail}"
+                "no request to the model was answered, so nothing about the model was measured. "
+                f"First failure: {first.detail}"
             ),
         )
 

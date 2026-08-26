@@ -24,6 +24,12 @@ regression from PASS to SKIP invisible.
 
 Nothing here touches the network. ``ScriptedCompleter`` lives in the library precisely so an eval
 can replay canned responses, and every completer below is one of those or a two-line fake.
+
+What is being driven is :mod:`kedge.agent.fill` -- the loop ``kedge convert`` runs -- reached
+through the eval's own names in :mod:`harness.cellgen`. It used to be a near-identical copy of
+that loop, with a prompt that had already drifted six bytes from the shipped one, so the number
+these tests protect was a number about the copy. Two tests near the top assert the identity
+directly, because everything below is worth only as much as it.
 """
 
 from __future__ import annotations
@@ -45,7 +51,6 @@ from harness.cellgen import (  # noqa: E402
     TODO_MARKER,
     CellOutcome,
     convert,
-    holes_in,
 )
 from harness.cellprompt import (  # noqa: E402
     CELL_PROMPT_PARTS,
@@ -66,6 +71,7 @@ from harness.render import plan_layout, write_notebook  # noqa: E402
 
 from kedge.agent.prompts import SYSTEM_PARTS, load_prompt  # noqa: E402
 from kedge.agent.validate import MAX_VALIDATION_ATTEMPTS  # noqa: E402
+from kedge.notebook.scaffold import holes_in  # noqa: E402
 from kedge.plan.propose import CompletionRequest, ScriptedCompleter  # noqa: E402
 from kedge.plan.store import plan_from_yaml  # noqa: E402
 
@@ -355,6 +361,41 @@ def reference_notebook() -> Any:
 # =============================================================================
 
 
+def test_the_eval_sends_the_products_prompt_and_not_a_copy_of_it() -> None:
+    """Byte for byte, because six bytes is how far the copy had already drifted.
+
+    "You are not in the chat pane" against "This is not the chat pane"; "the file the product
+    sends" against "the file the chat sends". Neither difference matters. A copy that can drift by
+    six bytes with a green suite is what matters, because the number the eval exists to produce --
+    what a model scores writing a whole conversion -- was then being produced by a copy of the
+    driver rather than by ``kedge convert``.
+
+    Asserted as object identity as well as equality: equality would still pass over a second
+    implementation that happens to agree today, which is precisely the state this replaced.
+    """
+    from kedge.agent import fillprompt
+
+    assert system_prompt is fillprompt.system_prompt
+    assert cell_messages is fillprompt.cell_messages
+    assert CELL_PROMPT_PARTS is fillprompt.FILL_PROMPT_PARTS
+    assert CELL_TASK is fillprompt.FILL_TASK
+    assert system_prompt() == fillprompt.system_prompt()
+
+
+def test_the_eval_drives_the_product_and_not_a_copy_of_it() -> None:
+    """The same argument one layer up: the loop is the shipped one, not a reimplementation.
+
+    A reviewer comparing the two modules' syntax trees found six functions byte-identical and
+    ``_fill_one`` different by two renamed types and a log string. An eval that measures a
+    near-identical reimplementation measures the reimplementation.
+    """
+    from kedge.agent import fill as agent_fill
+    from kedge.agent.fill import fill_holes
+
+    assert convert.func is fill_holes, "the eval runs the shipped loop, keywords aside"
+    assert CellOutcome is agent_fill.FillOutcome
+
+
 def test_the_prompt_is_the_products_own_parts_less_the_tool_file() -> None:
     """Every part the product ships is sent, except the one describing tools that do not exist.
 
@@ -413,11 +454,11 @@ def test_the_prompt_refuses_to_build_when_the_shipped_rules_move(
     file and the heading, rather than carrying on and marking models down for a rule it never
     told them.
     """
-    import harness.cellprompt as cellprompt
+    from kedge.agent import fillprompt
 
-    monkeypatch.setattr(cellprompt, "load_prompt", lambda _name: "## Something Else\n\nprose")
+    monkeypatch.setattr(fillprompt, "load_prompt", lambda _name: "## Something Else\n\nprose")
     with pytest.raises(LookupError, match="no longer has a"):
-        cellprompt.policy_rules()
+        policy_rules()
 
 
 def test_the_task_block_says_there_are_no_tools() -> None:
@@ -486,7 +527,14 @@ def test_the_reference_bodies_fill_every_hole_first_time(reference_conversion: A
     assert result.holes == len(REFERENCE_BODIES)
     assert result.filled == result.holes, result.render()
     assert result.first_time == result.holes, result.render()
-    assert result.counts() == {"filled": 6, "rejected": 0, "empty": 0, "error": 0}
+    assert result.counts() == {
+        "filled": 6,
+        "rejected": 0,
+        "empty": 0,
+        "error": 0,
+        "skipped": 0,
+        "unfillable": 0,
+    }
 
 
 def test_a_translated_cell_stops_declaring_itself_unfinished(reference_conversion: Any) -> None:
@@ -497,7 +545,7 @@ def test_a_translated_cell_stops_declaring_itself_unfinished(reference_conversio
     actually left undone.
     """
     result = reference_conversion.result
-    filled = [cell for cell in result.generated if cell.outcome is CellOutcome.FILLED]
+    filled = [cell for cell in result.cells if cell.outcome is CellOutcome.FILLED]
     assert filled
     for cell in filled:
         assert TODO_MARKER not in cell.code, f"{cell.name} still declares itself a hole"
@@ -718,6 +766,67 @@ def test_a_mutating_handoff_declared_read_only_is_detected_from_the_statement() 
     ), "the reference plan no longer carries this defect"
 
 
+def _with_a_statementless_handoff(source: Any) -> Any:
+    """The reference plan with ``extract_query``'s hand-off block taken away.
+
+    Exactly what a model produces when it types ``kind: handoff`` and supplies no ``statement``.
+    ``Stage.effective_handoff()`` cannot guess one, so it synthesises a hand-off whose statement
+    text *is* ``-- TODO(kedge): the plan marked this stage a hand-off but supplied no
+    statement``, and the cell that comes out carries the marker inside a string literal on an
+    executable line.
+    """
+    stages = [
+        stage.model_copy(update={"handoff": None}) if stage.id == "extract_query" else stage
+        for stage in source.stages
+    ]
+    return source.model_copy(update={"stages": stages})
+
+
+def test_a_hole_no_model_can_be_asked_to_fill_stays_in_the_models_denominator() -> None:
+    """The flattering denominator, pinned where it flatters most: the composed path.
+
+    ``split_hole`` refuses this cell -- there is no placeholder under a header, so replacing "the
+    rest of it" would take the display block with it -- and the driver used to drop it where it
+    found it. The stage then appeared nowhere: not a hole, not unfilled, not skipped, not refused.
+    On ``--convert M --plan-from M`` that is the model which wrote the statement-less hand-off
+    having the consequence removed from **its own** generation denominator and printed as "6/6
+    hole(s) filled", over a notebook still carrying a ``TODO(kedge)``.
+    """
+    from kedge.notebook.scaffold import build_cells
+
+    doctored = _with_a_statementless_handoff(plan())
+    cells = build_cells(doctored, workbook_path=adjustment_case.WORKBOOK)
+
+    result = convert(
+        doctored,
+        completer=ScriptedCompleter(list(REFERENCE_BODIES)),
+        workbook_path=adjustment_case.WORKBOOK,
+    )
+
+    assert [cell.name for cell in holes_in(cells)] == [cell.name for cell in result.cells], (
+        "the scaffolder's count of what the notebook owes and the report's must agree"
+    )
+    blocked = next(cell for cell in result.cells if cell.name == "extract_query")
+    assert blocked.outcome is CellOutcome.UNFILLABLE
+    assert blocked.tries == 0, "nothing could be asked, so nothing was"
+    assert not result.complete
+    assert "6/6" not in result.summary_line()
+    assert TODO_MARKER in result.codes[result.names.index("extract_query")]
+
+
+def test_that_conversion_is_incomplete_rather_than_graded(tmp_path: Path) -> None:
+    """And the outcome says so, rather than ``GRADED`` over a notebook with a marker in it."""
+    report = convert_and_grade(
+        adjustment_case,
+        _with_a_statementless_handoff(plan()),
+        completer=ScriptedCompleter(list(REFERENCE_BODIES)),
+        notebook=tmp_path / "converted.py",
+    )
+
+    assert report.outcome is ConversionOutcome.INCOMPLETE
+    assert report.result.counts()["unfillable"] == 1
+
+
 def test_the_reference_plan_no_longer_declares_its_update_read_only() -> None:
     """The fixture half of the same defect, pinned so a regenerated plan cannot lose it.
 
@@ -795,8 +904,8 @@ def test_a_model_that_writes_pandas_is_rejected_every_time_and_recorded_as_such(
     result = convert_with(completer)
 
     assert result.filled == 0
-    assert {cell.outcome for cell in result.generated} == {CellOutcome.REJECTED}
-    offender = next(cell for cell in result.generated if cell.name == "adjust")
+    assert {cell.outcome for cell in result.cells} == {CellOutcome.REJECTED}
+    offender = next(cell for cell in result.cells if cell.name == "adjust")
     assert offender.tries == MAX_VALIDATION_ATTEMPTS
     assert any("pandas" in message for message in offender.attempts[0].violations)
     assert offender.attempts[0].stage == "style"
@@ -817,7 +926,7 @@ def test_a_model_that_redefines_another_cells_name_is_rejected_by_the_marimo_sta
     completer = _AlwaysCompleter("kedge_run = 1\nadjust = pre_adjustment\nadjust")
     result = convert_with(completer, max_attempts=1)
 
-    offender = next(cell for cell in result.generated if cell.name == "adjust")
+    offender = next(cell for cell in result.cells if cell.name == "adjust")
     assert offender.outcome is CellOutcome.REJECTED
     assert offender.attempts[0].stage == "marimo"
     assert any("kedge_run" in message for message in offender.attempts[0].violations)
@@ -827,10 +936,10 @@ def test_a_model_that_answers_with_nothing_is_empty_rather_than_rejected() -> No
     """ "Said nothing" and "said something wrong" are different results and must not merge."""
     result = convert_with(_AlwaysCompleter("   \n  \n"), max_attempts=2)
 
-    assert {cell.outcome for cell in result.generated} == {CellOutcome.EMPTY}
+    assert {cell.outcome for cell in result.cells} == {CellOutcome.EMPTY}
     assert result.filled == 0
-    assert all(cell.tries == 2 for cell in result.generated)
-    assert all(not attempt.violations for cell in result.generated for attempt in cell.attempts)
+    assert all(cell.tries == 2 for cell in result.cells)
+    assert all(not attempt.violations for cell in result.cells for attempt in cell.attempts)
 
 
 def test_a_model_that_answers_only_in_prose_fails_at_the_syntax_stage() -> None:
@@ -839,7 +948,7 @@ def test_a_model_that_answers_only_in_prose_fails_at_the_syntax_stage() -> None:
         _AlwaysCompleter("I would filter the frame and round it."), max_attempts=1
     )
 
-    offender = next(cell for cell in result.generated if cell.name == "adjust")
+    offender = next(cell for cell in result.cells if cell.name == "adjust")
     assert offender.outcome is CellOutcome.REJECTED
     assert offender.attempts[0].stage == "syntax"
 
@@ -854,7 +963,7 @@ def test_a_body_that_does_not_define_the_cells_name_is_rejected_where_it_happene
     completer = _AlwaysCompleter("_working = pre_adjustment.head(3)\n_working")
     result = convert_with(completer, max_attempts=1)
 
-    offender = next(cell for cell in result.generated if cell.name == "adjust")
+    offender = next(cell for cell in result.cells if cell.name == "adjust")
     assert offender.outcome is CellOutcome.REJECTED
     assert offender.attempts[0].stage == "definition"
     assert "must define 'adjust'" in offender.attempts[0].violations[0]
@@ -871,18 +980,49 @@ def test_a_model_that_echoes_the_comment_header_does_not_leave_a_todo_in_working
     echoed = f"{header}TODO(kedge): translate this stage.\nadjust = pre_adjustment\nadjust"
     result = convert_with(_AlwaysCompleter(echoed), max_attempts=1)
 
-    offender = next(cell for cell in result.generated if cell.name == "adjust")
+    offender = next(cell for cell in result.cells if cell.name == "adjust")
     assert offender.outcome is CellOutcome.FILLED
     assert offender.code.count("TODO(kedge)") == 0, "neither copy of the marker survives"
     assert offender.code.endswith("adjust = pre_adjustment\nadjust")
 
 
 def test_a_completer_that_raises_is_an_error_not_a_bad_conversion() -> None:
+    """Every hole is put to the endpoint, because an eval that stops measures nothing else.
+
+    ``convert`` binds ``stop_on_error=False``; ``kedge convert`` leaves it True. That is one
+    parameter on one implementation, set differently for reasons about what each caller is for --
+    a user at a terminal has learned everything a dead endpoint can teach after the first failure,
+    while a sweep leg would be throwing away five paid-for measurements over one transient 429.
+    Here the endpoint is genuinely dead, so all six come back ``ERROR`` and no hole is skipped.
+    """
     result = convert_with(_BrokenCompleter())
 
-    assert {cell.outcome for cell in result.generated} == {CellOutcome.ERROR}
-    assert all(cell.tries == 1 for cell in result.generated), "a raise must not be retried blindly"
-    assert "could not be reached" in result.generated[0].detail
+    assert {cell.outcome for cell in result.cells} == {CellOutcome.ERROR}
+    assert result.skipped == 0, "the eval presses on; nothing goes unasked"
+    assert all(cell.tries == 1 for cell in result.cells), "a raise must not be retried blindly"
+    assert "could not be reached" in result.cells[0].detail
+    # Never the model's judgement: nothing here is a rejection.
+    assert result.counts()["rejected"] == 0
+    assert result.unmeasured, "nothing came back, so nothing was measured"
+
+
+def test_the_eval_presses_on_where_the_product_stops_and_the_choice_is_visible() -> None:
+    """One deliberate keyword is the whole difference, and it is asserted rather than assumed.
+
+    The alternative -- inheriting the product's default -- means one transient 429 on the first
+    hole abandons the run, reports ``NO_MODEL``, grades nothing and spends a whole sweep leg on a
+    single call. ``INTERRUPTED`` and ``Coverage`` exist precisely so a partial run can be reported
+    honestly instead.
+    """
+    from kedge.agent.fill import fill_holes
+
+    assert convert.func is fill_holes
+    assert convert.keywords == {"stop_on_error": False}
+
+    stopping = convert_with(_BrokenCompleter(), stop_on_error=True)
+
+    assert stopping.errored == 1
+    assert stopping.skipped == stopping.holes - 1, "the product's behaviour is one keyword away"
 
 
 def test_a_conversion_with_no_model_at_all_is_not_scored(tmp_path: Path) -> None:
@@ -919,6 +1059,7 @@ def test_an_endpoint_that_fails_part_way_is_interrupted_rather_than_incomplete(
 
     assert report.outcome is ConversionOutcome.INTERRUPTED
     assert report.result.errored == 5
+    assert not report.result.unmeasured, "one hole did come back; this is not NO_MODEL"
     assert report.result.filled == 1
     assert report.coverage is not None
     assert report.coverage.graded < report.coverage.declared, (
@@ -1122,10 +1263,10 @@ def test_a_plan_kedge_refuses_to_scaffold_ends_the_run_rather_than_the_process(
             calls.append(1)
             return "x = 1"
 
-    import harness.cellgen
+    from kedge.agent import fill as agent_fill
 
-    original = harness.cellgen.build_cells
-    harness.cellgen.build_cells = refuse  # type: ignore[assignment]
+    original = agent_fill.build_cells
+    agent_fill.build_cells = refuse  # type: ignore[assignment]
     try:
         report = convert_and_grade(
             adjustment_case,
@@ -1137,7 +1278,7 @@ def test_a_plan_kedge_refuses_to_scaffold_ends_the_run_rather_than_the_process(
             plan_is_the_models=True,
         )
     finally:
-        harness.cellgen.build_cells = original  # type: ignore[assignment]
+        agent_fill.build_cells = original  # type: ignore[assignment]
 
     assert report.outcome is ConversionOutcome.NO_PLAN
     assert report.result is None
@@ -1266,8 +1407,12 @@ def test_a_gate_line_is_kept_out_of_the_hole() -> None:
     ``_gate_<name> = <checkpoint>["decision"]`` is what keeps a stage downstream of an approval
     invisible until the approval is recorded. It is the scaffolder's, not the translation's, so
     it stays in the header the model is shown and never in the part it replaces.
+
+    Asserted against the scaffolder's own functions, which is where they always lived: the eval
+    used to import them from its copy of the driver, which imported them from here under private
+    aliases, so a test about ``scaffold.py`` was reaching through two modules to get at it.
     """
-    from harness.cellgen import _split_hole
+    from kedge.notebook.scaffold import split_hole
 
     code = (
         "# Stage 4 of 8: apply\n"
@@ -1277,16 +1422,16 @@ def test_a_gate_line_is_kept_out_of_the_hole() -> None:
         "apply = upstream  # passthrough until translated\n"
         "apply"
     )
-    header, placeholder = _split_hole(code)
+    header, placeholder = split_hole(code)
 
     assert "_gate_apply" in header
     assert "_gate_apply" not in placeholder
     assert "passthrough until translated" in placeholder
     # The marker is an instruction to a model, not documentation of the stage, so a filled cell
     # keeps the gate and the stage heading and loses the instruction.
-    from harness.cellgen import _without_the_marker
+    from kedge.notebook.scaffold import strip_marker
 
-    kept = _without_the_marker(header)
+    kept = strip_marker(header)
     assert "_gate_apply" in kept
     assert "TODO(kedge)" not in kept
     assert "# Stage 4 of 8: apply" in kept
@@ -1302,8 +1447,8 @@ def test_a_gate_line_is_kept_out_of_the_hole() -> None:
     ],
 )
 def test_a_fenced_reply_is_unwrapped(reply: str, expected: str) -> None:
-    """The product never needs this; without a tool surface a fence is how code arrives."""
-    from harness.cellgen import _body_of
+    """The chat never needs this; without a tool surface a fence is how code arrives."""
+    from kedge.agent.fill import _body_of
 
     assert _body_of(reply) == expected
 

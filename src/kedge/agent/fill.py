@@ -15,35 +15,40 @@ registry of names as it stands *after the holes above it were filled*. Order is 
 hole is filled against the names defined above it, so filling them out of order asks for a
 translation of a frame that does not exist yet.
 
-**The prompt is assembled, never paraphrased.** :data:`FILL_PROMPT_PARTS` is
-:data:`~kedge.agent.prompts.SYSTEM_PARTS` minus ``tools.md``, subtracted by name so a part added
-to the product prompt tomorrow is in this seam tomorrow without anybody remembering a second list
-exists. The subtraction is deliberate and it is the one place this module departs from the
-proposal that asked for it, which argued that "in the product the subtraction is unnecessary --
-the tools are real". They are real in the *chat* seam. They are not real here: ``kedge convert``
-is headless, writes through :class:`~kedge.notebook.filedriver.FileNotebookDriver`, and offers no
-``list_cells``, no ``probe`` and no ``propose_cell``. A model told to call a tool that does not
-exist answers with a tool call in prose, the reply holds no cell body, and a *harness* mismatch is
-recorded as a model failure. So ``tools.md`` goes, exactly as it does in the eval, and for exactly
-the same reason.
+**It belongs to the agent, not to the notebook.** It was written under ``notebook/`` and had to
+import ``kedge.agent.context``, ``kedge.agent.prompts`` and ``kedge.agent.validate`` to work,
+inverting the documented layering ``analysis/ -> plan/ -> notebook/ -> agent/ -> server/``. There
+was no runtime cycle only because ``notebook/__init__.py`` did not import it, and the blast radius
+of adding that one line was the whole ``agent`` package rather than one module, because
+``agent/__init__.py`` eagerly aggregates ``context``. What this module *is* settles where it goes:
+a model-driving loop, owning reply parsing, retry history, a :class:`~kedge.plan.propose.Completer`
+and a check that extends the gate. That is ``agent/``'s job. What is genuinely notebook work is in
+``notebook/scaffold.py`` -- the ``TODO(kedge)`` seam of :func:`~kedge.notebook.scaffold.holes_in`,
+:func:`~kedge.notebook.scaffold.split_hole` and :func:`~kedge.notebook.scaffold.strip_marker` --
+and this module calls it rather than carrying a copy. ``scripts/guardrails.py`` now fails if
+anything under ``kedge/notebook/`` imports ``kedge.agent`` again.
 
-**Dropping the file drops the rules with it, so one section is carried across.** ``tools.md``'s
-``## Validation`` heading is where the product states what :class:`~kedge.agent.validate.Policy`
-refuses -- shell, network, database connections, writes outside the working directory, credentials
-in literals -- and this seam still runs the real ``Policy``. :func:`policy_rules` quotes that
-section out of the shipped file at load time rather than restating it, because a paraphrase is a
-second copy of a rule and a second copy rots. It raises rather than returning nothing if the
-heading ever moves: silently sending no rules is the exact failure it exists to prevent.
+**The prompt is assembled, never paraphrased**, and it is assembled in
+:mod:`kedge.agent.fillprompt` -- which is also what the eval sends, by calling it rather than by
+copying it.
 
-**Six outcomes, not two.** :class:`FillOutcome` has five members and :attr:`FilledCell.first_time`
-splits the successful one, because the answers differ. A hole nobody asked about, a hole filled
+**Seven outcomes, not two.** :class:`FillOutcome` has six members and
+:attr:`FilledCell.first_time` splits the successful one, because the answers differ. A hole filled
 first time, a hole filled after two rejections, a hole the gate refused every time, a hole the
-model answered with prose, and a hole the endpoint never answered at all are six different things
-to do next -- and the last of them is not the model's judgement. Collapsing a transport failure
-into "the model could not write this cell" attributes a dead endpoint to a model, which is the one
-mistake a conversion report must not make. It is also why a transport failure abandons the run
-(see ``stop_on_error``): asking a dead endpoint five more times costs five timeouts and reports
-one fact five times.
+model answered with prose, a hole the endpoint never answered, a hole nobody asked about because
+an earlier one killed the endpoint, and a hole nothing *can* be asked about are seven different
+things to do next -- and only four of them are the model's judgement. Collapsing a transport
+failure into "the model could not write this cell" attributes a dead endpoint to a model, which is
+the one mistake a conversion report must not make. It is also why a transport failure abandons the
+run by default (see ``stop_on_error``): asking a dead endpoint five more times costs five timeouts
+and reports one fact five times.
+
+**Every one of them is in the denominator.** The seventh --
+:attr:`FillOutcome.UNFILLABLE` -- exists because it was not. A hole with no placeholder under its
+header cannot be put to a model, and it used to be dropped where it was found: not in ``cells``,
+not in :attr:`FillReport.holes`, not in :attr:`FillReport.complete`. So a conversion that left a
+``TODO(kedge)`` on disk exited 0 saying "nothing is left unwritten" -- the pass nobody earned that
+this project names as its most dangerous failure mode, one layer up in ``reconcile``.
 """
 
 from __future__ import annotations
@@ -51,22 +56,18 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
-from kedge.agent.context import (
-    CellFacts,
-    NameRegistry,
-    build_analysis_block,
-    build_plan_block,
-)
-from kedge.agent.prompts import SYSTEM_PARTS, build_system_prompt, load_prompt
+from kedge.agent.context import CellFacts, NameRegistry
+from kedge.agent.fillprompt import cell_messages
 from kedge.agent.validate import (
     MAX_VALIDATION_ATTEMPTS,
+    MISSING_NAME_STAGE,
     Policy,
     RoundingContext,
-    ValidationReport,
+    undefined_name,
     validate_cell,
 )
 from kedge.errors import NotebookError
@@ -94,207 +95,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "FILL_PROMPT_PARTS",
-    "FILL_TASK",
-    "POLICY_SOURCE",
+    "NO_PLACEHOLDER",
     "TODO_MARKER",
     "FillAttempt",
     "FillOutcome",
     "FillReport",
     "FilledCell",
-    "PromptAssemblyError",
-    "cell_messages",
     "convert_notebook",
     "fill_holes",
-    "policy_rules",
-    "system_prompt",
 ]
 
 _FENCE = re.compile(r"```(?:[a-zA-Z0-9_+-]*)\n(.*?)```", re.DOTALL)
-
-
-class PromptAssemblyError(NotebookError, LookupError):
-    """The prompt cannot be assembled from the shipped parts, so nothing is sent.
-
-    Both bases earn their place. :class:`~kedge.errors.NotebookError` is what CONVENTIONS asks
-    for and what makes this reach the command line as a message rather than a traceback --
-    ``kedge convert`` catches ``KedgeError`` and nothing else. ``LookupError`` is what it
-    actually is: a heading that is no longer in the file. Callers written against either one
-    keep working.
-    """
-
-
-# =============================================================================
-# THE PROMPT
-# =============================================================================
-
-
-FILL_PROMPT_PARTS: tuple[str, ...] = tuple(part for part in SYSTEM_PARTS if part != "tools.md")
-"""The product's system prompt parts, less the one describing tools this seam does not offer.
-
-Subtracted rather than enumerated. A new part added to
-:data:`~kedge.agent.prompts.SYSTEM_PARTS` -- another file of Excel semantics, say -- reaches this
-seam the moment it ships. Listing the five wanted files here would have made this the place a
-conversion silently stopped tracking the chat prompt.
-"""
-
-POLICY_SOURCE = ("tools.md", "## Validation")
-"""Where the policy rules are quoted from: the shipped file, and the heading inside it."""
-
-
-def policy_rules(source: tuple[str, str] = POLICY_SOURCE) -> str:
-    """The shipped ``## Validation`` section, quoted verbatim out of ``tools.md``.
-
-    Dropping ``tools.md`` from the prompt drops the only statement of what
-    :class:`~kedge.agent.validate.Policy` refuses, while the gate itself stays. A model that
-    reaches for ``duckdb.connect(...)`` is warned in the chat and ambushed here, so a conversion
-    would refuse cells the chat would have talked the model out of writing -- and the fix must not
-    be a paraphrase, because a paraphrase is a second copy of a rule that drifts out of step with
-    the first and nobody notices until a cell is blamed for it.
-
-    Args:
-        source: The prompt file, and the Markdown heading whose section to quote.
-
-    Returns:
-        The section, heading line included, exactly as the shipped file holds it.
-
-    Raises:
-        PromptAssemblyError: when the heading is not in the file. A prompt assembled without the
-            rules would run and would refuse cells it never warned about; refusing to build one is
-            the whole point of checking.
-    """
-    name, heading = source
-    text = load_prompt(name)
-    lines = text.splitlines()
-    start = next((index for index, line in enumerate(lines) if line.strip() == heading), None)
-    if start is None:
-        msg = (
-            f"the prompt part {name!r} no longer has a {heading!r} section, so a conversion cannot "
-            f"tell a model what the validation gate refuses. Point POLICY_SOURCE at wherever those "
-            f"rules live now -- do not restate them here, or `kedge convert` will start rejecting "
-            f"cells it never warned about."
-        )
-        raise PromptAssemblyError(msg)
-    end = next(
-        (index for index in range(start + 1, len(lines)) if lines[index].startswith(("## ", "# "))),
-        len(lines),
-    )
-    return "\n".join(lines[start:end]).rstrip()
-
-
-FILL_TASK = """
-# This turn: one cell body, and nothing else
-
-This is not the chat pane and you have no tools. There is no `list_cells`, no `probe`, no
-`propose_cell`; there is one cell, and your reply *is* its body. Everything you are given about
-the workbook and the plan is below -- there is no way to ask for more, so work from it and say
-what you assumed rather than guessing quietly.
-
-The notebook has already been scaffolded from the approved plan. Its structure is settled: the
-cells exist, they are named, and the ones above this one have been written. What is left is the
-translation inside this cell, marked `TODO(kedge)`.
-
-Reply with **Python only**: the lines that replace the placeholder body, at zero indentation, no
-Markdown fence, no explanation before or after. The comment header above the `TODO(kedge)` line
-is kept for you -- do not repeat it. The cell must define the name the placeholder defines,
-because the cells below read it; give anything else you need a leading underscore, which marimo
-treats as cell-local.
-
-Your reply goes through kedge's validation gate before it is accepted. If it is rejected you get
-the violations back and a limited number of further attempts -- read them and fix the cause,
-because a cell that never passes is a hole in the notebook rather than a cell that came out
-badly. The gate's rules are below, quoted from the file the chat sends: the tool names in them do
-not apply here, but every rule does, because it is the same gate.
-""".strip()
-"""The one block this seam adds, appended through ``build_system_prompt(extra=...)``.
-
-It states the mechanics of the seam and deliberately nothing else. Every rule about *how to
-translate* -- polars, LazyFrames, ``kedge.xl``, ``kedge.sql``, the single-definition rule -- is in
-the shipped parts above it, and restating one here would create a second copy to keep in step with
-the first. It ends up out of step; they always do. The rules of the gate itself are not restated
-either: :func:`policy_rules` quotes them.
-"""
-
-
-def system_prompt(*, parts: Sequence[str] = FILL_PROMPT_PARTS, extra: Sequence[str] = ()) -> str:
-    """The system prompt for the cell-filling seam.
-
-    Args:
-        parts: Which shipped prompt files to send. Defaults to :data:`FILL_PROMPT_PARTS`.
-        extra: Blocks appended after :data:`FILL_TASK` and the quoted policy rules, for a caller
-            with something further to say.
-
-    Returns:
-        The assembled prompt, built by the product's own
-        :func:`~kedge.agent.prompts.build_system_prompt`.
-
-    Raises:
-        PromptAssemblyError: when the policy rules can no longer be quoted. See
-            :func:`policy_rules`.
-    """
-    return build_system_prompt(parts=parts, extra=(FILL_TASK, policy_rules(), *extra))
-
-
-def cell_messages(
-    *,
-    cell: ScaffoldCell,
-    plan: ProcessPlan,
-    analysis: WorkbookAnalysis | None,
-    registry: NameRegistry,
-    history: Sequence[tuple[str, str]] = (),
-) -> list[dict[str, str]]:
-    """The messages for one hole, in the roles the chat loop puts them in.
-
-    One system message carrying the prompt and the pinned blocks together, then a user message
-    carrying the cell, then any retry traffic. That is what
-    :meth:`kedge.agent.context.ConversationWindow._render` does -- it joins the system prompt and
-    every pinned block into a single ``{"role": "system"}`` entry before any conversation message
-    -- and splitting them here would put some eight thousand tokens in a role the chat never puts
-    them in.
-
-    The pinned blocks are in :meth:`kedge.agent.loop.KedgeAgent._window_for`'s own
-    least-volatile-first order: the analysis, then the plan, then the registry. A prompt cache keys
-    on the prefix, so anything ahead of a block that changes stays cached; the registry is the one
-    that changes between holes, and it goes last. The one pinned block left out is
-    :meth:`~kedge.agent.context.NotebookState.render`, which instructs the reader to call
-    ``list_cells`` and exists to describe a live kernel's staleness -- neither of which is a thing
-    that can happen here.
-
-    Args:
-        cell: The scaffolded cell, comment header and placeholder body together. Sent whole: the
-            intent, the sources, the assumptions and the Excel-pattern hint are the brief.
-        plan: The approved plan, rendered as the model's standing instructions.
-        analysis: The workbook analysis. ``None`` renders the block that says so, which is what
-            the chat does too.
-        registry: Every public name the notebook already owns, including the holes filled above
-            this one.
-        history: Prior ``(role, content)`` pairs for this cell -- the rejected body and the gate's
-            verdict on it.
-
-    Returns:
-        The message list, ready for a :class:`~kedge.plan.propose.CompletionRequest`.
-    """
-    head = "\n\n".join(
-        [
-            system_prompt(),
-            build_analysis_block(analysis),
-            build_plan_block(plan),
-            registry.render(),
-        ]
-    )
-    task = (
-        f"## The cell to write: `{cell.name}`\n\n"
-        f"This is the scaffolded cell as it stands. Everything above the "
-        f"`{TODO_MARKER}` line is kept as it is; reply with what replaces the "
-        f"placeholder below it, Python only.\n\n"
-        f"```python\n{cell.code}\n```"
-    )
-    messages = [
-        {"role": "system", "content": head},
-        {"role": "user", "content": task},
-    ]
-    messages.extend({"role": role, "content": content} for role, content in history)
-    return messages
 
 
 # =============================================================================
@@ -303,7 +114,7 @@ def cell_messages(
 
 
 class FillOutcome(StrEnum):
-    """How one hole came out. Five states, because they need five different answers.
+    """How one hole came out. Six states, because they need six different answers.
 
     Example:
         >>> bool(FillOutcome.FILLED), bool(FillOutcome.REJECTED)
@@ -327,6 +138,22 @@ class FillOutcome(StrEnum):
     """Never asked. The run was abandoned after :attr:`ERROR`, so this hole was never put to the
     model at all -- which is a different thing from a hole the model could not write, and reads
     as one only if the two are collapsed."""
+
+    UNFILLABLE = "unfillable"
+    """A hole this driver cannot put to a model at all, and which the notebook still owes.
+
+    Today there is one shape: a hand-off whose statement *is* the marker, which
+    :func:`~kedge.notebook.scaffold.split_hole` refuses to split because there is no placeholder
+    body under the header -- asking a model to replace "the rest of the cell" would take the
+    display block with it. It is exactly what a plan declaring a hand-off with no statement
+    produces, which is exactly what a model writes when it types ``kind: handoff`` and stops.
+
+    It exists because leaving such a cell out of the report was a **shrinking denominator**. The
+    hole was skipped silently, so it was not in ``cells``, not in :attr:`FillReport.holes`, not in
+    :attr:`FillReport.unfilled` and not in :attr:`FillReport.complete` -- and a conversion that
+    left a ``TODO(kedge)`` on disk exited 0 saying "nothing is left unwritten". Worse where it is
+    measured: the model that wrote the statement-less hand-off had that stage removed from its own
+    generation denominator and was reported as filling every hole it was given."""
 
     def __bool__(self) -> bool:
         """True only for :attr:`FILLED`, so an unfilled hole cannot read as a success."""
@@ -410,13 +237,29 @@ class FillReport:
     notebook in.
 
     Example:
-        >>> FillReport(names=(), codes=(), cells=()).complete
-        True
+        A plan is required; ``model_construct`` is used here only because this example needs one
+        to exist rather than to say anything, and a real one is a validated document.
+
+        >>> from kedge.plan.model import ProcessPlan
+        >>> report = FillReport(names=(), codes=(), cells=(), plan=ProcessPlan.model_construct())
+        >>> report.holes, report.complete
+        (0, True)
     """
 
     names: tuple[str, ...]
     codes: tuple[str, ...]
     cells: tuple[FilledCell, ...]
+    plan: ProcessPlan
+    """The plan this conversion was of. Required, and required on purpose.
+
+    Carried for the same reason :attr:`scaffolded` is: a report that cannot name its own subject
+    cannot say which stage a finding is about. What a hand-off declares, and whether the cell that
+    came out of it matches, is a question about the plan and the codes together -- and reaching
+    for the plan afterwards means the caller holding the report has to have kept it too.
+
+    It is not ``| None``. A default would make every reader of ``report.plan.stages`` decide
+    whether to guard, and the honest answer is that there is no report without a plan: every
+    construction here has one in hand."""
     scaffolded: tuple[ScaffoldCell, ...] = ()
     """The cells as they stood before filling, roles and stage ids intact. Kept because the role
     of a cell -- head, stage, checkpoint, hand-off, reconciliation -- is what lets a report say
@@ -472,6 +315,30 @@ class FillReport:
     def skipped(self) -> int:
         """Holes never put to the model, because the run was abandoned."""
         return sum(1 for cell in self.cells if cell.outcome is FillOutcome.SKIPPED)
+
+    @property
+    def unmeasured(self) -> bool:
+        """Whether **no request to the model was ever answered**. Nothing else.
+
+        The claim is deliberately narrow, because the obvious wider one is false. "Not one hole
+        came back with a body the gate could have an opinion about" is what a caller wants to say,
+        and it is wrong on a run where the first hole's first attempt was rejected and the second
+        attempt was the one the endpoint dropped: that hole ends :attr:`FillOutcome.ERROR`, every
+        later one is skipped, and the gate's opinion is sitting in ``cells[0].attempts[0].
+        violations`` all the while. Reporting that as "nothing was measured" **exonerates** a model
+        whose one answered request breached the house style, which is the wrong direction for a
+        mistake of this kind to run in.
+
+        So it asks the question a transport failure actually answers: did anything come back at
+        all. An attempt with no ``error`` is a reply, however bad -- an empty one included, since
+        "said nothing" is a fact about the model too. This is the sentence a caller may print, and
+        the two now say the same thing.
+
+        False when there were no holes at all: that is a statement about the plan, and a caller
+        that wants it asks :attr:`holes`.
+        """
+        answered = any(attempt.error is None for cell in self.cells for attempt in cell.attempts)
+        return bool(self.cells) and not answered
 
     @property
     def unfilled(self) -> tuple[FilledCell, ...]:
@@ -600,40 +467,13 @@ def _without_echoed_header(body: str) -> str:
     return body
 
 
-_MISSING_NAME_STAGE = "definition"
-"""The one check this driver makes that the shipped gate does not. See :func:`_undefined_name`."""
-
-
-def _undefined_name(report: ValidationReport, hole: ScaffoldCell) -> tuple[str, ...]:
-    """Refuse a body that does not define the name the cells below it read.
-
-    The one thing checked here that :func:`~kedge.agent.validate.validate_cell` does not, and it
-    is a stand-in rather than an addition. In the chat the kernel catches this: the cell is
-    accepted, flushed, and the cells downstream of it fail on a name that was never bound, which
-    marimo reports precisely. ``kedge convert`` runs no kernel at all -- it writes through
-    :class:`~kedge.notebook.filedriver.FileNotebookDriver` -- so without this check the failure
-    surfaces the next time somebody opens the notebook, three cells below the one that caused it,
-    and the blame lands on a cell that was written correctly.
-
-    Args:
-        report: The gate's verdict, whose ``names`` hold what the body defines.
-        hole: The cell being filled, whose name the body has to bind.
-
-    Returns:
-        One violation naming the cell that failed to define the name, or nothing when the body
-        defines it.
-    """
-    if hole.name in report.names.public_defs:
-        return ()
-    defined = ", ".join(report.names.public_defs) or "nothing"
-    return (
-        f"definition: this cell must define '{hole.name}' -- the cells below read it by that "
-        f"name. It defines {defined}.",
-    )
-
-
 _SURVIVING_MARKER_STAGE = "marker"
-"""The second check this driver makes that the shipped gate does not. See :func:`_surviving_marker`."""
+"""The one check this driver makes that neither the gate nor the kernel does.
+
+See :func:`_surviving_marker`. The other one -- the name the cells below read -- is
+:func:`~kedge.agent.validate.undefined_name`, which sits beside the gate it extends because
+leaving it here guarantees a third copy the day anything else needs it.
+"""
 
 
 def _surviving_marker(code: str) -> tuple[str, ...]:
@@ -710,8 +550,17 @@ def _unfilled_detail(attempts: Sequence[FillAttempt], last: FillOutcome) -> str:
     return f"no cell body in any of {total} reply(ies)"
 
 
-def _fillable(cells: Sequence[ScaffoldCell]) -> tuple[tuple[int, ScaffoldCell], ...]:
-    """The holes this driver can actually write, each with its **position** in the notebook.
+NO_PLACEHOLDER = (
+    "no body could be asked for: the cell carries the marker but the scaffolder left no "
+    "placeholder under the header to replace, which is what a hand-off declaring no statement "
+    "comes out as. Put the statement in the plan and approve it again, or translate this cell by "
+    "hand -- either way the notebook still owes this one."
+)
+"""Why a hole is :attr:`FillOutcome.UNFILLABLE`. Reported, never silently skipped."""
+
+
+def _holes(cells: Sequence[ScaffoldCell]) -> tuple[tuple[int, ScaffoldCell, str], ...]:
+    """Every hole the notebook owes a body for, each with its **position** and its blocker.
 
     Positions, not names. Keying anything by cell name assumes names are unique and they are not:
     every cell a user creates in marimo is ``def _()``, and the file bridge reports that name as
@@ -720,25 +569,31 @@ def _fillable(cells: Sequence[ScaffoldCell]) -> tuple[tuple[int, ScaffoldCell], 
     registry, and the gate then accepted a later cell redefining it. A multiply-defined breach
     written to the file, past the one check whose whole job is catching it.
 
-    Two kinds of hole are skipped, both because there is nothing safe to write:
+    Two cells carrying the marker cannot be put to a model, and they are **not** the same case:
 
-    * **A cell with no public name of its own.** ``_`` and anything underscore-prefixed is
-      cell-local to marimo, so :func:`~kedge.agent.validate.validate_cell` can never see it
-      defined and the driver would spend every attempt rejecting a body for not defining a name
-      it is not allowed to define -- then report ``- _: rejected``, which names nothing anybody
-      can act on, and repeat it on every later run. kedge emits no unnamed cell, so a marker in
-      one came from somewhere else.
-    * **A hole :func:`~kedge.notebook.scaffold.split_hole` will not split.** A hand-off whose
-      statement is itself the marker has no placeholder body; asking a model to replace "the rest
-      of the cell" would take the display block with it.
+    * **A hole :func:`~kedge.notebook.scaffold.split_hole` will not split** is still a hole. There
+      is nothing to ask for -- a hand-off whose statement is itself the marker has no placeholder
+      body, and asking a model to replace "the rest of the cell" would take the display block with
+      it -- but the notebook owes it, so it comes back with :data:`NO_PLACEHOLDER` and is counted.
+      It used to be dropped here, which took it out of the denominator as well as out of the work
+      list: see :attr:`FillOutcome.UNFILLABLE`.
+    * **A cell with no public name of its own** is not a hole at all, and is the one case this
+      still drops. ``_`` and anything underscore-prefixed is cell-local to marimo, so
+      :func:`~kedge.agent.validate.validate_cell` can never see it defined and the driver would
+      spend every attempt rejecting a body for not defining a name it is not allowed to define --
+      then report ``- _: rejected``, which names nothing anybody can act on, and repeat it on
+      every later run for ever. The difference that settles it: **kedge emits no unnamed cell**,
+      so a marker in one is a note in somebody's own cell rather than work kedge left behind, and
+      counting it would peg the exit code at 1 over a file kedge never wrote.
 
     Args:
         cells: The notebook's cells, in order.
 
     Returns:
-        ``(position, cell)`` for each fillable hole, in the scaffolder's own order.
+        ``(position, cell, blocker)`` per hole in the scaffolder's own order, the blocker empty
+        for a hole a model can be asked to fill.
     """
-    fillable: list[tuple[int, ScaffoldCell]] = []
+    holes: list[tuple[int, ScaffoldCell, str]] = []
     for position, cell in enumerate(cells):
         # `holes_in`'s own predicate, applied positionally. Calling it and then looking the
         # results back up by name is what created the collision this function exists to avoid.
@@ -748,10 +603,13 @@ def _fillable(cells: Sequence[ScaffoldCell]) -> tuple[tuple[int, ScaffoldCell], 
             logger.info("cell %r carries the marker but has no public name to fill", cell.name)
             continue
         if not split_hole(cell.code)[0]:
-            logger.info("cell %s carries the marker but has no placeholder to replace", cell.name)
+            logger.warning(
+                "cell %s carries the marker but has no placeholder to replace", cell.name
+            )
+            holes.append((position, cell, NO_PLACEHOLDER))
             continue
-        fillable.append((position, cell))
-    return tuple(fillable)
+        holes.append((position, cell, ""))
+    return tuple(holes)
 
 
 def _registry_for(names: Sequence[str], codes: Sequence[str]) -> NameRegistry:
@@ -811,7 +669,7 @@ def fill_holes(
             clamped: it would report every hole as unfilled with no model ever asked.
         policy: What generated code may reach for. Defaults to the shipped default -- no network,
             no database, no writes outside the working directory. Whatever is passed, the model is
-            told what it refuses: see :func:`policy_rules`.
+            told what it refuses: see :func:`~kedge.agent.fillprompt.policy_rules`.
         stop_on_error: Abandon the run the first time the completer raises, recording every
             remaining hole as :attr:`FillOutcome.SKIPPED`. On by default because a transport
             failure is a fact about the endpoint rather than about the cell: asking it five more
@@ -854,7 +712,20 @@ def fill_holes(
     started = time.perf_counter()
     completions = 0
     abandoned = False
-    for position, hole in _fillable(scaffolded):
+    for position, hole, blocker in _holes(scaffolded):
+        if blocker:
+            # Recorded before the abandonment check: whether this hole can be asked about is a
+            # fact about the scaffold, not about the endpoint, and it is true either way.
+            results.append(
+                FilledCell(
+                    name=hole.name,
+                    stage_id=hole.stage_id,
+                    outcome=FillOutcome.UNFILLABLE,
+                    code=hole.code,
+                    detail=blocker,
+                )
+            )
+            continue
         if abandoned:
             results.append(
                 FilledCell(
@@ -892,6 +763,7 @@ def fill_holes(
         scaffolded=tuple(scaffolded),
         seconds=seconds,
         completions=completions,
+        plan=plan,
     )
     logger.info(
         "filled %d of %d hole(s) in plan v%d for %s",
@@ -979,13 +851,13 @@ def _fill_one(
             rounding=rounding,
             frame_names=registry.frame_names(),
         )
-        missing = _undefined_name(report, hole)
+        missing = undefined_name(report, hole.name)
         surviving = _surviving_marker(code)
         violations = report.messages or missing or surviving
         if report.stage is not None:
             stage: str | None = report.stage.value
         elif missing:
-            stage = _MISSING_NAME_STAGE
+            stage = MISSING_NAME_STAGE
         elif surviving:
             stage = _SURVIVING_MARKER_STAGE
         else:
@@ -1149,14 +1021,7 @@ async def convert_notebook(
         await driver.edit_cell(cell.name, cell.code, run=False)
         written.append(cell.name)
     logger.info("wrote %d filled cell(s) to the notebook", len(written))
-    return FillReport(
-        names=report.names,
-        codes=report.codes,
-        cells=report.cells,
-        scaffolded=report.scaffolded,
-        seconds=report.seconds,
-        completions=report.completions,
-        written=tuple(written),
-        scaffolded_summary=summary,
-        refused=refused,
-    )
+    # `replace` rather than ten fields copied across by hand: a field added to `FillReport`
+    # tomorrow arrives here without anybody remembering that this constructor exists. The
+    # hand-copied version had already forgotten one.
+    return replace(report, written=tuple(written), scaffolded_summary=summary, refused=refused)

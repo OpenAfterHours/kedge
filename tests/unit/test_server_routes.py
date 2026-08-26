@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -39,7 +40,7 @@ from kedge.plan.review import (
     reject,
     request_changes,
 )
-from kedge.plan.store import PlanStore
+from kedge.plan.store import PLAN_FILENAME_PATTERN, PlanStore
 from kedge.plan.triage import triage
 from kedge.server import routes as routes_module
 from kedge.server.agent_seam import CancelToken, ScriptedAgent, TurnRequest
@@ -240,6 +241,435 @@ def test_context_reports_no_notebook_url_when_marimo_is_not_attached(client: Tes
     assert payload["notebook_url"] is None
     assert payload["marimo"]["attached"] is False
     assert payload["workbook"]["name"] == "rwa_monthly_v14.xlsx"
+
+
+# ── the conversion state, and the suggestions drawn from it ──────────────────────────────────
+
+
+# The cell names `make_plan`'s four stages scaffold to. Written out rather than derived, so a
+# change to `cell_name_for` fails here instead of quietly agreeing with itself.
+_STAGE_CELLS = ("load_handin", "apply_haircuts", "manual_overrides", "write_output")
+
+_HOLE = (
+    "# Stage: still a passthrough\n"
+    "#\n"
+    "# TODO(kedge): translate this stage into polars.\n"
+    "value = upstream  # passthrough until translated"
+)
+# The pound sign is not decoration. It is what makes this file's bytes multi-byte, which is what
+# a truncation part-way through a character needs -- and non-ASCII here is realistic rather than
+# contrived: the briefing cell renders the workbook's own prose verbatim.
+_WRITTEN = "# Stage: translated, and the figures below are in £\nvalue = upstream.sum()"
+
+
+def _notebook_file(*cells: tuple[str, str]) -> str:
+    """Render a marimo notebook holding the named cells, in the shape marimo writes."""
+    blocks = "\n\n\n".join(
+        f"@app.cell\ndef {name}():\n"
+        + "\n".join(f"    {line}" for line in body.splitlines())
+        + "\n    return"
+        for name, body in cells
+    )
+    return f'import marimo\n\n__generated_with = "0.23.15"\napp = marimo.App()\n\n\n{blocks}\n'
+
+
+def _scaffold(*holes: str) -> str:
+    """A notebook holding a cell for every stage in ``make_plan``, some of them still holes."""
+    return _notebook_file(*((name, _HOLE if name in holes else _WRITTEN) for name in _STAGE_CELLS))
+
+
+def _save_plan(workspace: Workspace, *, state: str) -> Path:
+    """Put one plan in this workspace's own store, at the given point in review.
+
+    Acknowledging the drops bumps the version, so the file this lands in is not ``plan-v001``.
+    That is why the path comes back rather than being assumed.
+    """
+    plan = acknowledge_all_drops(make_plan(), note="reviewed")
+    if state == "approved":
+        plan = approve(plan, by="tests")
+    elif state == "rejected":
+        plan = reject(plan, by="tests", reason="the decomposition misses the second hand-in")
+    elif state == "revise":
+        plan = request_changes(plan, by="tests", note="split the transform in two")
+    elif state != "draft":  # pragma: no cover - a typo in a test, caught immediately
+        raise AssertionError(state)
+    return PlanStore.for_workspace(workspace).save(plan)
+
+
+def _conversion(client: TestClient) -> dict[str, Any]:
+    """The conversion block, through the real route."""
+    response = client.get("/api/context")
+    assert response.status_code == 200, response.text
+    return response.json()["conversion"]
+
+
+# ── which state the workbook is in ───────────────────────────────────────────────────────────
+
+
+def test_context_reports_that_nothing_has_been_planned_yet(client: TestClient) -> None:
+    # The state every workbook is in on the first open, and the one the hub exists to move out of.
+    assert _conversion(client) == {"state": "none", "unwritten": None}
+
+
+def test_context_reports_a_draft_plan_as_waiting_for_review(
+    workspace: Workspace, client: TestClient
+) -> None:
+    _save_plan(workspace, state="draft")
+    assert _conversion(client)["state"] == "proposed"
+
+
+def test_a_rejected_plan_is_not_reported_as_one_still_waiting_for_review(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """A rejection is terminal, and calling it "proposed" is a loop with no way out.
+
+    ``approve`` refuses a rejected plan outright and says to propose a new one. Reported as
+    ``proposed``, the pane offers "talk me through the plan you have proposed" for ever -- and
+    takes the conversion kickoff off the screen at the one moment it is the only useful thing
+    left to say.
+    """
+    _save_plan(workspace, state="rejected")
+    assert _conversion(client)["state"] == "rejected"
+
+
+def test_a_plan_sent_back_for_changes_asks_for_a_revision(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # Not terminal, unlike a rejection: this plan can still be approved once it has been revised,
+    # so the thing to offer is the revision rather than a fresh plan.
+    _save_plan(workspace, state="revise")
+    assert _conversion(client)["state"] == "revise"
+
+
+def test_an_approval_at_an_older_version_still_counts(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # The scaffolder walks back from the newest version, so this is the plan the notebook was
+    # built from and the one work should be offered against.
+    store = PlanStore.for_workspace(workspace)
+    approved = store.save(approve(acknowledge_all_drops(make_plan(), note="reviewed"), by="tests"))
+    store.save(make_plan(version=int(PLAN_FILENAME_PATTERN.match(approved.name).group(1)) + 1))
+
+    workspace.notebook_path.write_text(_scaffold("write_output"), encoding="utf-8")
+    assert _conversion(client) == {"state": "approved", "unwritten": 1}
+
+
+def test_context_survives_a_plan_history_it_cannot_read(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # "unknown" rather than "none": offering to propose a first plan over a plan that exists but
+    # will not parse sends the user round a loop that cannot end.
+    (workspace.plans_dir / "plan-v001.yaml").write_text("not: [a plan", encoding="utf-8")
+    assert _conversion(client)["state"] == "unknown"
+
+
+def test_an_unapproved_history_is_read_without_building_the_plan_model(
+    workspace: Workspace, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The worst case for cost is the case where nothing is approved.
+
+    Every version has to be looked at, and validating a ``ProcessPlan`` costs around ten
+    milliseconds -- a tenth of a second over a ten-version history, on a route the pane polls
+    every five seconds while no kernel is attached. Only the approved version is loaded; the rest
+    are probed for one key. ``PlanStore.load`` raising here would be a 500, not a caught error, so
+    this fails loudly if the model is built after all.
+    """
+    for version in (1, 2, 3):
+        PlanStore.for_workspace(workspace).save(make_plan(version=version))
+
+    def refuse(self: PlanStore, version: int) -> None:
+        raise AssertionError("the plan model must not be built for an unapproved version")
+
+    monkeypatch.setattr(PlanStore, "load", refuse)
+    assert _conversion(client)["state"] == "proposed"
+
+
+# ── counting what is still unwritten ─────────────────────────────────────────────────────────
+
+
+def test_context_counts_the_cells_still_carrying_the_scaffolders_marker(
+    workspace: Workspace, client: TestClient
+) -> None:
+    _save_plan(workspace, state="approved")
+    workspace.notebook_path.write_text(_scaffold("apply_haircuts", "write_output"), "utf-8")
+
+    assert _conversion(client) == {"state": "approved", "unwritten": 2}
+
+
+def test_a_conversion_with_no_holes_left_is_reported_as_written(
+    workspace: Workspace, client: TestClient
+) -> None:
+    _save_plan(workspace, state="approved")
+    workspace.notebook_path.write_text(_scaffold(), encoding="utf-8")
+
+    assert _conversion(client) == {"state": "written", "unwritten": 0}
+
+
+def test_the_count_of_holes_is_read_off_the_file_rather_than_the_kernel(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """The staleness guard is the point, not an optimisation.
+
+    Counting through ``driver.list_cells(with_code=True)`` records a read against every cell, and
+    that read is the only thing standing between a user's own edit and an ``edit_cell`` that
+    overwrites it. This route is answered on every page load and every five seconds while no
+    kernel is attached -- moments the user did not ask for, and may well be typing through -- so
+    it reads the file instead. No kernel is attached here at all, and the count still tracks what
+    is on disk.
+    """
+    assert workspace.marimo is None
+    _save_plan(workspace, state="approved")
+
+    workspace.notebook_path.write_text(_scaffold("load_handin", "write_output"), "utf-8")
+    assert _conversion(client)["unwritten"] == 2
+
+    workspace.notebook_path.write_text(_scaffold("write_output"), encoding="utf-8")
+    assert _conversion(client)["unwritten"] == 1
+
+
+def test_a_notebook_missing_the_plans_later_stages_is_not_called_finished(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """A prefix of the notebook parses perfectly, and every cell it lost is a hole uncounted.
+
+    marimo's autosave truncates and rewrites in place -- no temp file, no rename -- so a read
+    taken mid-write returns a prefix. The error is always an undercount, and an undercount of zero
+    says the conversion is finished. Sampled over a real scaffold, one truncation point in eight
+    reports zero.
+    """
+    _save_plan(workspace, state="approved")
+    whole = _scaffold("manual_overrides", "write_output")
+    workspace.notebook_path.write_text(whole, encoding="utf-8")
+    assert _conversion(client) == {"state": "approved", "unwritten": 2}
+
+    # Cut both holes off at a cell boundary. What is left parses, and every cell in it is written.
+    truncated = whole[: whole.index("@app.cell", whole.index("def apply_haircuts"))]
+    workspace.notebook_path.write_text(truncated, encoding="utf-8")
+
+    assert _conversion(client) == {"state": "approved", "unwritten": None}
+
+
+def test_an_empty_notebook_is_not_called_a_finished_conversion(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # No race needed for this one: a plan approved in the pane whose scaffolding step failed
+    # leaves exactly this, and it parses cleanly to no cells at all.
+    _save_plan(workspace, state="approved")
+    workspace.notebook_path.write_text(_notebook_file(), encoding="utf-8")
+
+    assert _conversion(client) == {"state": "approved", "unwritten": None}
+
+
+def test_context_omits_the_count_rather_than_guessing_when_the_notebook_is_not_readable(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # The state between opening a workbook and the first scaffold: a file that is not a marimo
+    # notebook yet. Not an error, and worth no more than an omitted number.
+    _save_plan(workspace, state="approved")
+    assert workspace.notebook_path.read_text(encoding="utf-8") == "import marimo\n"
+    assert _conversion(client)["unwritten"] is None
+
+    workspace.notebook_path.unlink()
+    assert _conversion(client)["unwritten"] is None
+
+
+def test_context_answers_over_a_notebook_that_cannot_be_decoded_or_parsed(
+    workspace: Workspace, client: TestClient
+) -> None:
+    """Neither of these is an ``OSError`` and neither is a ``KedgeError``, and both were a 500.
+
+    A 500 here is worse than it sounds: ``boot()`` in ``app.js`` catches a failed context, says
+    "The kedge server is not answering" -- which is a lie, one route threw -- and returns before
+    installing the health poll, so the pane stays dead until somebody reloads it by hand.
+    """
+    _save_plan(workspace, state="approved")
+    data = _scaffold().encode("utf-8")
+
+    # Truncated one byte into a pound sign: `read_text` raises `UnicodeDecodeError`, a ValueError.
+    workspace.notebook_path.write_bytes(data[: data.index("£".encode()) + 1])
+    assert _conversion(client)["unwritten"] is None
+
+    # A null byte decodes cleanly and then `ast.parse` raises `ValueError` of its own.
+    workspace.notebook_path.write_bytes(data + b"\x00")
+    assert _conversion(client)["unwritten"] is None
+
+
+def test_a_notebook_past_the_read_cap_is_not_parsed_at_all(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # `ast.parse` is superlinear -- 338KB costs 129ms and 1.35MB costs two seconds, on a route
+    # polled every five seconds. Past the cap the answer is silence, which the pane can draw.
+    _save_plan(workspace, state="approved")
+    padding = "# padding\n" * ((routes_module._NOTEBOOK_READ_CAP // 10) + 1)
+    workspace.notebook_path.write_text(_scaffold("write_output") + padding, encoding="utf-8")
+
+    assert workspace.notebook_path.stat().st_size > routes_module._NOTEBOOK_READ_CAP
+    assert _conversion(client)["unwritten"] is None
+
+
+def test_the_notebook_is_not_read_at_all_without_an_approved_plan(
+    workspace: Workspace, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The number is not used in any of these states, and reading a 35KB file to answer a question
+    # nobody asked is not free.
+    def refuse(*_args: object, **_kw: object) -> None:
+        raise AssertionError("the notebook must not be read without an approved plan")
+
+    monkeypatch.setattr(routes_module, "_unwritten_cells", refuse)
+    for state in ("draft", "rejected", "revise"):
+        filed = _save_plan(workspace, state=state)
+        assert _conversion(client)["unwritten"] is None
+        filed.unlink()
+    assert _conversion(client)["state"] == "none"
+
+
+# ── the suggestions the pane draws from it ───────────────────────────────────────────────────
+
+
+def _suggestion_sets(script: str) -> dict[str, list[str]]:
+    """The pane's suggestion sets, read out of the served script.
+
+    There is no build step and no JS test runner, so the strings are asserted where the browser
+    gets them: the response body of ``/static/app.js``. Every suggestion is one string literal on
+    one line, which is what makes this readable rather than a parser -- and a line that is not one
+    is an error rather than a suggestion quietly dropped, because a silently empty parse turns
+    every assertion below into a test of nothing.
+    """
+    literal = re.compile(r'"((?:[^"\\]|\\.)*)",?$')
+    sets: dict[str, list[str]] = {}
+    key: str | None = None
+    inside = False
+    for number, line in enumerate(script.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("const SUGGESTION_SETS = {"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if stripped == "};":
+            break
+        opened = re.fullmatch(r"(\w+): \[", stripped)
+        if opened:
+            key = opened.group(1)
+            sets[key] = []
+            continue
+        if stripped.startswith("]") or stripped.startswith("/*") or stripped.startswith("*"):
+            if stripped.startswith("]"):
+                key = None
+            continue
+        if key is None:
+            continue
+        found = literal.fullmatch(stripped)
+        assert found, f"app.js:{number} is inside a suggestion set but is not one string literal"
+        sets[key].append(found.group(1))
+    assert inside, "SUGGESTION_SETS was not found in the served app.js"
+    assert sets, "SUGGESTION_SETS was found but no set was parsed out of it"
+    assert all(sets.values()), f"an empty suggestion set was parsed: {sets}"
+    return sets
+
+
+@pytest.mark.parametrize(
+    ("plan", "notebook", "expected"),
+    [
+        (None, None, "none"),
+        ("draft", None, "proposed"),
+        ("revise", None, "revise"),
+        ("rejected", None, "rejected"),
+        ("approved", ("write_output",), "approved"),
+        ("approved", (), "written"),
+        ("broken", None, "unknown"),
+    ],
+)
+def test_the_pane_has_a_suggestion_set_for_every_state_the_route_reports(
+    workspace: Workspace,
+    client: TestClient,
+    plan: str | None,
+    notebook: tuple[str, ...] | None,
+    expected: str,
+) -> None:
+    """Each state, driven through the real route, and the pane's own table asked for its wording.
+
+    The pane is a lookup -- ``SUGGESTION_SETS[conversion.state]`` -- so this is the whole of the
+    coupling between the two ends, and there is no re-implementation of a JavaScript branch here
+    to agree with itself while the browser does something else.
+    """
+    if plan == "broken":
+        (workspace.plans_dir / "plan-v001.yaml").write_text("not: [a plan", encoding="utf-8")
+    elif plan is not None:
+        _save_plan(workspace, state=plan)
+    if notebook is not None:
+        workspace.notebook_path.write_text(_scaffold(*notebook), encoding="utf-8")
+
+    assert _conversion(client)["state"] == expected
+
+    script = client.get("/static/app.js").text
+    sets = _suggestion_sets(script)
+    assert expected in sets, f"app.js has no suggestions for the state {expected!r}"
+    assert "SUGGESTION_SETS[conversion.state]" in script, "the pane must key off the state"
+
+    # Every set leads with something different, so the lead genuinely says where the work is.
+    leads = [entries[0] for entries in sets.values()]
+    assert len(set(leads)) == len(leads)
+
+
+def test_the_conversion_kickoff_leads_the_suggestions_on_a_workbook_with_no_plan(
+    client: TestClient,
+) -> None:
+    """The one click the whole hub exists for, and it has to work when sent unedited.
+
+    It names the job in the user's own words, asks for the workbook to be read first -- which is
+    what ``propose_plan`` refuses without -- and asks for a plan to approve, which is the gate
+    ``propose_cell`` and ``edit_cell`` sit behind.
+    """
+    assert _conversion(client)["state"] == "none"
+
+    kickoff = _suggestion_sets(client.get("/static/app.js").text)["none"][0]
+    assert kickoff == (
+        "Convert this workbook into a marimo notebook. Read it, then propose a plan I can approve."
+    )
+
+
+def test_the_kickoff_comes_back_when_a_plan_is_rejected(
+    workspace: Workspace, client: TestClient
+) -> None:
+    # A rejection is the one moment the user most needs to be told they can start again, and it
+    # is exactly where a plan-exists-so-stop-offering-it rule would have taken the offer away.
+    _save_plan(workspace, state="rejected")
+    assert _conversion(client)["state"] == "rejected"
+
+    lead = _suggestion_sets(client.get("/static/app.js").text)["rejected"][0]
+    assert lead.startswith("Convert this workbook into a marimo notebook")
+    assert "new plan" in lead
+
+
+def test_no_suggestion_names_a_sheet_a_range_or_a_column(client: TestClient) -> None:
+    # They are shown for every workbook. The list these replaced opened with "Translate the
+    # haircut lookup on Calc!H2:H50000" -- a range from a fixture workbook, offered to every user
+    # who ever opened the pane, none of whom had that sheet.
+    reference = re.compile(r"!\$?[A-Z]{1,3}\$?\d+|\b[A-Z]{1,3}\d+:\$?[A-Z]{1,3}\d+")
+    sets = _suggestion_sets(client.get("/static/app.js").text)
+    assert len(sets) >= 5, f"only {len(sets)} sets parsed; the guard would be vacuous"
+    for name, entries in sets.items():
+        for entry in entries:
+            assert not reference.search(entry), f"{name}: {entry}"
+
+
+def test_the_welcome_is_only_redrawn_when_the_suggestions_would_change(
+    client: TestClient,
+) -> None:
+    # `applyContext` runs on every context read, and while no kernel is attached the health poll
+    # takes one every five seconds. `showWelcome` is a `replaceChildren`, so an unconditional
+    # redraw drops the focus off a suggestion button four times a minute.
+    script = client.get("/static/app.js").text
+    assert "suggestionsFor(context) !== shownSuggestions" in script
+
+
+def test_a_failed_context_leaves_the_pane_able_to_recover_on_its_own(client: TestClient) -> None:
+    # `boot()` returns before `setInterval(pollHealth, 5000)` on this path, so without a retry one
+    # failed context is a pane that stays dead until somebody reloads it by hand.
+    script = client.get("/static/app.js").text
+    boot = script[script.index("The kedge server is not answering") :]
+    assert "window.location.reload()" in boot
 
 
 # ── health ───────────────────────────────────────────────────────────────────────────────────
