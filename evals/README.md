@@ -325,6 +325,48 @@ scaffolded, so grading a notebook against it reports a shape the notebook was ne
 It exists because the two-flag form was the step nobody took. The composed path had never been
 graded once, and the first time it was, by hand, it came back at 6 of the rubric's 72 points.
 
+### Driving a conversion that names its steps differently
+
+Every widget and every stage cell in a converted notebook is named after a **stage id**, and a
+stage id is the model's free choice. The reference plan calls the checkpoint before the update
+`approve_adjustment`; one real hub plan called it `select_adjustment_population`. Same step, two
+names, and no spelling rule connects them — `harness/align.py` bridges a difference in *prefix*,
+which is a different problem.
+
+The consequence was not a partial drive but a total one. **Not one of the eight scripted actions
+named a widget the hub's notebook had**, so the run stopped at the first thing waiting for a
+human, and the whole deterministic tier was reported as blocked. A conversion that could not be
+driven was indistinguishable from one that did not work.
+
+`harness/roles.py` resolves both sides through the plan instead:
+
+- **Driving**, by `Role` — the first hand-in, every checkpoint's decision, every confirmation that
+  a statement was run, the extract's parameters by their own names. `case.role_script` says what
+  the human does; the roles are read off `build_cells`, so the naming convention stays the
+  scaffolder's and is never copied into the harness.
+- **Reading results**, by `frame_aliases` — the graders ask for `adjust`, `verification`,
+  `signoff`, which are the reference plan's stage ids because that is the vocabulary the rubric is
+  written in. Both plans are put through the same role lookup and the difference becomes an alias.
+  Over the reference against itself it is the **identity**, which is the assertion that keeps it
+  honest: a map that renamed anything there would be scoring the gold conversion through a
+  translation layer.
+
+The roles are plan and workbook properties, never guesses about wording. "The stage that computes
+the uplift" is found by the **analysis operation ids** it claims — `adjustment_e17_e92` is a range
+in the workbook, so that one cannot be moved by renaming anything.
+
+A role the other plan does not fill is **absent, not guessed at**. A plan that types its `UPDATE`
+as `output` hands nothing over, so there is no `update_statement` to find, and the grader reports
+that rather than being pointed at whatever stage happened to be nearby.
+
+This also closes the denominator hole from the other side. Before it, a name the rubric asked for
+and the notebook did not define was a `SKIP` — "possibly just a rename" — and a skip leaves the
+denominator, so a conversion's score *rose* as its naming diverged. With the role map in place an
+absent name is an absent step, so it is `BLOCKED` and keeps its points. Measured on one hub
+scaffold: 5/71, then 9/53 with driving alone and the denominator quietly falling away, then
+**9/71** once the results were read by role too — the same denominator as the reference, and the
+first two numbers in this repo that are directly comparable.
+
 **`--plan` on its own is refused.** `--notebook` defaults to the committed reference conversion, so
 `--plan a-model-plan.yaml` alone grades a model's plan alongside a human's cell bodies: measured on
 a real hub plan, **49/66 (74%)**, of which 45 points are the reference notebook's deterministic

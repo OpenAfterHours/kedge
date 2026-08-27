@@ -707,6 +707,66 @@ def test_a_plan_that_declares_no_handin_of_its_own_still_fails_for_the_old_reaso
     assert "head hand-in" in detail_of(report, "takes_two_handins")
 
 
+def test_the_reference_plan_resolves_to_the_names_this_case_hardcodes() -> None:
+    """The role script and the literal one must be the same script on the reference.
+
+    This is what stops the role layer being a second, looser way to drive. If resolving by role
+    reached one widget the hand-written script does not, or missed one it does, the two runs
+    would not be measuring the same thing -- and the literal script is the one every committed
+    71/71 was earned through.
+    """
+    from harness.roles import bind_by_role
+
+    plan = load_plan(PLAN_PATH)
+    pre, post = Path("pre.csv"), Path("post.csv")
+
+    bound, unresolved = bind_by_role(
+        plan, adjustment_case.REFERENCE_NOTEBOOK, adjustment_case.role_script(pre, post)
+    )
+
+    assert not unresolved, unresolved
+    assert set(bound) == set(adjustment_case.script_for(pre, post))
+
+
+def test_the_reference_plan_aliases_to_itself() -> None:
+    """The rubric's vocabulary *is* the reference plan's stage ids, so the map is the identity.
+
+    A mapping that renamed anything here would be scoring the gold conversion through a
+    translation layer, and every number this eval has ever published would be a number about
+    that layer as much as about the notebook.
+    """
+    from harness.roles import frame_aliases, stage_roles
+
+    plan = load_plan(PLAN_PATH)
+
+    assert frame_aliases(plan, plan) == {}
+    # And the roles it fills are the stage ids the graders ask for by name.
+    roles = stage_roles(plan)
+    assert roles["computing"] == "adjust"
+    assert roles["writing_handoff"] == "update_statement"
+    assert roles["verifying"] == "verification"
+    assert roles["final"] == "signoff"
+
+
+def test_a_plan_that_names_its_stages_differently_still_answers_the_rubric() -> None:
+    """The whole point of the role layer, on the plan that made the case for it.
+
+    The observed hub plan calls the arithmetic ``calculate_uplift`` and the sign-off
+    ``produce_signoff``. Those are the same two steps, and before this every grader that asked
+    for ``adjust`` or ``signoff`` found nothing and skipped -- which took the points out of the
+    denominator, so the score went *up* as the naming diverged.
+    """
+    from harness.roles import frame_aliases
+    from observed_conversion import observed_plan
+
+    aliases = frame_aliases(load_plan(PLAN_PATH), observed_plan())
+
+    assert aliases["adjust"] == "apply_uplift"
+    # A role the other plan does not fill is absent rather than guessed at: this plan types its
+    # update as `output`, so it hands nothing over and there is no `update_statement` to find.
+    assert "update_statement" not in aliases
+
+
 def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> None:
     """The real artifact, not a mutation of the reference: one model-written plan, verbatim.
 

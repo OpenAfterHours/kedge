@@ -44,6 +44,7 @@ logger = logging.getLogger(__name__)
 CASE_DIR = Path(__file__).resolve().parent
 WORKBOOK = CASE_DIR / "q2_accrual_adjustment.xlsx"
 REFERENCE_NOTEBOOK = CASE_DIR / "notebook.py"
+REFERENCE_PLAN = CASE_DIR / "plan.yaml"
 RUBRIC = CASE_DIR / "expected.yaml"
 
 DATA_HEADER_ROW = 18
@@ -142,24 +143,51 @@ def write_handins(directory: Path) -> tuple[Path, Path]:
     return pre, post
 
 
-def script_for(pre: Path, post: Path) -> dict[str, Any]:
-    """The human's part, played the same way every run.
+PERIOD = dt.date(2026, 6, 30)
+LEDGER = "STATUTORY"
+APPROVAL_NOTE = "Uplift agreed at the June finance committee; scope checked against the statement."
+RAN_NOTE = "76 rows affected, ticket FC-2291."
 
-    Keyed by the variable each widget is assigned to. A notebook that names its widgets
-    differently will not be driven by this -- which is a real limitation of grading a runbook
-    headlessly, and is reported as unused inputs rather than silently scored as a stop.
+
+def script_for(pre: Path, post: Path) -> dict[str, Any]:
+    """The human's part, played the same way every run, keyed by the reference's widget names.
+
+    Kept because ``evals/run.py`` with no ``--plan`` has no plan to resolve roles through, and
+    grading the committed reference conversion is the run that proves the graders work. Where
+    there *is* a plan, :func:`role_script` is what drives, and
+    :func:`test_the_reference_plan_resolves_to_the_names_this_script_hardcodes` asserts the two
+    agree on the reference -- so this dict cannot quietly drift away from the roles it stands for.
     """
     return {
-        "period_end": dt.date(2026, 6, 30),
-        "ledger": "STATUTORY",
+        "period_end": PERIOD,
+        "ledger": LEDGER,
         "pre_adjustment_pick": (pre,),
         "approve_adjustment_decision": "approve",
-        "approve_adjustment_note": (
-            "Uplift agreed at the June finance committee; scope checked against the statement."
-        ),
+        "approve_adjustment_note": APPROVAL_NOTE,
         "update_statement_ran": True,
-        "update_statement_ran_note": "76 rows affected, ticket FC-2291.",
+        "update_statement_ran_note": RAN_NOTE,
         "post_adjustment_pick": (post,),
+    }
+
+
+def role_script(pre: Path, post: Path) -> dict[Any, Any]:
+    """The same human part, said in terms of what each step *is*.
+
+    A stage id is the model's free choice, so every widget name in a converted notebook is too.
+    This is what a runbook's steps are regardless of what the plan called them: two inputs in
+    order, approve every checkpoint with a reason, confirm every statement that was run, and the
+    extract's own parameters by their names in the workbook.
+    """
+    from harness.roles import Role
+
+    return {
+        Role.HANDIN: ((pre,), (post,)),
+        Role.CHECKPOINT_DECISION: "approve",
+        Role.CHECKPOINT_NOTE: APPROVAL_NOTE,
+        Role.HANDOFF_RAN: True,
+        Role.HANDOFF_RAN_NOTE: RAN_NOTE,
+        "period_end": PERIOD,
+        "ledger": LEDGER,
     }
 
 
@@ -181,7 +209,54 @@ class Context:
 
     @property
     def defs(self) -> dict[str, Any]:
-        return self.run.definitions
+        """What the run defined, with this plan's stage names answering to the rubric's.
+
+        The graders ask for ``adjust``, ``verification``, ``signoff`` -- the reference plan's
+        stage ids, because that is the vocabulary the rubric is written in. A conversion built
+        from any other plan names the same steps after its own stages, so every one of those
+        lookups missed and the item skipped. A skip leaves the denominator, so the score rose as
+        the naming diverged: on one hub scaffold, 5/71 became 9/53 with the notebook no better.
+
+        :func:`~harness.roles.frame_aliases` decides the mapping by playing the same role lookup
+        over both plans, and it is the identity on the reference. Names it cannot place are left
+        alone and simply come back absent, which is the true answer.
+        """
+        definitions = self.run.definitions
+        aliases = self._aliases
+        if not aliases:
+            return definitions
+
+        from harness.roles import rename
+
+        # Every definition also answers to the rubric's name for it. `adjust_totals` is not a
+        # stage -- it is a variable the computing stage's own body defines -- so it moves with
+        # the stage, which `rename` handles by replacing whole leading segments.
+        resolved = dict(definitions)
+        reverse = {actual: wanted for wanted, actual in aliases.items()}
+        for name, value in definitions.items():
+            wanted = rename(name, reverse)
+            if wanted != name:
+                resolved.setdefault(wanted, value)
+        return resolved
+
+    @property
+    def _aliases(self) -> dict[str, str]:
+        if self.plan is None:
+            return {}
+        from harness.roles import frame_aliases
+
+        return frame_aliases(_reference_plan(), self.plan)
+
+    def rename(self, name: str) -> str:
+        """A cell name in the rubric's vocabulary, said in this plan's.
+
+        :attr:`defs` answers to both names at once, which is right for a lookup. A grader that
+        reads *cell names* -- which cells were on screen, which ran -- needs the one this
+        notebook actually uses, because it is comparing against a list the notebook produced.
+        """
+        from harness.roles import rename
+
+        return rename(name, self._aliases)
 
     def need(self, *names: str) -> ItemResult | None:
         """A skip or a block naming what is missing, or ``None`` when everything is there.
@@ -205,10 +280,33 @@ class Context:
             return _blocked(
                 f"the notebook defines no {', '.join(absent)}. It {self.run.summary_line()}."
             )
+        if self.plan is not None:
+            # A plan was supplied, so :attr:`defs` has already answered the rubric's vocabulary
+            # with this plan's own stage names. Still absent means the step is not there -- the
+            # stage was never written, or the plan never had it -- and that is the conversion's,
+            # so it keeps its points. Before the role map this was indistinguishable from a
+            # rename, and calling every rename a skip is what let a diverging notebook shrink its
+            # own denominator.
+            return _blocked(
+                f"the notebook defines no {', '.join(absent)}, and this plan names no stage "
+                f"that plays that part. It ran to completion, so nothing was waiting on it."
+            )
         return _skip(
-            f"the notebook defines no {', '.join(absent)}. It ran to completion, so this is a "
-            f"naming difference rather than a stop."
+            f"the notebook defines no {', '.join(absent)}. It ran to completion and no plan was "
+            f"supplied, so a rename cannot be told from an absence."
         )
+
+
+@cache
+def _reference_plan() -> Any:
+    """The plan the rubric's vocabulary comes from, loaded once.
+
+    Cached because every grader that reads a definition asks for the alias map, and the map is a
+    property of two files that do not change during a run.
+    """
+    from kedge.plan.store import plan_from_yaml
+
+    return plan_from_yaml(REFERENCE_PLAN.read_text(encoding="utf-8"))
 
 
 def _pass(detail: str = "") -> ItemResult:
@@ -570,18 +668,36 @@ def progressive_disclosure(ctx: Context) -> ItemResult:
             )
         )
 
-    early = [name for name in MUST_BE_HIDDEN_AT_THE_START if name in seen]
+    # Said in this plan's own names. Both lists are the *reference* conversion's cell names, so
+    # against a conversion that calls its stages anything else the first list named cells the
+    # notebook does not have -- and the dangerous half of this grader passed vacuously, on the
+    # one defect it was written for. A hub conversion really rendering its re-extract before the
+    # update would not have been caught.
+    hidden = [ctx.rename(name) for name in MUST_BE_HIDDEN_AT_THE_START]
+    first = [ctx.rename(name) for name in STEPS_BEFORE_ANY_INPUT]
+
+    early = [name for name in hidden if name in seen]
     if early:
         return _fail(
             f"visible on a fresh open, before their step: {', '.join(early)}.\n"
             f"A cell that only constructs widgets reads nothing, so marimo has no edge to hide "
             f"it on. Have it read the token of the step before it."
         )
-    missing = [name for name in STEPS_BEFORE_ANY_INPUT if name not in seen]
+    missing = [name for name in first if name not in seen]
     if missing:
+        # A name the role map could not place is not a rename this grader failed to follow: it
+        # is a step the plan does not have. Say which, because "not visible" reads as a layout
+        # problem and a missing hand-off is not one.
+        unplaced = [name for name in missing if name == ctx.rename(name) and name not in ctx.defs]
+        detail = (
+            f"\nThis plan names no stage that plays the part of: {', '.join(unplaced)}. "
+            f"That is a step the conversion does not have, rather than one it renamed."
+            if unplaced
+            else ""
+        )
         return _fail(
             f"not visible on a fresh open: {', '.join(missing)}. A runbook that shows the user "
-            f"nothing to do has stalled, whatever it is waiting for."
+            f"nothing to do has stalled, whatever it is waiting for.{detail}"
         )
     return _pass(f"{len(seen)} cell(s) shown; the rest wait their turn")
 

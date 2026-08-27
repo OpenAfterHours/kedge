@@ -21,6 +21,7 @@ import yaml
 from harness.align import align_inputs
 from harness.drive import run_notebook, unused_inputs, workspace_overrides
 from harness.model import EvalReport, ItemResult, Outcome, TierResult
+from harness.roles import bind_by_role
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +61,7 @@ def grade(
     with tempfile.TemporaryDirectory(prefix="kedge-eval-") as workspace:
         root = Path(workspace)
         pre, post = case.write_handins(root / "handins-in")
-        script = case.script_for(pre, post)
-        # Re-keyed onto the widgets *this* notebook has. The script's names come from the
-        # reference conversion, and the scaffolder derives every widget name from the plan's
-        # stage ids -- so a conversion built from anybody else's plan was driven by nothing at
-        # all, stopped at the first step waiting for a human, and had everything below it
-        # reported as blocked. Measured on a real hub conversion: not one of the eight scripted
-        # actions named a widget it had. `harness.align` already existed for this and the live
-        # `--convert` path already used it; this path did not, so the only route a hub user takes
-        # was the one route that could not be graded.
-        alignment = align_inputs(notebook, tuple(script))
-        inputs, unplayed = alignment.bind(script)
+        inputs, unplayed, driving = _drive_script(case, notebook, plan, pre=pre, post=post)
         run = run_notebook(
             notebook,
             inputs=inputs,
@@ -94,11 +85,54 @@ def grade(
         f"notebook: {notebook}",
         f"workbook: {case.WORKBOOK.name}",
         f"run: {run.summary_line()}",
-        *alignment.notes(),
+        *driving,
     ]
     if plan is None:
         notes.append("no plan supplied, so the structural tier was skipped in full")
     return EvalReport(case=rubric["workbook"], tiers=tiers, notes=tuple(notes))
+
+
+def _drive_script(
+    case: Any, notebook: Path, plan: Any, *, pre: Path, post: Path
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
+    """What to bind onto this notebook's widgets, and how that was decided.
+
+    Two routes, and which one is taken turns on whether there is a plan.
+
+    **With a plan, by role.** Every widget a converted notebook offers is named after a stage id,
+    and a stage id is the model's free choice. The reference plan calls the checkpoint before the
+    update ``approve_adjustment``; one real hub plan called it ``select_adjustment_population``.
+    No spelling rule connects those, so a script keyed by the reference's names named *nothing at
+    all* in that notebook -- the run stopped at the first step waiting for a human and the whole
+    deterministic tier was reported as blocked, which reads as a conversion defect and was
+    largely a harness one. :mod:`harness.roles` resolves both sides through the plan instead.
+
+    **Without one, by name.** ``evals/run.py`` with no ``--plan`` grades the committed reference
+    conversion, and that run is the one that proves the graders work. There is no plan to resolve
+    roles through, so the reference's own names are used and :mod:`harness.align` bridges a
+    difference in prefix. That is all it can bridge, and all that is needed there.
+
+    Returns:
+        ``(inputs, actions that were not played, notes for the report)``.
+    """
+    if plan is not None and hasattr(case, "role_script"):
+        inputs, unresolved = bind_by_role(plan, notebook, case.role_script(pre, post))
+        notes = [f"driven by role, through the plan: {len(inputs)} action(s) bound"]
+        if unresolved:
+            notes.append(
+                "steps this notebook has no widget for, so they were not played: "
+                + "; ".join(unresolved)
+            )
+        return inputs, unresolved, tuple(notes)
+
+    script = case.script_for(pre, post)
+    alignment = align_inputs(notebook, tuple(script))
+    inputs, unplayed = alignment.bind(script)
+    return (
+        inputs,
+        unplayed,
+        ("driven by name, against the reference's own widgets", *alignment.notes()),
+    )
 
 
 def _tier(name: str, rubric: dict[str, Any], graders: dict[str, Any], context: Any) -> TierResult:
