@@ -159,12 +159,19 @@ def role_script(pre: Path, post: Path) -> dict[Any, Any]:
 
     This is the script. :func:`script_for` is this one spelled out against the reference
     conversion's own widgets, for the run that has no plan to resolve roles through.
+
+    The decision is :data:`~harness.roles.UNBLOCK` rather than the word ``approve``, and that is
+    the same fix as the widget names one level down. A plan declares its own
+    ``Checkpoint.options`` and the scaffolder gates on the first of them, so a real generated plan
+    asked for ``Approve entities E-04, E-07, E-09 and E-12; statutory ledger; ...`` -- and against
+    it the literal ``"approve"`` recorded a decision its own gate rejects. The run stopped at the
+    first checkpoint with 27 points blocked below it.
     """
-    from harness.roles import Role
+    from harness.roles import UNBLOCK, Role
 
     return {
         Role.HANDIN: ((pre,), (post,)),
-        Role.CHECKPOINT_DECISION: "approve",
+        Role.CHECKPOINT_DECISION: UNBLOCK,
         Role.CHECKPOINT_NOTE: APPROVAL_NOTE,
         Role.HANDOFF_RAN: True,
         Role.HANDOFF_RAN_NOTE: RAN_NOTE,
@@ -201,18 +208,48 @@ def literal(script: Mapping[Any, Any]) -> dict[str, Any]:
 
     A key that is already a plain string is a parameter, and the reference calls its parameters
     what the workbook calls them -- ``period_end``, ``ledger`` -- so it passes straight through.
+
+    :data:`~harness.roles.UNBLOCK` needs a word here as much as a role needs a name, and it gets
+    one the same way: from the reference plan, not from a second literal beside the first.
     """
+    from harness.roles import UNBLOCK
+
     names = _reference_widgets()
     inputs: dict[str, Any] = {}
     for key, value in script.items():
+        said = _reference_decision() if value is UNBLOCK else value
         widgets = names.get(key)
         if widgets is None:
-            inputs[str(key)] = value
+            inputs[str(key)] = said
         elif len(widgets) > 1:
-            inputs.update(zip(widgets, value, strict=False))
+            inputs.update(zip(widgets, said, strict=False))
         else:
-            inputs[widgets[0]] = value
+            inputs[widgets[0]] = said
     return inputs
+
+
+@cache
+def _reference_decision() -> str:
+    """The word the reference conversion's checkpoint accepts to let the run continue.
+
+    Derived from the reference plan the committed notebook was scaffolded from, for the same
+    reason :func:`script_for` is derived from :func:`role_script`: two literals for one fact
+    drift, and the one that drifts silently is the one that stops the gold conversion being
+    driven. It is ``approve``, and the point is that nothing here says so.
+    """
+    from harness.roles import Role, slots_for
+
+    decisions = [
+        slot.options
+        for slot in slots_for(_reference_plan())
+        if slot.role is Role.CHECKPOINT_DECISION and slot.options
+    ]
+    if not decisions:
+        # Only reachable if the reference plan stops scaffolding a checkpoint at all, which is a
+        # defect of its own and belongs to whichever test is about that.
+        logger.warning("the reference plan offers no checkpoint decision; falling back")
+        return "approve"
+    return decisions[0][0]
 
 
 def script_for(pre: Path, post: Path) -> dict[str, Any]:

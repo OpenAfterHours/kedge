@@ -974,3 +974,175 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
     details = {item.id: item.detail for item in tier.items}
     assert "verify_post_adjustment" in details["takes_two_handins"]
     assert "Sign-off" in details["the_briefing_survives_the_workbook"]
+
+
+# =============================================================================
+# THE VALUES ARE THE PLAN'S TOO
+# =============================================================================
+#
+# `harness.roles` resolved every widget *name* through the plan and left the scripted *values*
+# keyed to the reference conversion, which is the same defect one level down. A checkpoint's
+# vocabulary is `Checkpoint.options` -- the model's free choice, exactly as a stage id is -- and
+# the scaffolder gates on `options[0]`. So a script saying the literal "approve" recorded a
+# decision the gate rejects, the checkpoint never opened, and the whole tier below it was blocked.
+
+
+def _decision_gate(notebook: Path, name: str) -> str:
+    """The one answer this notebook's ``mo.stop`` will let past, read off the emitted gate.
+
+    The assertion that keeps the harness honest about what "approve" means. Comparing the bound
+    value against ``options[0]`` would only prove the harness agrees with itself; comparing it
+    against the code the scaffolder actually wrote proves it agrees with the notebook.
+    """
+    import re
+
+    text = notebook.read_text(encoding="utf-8")
+    match = re.search(r"_decision\s*!=\s*(['\"])(.+?)\1", text)
+    assert match is not None, f"no decision gate for {name!r} in the scaffolded notebook"
+    return match.group(2)
+
+
+def test_a_checkpoint_that_spells_approval_its_own_way_is_still_approved(tmp_path: Path) -> None:
+    """The 27-point defect: a plan may name its decisions, and one real one did.
+
+    ``plan-from-gpt-5-6-terra.yaml`` asks for *"Approve entities E-04, E-07, E-09 and E-12;
+    statutory ledger; the selected period; exclude CANCELLED trades"*. Against that,
+    ``Role.CHECKPOINT_DECISION: "approve"`` wrote a decision into the run record, the gate
+    compared it against the plan's own first option, and the notebook stopped at step 3 of 9 with
+    every deterministic item below it BLOCKED -- a conversion that could not be driven, reported
+    as one that did not work.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+
+    original = load_plan(PLAN_PATH)
+    checkpoint = next(
+        stage.checkpoint for stage in original.stages if stage.id == "approve_adjustment"
+    )
+    plan = restaged(
+        original,
+        {
+            "approve_adjustment": {
+                "checkpoint": checkpoint.model_copy(update={"options": ["agreed", "disputed"]})
+            }
+        },
+    )
+    notebook = _scaffolded(plan, tmp_path / "own_words.py")
+
+    decisions = [slot for slot in slots_for(plan) if slot.role is Role.CHECKPOINT_DECISION]
+    assert [slot.options for slot in decisions] == [("agreed", "disputed")]
+
+    bound, unresolved = bind_by_role(
+        plan, notebook, adjustment_case.role_script(Path("pre.csv"), Path("post.csv"))
+    )
+
+    assert not unresolved, unresolved
+    assert bound["approve_adjustment_decision"] == "agreed"
+    assert bound["approve_adjustment_decision"] == _decision_gate(notebook, "approve_adjustment"), (
+        "the harness approved the checkpoint with a word its own gate would refuse"
+    )
+
+
+def test_the_reference_plan_is_still_approved_with_the_word_it_uses() -> None:
+    """Deriving the decision must not change what the gold conversion is driven with.
+
+    Every committed 71/71 was earned by writing ``approve`` into ``approve_adjustment_decision``,
+    and the reference plan says ``approve``. If it did not, the derivation would be scoring the
+    gold conversion through a translation layer -- which is the same thing
+    :func:`test_the_reference_plan_aliases_to_itself` refuses on the naming side.
+    """
+    from harness.roles import bind_by_role
+
+    plan = load_plan(PLAN_PATH)
+    pre, post = Path("pre.csv"), Path("post.csv")
+
+    bound, _unresolved = bind_by_role(
+        plan, adjustment_case.REFERENCE_NOTEBOOK, adjustment_case.role_script(pre, post)
+    )
+
+    assert bound["approve_adjustment_decision"] == "approve"
+    # And the literal script -- the one run with no plan to resolve anything through -- says the
+    # same word, derived rather than written out a second time beside it.
+    assert adjustment_case.script_for(pre, post)["approve_adjustment_decision"] == "approve"
+
+
+def test_a_period_wanted_by_two_hand_offs_reaches_both(tmp_path: Path) -> None:
+    """Two steps asking for the same thing is not two steps disagreeing about one widget.
+
+    A runbook that extracts, updates and re-extracts hands over two statements, and both of them
+    want the period. The scaffolder gives each hand-off its own widget, so a script with one
+    ``period_end`` has two slots to fill and must fill both -- an extract query left without its
+    period is a step driven with nothing at all.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+
+    plan = _both_hand_offs_want_the_period()
+    notebook = _scaffolded(plan, tmp_path / "two_periods.py")
+
+    wanted = [
+        slot.name
+        for slot in slots_for(plan)
+        if slot.role is Role.PARAMETER and slot.name.endswith("_period_end")
+    ]
+    assert wanted == ["extract_query_period_end", "update_statement_period_end"]
+
+    bound, unresolved = bind_by_role(
+        plan, notebook, adjustment_case.role_script(Path("pre.csv"), Path("post.csv"))
+    )
+
+    assert not unresolved, unresolved
+    assert bound["extract_query_period_end"] == adjustment_case.PERIOD
+    assert bound["update_statement_period_end"] == adjustment_case.PERIOD
+
+
+def test_two_steps_that_disagree_about_one_widget_still_bind_neither() -> None:
+    """The guard the sharing above must not weaken, and the half of it that was never true.
+
+    Two slots landing on one widget with two *different* values is one step driven with another
+    step's value, and there is no way to tell which afterwards. It used to bind the first and
+    report only the second -- so the loud wrong answer its own comment promised was a quiet one
+    for whichever slot the scaffolder happened to emit first.
+
+    Reached the way it is reached in the wild: a notebook whose widget is named for the parameter
+    rather than for the stage, so both hand-offs' slots strip down onto the same name.
+    """
+    import datetime as dt
+
+    from harness.roles import bind_by_role
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    quarrelling = {
+        **adjustment_case.role_script(pre, post),
+        "query_period_end": dt.date(2026, 3, 31),
+    }
+
+    bound, unresolved = bind_by_role(
+        _both_hand_offs_want_the_period(), adjustment_case.REFERENCE_NOTEBOOK, quarrelling
+    )
+
+    assert "period_end" not in bound, "one hand-off was driven with the other hand-off's period"
+    said = "; ".join(unresolved)
+    assert "extract_query_period_end" in said
+    assert "update_statement_period_end" in said
+
+
+def _both_hand_offs_want_the_period() -> Any:
+    """The reference plan with a second statement hand-off that also asks for the period.
+
+    The shape every runbook that re-extracts has, and the one
+    ``plan-from-gpt-5-6-terra.yaml`` really wrote: two statements handed over, both needing to
+    know which period they are for. ``update_statement`` is turned from a generated hand-off into
+    a plain one because the scaffolder offers parameter widgets only where there is a statement to
+    substitute them into -- ``awaits_parameters`` is ``parameters and not is_generated`` -- so a
+    generated stage could not pose this question at all.
+    """
+    return _with_handoff(
+        load_plan(PLAN_PATH),
+        "update_statement",
+        template=None,
+        built_from=None,
+        statement=(
+            "UPDATE fin.accruals SET accrual_gbp = accrual_gbp * 1.045 "
+            "WHERE period_end = '{period_end}'"
+        ),
+        parameters=["period_end"],
+    )

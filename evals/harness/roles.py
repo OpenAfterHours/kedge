@@ -38,6 +38,17 @@ Two escape hatches, both narrow and both reported:
 
 Anything that resolves to nothing is returned as unresolved rather than dropped. A scripted
 action that quietly names nothing is the harness bug that makes every grader below it lie.
+
+**A widget's name is not the only thing a plan chooses; so is what it will accept.** Fixing the
+names by role and leaving the *values* keyed to the reference conversion left exactly the same
+defect one level down. ``Checkpoint.options`` is the plan's own vocabulary -- ``approve`` /
+``reject`` on the reference, ``Approve entities E-04, E-07, E-09 and E-12; statutory ledger; ...``
+on a real generated one -- and :func:`kedge.notebook.scaffold._checkpoint_cells` writes both the
+dropdown and the ``mo.stop`` comparison from it, taking ``options[0]`` as the answer that
+unblocks. A script saying the literal ``"approve"`` therefore recorded a decision the gate does
+not accept: the checkpoint never opened, and the whole deterministic tier below it was blocked --
+the same total failure the names caused, from the same cause. :data:`UNBLOCK` is how a case says
+*approve* without saying how this plan spells it.
 """
 
 from __future__ import annotations
@@ -58,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ORDERED_ROLES",
+    "UNBLOCK",
     "Role",
     "Slot",
     "bind_by_role",
@@ -123,6 +135,28 @@ process's inputs are: the first grid is not the second."""
 
 
 @dataclass(frozen=True, slots=True)
+class _Unblocking:
+    """See :data:`UNBLOCK`. A class of its own so ``is`` decides it and nothing else can."""
+
+    def __repr__(self) -> str:
+        return "UNBLOCK"
+
+
+UNBLOCK = _Unblocking()
+"""A scripted decision, said as *what it does* rather than as a word this plan may not know.
+
+Every other scripted value is a fact about the process -- this grid, this period, this reason --
+and means the same thing in any plan. A checkpoint's decision does not: the plan declares its own
+:attr:`~kedge.plan.model.Checkpoint.options` and the scaffolder gates on ``options[0]``, so
+"approve" is a spelling rather than a meaning. Bound per :class:`Slot` in :func:`bind_by_role`,
+which is where the plan is to hand -- and a role's value applies to every slot of that role, so
+one ``UNBLOCK`` approves a runbook's checkpoints in whatever vocabulary each of them uses.
+
+The sentinel is deliberately not a string: a string sentinel would be a valid decision on some
+plan somewhere, and a case's script would silently mean two things."""
+
+
+@dataclass(frozen=True, slots=True)
 class Slot:
     """One thing the human does, as the scaffolder would name it."""
 
@@ -134,6 +168,12 @@ class Slot:
     parameter: str = ""
     ordinal: int = 0
     """Position among the slots of this role, in notebook order. Only read for hand-ins."""
+
+    options: tuple[str, ...] = ()
+    """What this widget accepts, first being the answer that lets the run continue.
+
+    Only a checkpoint's decision has any. Everything else a runbook puts in front of a person is
+    free text, a file or a tick, and there is nothing for a plan to have chosen."""
 
     def describe(self) -> str:
         detail = f" ({self.parameter})" if self.parameter else ""
@@ -169,6 +209,7 @@ def slots_for(plan: Any) -> tuple[Slot, ...]:
         logger.warning("the plan would not scaffold, so no roles could be read: %s", error)
         return ()
 
+    by_id = {stage.id: stage for stage in plan.stages}
     slots: list[Slot] = []
     seen: dict[Role, int] = {}
     for cell in cells:
@@ -188,9 +229,32 @@ def slots_for(plan: Any) -> tuple[Slot, ...]:
                     stage_id=stage_id,
                     parameter=parameter,
                     ordinal=ordinal,
+                    options=_accepted(role, by_id.get(stage_id)),
                 )
             )
     return tuple(slots)
+
+
+def _accepted(role: Role, stage: Any) -> tuple[str, ...]:
+    """What this widget will accept, first being the answer that unblocks the run.
+
+    Read off the plan rather than off the emitted cell, because the plan is where the choice was
+    made: :attr:`~kedge.plan.model.Checkpoint.options` documents its first entry as "the one that
+    unblocks downstream cells", and :func:`kedge.notebook.scaffold._checkpoint_cells` writes the
+    dropdown and the ``mo.stop`` comparison from that same list. This is not the naming rule the
+    module docstring refuses to copy -- a name is the scaffolder's derivation, and an option is
+    the plan's own text, passed through untouched.
+
+    A stage the walk cannot find, or one carrying no checkpoint, yields nothing; the caller
+    reports that rather than guessing a word.
+    """
+    if role is not Role.CHECKPOINT_DECISION or stage is None:
+        return ()
+    try:
+        return tuple(stage.effective_checkpoint().options)
+    except Exception as error:  # pragma: no cover - a plan this malformed cannot scaffold
+        logger.warning("no decision vocabulary could be read for %r: %s", stage, error)
+        return ()
 
 
 def _classify(cell_role: str, name: str, kind: str) -> tuple[Role | None, str]:
@@ -241,7 +305,8 @@ def bind_by_role(
             plain string, for :attr:`Role.PARAMETER`. An :data:`ORDERED_ROLES` entry is a
             sequence applied to that role's slots in order; every other role's value is applied
             to every slot of that role, because a runbook's checkpoints all have to be approved
-            for the run to reach the end.
+            for the run to reach the end. :data:`UNBLOCK` stands for whatever *that* slot's
+            checkpoint accepts.
 
     Returns:
         ``(inputs keyed by this notebook's widget names, descriptions of what could not be
@@ -251,10 +316,10 @@ def bind_by_role(
     defined = widgets.names
     slots = slots_for(plan)
 
-    inputs: dict[str, Any] = {}
     unresolved: list[str] = []
     ordered = {role: list(values.get(role, ()) or ()) for role in ORDERED_ROLES}
     head_taken: frozenset[Role] = frozenset()
+    claimed: dict[str, list[tuple[Slot, Any]]] = {}
 
     for slot in slots:
         if slot.role in ORDERED_ROLES:
@@ -272,25 +337,58 @@ def bind_by_role(
                 continue
             value = values[slot.role]
 
+        value, why = _said_here(value, slot)
+        if why:
+            unresolved.append(f"{slot.describe()} -- {why}")
+            continue
+
         name, head_taken = _resolve(slot, defined, head_taken=head_taken)
         if name is None:
             unresolved.append(slot.describe())
             continue
-        if name in inputs and inputs[name] != value:
-            # Two slots on one widget drives one step with another step's value. Both are
-            # reported instead, which is `Alignment.bind`'s rule and it is right for the same
-            # reason: a loud wrong answer beats a quiet one.
-            #
-            # Two slots on one widget with the *same* value is not that. It is what the head
-            # hand-in is: a notebook whose plan declares a first hand-in it does not define
-            # falls back onto `handin_pick`, which the head slot has already been given the
-            # same grid. Reporting it would cost `ran_to_completion` two points for a drive
-            # that went exactly where it was meant to.
-            unresolved.append(f"{slot.describe()} -- collides with a slot already bound there")
+        claimed.setdefault(name, []).append((slot, value))
+
+    inputs: dict[str, Any] = {}
+    for name, claims in claimed.items():
+        first = claims[0][1]
+        if all(value == first for _slot, value in claims[1:]):
+            # Several slots wanting one widget filled with one value is not a mis-drive, and two
+            # shapes of runbook produce it. The head hand-in is one: a notebook whose plan
+            # declares a first hand-in it does not itself define falls back onto `handin_pick`,
+            # which the head slot has already been given the same grid. A parameter both extract
+            # queries need is the other -- the pre- and post-adjustment statements each want the
+            # period, and they want the same period. Reporting either would cost
+            # `ran_to_completion` two points for a drive that went exactly where it was meant to.
+            inputs[name] = first
             continue
-        inputs[name] = value
+        # Disagreement is the thing the guard is for: one step driven with another step's value.
+        # None of them is played and all of them are reported, which is `Alignment.bind`'s rule
+        # and is right for the same reason -- a loud wrong answer beats a quiet one. Binding the
+        # first and reporting only the rest, which is what this used to do, is the quiet one.
+        unresolved.extend(
+            f"{slot.describe()} -- {len(claims)} steps want {name!r} and disagree about what "
+            f"belongs in it, so none of them was played"
+            for slot, _value in claims
+        )
 
     return inputs, tuple(unresolved)
+
+
+def _said_here(value: Any, slot: Slot) -> tuple[Any, str]:
+    """A scripted value, said in the vocabulary this particular slot accepts.
+
+    Only :data:`UNBLOCK` is translated, and only a checkpoint's decision has anything to
+    translate it into. A slot that offers no options is reported rather than guessed at: writing
+    ``"approve"`` there is how this defect started.
+
+    Returns:
+        ``(value, "")``, or ``(value, why it could not be said here)``.
+    """
+    if value is not UNBLOCK:
+        return value, ""
+    if not slot.options:
+        return value, "the plan declares no decision this checkpoint would accept"
+    return slot.options[0], ""
 
 
 def _parameter_key(slot: Slot, values: Mapping[Any, Any]) -> str | None:
