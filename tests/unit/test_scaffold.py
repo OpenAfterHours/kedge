@@ -1241,6 +1241,134 @@ def test_a_stage_listing_its_checkpoint_first_still_builds_on_a_frame() -> None:
     assert '_gate_summarise = sign_off["decision"]' in code
 
 
+# ── a checkpoint that reads a file of its own ────────────────────────────────
+
+
+def runbook_plan(**checkpoint_overrides: Any) -> ProcessPlan:
+    """`load -> verify`, with the re-extract declared on the checkpoint that asks about it.
+
+    Where a model puts it, and where the process itself puts it: "does the re-extract agree with
+    what we predicted?" is one step, and the file it needs arrives at the moment it is asked for.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_it",
+                    intent="Read the opening extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="opening extract")],
+                ),
+                Stage(
+                    id="verify",
+                    intent="Check the re-extract against what was predicted",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    depends_on=["load_it"],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                    **checkpoint_overrides,
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def test_a_checkpoint_that_reads_a_file_of_its_own_gets_the_cells_to_receive_it() -> None:
+    """The runbook whose re-extract had nowhere to arrive.
+
+    `build_cells` used to `continue` past a checkpoint before it looked for a hand-in source, so
+    a `{origin: handin, ref: ...}` declared there scaffolded the approval card and nothing else:
+    the file was read out of the plan, validated, rendered on the card the user approved, and
+    then dropped. A real hub conversion stopped dead at that step, waiting for a grid the
+    notebook never asked for -- and the shape that needed a second hand-in most was the one
+    shape that could not have one, because a re-extract arrives at the checkpoint by definition.
+    """
+    cells = build_cells(runbook_plan())
+    receivers = [cell.name for cell in cells if cell.role == "handin" and cell.stage_id == "verify"]
+
+    assert receivers == ["verify_input", "verify_handin", "verify_frame"]
+    assert "kedge.ingest.receive(" in named(cells, "verify_handin").code
+    assert "kedge.ingest.read_data(verify_handin.path)" in named(cells, "verify_frame").code
+
+
+def test_the_file_is_asked_for_before_the_decision_it_is_evidence_for() -> None:
+    """Supply the re-extract, then record what you make of it -- the order a user works in.
+
+    Emitted the other way round the page reads as an approval with its evidence filed underneath
+    it, which is the same mistake `_with_reconciliation` exists to undo one cell further down.
+    """
+    names = [cell.name for cell in build_cells(runbook_plan())]
+
+    assert names.index("verify_input") < names.index("verify_ui")
+    assert names.index("verify_frame") < names.index("verify_ui")
+    assert names.index("verify_ui") < names.index("verify")
+
+
+def test_the_approval_card_stays_dark_until_that_file_has_arrived() -> None:
+    """Position on the page hides nothing; only a dataflow edge does.
+
+    A cell that just builds `mo.ui` elements reads no upstream name, so marimo has nothing to
+    gate it on and it renders from the moment the notebook opens -- offering a sign-off on data
+    nobody has supplied yet, above the selector asking for it. Reading the frame is the edge.
+    """
+    ui = named(build_cells(runbook_plan()), "verify_ui").code
+
+    assert "_after_verify = verify_frame" in ui
+    assert "mo.ui.dropdown(" in ui
+
+
+def test_a_checkpoint_with_a_file_of_its_own_still_reserves_its_decision_names() -> None:
+    """Both sets of derived names, not whichever the name map matched last.
+
+    The name map reassigned one satellite function over another, so a stage that was a checkpoint
+    *and* carried a hand-in reserved the receiver names and quietly stopped reserving
+    `<name>_decision` and `<name>_note`. A plan with a checkpoint `review` beside a stage
+    `review_decision` would then scaffold two cells defining one name, which marimo rejects as
+    multiply defined and the user meets as a notebook that will not open.
+    """
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(id="review_decision", intent="A stage that wants the checkpoint's name"),
+                Stage(
+                    id="review",
+                    intent="The checkpoint itself",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="the re-extract")],
+                    checkpoint=Checkpoint(question="Approved?"),
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    owner: dict[str, str] = {}
+    for cell in build_cells(plan):
+        for name in public_names(cell.code):
+            assert name not in owner, f"{name!r} defined by {owner.get(name)!r} and {cell.name!r}"
+            owner[name] = cell.name
+
+
+def test_a_checkpoints_own_file_does_not_summon_the_head_hand_in() -> None:
+    """The head hand-in blocks the whole notebook, so it is emitted only where something reads it.
+
+    A checkpoint reads no frame at all, and where it declares a hand-in it reads *that* one, under
+    its own name. Either way the answer is the one every other stage with a file of its own gets:
+    no. Emitting the head anyway would put six cells and a blocking `mo.stop` at the top of a
+    runbook for an input no step of the process names.
+    """
+    names = {cell.name for cell in build_cells(runbook_plan())}
+
+    assert "handin_source" not in names, "the head hand-in was emitted for nobody to read"
+    assert "handin_frame" not in names
+    assert {"verify_input", "load_it_input"} <= names
+
+
 # ── what a stage cell tells the person who has to finish it ──────────────────
 
 

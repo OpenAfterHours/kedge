@@ -722,12 +722,18 @@ def reject(
 # about ``NOT RECONCILED``. Each is therefore run over the analyser's own output for every
 # workbook in ``tests/fixtures`` with a plausible correct plan, and has to stay quiet.
 
-_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: frozenset[StageKind] = frozenset({StageKind.CHECKPOINT})
-"""Stage kinds whose own ``handin`` source produces no cells.
+_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: frozenset[StageKind] = frozenset()
+"""Stage kinds whose own ``handin`` source produces no cells. Empty, and that emptiness is a claim.
 
-Mirrors the ``if stage.is_checkpoint: ... continue`` that ``scaffold.build_cells`` takes before
-it reaches ``_handin_cells``. Kept as a set rather than a bare comparison so the tripwire test
-can assert it against the scaffolder for every member of :class:`StageKind`.
+It held ``CHECKPOINT`` while ``scaffold.build_cells`` took an ``if stage.is_checkpoint: ...
+continue`` before it reached ``_handin_cells``, so a re-extract declared on the checkpoint that
+gates it had nowhere to arrive. The scaffolder now asks for a stage's own hand-in ahead of every
+kind branch, so no kind is ignored.
+
+Kept rather than deleted, because the tripwire test measures this against the scaffolder for every
+member of :class:`StageKind` and an empty set is the strongest form that assertion takes: if a
+kind ever stops getting hand-in cells again, the test names it here rather than a user meeting it
+as a runbook that stops halfway.
 """
 
 _IN_THE_WORKBOOK: frozenset[str] = frozenset({"sheet", "cell_comment"})
@@ -1038,27 +1044,37 @@ def _dropped_briefing_warning(plan: ProcessPlan, analysis: WorkbookAnalysis | No
 
 
 def _stranded_handin_warnings(plan: ProcessPlan) -> list[str]:
-    """A hand-in declared where the scaffolder does not look for one.
+    """A hand-in declared on a checkpoint: it arrives now, but nothing computes on it.
 
-    ``build_cells`` emits the three receiver cells for every stage kind but ``checkpoint``, which
-    it has already ``continue``d past. A re-extract declared on the checkpoint that gates it
-    therefore produces no selector, no receipt and no frame, and the file the rest of the process
-    exists to verify against has nowhere to arrive. Nothing else reports it: the plan validates,
-    the notebook scaffolds, and the missing input surfaces as a stage built on the wrong frame.
+    This used to be the sharper finding of the two. ``build_cells`` ``continue``d past a checkpoint
+    before it looked for a hand-in source, so the file had *nowhere to arrive* -- no selector, no
+    receipt, no frame -- and a runbook stopped dead at the step meant to prove the update had
+    worked. The scaffolder now emits the receiver cells for a checkpoint like any other stage, and
+    :data:`_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES` is empty because of it.
+
+    **The wording follows the consequence down rather than keeping the louder claim.** What is
+    left is real but smaller: a checkpoint records a decision and generates no code, and
+    ``scaffold._upstream_name`` never treats a checkpoint as the frame a stage builds on, so
+    nothing is scaffolded to *read* the file the checkpoint now receives -- the comparison a
+    re-extract exists for has no cell of its own. Saying "that file has nowhere to arrive" about a
+    notebook that visibly asks for it would be the worse error of the two: an approval card is
+    read exactly as long as everything on it is true.
     """
-    ignored = _and_more(sorted(kind.value for kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES))
     warnings: list[str] = []
     for stage in plan.stages:
-        if stage.kind not in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES:
+        if not stage.is_checkpoint:
             continue
         label = _stage_handin_label(stage)
         if label is None:
             continue
         warnings.append(
             f"Move the hand-in ({label!r}) off {stage.id!r} and onto the stage that reads the "
-            f"file: the scaffolder emits hand-in cells for every kind but {ignored}, so declared "
-            f"on a `kind: {stage.kind.value}` stage it gets no selector cell, no receipt cell and "
-            f"no frame, and that file has nowhere to arrive"
+            f"file: a `kind: checkpoint` stage does get its own selector, receipt and frame, so "
+            f"{label!r} arrives -- but a checkpoint records a decision and computes nothing, and "
+            f"no stage builds on a checkpoint's frame, so nothing is scaffolded to compare that "
+            f"file against what this process predicted. Declared on the `kind: load` or "
+            f"`kind: transform` stage that reads it, with {stage.id!r} left to record the "
+            f"decision, the comparison has a cell to live in"
         )
     return warnings
 

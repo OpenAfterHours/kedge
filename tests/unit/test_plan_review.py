@@ -1601,10 +1601,19 @@ def test_a_workbook_that_explained_nothing_is_not_asked_for_a_briefing() -> None
     assert "dropped briefing" not in _fired(review_warnings(_clean_plan(), make_analysis()))
 
 
-# ── 4. a hand-in with nowhere to arrive ─────────────────────────────────────
+# ── 4. a hand-in on a stage that computes nothing ───────────────────────────
 
 
-def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nowhere_to_arrive() -> None:
+def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nothing_to_read_it() -> None:
+    """The warning has to shrink when the defect it described does.
+
+    It used to say the file had nowhere to arrive, and that was true while ``build_cells``
+    ``continue``d past a checkpoint before looking for a hand-in source. The scaffolder emits the
+    receiver cells now, so a card still claiming the file is lost is a card describing a notebook
+    that visibly asks for it -- and an approval card is read exactly as long as everything on it
+    is true. What survives is the part that is still the case: a checkpoint computes nothing, so
+    the comparison the re-extract exists for has no cell.
+    """
     plan = _clean_plan(
         stages=[
             Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
@@ -1621,9 +1630,10 @@ def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nowhere_to_arr
     assert any(
         "'verify'" in warning
         and "'post-adjustment extract'" in warning
-        and "no selector cell, no receipt cell and no frame" in warning
+        and "computes nothing" in warning
         for warning in warnings
     )
+    assert not any("nowhere to arrive" in warning for warning in warnings)
 
 
 def test_the_same_hand_in_on_the_stage_that_reads_it_is_not_reported() -> None:

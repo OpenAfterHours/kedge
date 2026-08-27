@@ -600,21 +600,37 @@ def _satellite_names(name: str) -> tuple[str, ...]:
     return (f"{name}_ui", f"{name}_decision", f"{name}_note")
 
 
+def _claimed_names(stage: Stage, name: str) -> tuple[str, ...]:
+    """Every name this stage's cells define beyond the stage name itself.
+
+    A union rather than a choice, because a stage is allowed to be more than one of these at
+    once. A checkpoint that declares a hand-in of its own scaffolds the three receiver cells
+    *and* the approval pair, so it claims both sets of derived names. Reserving only the last
+    match -- which is what a chain of reassignments did -- left a checkpoint's ``<name>_ui``,
+    ``<name>_decision`` and ``<name>_note`` unreserved the moment it also carried a hand-in, so
+    a plan with a checkpoint ``verify`` beside a stage ``verify_decision`` would scaffold two
+    cells defining one name. marimo rejects that as multiply defined, and the user meets it as a
+    notebook that will not open.
+    """
+    claimed: tuple[str, ...] = ()
+    if stage.is_checkpoint:
+        claimed += _satellite_names(name)
+    if stage.is_handoff:
+        claimed += _handoff_satellites(name)
+    if _named_handin(stage) is not None:
+        claimed += _handin_satellites(name)
+    return claimed
+
+
 def _name_map(plan: ProcessPlan) -> dict[str, str]:
     """Map every stage id to its cell name, assigned in emission order."""
     names: dict[str, str] = {}
     used: set[str] = set()
     for stage in plan.ordered_stages():
         name = cell_name_for(stage.id, used)
-        satellites = _satellite_names if stage.is_checkpoint else None
-        if stage.is_handoff:
-            satellites = _handoff_satellites
-        if _named_handin(stage) is not None:
-            satellites = _handin_satellites
-        if satellites is not None:
-            while any(taken in used for taken in satellites(name)):
-                name = cell_name_for(name, used | {name})
-            used.update(satellites(name))
+        while any(taken in used for taken in _claimed_names(stage, name)):
+            name = cell_name_for(name, used | {name})
+        used.update(_claimed_names(stage, name))
         names[stage.id] = name
         used.add(name)
     return names
@@ -671,15 +687,24 @@ def build_cells(
 
     ordered = plan.ordered_stages()
     for index, stage in enumerate(ordered, start=1):
-        if stage.is_checkpoint:
-            cells.extend(_checkpoint_cells(stage, index, len(ordered), names, gated))
-            continue
         # A stage that reads a hand-in of its own gets the three receiver cells first, and its
         # own cell then computes on the frame they define. Emitted before the stage rather than
-        # instead of it, so a stage that both receives and transforms keeps both.
+        # instead of it, so a stage that both receives and transforms keeps both -- and asked
+        # ahead of the kind branches, because *any* kind may declare one.
+        #
+        # This used to sit below the checkpoint branch, which `continue`d past it. A `kind:
+        # checkpoint` stage declaring `{origin: handin, ref: ...}` therefore got no selector, no
+        # receipt and no frame: the source was read, validated, rendered on the approval card,
+        # and then dropped. The shape that needed it most was the one shape that could not have
+        # it -- a runbook's re-extract arrives precisely at the checkpoint that asks "did the
+        # update do what we predicted?", and a real hub conversion stopped dead at that step
+        # with the file it was waiting for having nowhere to go.
         label = _named_handin(stage)
         if label is not None:
             cells.extend(_handin_cells(stage, index, len(ordered), names[stage.id], label, gated))
+        if stage.is_checkpoint:
+            cells.extend(_checkpoint_cells(stage, index, len(ordered), names, gated))
+            continue
         if stage.is_handoff:
             cells.extend(_handoff_cells(stage, index, len(ordered), names, gated))
             continue
@@ -1528,6 +1553,15 @@ def head_handin_reader(
     a **fall-through** rather than a declaration -- ``_upstream_name`` returns ``handin_frame``
     when nothing else matched -- so this names the stage that will consume the file, not
     necessarily one that asked for it.
+
+    A checkpoint is skipped, and it stays skipped now that a checkpoint may carry a hand-in of its
+    own. The rule this walk enforces is "does anything *read* ``handin_frame``", and a checkpoint
+    reads no frame at all: :func:`_checkpoint_cells` emits a decision record, and where the stage
+    declares a hand-in, :func:`_handin_cells` gives it ``<name>_frame`` under its own name. Either
+    way the answer is no, which is the same answer the non-checkpoint branch below gives a stage
+    with its own hand-in -- ``_upstream_name`` returns that stage's frame and never the head's. A
+    checkpoint's own hand-in must therefore not put six cells and a blocking ``mo.stop`` at the
+    top of the notebook for a file no step of the process names.
     """
     resolved = names if names is not None else _name_map(plan)
     gates = (
@@ -1702,6 +1736,13 @@ def _checkpoint_cells(
     value — the defining cell does not re-run on interaction. The gate cell is where ``mo.stop``
     lives, and ``mo.stop`` halts this cell *and its descendants*, so the block is real rather
     than advisory: a downstream cell referencing this stage's output is cancelled, not skipped.
+
+    Where the checkpoint declares a hand-in of its own, the UI cell reads that hand-in's frame as
+    well as whatever gates it. The decision is *about* that file -- "does the re-extract say what
+    we predicted?" -- so offering the dropdown before the file has arrived asks somebody to sign
+    off on data nobody has seen. And nothing else could hide it: a cell that only builds ``mo.ui``
+    elements has no dataflow edges, so it renders from the moment the notebook opens whatever
+    sits above it. Reading the frame is what creates the edge.
     """
     name = names[stage.id]
     checkpoint = stage.effective_checkpoint()
@@ -1724,8 +1765,21 @@ def _checkpoint_cells(
     )
 
     gates = _gate_tokens(stage, names, gated or {})
+    reads_a_handin = _named_handin(stage) is not None
+    if reads_a_handin:
+        gates = [f"{name}_frame", *gates]
     ui_lines = [
         f"# Checkpoint {index} of {total}: {_one_line(stage.id)}",
+        *(
+            [
+                "# Dark until the hand-in above it has arrived. This decision is about that",
+                "# file, and a card that only builds `mo.ui` elements reads nothing, so nothing",
+                "# could hide it -- it would offer a sign-off on data nobody has supplied yet.",
+                "# Reading the frame is what creates the edge marimo hides this cell on.",
+            ]
+            if reads_a_handin
+            else []
+        ),
         *(f"_after_{name} = {gate}" for gate in gates),
         "# Deliberately NOT automated. Forcing a judgement call into code either fabricates",
         "# logic that was never there or silently drops a control (PLAN 2.2). Recording the",

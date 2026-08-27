@@ -671,12 +671,19 @@ def test_a_hand_in_below_the_update_that_reads_no_token_also_fails() -> None:
     assert "position in the file is not the gate" in detail.lower()
 
 
-def test_a_re_extract_declared_on_a_checkpoint_fails_the_two_handins_item() -> None:
-    """The sharpest of the four, because the loose version was green on exactly this plan.
+def test_a_re_extract_declared_on_a_checkpoint_is_graded_on_the_cells_that_now_exist() -> None:
+    """This item follows the scaffolder, and the scaffolder moved.
 
-    ``build_cells`` returns early for a ``checkpoint`` stage before ``_named_handin`` is
-    consulted, so the hand-in is read by the schema, rendered on the approval card, and emitted
-    as nothing. The plan still declares two hand-ins; the notebook has one place to put a grid.
+    It was red on this plan, and correctly: ``build_cells`` returned early for a ``checkpoint``
+    before ``_named_handin`` was consulted, so the hand-in was read by the schema, rendered on the
+    approval card, and emitted as nothing -- two hand-ins declared, one place to put a grid. The
+    scaffolder now asks for a stage's own hand-in ahead of every kind branch, so the same plan
+    scaffolds the selector, the receipt and the frame, and the honest grade is green.
+
+    What is asserted is therefore not the outcome alone but *why* it is green: the cells are
+    there, under the checkpoint's own name. An item that passed here while the notebook had
+    nowhere to put the grid is the failure this whole tier was rebuilt to prevent, and it would
+    look identical from the outcome.
     """
     plan = restaged(load_plan(PLAN_PATH), {"post_adjustment": {"kind": "checkpoint"}})
     handins = [
@@ -685,12 +692,21 @@ def test_a_re_extract_declared_on_a_checkpoint_fails_the_two_handins_item() -> N
         for source in stage.sources
         if source.origin.value == "handin" and source.ref
     ]
-    assert len(handins) == 2, "the mutation removed a declared hand-in rather than stranding it"
+    assert len(handins) == 2, "the mutation removed a declared hand-in rather than retyping it"
+
+    from kedge.notebook.scaffold import build_cells
+
+    emitted = {
+        cell.name
+        for cell in build_cells(plan, allow_unapproved=True)
+        if cell.role == "handin" and cell.stage_id == "post_adjustment"
+    }
+    assert emitted == {"post_adjustment_input", "post_adjustment_handin", "post_adjustment_frame"}
 
     report = graded_plan(plan)
 
-    assert outcome_of(report, "takes_two_handins") is Outcome.FAIL
-    assert "nowhere to arrive" in detail_of(report, "takes_two_handins")
+    assert outcome_of(report, "takes_two_handins") is Outcome.PASS
+    assert "post_adjustment" in detail_of(report, "takes_two_handins")
 
 
 def test_a_plan_that_declares_no_handin_of_its_own_still_fails_for_the_old_reason() -> None:
@@ -783,16 +799,21 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
 
     The item-by-item outcome is asserted as well as the total, because the total moves whenever a
     weight does and what is pinned here is *which* items see the defect. Three are worth reading
-    twice. ``takes_two_handins`` was **green** on this plan while the notebook it scaffolded had
-    one place to put a grid. And two items are **blocked** rather than failing: a plan that hands
-    nothing over has no statement for ``mutates`` to contradict and no update for a re-extract to
-    wait for, so reporting either as a failure would name the wrong defect.
-    ``hands_over_rather_than_pretends`` is the item about that, and it is red.
+    twice. ``takes_two_handins`` is **green**, and it was red here until the scaffolder was fixed:
+    the mistyped ``kind`` cost the notebook its second hand-in entirely, and now it does not --
+    a ``kind: checkpoint`` stage gets its own selector, receipt and frame like any other. The plan
+    is still wrong about where that hand-in belongs, and ``review_warnings`` still says so on the
+    approval card, but the notebook does ask for the grid and this item grades the notebook. And
+    two items are **blocked** rather than failing: a plan that hands nothing over has no statement
+    for ``mutates`` to contradict and no update for a re-extract to wait for, so reporting either
+    as a failure would name the wrong defect. ``hands_over_rather_than_pretends`` is the item
+    about that, and it is red.
 
     Blocked, though, and no longer skipped -- so their five points stay in the denominator. This
     plan scored 5/19 while the defect that cost it those points also removed them from what it
-    was scored out of; it now scores 5/24. The one thing a plan must not gain by omitting a
-    hand-off is a smaller rubric.
+    was scored out of; it scored 5/24 once they were counted, and 8/24 once the scaffolder stopped
+    dropping the hand-in. The one thing a plan must not gain by omitting a hand-off is a smaller
+    rubric.
     """
     from harness.sweep import Bench, grade_structural
     from observed_conversion import observed_plan
@@ -802,7 +823,7 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
 
     assert outcomes == {
         "hands_over_rather_than_pretends": Outcome.FAIL,
-        "takes_two_handins": Outcome.FAIL,
+        "takes_two_handins": Outcome.PASS,
         "generates_the_update_from_the_frame": Outcome.FAIL,
         "does_not_drop_the_sql_column": Outcome.PASS,
         "raises_the_memo_discrepancy": Outcome.PASS,
@@ -813,7 +834,7 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
         "the_briefing_survives_the_workbook": Outcome.FAIL,
         "consults_the_knowledge_pack": Outcome.SKIP,
     }, tier.render()
-    assert (tier.earned, tier.available) == (5, 24), tier.render()
+    assert (tier.earned, tier.available) == (8, 24), tier.render()
     details = {item.id: item.detail for item in tier.items}
-    assert "nowhere to arrive" in details["takes_two_handins"]
+    assert "verify_post_adjustment" in details["takes_two_handins"]
     assert "Sign-off" in details["the_briefing_survives_the_workbook"]
