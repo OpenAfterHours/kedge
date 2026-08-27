@@ -452,6 +452,43 @@ def test_a_model_that_sends_the_old_bare_strings_is_read_rather_than_repaired() 
     ]
 
 
+def _near_miss_briefing() -> dict[str, Any]:
+    """A briefing whose content is right and whose shape is one field off, twice.
+
+    Reconstructed from what two live sweeps logged -- `briefing.watch_for: Input should be a
+    valid list` and one `briefing.sources.N: Input should be a valid string` per citation. The
+    citations are in the shape the analyser's own notes reach the model in, which is the shape a
+    model asked to cite one hands back.
+    """
+    return {
+        "purpose": "Records the quarterly uplift applied to statutory accruals.",
+        "watch_for": "One trade has no accrual pending a cost-centre reallocation.",
+        "sources": [
+            {"source": "sheet", "origin": "Sign-off", "location": "A3:A4", "heading": "Purpose"},
+            {
+                "source": "sheet",
+                "origin": "Sign-off",
+                "location": "A6:A7",
+                "heading": "Background",
+            },
+        ],
+    }
+
+
+def test_a_briefing_in_the_shape_the_notes_arrived_in_is_read_rather_than_repaired() -> None:
+    """The same bargain as the bare sources above, on the field it was actually costing money."""
+    raw = json.loads(make_draft().model_dump_json())
+    raw["briefing"] = _near_miss_briefing()
+
+    draft = parse_draft(json.dumps(raw))
+
+    assert draft.briefing is not None
+    assert draft.briefing.sources == ["Sign-off!A3:A4 (Purpose)", "Sign-off!A6:A7 (Background)"]
+    assert draft.briefing.watch_for == [
+        "One trade has no accrual pending a cost-centre reallocation."
+    ]
+
+
 # =============================================================================
 # FIELDS THAT ARE A HUMAN'S DECISION, NOT THE MODEL'S
 # =============================================================================
@@ -902,6 +939,25 @@ def test_a_single_attempt_does_not_ask_for_a_repair_it_will_never_send(analysis)
     with pytest.raises(ProposalError):
         propose_plan(analysis, completer=completer, max_attempts=1)
     assert len(completer.requests) == 1
+
+
+def test_a_briefing_one_shape_off_no_longer_spends_an_attempt(analysis) -> None:
+    """The measurement this exists for: 11 requests for 3 proposals, and this was both wasted ones.
+
+    ``max_attempts=1`` is the assertion. Before the normalisation the first attempt was the
+    wasted one -- one error for `watch_for` and one per citation, none of them about anything
+    the plan said -- so with no repair to fall back on this raised rather than returning a plan
+    whose content was already correct.
+    """
+    raw = json.loads(make_draft().model_dump_json())
+    raw["briefing"] = _near_miss_briefing()
+    completer = ScriptedCompleter([json.dumps(raw)])
+
+    plan = propose_plan(analysis, completer=completer, max_attempts=1)
+
+    assert len(completer.requests) == 1, "the shape difference was put back to the model"
+    assert plan.briefing is not None
+    assert plan.briefing.sources == ["Sign-off!A3:A4 (Purpose)", "Sign-off!A6:A7 (Background)"]
 
 
 def test_max_attempts_below_one_still_makes_one_attempt(analysis) -> None:

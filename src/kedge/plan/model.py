@@ -245,6 +245,113 @@ class Checkpoint(_PlanModel):
         return cleaned
 
 
+# ── citations ────────────────────────────────────────────────────────────────
+
+_CITATION_PLACE_KEYS = (
+    "ref",
+    "sheet",
+    "sheet_name",
+    "tab",
+    "origin",
+    "file",
+    "filename",
+    "document",
+    "workbook",
+    "source",
+    "where",
+    "citation",
+)
+"""Keys naming the thing a citation points at: a sheet, a file, or the person who said it."""
+
+_CITATION_LOCATION_KEYS = ("location", "cells", "cell", "range", "address")
+"""Keys naming which part of it: ``A3:A4``."""
+
+_CITATION_LABEL_KEYS = ("heading", "label", "section", "field", "part", "title")
+"""Keys naming what was read there: ``Purpose``. A label on its own points nowhere."""
+
+_CITATION_KEYS: frozenset[str] = frozenset(
+    _CITATION_PLACE_KEYS + _CITATION_LOCATION_KEYS + _CITATION_LABEL_KEYS
+)
+
+_NOTE_KINDS: frozenset[str] = frozenset(
+    {"sheet", "cell_comment", "docx", "doc_stub", "markdown", "plain_text"}
+)
+"""The values of :attr:`~kedge.analysis.model.ProcessNote.source`.
+
+Every documentation note reaches the model carrying one, so a citation echoed back in the note's
+own shape has ``source`` holding a *kind* rather than a place. Reading it as the place would
+render ``sheet!A3:A4`` -- a citation to nowhere, wearing the shape of a real one.
+"""
+
+_NOTE_KIND_PREFIXES = {"cell_comment": "cell comment on "}
+"""Kinds worth keeping in the rendered line. A ``sheet`` or a ``docx`` says itself already."""
+
+
+def _render_citation(entry: Mapping[str, Any]) -> str:
+    """Render a citation the model sent as an object into the one line ``sources`` holds.
+
+    The near miss this exists for costs a whole completion. The analyser's notes reach the model
+    as objects -- ``{"source": "sheet", "origin": "Sign-off", "location": "A3:A4", "heading":
+    "Purpose"}`` -- so a model asked to cite one hands the object back in the shape it was given,
+    and ``sources: list[str]`` refuses it once per citation on a plan that was otherwise correct.
+    None of that is a disagreement about content. The citation is present and complete; it is
+    spelled as a record rather than as a line.
+
+    **What this will not do is invent one.** An object naming no sheet, no file and no range
+    denotes nothing anybody can follow, and rendering ``{"heading": "Purpose"}`` as ``Purpose``
+    would manufacture precisely the confident, unfollowable attribution :class:`Briefing` exists
+    to refuse. So the shape is normalised and the attribution never is: an object that cites
+    nothing raises, and the repair loop is the right place for that to go.
+
+    Args:
+        entry: What arrived in place of a citation string.
+
+    Returns:
+        ``Sign-off!A3:A4 (Purpose)`` -- the form the prompt asks for and the plans on disk use.
+    """
+    fields: dict[str, str] = {}
+    for key, value in entry.items():
+        name = _normalise(str(key))
+        if name not in _CITATION_KEYS or value is None:
+            continue
+        if not isinstance(value, str):
+            msg = (
+                f"the {name!r} of a briefing source must be text -- 'Sign-off', 'A3:A4', "
+                f"'Purpose' -- so that the citation reads as one line. Got "
+                f"{type(value).__name__}: {value!r}"
+            )
+            raise ValueError(msg)
+        if cleaned := value.strip():
+            fields[name] = cleaned
+
+    stated = [fields[key] for key in _CITATION_PLACE_KEYS if key in fields]
+    place = next((text for text in stated if _normalise(text) not in _NOTE_KINDS), None)
+    kind = next((_normalise(text) for text in stated if _normalise(text) in _NOTE_KINDS), None)
+    location = next((fields[key] for key in _CITATION_LOCATION_KEYS if key in fields), None)
+    label = next((fields[key] for key in _CITATION_LABEL_KEYS if key in fields), None)
+
+    if not place and not location:
+        msg = (
+            f"a briefing source must be a citation the next reader can follow -- "
+            f"'Sign-off!A3:A4 (Purpose)', 'cell comment on Calc!C1', 'procedure.docx' -- either "
+            f"as a string or as an object saying where the prose was read: sheet, cells, "
+            f"heading. Got {entry!r}, which names no sheet, no file and no range. Cite where it "
+            f"came from, or leave the briefing empty and say so: a citation pointing nowhere is "
+            f"worse than none, because it reads as attribution."
+        )
+        raise ValueError(msg)
+
+    rendered = place or ""
+    if location and location not in rendered:
+        joiner = "!" if rendered and "!" not in rendered and _A1_RANGE.match(location) else " "
+        rendered = f"{rendered}{joiner}{location}".strip()
+    if kind:
+        rendered = f"{_NOTE_KIND_PREFIXES.get(kind, '')}{rendered}"
+    if label and label.casefold() not in rendered.casefold():
+        rendered = f"{rendered} ({label})"
+    return rendered
+
+
 class Briefing(_PlanModel):
     """Why this process exists, for whoever opens the notebook in eight months.
 
@@ -263,9 +370,20 @@ class Briefing(_PlanModel):
     sheet, a cell comment, a companion procedure — or to a person who said it. Where the
     workbook explains nothing, the honest briefing says so and the field stays empty.
 
+    Two near misses in the *shape* of an answer are normalised rather than repaired, because a
+    repair round is a whole proposal's tokens spent on a plan that was already right: a lone
+    string where a list of them was asked for, and a citation sent as the object the analyser's
+    notes arrive in (:func:`_render_citation`). Neither touches what the briefing claims or what
+    it cites.
+
     Example:
         >>> Briefing(purpose="Quarterly accrual uplift", sources=["Sign-off!A3:A4"]).purpose
         'Quarterly accrual uplift'
+        >>> Briefing(
+        ...     purpose="Quarterly accrual uplift",
+        ...     sources=[{"sheet": "Sign-off", "cells": "A3:A4", "heading": "Purpose"}],
+        ... ).sources
+        ['Sign-off!A3:A4 (Purpose)']
     """
 
     purpose: str | None = Field(
@@ -297,6 +415,49 @@ class Briefing(_PlanModel):
         description="Where each part of this was learned: 'Sign-off!A3:A4 (Purpose)', 'cell "
         "comment on Calc!C1', 'procedure.docx'. Required wherever there is prose.",
     )
+
+    # ── normalisation ────────────────────────────────────────────────────
+
+    @field_validator("watch_for", mode="before")
+    @classmethod
+    def _one_warning_need_not_be_a_list(cls, value: Any) -> Any:
+        """Take a lone string as the list of one it plainly is.
+
+        A workbook with a single known issue gets written up as a single sentence, and
+        ``Input should be a valid list`` then costs a whole completion to repair a plan whose
+        content was already correct. There is no judgement in the difference: a model that
+        wrote one warning and a model that wrote a list of one wrote the same thing.
+        """
+        if value is None:
+            return []
+        return [value] if isinstance(value, str) else value
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def _citations_may_arrive_as_objects(cls, value: Any) -> Any:
+        """Render an object-shaped citation into the line it denotes; refuse one denoting none.
+
+        The same bargain as :meth:`_one_warning_need_not_be_a_list`, on the field where the
+        bargain has a limit -- see :func:`_render_citation` for where that limit is and why.
+
+        A blank string is dropped rather than kept, which tightens the rule below rather than
+        loosening it: ``sources: ['']`` is an empty citation list wearing a list's shape, and
+        counting it would let prose through attributed to nothing at all.
+        """
+        if value is None:
+            return []
+        entries = [value] if isinstance(value, str | Mapping) else value
+        if not isinstance(entries, list | tuple):
+            return value
+        cleaned: list[Any] = []
+        for entry in entries:
+            rendered = _render_citation(entry) if isinstance(entry, Mapping) else entry
+            if isinstance(rendered, str):
+                if rendered.strip():
+                    cleaned.append(rendered.strip())
+                continue
+            cleaned.append(rendered)
+        return cleaned
 
     @model_validator(mode="after")
     def _prose_must_be_attributable(self) -> Briefing:

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from conftest import make_draft, make_plan
@@ -15,6 +17,7 @@ from kedge.plan.model import (
     Approval,
     ApprovalState,
     Assessment,
+    Briefing,
     Checkpoint,
     Confidence,
     DroppedRange,
@@ -663,6 +666,142 @@ def test_a_rejected_drop_no_stage_claims_still_blocks_approval() -> None:
         )
     )
     assert any("no stage lists it as a source" in b for b in plan.approval_blockers())
+
+
+# ── the briefing, and the shapes a citation arrives in ──────────────────────
+#
+# Two live sweeps proposing three plans each reported `11 requests (2 wasted)`, and every wasted
+# one was the same near miss: `watch_for` as a sentence rather than a list of them, and each
+# citation as the object the analyser's notes reach the model in. A fifth of the cost of a
+# proposal, spent on a plan that was already right. The shape is normalised here; what the
+# briefing claims and what it cites are not.
+
+
+def test_a_lone_warning_is_taken_as_the_list_of_one_it_is() -> None:
+    """`watch_for: "one known issue"` -- the observed miss, and worth no completion at all."""
+    briefing = Briefing(
+        purpose="Records the quarterly uplift.",
+        watch_for="One trade has no accrual pending a cost-centre reallocation.",
+        sources=["Sign-off!A3:A4 (Purpose)"],
+    )
+
+    assert briefing.watch_for == ["One trade has no accrual pending a cost-centre reallocation."]
+
+
+@pytest.mark.parametrize(
+    ("entry", "rendered"),
+    [
+        # The analyser's own note shape, handed straight back. `source` holds the *kind*, so a
+        # renderer that read it as the place would cite `sheet!A3:A4`.
+        (
+            {
+                "source": "sheet",
+                "origin": "Sign-off",
+                "location": "A3:A4",
+                "heading": "Purpose",
+                "text": "To record the quarterly uplift.",
+            },
+            "Sign-off!A3:A4 (Purpose)",
+        ),
+        ({"sheet": "Sign-off", "cells": "A3:A4", "heading": "Purpose"}, "Sign-off!A3:A4 (Purpose)"),
+        ({"sheet": "Sign-off", "range": "A6:A7"}, "Sign-off!A6:A7"),
+        # Already qualified. The cells must not be pasted on twice.
+        ({"ref": "Sign-off!A3:A4", "location": "A3:A4"}, "Sign-off!A3:A4"),
+        ({"source": "cell_comment", "origin": "Calc!C1"}, "cell comment on Calc!C1"),
+        (
+            {"source": "docx", "origin": "procedure.docx", "heading": "Section 4"},
+            "procedure.docx (Section 4)",
+        ),
+        # No sheet, but a range is still somewhere a reader can go.
+        ({"cells": "A3:A4", "heading": "Purpose"}, "A3:A4 (Purpose)"),
+        # A person who said so is a citation the class's own docstring allows.
+        ({"source": "Jane in Financial Control"}, "Jane in Financial Control"),
+    ],
+)
+def test_a_citation_sent_as_an_object_is_rendered_into_the_line_it_denotes(
+    entry: dict[str, Any], rendered: str
+) -> None:
+    """Shape only: every part of the citation was in the object before it was in the string."""
+    assert Briefing(purpose="Records the quarterly uplift.", sources=[entry]).sources == [rendered]
+
+
+@pytest.mark.parametrize(
+    ("sources", "rendered"),
+    [
+        ({"sheet": "Sign-off", "cells": "A3:A4"}, "Sign-off!A3:A4"),
+        ("Sign-off!A3:A4 (Purpose)", "Sign-off!A3:A4 (Purpose)"),
+    ],
+)
+def test_one_citation_need_not_be_a_list_either(sources: Any, rendered: str) -> None:
+    assert Briefing(purpose="Records the quarterly uplift.", sources=sources).sources == [rendered]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        # A heading is what was read, never where. Rendering it as `Purpose` would manufacture
+        # the confident, unfollowable attribution the field exists to refuse.
+        {"heading": "Purpose"},
+        {"label": "Background", "field": "background"},
+        # The prose citing itself.
+        {"text": "The June reforecast moved the accrual basis to the 2026 rate card."},
+        {},
+        # A mapping keyed by the briefing field it covers. The value is a fine citation and the
+        # key is not a place, so which half is which is a guess -- and a guess here invents.
+        {"purpose": "Sign-off!A3:A4"},
+    ],
+)
+def test_an_object_that_names_no_place_is_refused_rather_than_rendered(
+    entry: dict[str, Any],
+) -> None:
+    """The line this normalisation must not cross, asserted from the wrong side of it."""
+    with pytest.raises(ValidationError, match="names no sheet, no file and no range"):
+        Briefing(purpose="Records the quarterly uplift.", sources=[entry])
+
+
+def test_a_citation_part_that_is_not_text_is_refused_rather_than_quietly_dropped() -> None:
+    """Dropping the cells would leave `Sign-off` -- vaguer than what the model actually said."""
+    with pytest.raises(ValidationError, match="must be text"):
+        Briefing(
+            purpose="Records the quarterly uplift.",
+            sources=[{"sheet": "Sign-off", "cells": ["A3", "A4"]}],
+        )
+
+
+@pytest.mark.parametrize("sources", [[], None, [""], ["   "]])
+def test_prose_with_nothing_behind_it_is_still_refused(sources: Any) -> None:
+    """Including the two shapes that used to wear a list's shape while citing nothing."""
+    with pytest.raises(ValidationError, match="must say where that came from"):
+        Briefing(purpose="Records the quarterly uplift.", sources=sources)
+
+
+def test_a_briefing_that_explains_nothing_needs_no_citation() -> None:
+    """An honest blank is a correct answer, and normalising `null` must not change that."""
+    assert Briefing(sources=None, watch_for=None).is_empty
+
+
+def test_the_reference_plan_loads_with_every_citation_exactly_as_it_was_written() -> None:
+    """A briefing already written the way it was asked for must come back untouched.
+
+    The tripwire for the normalisation above, against the one briefing in the repository that a
+    person wrote and the eval grades: a renderer reaching a citation that is already a line, or a
+    strip dropping one, would change what this plan cites. Compared against the file's own bytes
+    rather than a transcription, so it cannot drift into agreeing with the schema about a plan
+    neither of them read.
+    """
+    from kedge.plan.store import plan_from_yaml
+
+    path = Path(__file__).resolve().parents[2] / "evals/adjustment_signoff/plan.yaml"
+    written = yaml.safe_load(path.read_text(encoding="utf-8"))["briefing"]
+
+    briefing = plan_from_yaml(path.read_text(encoding="utf-8")).briefing
+
+    assert briefing is not None
+    assert briefing.sources == written["sources"]
+    assert len(briefing.sources) == 6
+    assert briefing.watch_for == written["watch_for"]
+    assert briefing.purpose == written["purpose"]
+    assert briefing.background == written["background"]
 
 
 # ── the stage DAG ───────────────────────────────────────────────────────────
