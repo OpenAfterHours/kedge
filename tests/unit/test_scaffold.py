@@ -1358,15 +1358,131 @@ def test_a_checkpoints_own_file_does_not_summon_the_head_hand_in() -> None:
     """The head hand-in blocks the whole notebook, so it is emitted only where something reads it.
 
     A checkpoint reads no frame at all, and where it declares a hand-in it reads *that* one, under
-    its own name. Either way the answer is the one every other stage with a file of its own gets:
-    no. Emitting the head anyway would put six cells and a blocking `mo.stop` at the top of a
-    runbook for an input no step of the process names.
+    its own name. Neither is `handin_frame`, so a checkpoint's file never summons the head on its
+    own account -- and here nothing else does either, because `load_it` reads a file of its own.
     """
     names = {cell.name for cell in build_cells(runbook_plan())}
 
     assert "handin_source" not in names, "the head hand-in was emitted for nobody to read"
     assert "handin_frame" not in names
     assert {"verify_input", "load_it_input"} <= names
+
+
+def _checkpoint_only_plan(consumer: Stage) -> ProcessPlan:
+    """A checkpoint carrying the plan's only named hand-in, and one stage built on it.
+
+    The shape `_stranded_handin_warnings` tells a plan's author to take apart, scaffolded anyway,
+    because a warning is advice and the notebook still has to be built.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="verify",
+                    intent="Sign off the re-extract",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                ),
+                consumer,
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def test_a_stage_built_on_a_checkpoint_falls_through_and_the_head_is_emitted_for_it() -> None:
+    """Correcting a docstring that promised the opposite, rather than the behaviour.
+
+    `head_handin_reader` claimed a checkpoint's own hand-in "must therefore not put six cells and
+    a blocking `mo.stop` at the top of the notebook for a file no step of the process names", and
+    for a plan of checkpoint-plus-output it did exactly that: two file boxes for one declared
+    file, and the blocking one is the box nothing named.
+
+    It is not the walk's doing. `_upstream_name` never treats a checkpoint as a frame, so a stage
+    depending only on one falls through to `handin_frame` -- something genuinely does read the
+    head hand-in, and emitting it is right. What is wrong is the plan, and the approval card says
+    so in `_stranded_handin_warnings`; the docstring now says which of the two it is.
+    """
+    consumer = Stage(
+        id="report",
+        intent="The impact statement",
+        kind=StageKind.OUTPUT,
+        depends_on=["verify"],
+    )
+    cells = build_cells(_checkpoint_only_plan(consumer))
+    names = [cell.name for cell in cells]
+
+    assert "handin_frame" in names
+    assert "report = handin_frame.collect()" in named(cells, "report").code
+    assert [name for name in names if name.endswith("_input")] == ["verify_input"]
+
+
+def test_the_acceptance_is_keyed_to_the_file_the_arithmetic_actually_ran_on() -> None:
+    """PLAN 6.2 and CLAUDE.md non-negotiable 6: a wrong baseline is worse than a loud break.
+
+    A checkpoint's hand-in is an ancestor of anything downstream of the checkpoint, and
+    `_baseline_handin` walked ancestors without asking whether the frame was *read*. So the panel
+    cited `verify_handin.sha256` while `compare` was built on `handin_frame` -- the head hand-in,
+    reached by fall-through -- and `check_translation` decides by digest whether a later run may
+    re-compare itself against the workbook. Keyed to a file that takes no part in the computation,
+    that decision means nothing, which is what `_baseline_handin`'s own docstring forbids.
+
+    Before a checkpoint's hand-in scaffolded any cells this was a `NameError`: loud, and broken.
+    Quiet and wrong is the worse of the two.
+    """
+    consumer = Stage(
+        id="compare",
+        intent="Compare the re-extract against the prediction",
+        depends_on=["verify"],
+        operations=["calc_h2_h500"],
+    )
+    cells = build_cells(_checkpoint_only_plan(consumer))
+
+    computed = named(cells, "compare").code
+    cited = [
+        line.strip()
+        for line in named(cells, "reconciliation").code.splitlines()
+        if "handin_sha256" in line
+    ]
+
+    assert "compare = handin_frame" in computed
+    assert cited == ["handin_sha256=handin.sha256,"]
+
+
+def test_a_gated_checkpoint_with_a_file_of_its_own_reads_both_and_assigns_once() -> None:
+    """Two `_after_<name> = ...` lines assigning one name made the first a dead store.
+
+    Harmless to marimo, which took the edges either way, and not harmless in a cell a reviewer is
+    meant to read: the line that looks like it holds the frame holds the checkpoint above it.
+    """
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(id="approve", intent="Approve first", kind=StageKind.CHECKPOINT),
+                Stage(
+                    id="verify",
+                    intent="Sign off the re-extract",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    depends_on=["approve"],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    ui = named(build_cells(plan), "verify_ui").code
+    reads = [line for line in ui.splitlines() if line.startswith("_after_verify")]
+
+    assert reads == ["_after_verify = (verify_frame, approve)"]
 
 
 # ── what a stage cell tells the person who has to finish it ──────────────────

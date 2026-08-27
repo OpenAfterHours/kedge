@@ -1554,14 +1554,21 @@ def head_handin_reader(
     when nothing else matched -- so this names the stage that will consume the file, not
     necessarily one that asked for it.
 
-    A checkpoint is skipped, and it stays skipped now that a checkpoint may carry a hand-in of its
-    own. The rule this walk enforces is "does anything *read* ``handin_frame``", and a checkpoint
-    reads no frame at all: :func:`_checkpoint_cells` emits a decision record, and where the stage
-    declares a hand-in, :func:`_handin_cells` gives it ``<name>_frame`` under its own name. Either
-    way the answer is no, which is the same answer the non-checkpoint branch below gives a stage
-    with its own hand-in -- ``_upstream_name`` returns that stage's frame and never the head's. A
-    checkpoint's own hand-in must therefore not put six cells and a blocking ``mo.stop`` at the
-    top of the notebook for a file no step of the process names.
+    A checkpoint is skipped by the branch below, and it stays skipped now that a checkpoint may
+    carry a hand-in of its own: :func:`_checkpoint_cells` renders a decision, and where the stage
+    declares a hand-in of its own, :func:`_handin_cells` gives it ``<name>_frame`` under its own
+    name. Neither reads ``handin_frame``. Note that the branch *above* it does not skip: a stage
+    declaring the bare ``{origin: handin}`` is the head hand-in's reader whatever kind it is, and
+    a checkpoint may say so as legitimately as anything else.
+
+    **What this does not promise is that a checkpoint's own hand-in keeps the head cells out.**
+    ``_upstream_name`` never treats a checkpoint as a frame, so a stage whose only dependency is
+    one falls through to ``handin_frame`` -- and then something genuinely does read the head
+    hand-in, and it is emitted, correctly, beside the checkpoint's own file box. Two boxes for a
+    process that declared one file is the plan's shape showing through rather than this walk's
+    doing, and it is :func:`kedge.plan.review._stranded_handin_warnings` that says so on the
+    approval card: move the file onto the stage that computes on it, and the fall-through and the
+    second box both go with it.
     """
     resolved = names if names is not None else _name_map(plan)
     gates = (
@@ -1780,7 +1787,7 @@ def _checkpoint_cells(
             if reads_a_handin
             else []
         ),
-        *(f"_after_{name} = {gate}" for gate in gates),
+        *_after_lines(name, gates),
         "# Deliberately NOT automated. Forcing a judgement call into code either fabricates",
         "# logic that was never there or silently drops a control (PLAN 2.2). Recording the",
         "# decision and the reason here is better than the Excel original, where the same step",
@@ -1946,7 +1953,7 @@ def _handin_cells(
             if gates
             else []
         ),
-        *(f"_after_{name} = {gate}" for gate in gates),
+        *_after_lines(name, gates),
         # `!r` rather than interpolation into a quoted literal, exactly as `heading` and
         # `waiting` are handled three lines down. A hand-in ref is plan-supplied free text, and
         # `the "after" extract` -- an entirely ordinary thing to call one -- closed the literal
@@ -2067,6 +2074,21 @@ def _gate_tokens(stage: Stage, names: dict[str, str], gated: Mapping[str, str]) 
     re-extract taken before the update had been run.
     """
     return [gated[item] for item in stage.depends_on if item in gated]
+
+
+def _after_lines(name: str, gates: Sequence[str]) -> list[str]:
+    """The assignment that reads every token this cell waits for. One line, or none.
+
+    Reading the name is the whole job; the assignment exists only so that the reading happens.
+    One line per token, each assigning the *same* ``_after_<name>``, is what this was, and it
+    made every line but the last a dead store -- which marimo does not care about, because it
+    took the edges either way, and a reviewer does, because these cells are meant to be read.
+    """
+    if not gates:
+        return []
+    if len(gates) == 1:
+        return [f"_after_{name} = {gates[0]}"]
+    return [f"_after_{name} = ({', '.join(gates)})"]
 
 
 def _waiting(index: int, total: int, title: str, instruction: str) -> str:
@@ -2535,14 +2557,31 @@ def _baseline_handin(plan: ProcessPlan, names: dict[str, str], head: bool) -> st
     nearest, because a process with several inputs is reconciled against the position it starts
     from, and that is the extract the workbook itself was built on.
 
+    **A stage that generates no code is passed over even when it declares a hand-in**, and that
+    is the paragraph above enforced rather than restated. Being an ancestor of the arithmetic is
+    not the same as feeding it: :func:`_upstream_name` never resolves to a checkpoint or a
+    hand-off, so a stage depending on one is built on whatever *it* found -- usually
+    ``handin_frame`` -- while its own ``<name>_frame`` is read by its approval card and by
+    nothing that computes. Walking past that distinction cited ``<checkpoint>_handin.sha256``
+    over a comparison that ran on the head hand-in, which is exactly the file-that-takes-no-part
+    this function exists to refuse. It was a ``NameError`` before a checkpoint's hand-in
+    scaffolded any cells; quiet and wrong is the worse of the two (CLAUDE.md non-negotiable 6).
+
+    The fall-through is then consistent by construction rather than by coincidence: whatever
+    made the computation reach ``handin_frame`` is what made :func:`head_handin_is_read` true,
+    so ``head`` is set exactly when ``handin`` is the record to cite.
+
     Args:
         plan: The plan being scaffolded.
         names: Stage id to cell name.
         head: Whether the notebook's own hand-in cells were emitted.
 
     Returns:
-        The name of the ``HandIn`` record to take the digest from, or ``None`` when this plan
-        reads no hand-in at all.
+        The name of the ``HandIn`` record to take the digest from, or ``None`` when nothing the
+        map reports on was computed from a hand-in at all.
+        :func:`kedge.reconcile.check_translation` takes ``None`` as "this run's data cannot be
+        identified" and declines to re-compare, which is the safe direction: it cites the
+        recorded acceptance rather than passing a comparison it has no business making.
     """
     contributing = {
         stage.id
@@ -2559,6 +2598,8 @@ def _baseline_handin(plan: ProcessPlan, names: dict[str, str], head: bool) -> st
         ancestors.add(stage_id)
         frontier.extend(by_id[stage_id].depends_on)
     for stage in plan.ordered_stages():
+        if stage.generates_no_code:
+            continue
         if (not contributing or stage.id in ancestors) and _named_handin(stage) is not None:
             return f"{names[stage.id]}_handin"
     return "handin" if head else None
