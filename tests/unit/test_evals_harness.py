@@ -744,6 +744,142 @@ def test_the_reference_plan_resolves_to_the_names_this_case_hardcodes() -> None:
     assert set(bound) == set(adjustment_case.script_for(pre, post))
 
 
+def _scaffolded(plan: Any, path: Path) -> Path:
+    """This plan's notebook, holes and all, written where ``bind_by_role`` can read it."""
+    from harness.cellgen import ConversionResult
+    from harness.render import write_notebook
+
+    from kedge.notebook.scaffold import build_cells
+
+    cells = build_cells(plan, allow_unapproved=True)
+    return write_notebook(
+        ConversionResult(
+            names=tuple(cell.name for cell in cells),
+            codes=tuple(cell.code for cell in cells),
+            cells=(),
+            plan=plan,
+        ),
+        path,
+    )
+
+
+def test_the_first_stage_hand_in_takes_the_first_grid_beside_the_head_one(tmp_path: Path) -> None:
+    """The defect that had a whole conversion computing off the wrong extract.
+
+    A plan can declare a hand-in on its load stage *and* still have something reading the
+    notebook's fixed head one, and then there are two selectors above the arithmetic with one
+    process input between them. Numbering them 0 and 1 gave the head the pre-adjustment grid and
+    the pre-adjustment stage the **post**-adjustment one, and left the re-extract with nothing.
+
+    It was close to invisible from the report. Entity names and row counts passed -- both grids
+    have the same 120 rows and the same names -- while ``Adjustment!D/E/F`` and ``D94:F94``
+    reconciled as ``failed``, which reads as arithmetic that is out rather than as an input that
+    is the wrong one. ``null_is_not_zero`` and ``cancelled_rows_excluded`` were passing by luck.
+
+    Graded on the real artifact: the plan a model proposed through the hub, committed verbatim as
+    ``observed_conversion.py``. The head is emitted there for the reason it is emitted anywhere,
+    which is that a stage of that plan reads the notebook's own frame -- not because a test
+    author arranged it.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+    from observed_conversion import observed_plan
+
+    from kedge.notebook.scaffold import head_handin_is_read
+
+    plan = observed_plan()
+    assert head_handin_is_read(plan), "this plan no longer exercises the head hand-in at all"
+
+    handins = [slot for slot in slots_for(plan) if slot.role is Role.HANDIN]
+    assert [(slot.stage_id, slot.ordinal) for slot in handins] == [
+        ("", 0),
+        ("load_pre_adjustment", 0),
+        ("verify_post_adjustment", 1),
+    ], "the head hand-in consumed an ordinal that belongs to a stage"
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    bound, unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "scaffolded.py"),
+        adjustment_case.role_script(pre, post),
+    )
+
+    assert not unresolved, unresolved
+    # The head is fed from the process's own first input rather than competing with it, which is
+    # what `harness.align._head_feed` already does on the name-driven path.
+    assert bound["handin_pick"] == (pre,)
+    assert bound["load_pre_adjustment_pick"] == (pre,)
+    assert bound["verify_post_adjustment_pick"] == (post,)
+
+
+def test_the_head_hand_in_still_takes_the_first_grid_when_it_is_the_only_one(
+    tmp_path: Path,
+) -> None:
+    """The other half of the same rule, and the shape almost every plan before hand-offs had.
+
+    A plan whose stages declare no hand-in of their own falls through to the head entirely. Fixing
+    the ordinal by simply refusing to drive a stage-less slot would have stopped that notebook in
+    its third cell -- with no defect anywhere in the conversion -- so the head keeps ordinal 0 and
+    only declines to *consume* it.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+    from observed_conversion import observed_plan
+
+    from kedge.notebook.scaffold import head_handin_is_read
+
+    original = observed_plan()
+    declared = {
+        stage.id
+        for stage in original.stages
+        if any(source.origin.value == "handin" and source.ref for source in stage.sources)
+    }
+    plan = restaged(original, {stage_id: {"sources": []} for stage_id in declared})
+    assert head_handin_is_read(plan), "the mutation left a stage hand-in in place"
+
+    handins = [slot for slot in slots_for(plan) if slot.role is Role.HANDIN]
+    assert [(slot.stage_id, slot.ordinal) for slot in handins] == [("", 0)]
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    bound, _unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "head_only.py"),
+        adjustment_case.role_script(pre, post),
+    )
+
+    assert bound["handin_pick"] == (pre,)
+
+
+def test_a_pasted_grid_reaches_the_first_hand_in_of_whatever_plan_it_is(tmp_path: Path) -> None:
+    """``a_paste_out_of_excel_works`` has to be posable against a notebook it did not name.
+
+    The paste box was not classified at all, so the one grader that drives a paste could only
+    ever be posed by spelling ``pre_adjustment_paste`` -- the reference conversion's name for it.
+    Against anything else the paste went nowhere and the grader reported the conversion could not
+    take a grid out of Excel, which was a statement about the harness.
+    """
+    from harness.roles import Role, bind_by_role
+    from observed_conversion import observed_plan
+
+    plan = observed_plan()
+    post = Path("post.csv")
+    bound, unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "scaffolded.py"),
+        {
+            **adjustment_case.role_script(post, post),
+            Role.HANDIN: ((), (post,)),
+            Role.PASTE: ("trade\tentity\n",),
+        },
+    )
+
+    assert not unresolved, unresolved
+    assert bound["load_pre_adjustment_paste"] == "trade\tentity\n"
+    assert bound["handin_paste"] == "trade\tentity\n"
+    # The grid arrives by paste and by nothing else, and only at the step that takes it.
+    assert bound["load_pre_adjustment_pick"] == ()
+    assert "verify_post_adjustment_paste" not in bound
+    assert bound["verify_post_adjustment_pick"] == (post,)
+
+
 def test_the_reference_plan_aliases_to_itself() -> None:
     """The rubric's vocabulary *is* the reference plan's stage ids, so the map is the identity.
 

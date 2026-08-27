@@ -149,34 +149,16 @@ APPROVAL_NOTE = "Uplift agreed at the June finance committee; scope checked agai
 RAN_NOTE = "76 rows affected, ticket FC-2291."
 
 
-def script_for(pre: Path, post: Path) -> dict[str, Any]:
-    """The human's part, played the same way every run, keyed by the reference's widget names.
-
-    Kept because ``evals/run.py`` with no ``--plan`` has no plan to resolve roles through, and
-    grading the committed reference conversion is the run that proves the graders work. Where
-    there *is* a plan, :func:`role_script` is what drives, and
-    :func:`test_the_reference_plan_resolves_to_the_names_this_script_hardcodes` asserts the two
-    agree on the reference -- so this dict cannot quietly drift away from the roles it stands for.
-    """
-    return {
-        "period_end": PERIOD,
-        "ledger": LEDGER,
-        "pre_adjustment_pick": (pre,),
-        "approve_adjustment_decision": "approve",
-        "approve_adjustment_note": APPROVAL_NOTE,
-        "update_statement_ran": True,
-        "update_statement_ran_note": RAN_NOTE,
-        "post_adjustment_pick": (post,),
-    }
-
-
 def role_script(pre: Path, post: Path) -> dict[Any, Any]:
-    """The same human part, said in terms of what each step *is*.
+    """The human's part, said in terms of what each step *is*.
 
     A stage id is the model's free choice, so every widget name in a converted notebook is too.
     This is what a runbook's steps are regardless of what the plan called them: two inputs in
     order, approve every checkpoint with a reason, confirm every statement that was run, and the
     extract's own parameters by their names in the workbook.
+
+    This is the script. :func:`script_for` is this one spelled out against the reference
+    conversion's own widgets, for the run that has no plan to resolve roles through.
     """
     from harness.roles import Role
 
@@ -189,6 +171,61 @@ def role_script(pre: Path, post: Path) -> dict[Any, Any]:
         "period_end": PERIOD,
         "ledger": LEDGER,
     }
+
+
+def _reference_widgets() -> dict[Any, tuple[str, ...]]:
+    """What the reference conversion calls each role, in order for the ordered ones.
+
+    The one place this case says a widget name out loud. It is allowed to, because the reference
+    conversion is committed beside it and is not going to be renamed by a model -- and
+    :func:`literal` needs a spelling for the run where there is no plan to derive one from.
+    """
+    from harness.roles import Role
+
+    return {
+        Role.HANDIN: ("pre_adjustment_pick", "post_adjustment_pick"),
+        Role.PASTE: ("pre_adjustment_paste", "post_adjustment_paste"),
+        Role.CHECKPOINT_DECISION: ("approve_adjustment_decision",),
+        Role.CHECKPOINT_NOTE: ("approve_adjustment_note",),
+        Role.HANDOFF_RAN: ("update_statement_ran",),
+        Role.HANDOFF_RAN_NOTE: ("update_statement_ran_note",),
+        Role.RUN_MODE: ("kedge_run_mode",),
+    }
+
+
+def literal(script: Mapping[Any, Any]) -> dict[str, Any]:
+    """A role-keyed script, spelled against the reference conversion's own widget names.
+
+    The fallback for the one run that cannot resolve roles: ``evals/run.py`` with no ``--plan``,
+    which grades the committed reference conversion and is the run that proves the graders work.
+
+    A key that is already a plain string is a parameter, and the reference calls its parameters
+    what the workbook calls them -- ``period_end``, ``ledger`` -- so it passes straight through.
+    """
+    names = _reference_widgets()
+    inputs: dict[str, Any] = {}
+    for key, value in script.items():
+        widgets = names.get(key)
+        if widgets is None:
+            inputs[str(key)] = value
+        elif len(widgets) > 1:
+            inputs.update(zip(widgets, value, strict=False))
+        else:
+            inputs[widgets[0]] = value
+    return inputs
+
+
+def script_for(pre: Path, post: Path) -> dict[str, Any]:
+    """:func:`role_script`, keyed by the reference conversion's own widget names.
+
+    Kept because ``evals/run.py`` with no ``--plan`` has no plan to resolve roles through, and
+    grading the committed reference conversion is the run that proves the graders work. It is
+    *derived* rather than written out a second time: the two used to be separate literals, and
+    :func:`test_the_reference_plan_resolves_to_the_names_this_case_hardcodes` was the only thing
+    stopping them drifting apart. That test now asserts something better -- that resolving the
+    roles through the plan reaches the same widgets this table names.
+    """
+    return literal(role_script(pre, post))
 
 
 # =============================================================================
@@ -209,7 +246,11 @@ class Context:
 
     @property
     def defs(self) -> dict[str, Any]:
-        """What the run defined, with this plan's stage names answering to the rubric's.
+        """What the main run defined, with this plan's stage names answering to the rubric's."""
+        return self.defs_of(self.run)
+
+    def defs_of(self, run: NotebookRun) -> dict[str, Any]:
+        """The same, for a run a grader drove itself.
 
         The graders ask for ``adjust``, ``verification``, ``signoff`` -- the reference plan's
         stage ids, because that is the vocabulary the rubric is written in. A conversion built
@@ -220,8 +261,14 @@ class Context:
         :func:`~harness.roles.frame_aliases` decides the mapping by playing the same role lookup
         over both plans, and it is the identity on the reference. Names it cannot place are left
         alone and simply come back absent, which is the true answer.
+
+        Takes the run rather than reading :attr:`run`, because half the deterministic tier drives
+        the notebook *again* -- a paste instead of a file, a later period, a second pass with no
+        inputs at all -- and every one of those read the fresh run's definitions raw. The alias
+        map applies to a re-drive exactly as it does to the first one; reading past it there
+        meant those graders were the only ones still keyed to the reference's vocabulary.
         """
-        definitions = self.run.definitions
+        definitions = run.definitions
         aliases = self._aliases
         if not aliases:
             return definitions
@@ -257,6 +304,29 @@ class Context:
         from harness.roles import rename
 
         return rename(name, self._aliases)
+
+    def bind(self, script: Mapping[Any, Any]) -> dict[str, Any]:
+        """A role-keyed script of human actions, said in this notebook's own widget names.
+
+        The two routes :func:`harness.grade._drive_script` takes for the main run, for the same
+        reason: with a plan, roles resolve through it; without one, the reference conversion's
+        own names are the only spelling there is.
+
+        Every grader that re-drives the notebook goes through here. Six of them used to hand
+        :func:`_drive` a ``script_for`` dict straight -- thirteen points of the deterministic
+        tier measured through a script of names the notebook under test does not have, so on any
+        conversion but the reference they failed for a harness reason wearing a conversion's
+        clothes.
+        """
+        if self.plan is None:
+            return literal(script)
+
+        from harness.roles import bind_by_role
+
+        inputs, unresolved = bind_by_role(self.plan, self.notebook, script)
+        if unresolved:
+            logger.warning("re-drive could not place: %s", "; ".join(unresolved))
+        return inputs
 
     def need(self, *names: str) -> ItemResult | None:
         """A skip or a block naming what is missing, or ``None`` when everything is there.
@@ -643,13 +713,17 @@ is no way to detect that afterwards, which is what makes it worth a grader of it
 """
 
 
-def _drive(ctx: Context, inputs: dict[str, Any], root: Path) -> Any:
-    """Drive the notebook again, in a workspace of this grader's own."""
+def _drive(ctx: Context, script: Mapping[Any, Any], root: Path) -> Any:
+    """Drive the notebook again, in a workspace of this grader's own.
+
+    ``script`` is keyed by role, exactly as the main run's is, and :meth:`Context.bind` resolves
+    it against the notebook in front of it.
+    """
     from harness.drive import run_notebook, workspace_overrides
 
     return run_notebook(
         ctx.notebook,
-        inputs=inputs,
+        inputs=ctx.bind(script),
         overrides=workspace_overrides(root, WORKBOOK),
     )
 
@@ -797,10 +871,10 @@ def the_period_is_an_input(ctx: Context) -> ItemResult:
     with tempfile.TemporaryDirectory(prefix="kedge-eval-period-") as workspace:
         root = Path(workspace)
         pre, post = write_handins(root / "handins-in")
-        script = {**script_for(pre, post), "period_end": chosen}
+        script = {**role_script(pre, post), "period_end": chosen}
         run = _drive(ctx, script, root)
 
-    statement = str(run.definitions.get("extract_query", ""))
+    statement = str(ctx.defs_of(run).get("extract_query", ""))
     if not statement:
         return _blocked("the notebook defines no extract_query under a changed period")
     if chosen.isoformat() not in statement:
@@ -827,15 +901,23 @@ def a_paste_out_of_excel_works(ctx: Context) -> ItemResult:
 
     Graded through the paste box rather than a file, because a file written by a query tool is
     the case that already worked.
+
+    The first hand-in arrives as a paste and nothing else: :attr:`~harness.roles.Role.PASTE` is
+    ordered alongside :attr:`~harness.roles.Role.HANDIN`, so the grid reaches whichever stage the
+    plan takes its first input on and the file that would otherwise have arrived there is
+    withheld. Said in the reference's own widget names this could only ever be posed against the
+    reference.
     """
+    from harness.roles import Role
+
     grid = excel_style_paste("Pre-Adjustment")
     with tempfile.TemporaryDirectory(prefix="kedge-eval-paste-") as workspace:
         root = Path(workspace)
         _pre, post = write_handins(root / "handins-in")
         script = {
-            **script_for(post, post),
-            "pre_adjustment_pick": (),
-            "pre_adjustment_paste": grid,
+            **role_script(post, post),
+            Role.HANDIN: ((), (post,)),
+            Role.PASTE: (grid,),
         }
         run = _drive(ctx, script, root)
 
@@ -848,7 +930,7 @@ def a_paste_out_of_excel_works(ctx: Context) -> ItemResult:
             f"{detail}\nRead the hand-in through kedge.ingest.read_data, which types text "
             f"columns and reports that it did."
         )
-    totals = run.definitions.get("adjust_totals")
+    totals = ctx.defs_of(run).get("adjust_totals")
     if totals is None:
         return _fail("the paste was accepted but nothing was computed from it")
     uplift = float(totals["uplift"][0])
@@ -874,7 +956,7 @@ def the_run_resumes_after_the_kernel_dies(ctx: Context) -> ItemResult:
     with tempfile.TemporaryDirectory(prefix="kedge-eval-resume-") as workspace:
         root = Path(workspace)
         pre, post = write_handins(root / "handins-in")
-        first = _drive(ctx, script_for(pre, post), root)
+        first = _drive(ctx, role_script(pre, post), root)
         if not first.completed:
             return _blocked(
                 f"the first pass did not complete, so resuming cannot be graded: {first.summary_line()}"
@@ -888,7 +970,7 @@ def the_run_resumes_after_the_kernel_dies(ctx: Context) -> ItemResult:
             f"The hand-ins are in the managed store and the decisions are in the run file; "
             f"read them rather than asking again."
         )
-    totals = second.definitions.get("adjust_totals")
+    totals = ctx.defs_of(second).get("adjust_totals")
     if totals is None or not _close(float(totals["uplift"][0]), float(ctx.facts["uplift_total"])):
         return _fail("the resumed run reached the end but not with the same numbers")
     return _pass("resumed with no inputs re-supplied, same totals")
@@ -900,25 +982,27 @@ def starting_fresh_keeps_the_old_run(ctx: Context) -> ItemResult:
     A run record is evidence. A tool where "start again" quietly deletes it is one nobody should
     put a control through.
     """
+    from harness.roles import Role
+
     import kedge.runs
 
     with tempfile.TemporaryDirectory(prefix="kedge-eval-fresh-") as workspace:
         root = Path(workspace)
         pre, post = write_handins(root / "handins-in")
-        first = _drive(ctx, script_for(pre, post), root)
+        first = _drive(ctx, role_script(pre, post), root)
         if not first.completed:
             return _blocked("the first pass did not complete, so starting fresh cannot be graded")
-        original = str(first.definitions.get("KEDGE_RUN_ID", ""))
+        original = str(ctx.defs_of(first).get("KEDGE_RUN_ID", ""))
 
         second = _drive(
             ctx,
-            {**script_for(pre, post), "kedge_run_mode": "start a new run"},
+            {**role_script(pre, post), Role.RUN_MODE: "start a new run"},
             root,
         )
         store = kedge.runs.RunStore(root / "runs")
         ids = store.run_ids()
 
-    restarted = str(second.definitions.get("KEDGE_RUN_ID", ""))
+    restarted = str(ctx.defs_of(second).get("KEDGE_RUN_ID", ""))
     if restarted == original:
         return _fail(
             "choosing 'start a new run' carried on with the same run. Starting fresh has to "
@@ -949,21 +1033,21 @@ def reconciliation_does_not_rot_on_a_later_period(ctx: Context) -> ItemResult:
     with tempfile.TemporaryDirectory(prefix="kedge-eval-rot-") as workspace:
         root = Path(workspace)
         pre, post = write_handins(root / "handins-in")
-        first = _drive(ctx, script_for(pre, post), root)
+        first = _drive(ctx, role_script(pre, post), root)
         if not first.completed:
             return _blocked(f"the conversion run did not complete: {first.summary_line()}")
-        accepted = first.definitions.get("reconciliation")
+        accepted = ctx.defs_of(first).get("reconciliation")
         if accepted is None or not getattr(accepted, "translation_accepted", False):
             return _fail(
                 "the first run did not accept the translation, so there is nothing for a later "
                 "run to cite. That first run *is* the acceptance test."
             )
         # Next quarter: same process, different data.
-        later = _drive(ctx, {**script_for(post, post), "period_end": dt.date(2026, 9, 30)}, root)
+        later = _drive(ctx, {**role_script(post, post), "period_end": dt.date(2026, 9, 30)}, root)
 
     if not later.completed:
         return _fail(f"the later run did not complete: {later.summary_line()}")
-    check = later.definitions.get("reconciliation")
+    check = ctx.defs_of(later).get("reconciliation")
     if check is None:
         return _fail("the later run produced no translation check at all")
 

@@ -29,7 +29,8 @@ Two escape hatches, both narrow and both reported:
 - **The head hand-in.** A plan whose load stage declares no hand-in of its own falls through to
   the notebook's fixed head one, so the first hand-in role resolves to ``handin_pick``. That is
   a real notebook a real user drives; refusing to drive it would report a defect that is already
-  reported by ``takes_two_handins``.
+  reported by ``takes_two_handins``. It belongs to the notebook rather than to any stage, so it
+  takes the process's first input **without consuming it** -- see :func:`slots_for`.
 - **The bare parameter.** The committed reference conversion is hand-written and says
   ``period_end`` where a scaffolded one says ``extract_query_period_end``. Leading stems are
   stripped one at a time until something matches, which is :class:`~harness.align.Widgets`'
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ORDERED_ROLES",
     "Role",
     "Slot",
     "bind_by_role",
@@ -80,6 +82,17 @@ class Role(StrEnum):
     HANDIN = "handin"
     """A hand-in selector. Ordered: the first is the process's first input, and so on."""
 
+    PASTE = "paste"
+    """The same hand-in's paste box, ordered alongside :attr:`HANDIN`.
+
+    Every hand-in cell offers three ways in -- drop, select, paste -- and a grid out of Excel's
+    clipboard only exercises the third. Without a role for it, ``a_paste_out_of_excel_works``
+    could not be posed at all through this layer, and it is the grader for the failure mode that
+    reached a user: Excel copies what a cell *looks like*, so a formatted column arrives as text.
+
+    The drop zone has no role because nothing drives one. A role nothing plays is a name that
+    rots; add it with the grader that needs it."""
+
     CHECKPOINT_DECISION = "checkpoint_decision"
     CHECKPOINT_NOTE = "checkpoint_note"
     HANDOFF_RAN = "handoff_ran"
@@ -90,6 +103,23 @@ class Role(StrEnum):
     """An input to a hand-off's statement, keyed by the parameter's own name rather than by
     position -- a parameter is named after a column or a period in the workbook, which is far
     more stable across plans than a stage id."""
+
+    RUN_MODE = "run_mode"
+    """Carry on with the run on disk, or start a new one.
+
+    The one widget whose name is not the model's choice: it sits on the fixed head, belongs to
+    no stage, and every conversion spells it ``kedge_run_mode``. It is a role anyway so that a
+    grader can ask for it in the same vocabulary as everything else, rather than reaching past
+    this layer with a literal name -- which is how six graders came to drive a notebook through
+    a script of names it did not have."""
+
+
+ORDERED_ROLES = (Role.HANDIN, Role.PASTE)
+"""The roles whose scripted value is a *sequence*, applied to that role's slots in order.
+
+Every other role's single value is applied to every slot of it, because a runbook's checkpoints
+all have to be approved for the run to reach the end. These two are positional because the
+process's inputs are: the first grid is not the second."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +146,20 @@ def slots_for(plan: Any) -> tuple[Slot, ...]:
     Read off :func:`~kedge.notebook.scaffold.build_cells`, tagged by the ``role`` the scaffolder
     already puts on each cell. A plan the scaffolder refuses yields nothing and says so: that
     plan has a finding of its own and it is not this function's to report.
+
+    **The fixed head hand-in takes an ordinal without consuming one.** It belongs to the notebook
+    rather than to a stage (:func:`~kedge.notebook.scaffold.head_handin_is_read`), so on a plan
+    whose first load stage declares a hand-in of its own there are two selectors above the
+    arithmetic and only one process input between them. Numbering them 0 and 1 handed the
+    *second* grid to the first stage, and a whole conversion was then computed off the
+    re-extract: the money regions reconciled as ``failed`` while the entity names and the row
+    counts passed, which is the signature of the wrong grid rather than of bad arithmetic.
+
+    So a stage-less hand-in slot is pinned to ordinal 0 and the counter does not move. The head
+    is fed the same value as the first stage-declared hand-in, which is exactly what
+    :func:`harness.align._head_feed` already does on the name-driven path -- and where the head
+    is the *only* hand-in, ordinal 0 is still the process's first input, so that plan drives
+    unchanged.
     """
     from kedge.notebook.scaffold import build_cells
 
@@ -126,16 +170,17 @@ def slots_for(plan: Any) -> tuple[Slot, ...]:
         return ()
 
     slots: list[Slot] = []
-    handins = 0
+    seen: dict[Role, int] = {}
     for cell in cells:
         stage_id = cell.stage_id or ""
         for name, kind in _WIDGET.findall(cell.code):
             role, parameter = _classify(cell.role, name, kind)
             if role is None:
                 continue
-            ordinal = handins if role is Role.HANDIN else 0
-            if role is Role.HANDIN:
-                handins += 1
+            ordinal = 0
+            if role in ORDERED_ROLES and stage_id:
+                ordinal = seen.get(role, 0)
+                seen[role] = ordinal + 1
             slots.append(
                 Slot(
                     role=role,
@@ -156,9 +201,15 @@ def _classify(cell_role: str, name: str, kind: str) -> tuple[Role | None, str]:
     first as the second would approve a step by writing a note into it.
     """
     if name == "kedge_run_mode":
-        return None, ""
+        return Role.RUN_MODE, ""
     if cell_role == "handin":
-        return (Role.HANDIN, "") if kind == "file_browser" else (None, "")
+        # Three ways a grid arrives, and only two have a role. The tab strip holds the other
+        # widgets rather than a value, and nothing drives the drop zone.
+        if kind == "file_browser":
+            return Role.HANDIN, ""
+        if kind == "text_area" and name.endswith("_paste"):
+            return Role.PASTE, ""
+        return None, ""
     if cell_role == "checkpoint":
         if kind == "dropdown" and name.endswith("_decision"):
             return Role.CHECKPOINT_DECISION, ""
@@ -187,10 +238,10 @@ def bind_by_role(
         plan: The plan the notebook was scaffolded from. Roles are read from it.
         notebook: The notebook to drive.
         values: What the human does, keyed by :class:`Role` -- or by a parameter's name, as a
-            plain string, for :attr:`Role.PARAMETER`. A :attr:`Role.HANDIN` entry is a sequence
-            applied to the hand-in slots in order; every other role's value is applied to every
-            slot of that role, because a runbook's checkpoints all have to be approved for the
-            run to reach the end.
+            plain string, for :attr:`Role.PARAMETER`. An :data:`ORDERED_ROLES` entry is a
+            sequence applied to that role's slots in order; every other role's value is applied
+            to every slot of that role, because a runbook's checkpoints all have to be approved
+            for the run to reach the end.
 
     Returns:
         ``(inputs keyed by this notebook's widget names, descriptions of what could not be
@@ -202,14 +253,15 @@ def bind_by_role(
 
     inputs: dict[str, Any] = {}
     unresolved: list[str] = []
-    files = list(values.get(Role.HANDIN, ()) or ())
-    head_taken = False
+    ordered = {role: list(values.get(role, ()) or ()) for role in ORDERED_ROLES}
+    head_taken: frozenset[Role] = frozenset()
 
     for slot in slots:
-        if slot.role is Role.HANDIN:
-            if slot.ordinal >= len(files):
+        if slot.role in ORDERED_ROLES:
+            supplied = ordered[slot.role]
+            if slot.ordinal >= len(supplied):
                 continue
-            value: Any = files[slot.ordinal]
+            value: Any = supplied[slot.ordinal]
         elif slot.role is Role.PARAMETER:
             key = _parameter_key(slot, values)
             if key is None:
@@ -224,10 +276,16 @@ def bind_by_role(
         if name is None:
             unresolved.append(slot.describe())
             continue
-        if name in inputs:
+        if name in inputs and inputs[name] != value:
             # Two slots on one widget drives one step with another step's value. Both are
             # reported instead, which is `Alignment.bind`'s rule and it is right for the same
             # reason: a loud wrong answer beats a quiet one.
+            #
+            # Two slots on one widget with the *same* value is not that. It is what the head
+            # hand-in is: a notebook whose plan declares a first hand-in it does not define
+            # falls back onto `handin_pick`, which the head slot has already been given the
+            # same grid. Reporting it would cost `ran_to_completion` two points for a drive
+            # that went exactly where it was meant to.
             unresolved.append(f"{slot.describe()} -- collides with a slot already bound there")
             continue
         inputs[name] = value
@@ -248,18 +306,28 @@ def _parameter_key(slot: Slot, values: Mapping[Any, Any]) -> str | None:
     return None
 
 
-def _resolve(slot: Slot, defined: frozenset[str], *, head_taken: bool) -> tuple[str | None, bool]:
-    """This slot's widget in the notebook under test, and whether the head hand-in is now used."""
+_HEAD_WIDGETS = {Role.HANDIN: "handin_pick", Role.PASTE: "handin_paste"}
+"""The fixed head's own name for each ordered role, for the fallback in :func:`_resolve`.
+
+Written out rather than derived: the head belongs to the notebook, so these are constants of
+:mod:`kedge.notebook.scaffold` and not something a stem rule should be guessing at."""
+
+
+def _resolve(
+    slot: Slot, defined: frozenset[str], *, head_taken: frozenset[Role]
+) -> tuple[str | None, frozenset[Role]]:
+    """This slot's widget in the notebook under test, and which head widgets are now used."""
     if slot.name in defined:
         return slot.name, head_taken
     for candidate in _stems_stripped(slot.name):
         if candidate in defined:
             return candidate, head_taken
-    if slot.role is Role.HANDIN and not head_taken and "handin_pick" in defined:
+    head = _HEAD_WIDGETS.get(slot.role)
+    if head is not None and slot.role not in head_taken and head in defined:
         # The plan's load stage declared no hand-in of its own, so the scaffolder wired it to the
         # notebook's fixed head one. Only the first such stage gets it: there is exactly one head
         # hand-in, and a second input genuinely has nowhere to arrive.
-        return "handin_pick", True
+        return head, head_taken | {slot.role}
     return None, head_taken
 
 

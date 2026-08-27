@@ -61,7 +61,7 @@ artifacts already on disk.
 for index, stage in enumerate(ordered, start=1):
     if stage.is_checkpoint:
         cells.extend(_checkpoint_cells(...))
-        continue                     # <- never reaches _named_handin
+        continue  # <- never reaches _named_handin
     label = _named_handin(stage)
     if label is not None:
         cells.extend(_handin_cells(...))
