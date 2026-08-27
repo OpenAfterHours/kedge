@@ -25,3 +25,9 @@ evals/*/handins/
 evals/*/runs/
 evals/*/*.kedge/
 evals/*/reconciliation.json
+
+# What a live --convert run writes beside the case: a model's conversion and the plan it
+# was scaffolded from. Evidence of one run on one day, regenerable by paying for another, and
+# not source -- linting a generated notebook reports the model's style as this repo's.
+evals/*/converted-*.py
+evals/*/plan-from-*.yaml
