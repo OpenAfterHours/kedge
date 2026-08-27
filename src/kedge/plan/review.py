@@ -42,14 +42,13 @@ from kedge.plan.model import (
     ProcessPlan,
     SourceOrigin,
     Stage,
-    StageKind,
     StageSource,
 )
 from kedge.plan.triage import complexity
 from kedge.sql import changes_data, reads_as_sql
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from kedge.analysis.model import LogicalOperation, ProcessNote, WorkbookAnalysis
     from kedge.plan.triage import TriageResult
@@ -695,9 +694,9 @@ def reject(
 # =============================================================================
 #
 # The checks below the ordinary ones are about what :mod:`kedge.notebook.scaffold` will *do* with
-# the plan, and three of those need a predicate the scaffolder owns: which stage kinds it emits
-# hand-in cells for, when a stage's upstream frame resolves to the notebook's head hand-in, and
-# which stages define a token a later cell can be held behind.
+# the plan, and three of those need a predicate the scaffolder owns: which hand-in a stage reads
+# as its own, when a stage's upstream frame resolves to the notebook's head hand-in, and which
+# stages define a token a later cell can be held behind.
 #
 # **They are reimplemented here rather than imported, deliberately.** CLAUDE.md's layering is
 # ``analysis/ -> plan/ -> notebook/ -> agent/ -> server/``; the scaffolder imports this package,
@@ -722,20 +721,6 @@ def reject(
 # the card permanently amber and the whole list stops being read -- the argument CLAUDE.md makes
 # about ``NOT RECONCILED``. Each is therefore run over the analyser's own output for every
 # workbook in ``tests/fixtures`` with a plausible correct plan, and has to stay quiet.
-
-_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: frozenset[StageKind] = frozenset()
-"""Stage kinds whose own ``handin`` source produces no cells. Empty, and that emptiness is a claim.
-
-It held ``CHECKPOINT`` while ``scaffold.build_cells`` took an ``if stage.is_checkpoint: ...
-continue`` before it reached ``_handin_cells``, so a re-extract declared on the checkpoint that
-gates it had nowhere to arrive. The scaffolder now asks for a stage's own hand-in ahead of every
-kind branch, so no kind is ignored.
-
-Kept rather than deleted, because the tripwire test measures this against the scaffolder for every
-member of :class:`StageKind` and an empty set is the strongest form that assertion takes: if a
-kind ever stops getting hand-in cells again, the test names it here rather than a user meeting it
-as a runbook that stops halfway.
-"""
 
 _IN_THE_WORKBOOK: frozenset[str] = frozenset({"sheet", "cell_comment"})
 """The two :attr:`~kedge.analysis.model.ProcessNote.source` values that mean *this file*.
@@ -940,6 +925,55 @@ def _gates_a_stage_waits_for(plan: ProcessPlan, producers: set[str]) -> dict[str
     return reached
 
 
+def _transitive_dependents(
+    plan: ProcessPlan, upstream: Mapping[str, set[str]]
+) -> dict[str, set[str]]:
+    """Stage id to every stage that runs after it: :func:`_transitive_depends_on` read backwards.
+
+    Only ids the plan actually declares appear as keys, so a stage naming a dependency that does
+    not exist contributes nothing here -- the same tolerance the forward walk shows.
+    """
+    dependents: dict[str, set[str]] = {stage.id: set() for stage in plan.stages}
+    for stage in plan.stages:
+        for ancestor in upstream[stage.id]:
+            if ancestor in dependents:
+                dependents[ancestor].add(stage.id)
+    return dependents
+
+
+def _shares_a_branch_with(
+    stage_id: str,
+    writer_id: str,
+    upstream: Mapping[str, set[str]],
+    dependents: Mapping[str, set[str]],
+) -> bool:
+    """Whether the plan relates this stage to that hand-off at all.
+
+    The question :func:`_ungated_handin_warnings` could not answer without it, and the one that
+    separates a re-extract from a file that has nothing to do with the statement. A re-extract is
+    evidence **about** a statement, so a plan that means one says so somewhere: either the stage
+    itself is built on something the hand-off is built on -- the reference plan's ``adjust``,
+    which is both the arithmetic the ``UPDATE`` is rendered from and the prediction the re-extract
+    is checked against -- or something downstream joins the two, which is what a comparison stage
+    is. Either way the branches converge.
+
+    Where they never converge the plan is describing two unrelated things, and the older rule --
+    "no edge to the hand-off, therefore gate it on the hand-off" -- told it to invent one: a
+    reference mapping file was told to wait for an ``UPDATE`` it is not evidence for, a runbook's
+    *first* extract was told to hide behind an unrelated closing statement, and two independently
+    correct update/re-extract pairs in one workbook were told to cross-wire, which
+    :class:`~kedge.plan.model.PlanDraft` then refused as a cycle.
+
+    Args:
+        stage_id: The stage that takes a hand-in of its own.
+        writer_id: The hand-off whose statement changes data.
+        upstream: :func:`_transitive_depends_on` for this plan.
+        dependents: :func:`_transitive_dependents` for this plan.
+    """
+    branch = upstream[writer_id] | {writer_id}
+    return any(upstream[joining] & branch for joining in (stage_id, *dependents[stage_id]))
+
+
 def _cite(note: ProcessNote) -> str:
     """One note, located: ``Sign-off!A3:A4 (Purpose)``, ``Calc!C1``.
 
@@ -1111,7 +1145,7 @@ def _stranded_handin_warnings(plan: ProcessPlan) -> list[str]:
     before it looked for a hand-in source, so the file had *nowhere to arrive* -- no selector, no
     receipt, no frame -- and a runbook stopped dead at the step meant to prove the update had
     worked. The scaffolder now emits the receiver cells for a checkpoint like any other stage, and
-    :data:`_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES` is empty because of it.
+    ``test_the_scaffolder_emits_hand_in_cells_for_every_stage_kind`` is what keeps that true.
 
     **The wording follows the consequence down rather than keeping the louder claim.** What is
     left is real but smaller: a checkpoint records a decision and generates no code, and
@@ -1206,26 +1240,49 @@ def _ungated_handin_warnings(plan: ProcessPlan) -> list[str]:
     looks exactly like one pasted after, and no later step can tell them apart -- which is why
     this is worth a paragraph on the card rather than a tidier plan.
 
-    Two things keep it quiet on a correct plan. **A hand-in the plan puts before the statement is
-    not a re-extract**: where the hand-off depends on the stage, however indirectly, the file
-    demonstrably arrives first, which is the reference plan's ``pre_adjustment`` -- it feeds the
-    arithmetic the ``UPDATE`` is rendered from. And a stage already held behind the hand-off by a
-    chain of gates is gated, because each gate cell reads the token before it and defines its own
+    **Four things keep it quiet, in the order the loop asks them, and the last one is the whole
+    difficulty.**
+
+    A checkpoint's own hand-in belongs to :func:`_stranded_handin_warnings` alone. That warning's
+    repair is to move the file *off* the stage and this one's is to add a dependency *to* it, and
+    one plan defect must never produce two repair instructions pulling opposite ways -- least of
+    all through :func:`repairable_warnings`, which puts them to a model told every finding is a
+    defect it may not decline. The guard that used to say this was ``stage.kind in
+    _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES``, written one commit after that set was emptied, so it
+    was never once true and the double report happened on every plan that could produce it.
+
+    A stage already held behind **some** writing hand-off is left alone, whichever one it is.
+    The harm named below is a file box on screen from the moment the notebook opens; a stage
+    waiting on any confirmation at all does not have it, and which statement a re-extract is
+    evidence for is a judgement the plan has made that this check is in no position to overrule.
+    A chain of gates counts, because each gate cell reads the token before it and defines its own
     (:func:`_gates_a_stage_waits_for`).
+
+    A hand-in the plan puts *before* the statement is not a re-extract: where the hand-off depends
+    on the stage, however indirectly, the file demonstrably arrives first, which is the reference
+    plan's ``pre_adjustment`` -- it feeds the arithmetic the ``UPDATE`` is rendered from.
+
+    And the plan has to relate the two at all (:func:`_shares_a_branch_with`). Without that this
+    fired on correct plans, because absent an edge the rule read "no relation stated, therefore
+    gate it" -- the wrong default in a plan language where most pairs of stages have no relation
+    to state. A rule cannot be both ordering-free and silent on unrelated files without asking
+    what actually ties a re-extract to a statement, and that is what convergence answers.
     """
     writers = _confirming_handoffs(plan)
     if not writers:
         return []
+    writer_ids = {writer.id for writer in writers}
     reached = _gates_a_stage_waits_for(plan, _gate_producing_stage_ids(plan))
     upstream = _transitive_depends_on(plan)
+    dependents = _transitive_dependents(plan, upstream)
     warnings: list[str] = []
     for stage in plan.stages:
-        # A kind whose own hand-in scaffolds no cells has no selector to leave ungated. That is
-        # `_stranded_handin_warnings`' finding, and one defect must not cost two paragraphs.
-        if stage.kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES:
+        if stage.is_checkpoint:
             continue
         label = _stage_handin_label(stage)
         if label is None:
+            continue
+        if reached[stage.id] & writer_ids:
             continue
         missed = [
             writer.id
@@ -1234,20 +1291,20 @@ def _ungated_handin_warnings(plan: ProcessPlan) -> list[str]:
             # a self-dependency and the plan would not validate with one.
             if writer.id != stage.id
             and stage.id not in upstream[writer.id]
-            and writer.id not in reached[stage.id]
+            and _shares_a_branch_with(stage.id, writer.id, upstream, dependents)
         ]
         if not missed:
             continue
         named = _and_more([f"{item!r}" for item in missed])
         warnings.append(
             f"Add {named} to `depends_on` on {stage.id!r}: it takes a hand-in of its own "
-            f"({label!r}) and depends on nothing that records the statement as having been run, "
-            f"so its file box renders from the moment the notebook opens. A hand-in selector "
-            f"builds `mo.ui` elements and reads nothing else, so the hand-off's confirmation "
-            f"token is the only thing that can hide it — and it is read only where this stage "
-            f"names the hand-off in `depends_on` itself, never through another stage. Ungated, a "
-            f"re-extract taken before the statement ran arrives looking exactly like one taken "
-            f"after, and nothing afterwards can tell them apart"
+            f"({label!r}) and waits on no statement confirmation at all, so its file box renders "
+            f"from the moment the notebook opens. A hand-in selector builds `mo.ui` elements and "
+            f"reads nothing else, so a confirmation token is the only thing that can hide it — "
+            f"read where this stage names the hand-off in `depends_on`, or names a checkpoint or "
+            f"hand-off that waits for it in turn. Ungated, a re-extract taken before the "
+            f"statement ran arrives looking exactly like one taken after, and nothing afterwards "
+            f"can tell them apart"
         )
     return warnings
 
