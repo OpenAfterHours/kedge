@@ -2367,11 +2367,18 @@ def test_the_review_copy_of_the_gate_map_agrees_with_the_scaffolders() -> None:
     """Which stages define a token something later can be held behind.
 
     The battery is the set of near-misses, because the whole warning turns on this: a read-only
-    hand-off scaffolds no confirmation and so gates nothing, a claimed mutation scaffolds one even
-    over a `SELECT`, a written statement scaffolds one even where the plan calls itself read-only
-    (`mutates` is a claim; the statement is the fact), and a `handoff` block hanging off a `load`
-    stage never reaches `_handoff_cells` at all. Told any of those wrongly, the check either
-    demands a dependency on a token that is never defined or misses the one plan it exists for.
+    hand-off scaffolds no confirmation and gates on its statement instead, a claimed mutation
+    scaffolds one even over a `SELECT`, a written statement scaffolds one even where the plan
+    calls itself read-only (`mutates` is a claim; the statement is the fact), and a `handoff`
+    block hanging off a `load` stage never reaches `_handoff_cells` at all. Told any of those
+    wrongly, the check either demands a dependency on a token that is never defined or misses the
+    one plan it exists for.
+
+    The read-only case is the one that changed, and it is a *weaker* token rather than none: it
+    orders a file box below the query producing it, and carries a confirmation across where it
+    stands between one and a re-extract. It still asserts nothing about anybody having run
+    anything, which is why `_ungated_handin_warnings` intersects against the writing hand-offs
+    and not against this set.
     """
     stages = [
         Stage(id="approve", intent="Approve it", kind=StageKind.CHECKPOINT),

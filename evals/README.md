@@ -521,18 +521,28 @@ could ever have shown:
 All are fixed. `EXPECTED_DEFECTS` in `tests/unit/test_evals_convert.py` is now an exact **empty**
 set, and each defect has a test pinning the *mechanism* rather than the absence of a string, so one
 returning by another route is still caught. The reference bodies replayed through the pipeline score
-**65/71** — 65/68 and 60/63 at the two earlier states of the structural tier, and 47/63 before the scaffolder was
-fixed, so 13 of those points came from fixing kedge rather than from touching a grader. That figure
+**71/71** — 68/71, 65/68 and 60/63 at three earlier states, and 47/63 before the scaffolder was
+fixed, so 21 of those points came from fixing kedge rather than from touching a grader. That figure
 is the ceiling for the composed path, and it is measured with a human's plan and a human's cell
 bodies: a model's number on `--convert MODEL --plan-from MODEL` is the first honest reading of what
 a user gets.
 
-One item stays red on purpose: `progressive_disclosure` wants `extract_query` on screen at once,
-and a scaffolded notebook blocks it with *"Step 1 of 8 ... fill in the inputs above"* because it has
-no period end yet. The reference conversion passes by defaulting the date picker, and defaulting it
-is the part worth arguing about -- a runbook that opens with a query already scoped to a date nobody
-chose is how somebody extracts the wrong period. Recorded as a difference until someone decides
-which a runbook should do.
+The last item to go green was `progressive_disclosure`, which stood red for a while as a difference
+rather than a defect: it wants `extract_query` on screen at once, and a scaffolded notebook blocked
+it with *"Step 1 of 8 ... fill in the inputs above"* because it had no period end yet. The argument
+for leaving it was that the reference conversion only passes by *defaulting* its date picker, and a
+runbook that opens with a query already scoped to a date nobody chose is how somebody extracts the
+wrong period.
+
+Defaulting was never the alternative on offer. What a hand-off withholds until its parameters are
+supplied is the **statement**; what it was also withholding was the **step** — the heading, the
+instruction, and the fact that a query exists at all — while the box asking for that query's output
+sat on screen above it, ungated, because a selector builds `mo.ui` elements and reads nothing. A
+real user met that as "where is the sql to run to get the starting data?", then "i can't see it".
+Both halves are fixed in `scaffold.py`: the step renders either way and names the input it is still
+waiting for, and a stage's hand-in selector reads the hand-off's token, so it can never precede it.
+A *mutating* hand-off's token is still its confirmation, so the re-extract box stays behind the
+UPDATE.
 
 That is the argument for this mode in one paragraph. The reference conversion is a worked example of
 the destination; it was never evidence that kedge can get there.

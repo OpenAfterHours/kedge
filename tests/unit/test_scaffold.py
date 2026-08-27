@@ -52,6 +52,7 @@ from kedge.plan.model import (
     Approval,
     ApprovalState,
     Checkpoint,
+    Handoff,
     ProcessPlan,
     SourceOrigin,
     Stage,
@@ -1483,6 +1484,195 @@ def test_a_gated_checkpoint_with_a_file_of_its_own_reads_both_and_assigns_once()
     reads = [line for line in ui.splitlines() if line.startswith("_after_verify")]
 
     assert reads == ["_after_verify = (verify_frame, approve)"]
+
+
+# ── a hand-off, and the two halves of one step ───────────────────────────────
+#
+# "Run this query" and "give me what it returned" are one step of a runbook, and they were
+# coming out in the wrong order. The box asking for a file builds `mo.ui` elements and reads
+# nothing, so nothing could hide it; the query above it was behind a `mo.stop` on parameters
+# nobody had been shown a reason to fill in. A fresh open therefore offered a drop zone for an
+# extract and nowhere the extract's query -- which a real user met as "where is the sql to run
+# to get the starting data?", then "i can't see it".
+
+
+def handoff_plan() -> ProcessPlan:
+    """The shape every runbook has: extract, load, update, re-extract, load.
+
+    Both hand-offs take a period end, because that is the parameter almost every periodic
+    process has and it is the one that used to hide the step asking for it.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="extract",
+                    intent="Hand over the opening extract",
+                    kind=StageKind.HANDOFF,
+                    handoff=Handoff(
+                        instruction="Run this against the warehouse and bring the grid back.",
+                        statement="SELECT * FROM t WHERE period_end = {period_end}",
+                        connection="Warehouse",
+                        parameters=["period_end"],
+                    ),
+                ),
+                Stage(
+                    id="load_extract",
+                    intent="Read the opening extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="opening extract")],
+                    depends_on=["extract"],
+                ),
+                Stage(
+                    id="apply",
+                    intent="Hand over the update",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["load_extract"],
+                    handoff=Handoff(
+                        instruction="Run this in one transaction.",
+                        statement="UPDATE t SET a = 1 WHERE period_end = {period_end}",
+                        parameters=["period_end"],
+                        mutates=True,
+                    ),
+                ),
+                Stage(
+                    id="re_extract",
+                    intent="Hand over the same extract again",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["apply"],
+                    handoff=Handoff(
+                        instruction="Run the extract again now the update has been applied.",
+                        statement="SELECT * FROM t WHERE period_end = {period_end}",
+                        parameters=["period_end"],
+                    ),
+                ),
+                Stage(
+                    id="reload",
+                    intent="Read the re-extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="post-update extract")],
+                    depends_on=["re_extract", "apply"],
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def run_handoff(cells: list[ScaffoldCell], name: str, **values: Any) -> dict[str, Any]:
+    """Execute one hand-off cell with its inputs supplied, or deliberately not supplied.
+
+    Executed rather than read, because the claim is about what a user is shown. A test that
+    matched on the emitted text would have passed just as happily against the `mo.stop` this
+    replaced: the step's heading was in that cell's source the whole time, and never once on
+    screen.
+    """
+    recorded: list[dict[str, Any]] = []
+    namespace: dict[str, Any] = {
+        "mo": FakeMarimo(),
+        "kedge": SimpleNamespace(
+            sql=kedge.sql,
+            runs=SimpleNamespace(
+                record_parameters=lambda _runs, _id, **kw: recorded.append(kw),
+            ),
+        ),
+        "KEDGE_RUNS": Path("runs"),
+        "KEDGE_RUN_ID": "20260827T000000Z",
+        "recorded": recorded,
+        **{f"{name}_{key}": Selection(value) for key, value in values.items()},
+    }
+    exec(compile(named(cells, name).code, f"<{name}>", "exec"), namespace)
+    return namespace
+
+
+def test_a_handoff_waiting_on_its_parameters_still_shows_the_user_the_step() -> None:
+    """The first thing a runbook asks of anybody must be on screen when it opens.
+
+    A `mo.stop` here took the heading and the instruction down with the statement, and in app
+    mode everything below a stopped cell goes too -- so the page a user met was a date box and
+    a drop zone for a file, with nothing saying what either was for.
+    """
+    namespace = run_handoff(build_cells(handoff_plan()), "extract", period_end=None)
+
+    rendered = namespace["mo"].rendered
+    assert "### Step 1 of 5 -- run this: extract" in rendered
+    assert "Run this against the warehouse and bring the grid back." in rendered
+    assert namespace["extract"] is None, "an unfilled parameter must not build a statement"
+    assert namespace["recorded"] == [], "nor record itself against the run"
+    waiting = [text for text in rendered if "Still needed" in text]
+    assert waiting and "period end" in waiting[0], (
+        f"the step does not say which input it is waiting for: {rendered}"
+    )
+    assert not any("SELECT" in text for text in rendered), (
+        "an unscoped statement is worse than none: it is copyable"
+    )
+
+
+def test_a_handoff_with_its_parameters_filled_in_renders_the_statement() -> None:
+    """The other half of the same rule -- withholding the statement, never the step."""
+    import datetime as dt
+
+    cells = build_cells(handoff_plan())
+    namespace = run_handoff(cells, "extract", period_end=dt.date(2026, 6, 30))
+
+    assert namespace["extract"] == "SELECT * FROM t WHERE period_end = DATE '2026-06-30'"
+    assert namespace["recorded"] == [{"period_end": dt.date(2026, 6, 30)}]
+    assert any("```sql" in text for text in namespace["mo"].rendered)
+
+
+def test_a_handin_selector_cannot_render_above_the_query_that_produces_the_file() -> None:
+    """The ordering rule, and the only mechanism marimo offers for it.
+
+    A read-only hand-off scaffolds no confirmation, so before this the plan's own
+    `depends_on: [extract]` bought the selector nothing at all and the box rendered from the
+    moment the notebook opened. Reading the statement is a weaker claim than reading a
+    confirmation -- it says the step above is on screen, not that anybody has done it -- and
+    ordering the two halves of one step is exactly what it is for.
+    """
+    selector = named(build_cells(handoff_plan()), "load_extract_input").code
+    reads = [line for line in selector.splitlines() if line.startswith("_after_load_extract")]
+
+    assert reads == ["_after_load_extract = extract"]
+
+
+def test_a_re_extract_still_waits_for_the_confirmation_and_not_merely_the_statement() -> None:
+    """Ordering must not be bought at the price of the gate that matters.
+
+    A mutating hand-off's token stays its confirmation, so the box for the re-extract appears
+    only once somebody has said the UPDATE was run. A statement token here would put the box on
+    screen as soon as the UPDATE was *rendered*, which is the defect
+    `MUST_BE_HIDDEN_AT_THE_START` exists for: a grid pasted before the update ran looks exactly
+    like one pasted after, and nothing afterwards can tell them apart.
+    """
+    cells = build_cells(handoff_plan())
+    reload_reads = [
+        line for line in named(cells, "reload_input").code.splitlines() if line.startswith("_after")
+    ]
+    inputs_reads = [
+        line
+        for line in named(cells, "re_extract_inputs").code.splitlines()
+        if line.startswith("_after")
+    ]
+
+    assert reload_reads == ["_after_reload = (re_extract, apply_confirmed)"]
+    assert inputs_reads == ["_after_re_extract_inputs = apply_confirmed"], (
+        "the boxes asking which period to re-extract for render before the update is confirmed"
+    )
+
+
+def test_a_confirmation_is_not_offered_for_a_statement_that_was_never_built() -> None:
+    """ "I have run the statement above" over an unbuilt statement is a way to record a lie.
+
+    Reading the name is enough of an edge where the statement is fixed or generated. Where it
+    waits on a parameter the name is bound either way -- to `None` -- and an edge cannot see
+    that, so the check has to be on the value.
+    """
+    ui = named(build_cells(handoff_plan()), "apply_ran").code
+
+    assert "mo.stop(" in ui
+    assert "apply is None" in ui
+    assert "Step 3 of 5" in ui
 
 
 # ── what a stage cell tells the person who has to finish it ──────────────────

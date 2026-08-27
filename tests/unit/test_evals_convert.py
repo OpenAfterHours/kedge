@@ -218,7 +218,7 @@ could not reach, so they came back SKIP and FAIL for reasons that had nothing to
 model. They are graded now.
 """
 
-TIER_SCORES = {"deterministic": (42, 45), "structural": (26, 26)}
+TIER_SCORES = {"deterministic": (45, 45), "structural": (26, 26)}
 """Exactly what the reference bodies score, per tier: ``(earned, available)``.
 
 An exact pair rather than a bound on the failures. ``KNOWN_STRUCTURAL_GAPS`` bounds only what
@@ -226,6 +226,12 @@ goes red, so forcing ``does_not_drop_the_sql_column`` -- the sharpest discrimina
 has -- from PASS to SKIP took the score from 40/53 to 37/50 and left the suite green: nothing
 asserted the total. The structural tier had the same hole, ``earned == available`` being as true
 of 15/15 as of 18/18.
+
+The deterministic half moved from ``(42, 45)`` to ``(45, 45)`` when the scaffolder stopped taking
+a hand-off's whole step off the page while its parameters were unfilled, and started ordering a
+stage's hand-in box below the hand-off that produces the file. Those were the last three points
+between a scaffolded conversion and the rubric's ceiling; see ``KNOWN_STRUCTURAL_GAPS``, which is
+now empty.
 
 The structural half moved from ``(18, 18)`` to ``(23, 23)`` when that tier stopped grading the
 presence of a field and started grading the shape the scaffolder consumes: two new items (the
@@ -249,31 +255,25 @@ sit in this set for a reason that *was* somebody's fault -- the harness could no
 and that is the regression this exact set exists to catch.
 """
 
-KNOWN_STRUCTURAL_GAPS = {
-    # The one that is left, and it is not clear it is kedge's to fix.
-    #
-    # The grader wants `extract_query` on screen the moment the notebook opens. In a scaffolded
-    # notebook it is not: the statement takes a period end and a ledger, neither has a value yet,
-    # so the cell stops with "Step 1 of 8: extract_query. Fill in the inputs above before this
-    # statement can be built." The input boxes are on screen, and so is the instruction.
-    #
-    # The reference conversion passes because it *defaults* the period picker, and defaulting it
-    # is the part worth arguing about: a runbook that opens with a query already scoped to a date
-    # nobody chose is how somebody extracts the wrong period and reconciles it against the right
-    # one. Blocking with a named step and an instruction is the behaviour CLAUDE.md asks for
-    # everywhere else.
-    #
-    # So this stays here as a difference rather than being fixed in either direction, until
-    # somebody decides which of the two a runbook should do. What it is NOT any more is the defect
-    # it used to be: `post_adjustment_input` no longer renders before the UPDATE.
-    "progressive_disclosure",
-}
-"""Items a perfect set of cell bodies still cannot pass, and why.
+KNOWN_STRUCTURAL_GAPS: set[str] = set()
+"""Items a perfect set of cell bodies still cannot pass, and why. There are none left.
 
-Asserted as an upper bound rather than an equality: fixing the scaffolder should narrow this,
-and a new failure appearing outside it should fail this test loudly. Every entry names a defect
-in kedge rather than in a model, and the ones that are detectable from the notebook itself are
-also reported by the harness as a :class:`~harness.convert.Defect`.
+It held ``progressive_disclosure``, recorded as a difference rather than a defect on the argument
+that a scaffolded hand-off blocking with *"Step 1 of 8: extract_query. Fill in the inputs above"*
+was the behaviour CLAUDE.md asks for everywhere else, and that the reference conversion only
+passed by defaulting its date picker -- which is how somebody extracts the wrong period.
+
+Both halves of that were wrong. Defaulting is not the alternative on offer: the choice is between
+withholding the *statement* until it can be scoped, which is right, and withholding the *step*,
+which took the runbook's opening instruction off the page and left a box asking for the extract
+above the query that produces it. A real user met that as "where is the sql to run to get the
+starting data?". The heading and the instruction now render either way, and a stage's hand-in
+selector reads the hand-off's token so it can never precede it.
+
+Asserted as an upper bound rather than an equality: a new failure appearing outside it should fail
+this test loudly. Every entry names a defect in kedge rather than in a model, and the ones that
+are detectable from the notebook itself are also reported by the harness as a
+:class:`~harness.convert.Defect`.
 """
 
 EXPECTED_DEFECTS: set[str] = set()

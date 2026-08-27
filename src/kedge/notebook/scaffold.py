@@ -721,17 +721,31 @@ def build_cells(
 def _gate_map(plan: ProcessPlan, names: dict[str, str]) -> dict[str, str]:
     """Stage id to the token a downstream cell must read to be allowed to render.
 
-    Two kinds of stage produce one. A checkpoint's token is its decision record; a mutating
-    hand-off's is its confirmation. Both mean the same thing to the cell that reads it -- *a
-    person has done something, and until they had, you were not to be shown* -- which is why one
-    map covers both rather than the scaffolder branching on kind at every use.
+    Three kinds of stage produce one, and they are two different strengths of claim.
+
+    A checkpoint's token is its decision record and a mutating hand-off's is its confirmation.
+    Both say *a person has done something, and until they had, you were not to be shown*, and
+    both are withheld by a ``mo.stop`` until they have.
+
+    A read-only hand-off's token is the statement itself, and it says only *the step above you
+    is on screen*. That is weaker, and it is the whole of the ordering guarantee a runbook
+    needs: the box asking for an extract must not appear above the query that produces it.
+    Nothing else can supply it -- a selector cell builds ``mo.ui`` elements and reads nothing,
+    so marimo has no edge to place it behind, and a real user met that as "where is the sql to
+    run to get the starting data?" with the drop-box in front of them. A read-only query needs
+    no confirmation (the hand-in that follows *is* the evidence it was run), so the statement is
+    the only token there is.
     """
     gates: dict[str, str] = {}
     for stage in plan.stages:
         if stage.is_checkpoint:
             gates[stage.id] = names[stage.id]
-        elif stage.is_handoff and stage.effective_handoff().needs_confirmation:
-            gates[stage.id] = f"{names[stage.id]}_confirmed"
+        elif stage.is_handoff:
+            gates[stage.id] = (
+                f"{names[stage.id]}_confirmed"
+                if stage.effective_handoff().needs_confirmation
+                else names[stage.id]
+            )
     return gates
 
 
@@ -1945,10 +1959,11 @@ def _handin_cells(
         *(
             [
                 "#",
-                "# And this cell is itself hidden until the step above it is confirmed. Reading",
-                "# that token is what creates the edge marimo hides the cell on -- a selector",
+                "# And this cell is itself held behind the step above it, whose token it reads.",
+                "# Reading it is what creates the edge marimo hides the cell on -- a selector",
                 "# that constructed widgets and read nothing would render from the moment the",
-                "# notebook opened, inviting a re-extract taken before the statement ever ran.",
+                "# notebook opened: above the query whose output it is asking for, and, where",
+                "# the step above changes data, inviting an extract taken before it ever ran.",
             ]
             if gates
             else []
@@ -2102,7 +2117,9 @@ def _waiting(index: int, total: int, title: str, instruction: str) -> str:
     return f"**Step {index} of {total}: {title}.** {instruction}"
 
 
-def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list[ScaffoldCell]:
+def _confirmation_cells(
+    stage: Stage, index: int, total: int, name: str, handoff: Handoff
+) -> list[ScaffoldCell]:
     """The two cells that record a mutating statement as having been run.
 
     A read-only query needs none of this: the hand-in that follows *is* the evidence it was run,
@@ -2121,6 +2138,13 @@ def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list
     ran = f"{name}_ran"
     note = f"{name}_ran_note"
     confirmed = f"{name}_confirmed"
+    unbuilt = _waiting(
+        index,
+        total,
+        stage.id,
+        "Fill in the inputs above. The statement is not built yet, so there is nothing to "
+        "confirm having run.",
+    )
 
     ui_lines = [
         f"# Confirmation for '{_one_line(stage.id)}'. The statement above changes data, so nothing",
@@ -2129,7 +2153,15 @@ def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list
         "# Reads the statement so this cell is itself hidden until there is something to",
         "# confirm. A tick-box offering 'I have run it' above a statement that has not",
         "# been generated yet is not useless -- it is a way to record a lie.",
-        f"_awaiting_{name} = {name}",
+        # Reading the name is the edge; where the statement waits on a parameter it can be
+        # bound and still be `None`, and an edge does not see that. Then the check has to be on
+        # the value, or the tick-box comes back the moment the hand-off renders its "still
+        # needed" line -- offering to confirm a statement nobody has been shown.
+        *(
+            ["mo.stop(", f"    {name} is None,", f"    mo.md({unbuilt!r}),", ")"]
+            if handoff.parameters and not handoff.is_generated
+            else [f"_awaiting_{name} = {name}"]
+        ),
         f'{ran} = mo.ui.checkbox(label="I have run the statement above")',
         f"{note} = mo.ui.text_area(",
         '    label="Anything worth recording about the run (rows affected, ticket, who ran it)",',
@@ -2197,7 +2229,9 @@ def _identifier(text: str) -> str:
     return cleaned or "parameter"
 
 
-def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
+def _parameter_cell(
+    stage: Stage, name: str, handoff: Handoff, gates: Sequence[str] = ()
+) -> ScaffoldCell:
     """The inputs a parameterised statement is built from.
 
     A separate cell because marimo's single-definition rule forbids one cell from both creating
@@ -2210,10 +2244,16 @@ def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
     parameter is called and not what shape it is. A date is worth detecting: it is the parameter
     almost every periodic process has, and `mo.ui.date` yields a `datetime.date` that
     `kedge.sql.literal` renders as a proper `DATE` literal.
+
+    It reads whatever gates its own stage, for the reason every other widget-only cell does: at
+    the top of the process there is nothing to gate on and the boxes are the first thing anybody
+    sees, but a *later* hand-off's inputs are not, and "which period are you re-extracting for"
+    on screen at the moment the notebook opens is a question about a step nobody has reached.
     """
     lines = [
         f"# Inputs for '{_one_line(stage.id)}'. Fill these in first -- the statement below is built",
         "# from them, and the run records what they were.",
+        *_after_lines(f"{name}_inputs", gates),
     ]
     for parameter in handoff.parameters:
         variable = f"{name}_{_identifier(parameter)}"
@@ -2252,6 +2292,7 @@ def _handoff_cells(
     name = names[stage.id]
     handoff = stage.effective_handoff()
     gates = _gate_tokens(stage, names, gated)
+    awaits_parameters = bool(handoff.parameters) and not handoff.is_generated
 
     lines = [
         f"# Stage {index} of {total}: {_one_line(stage.id)}  [handoff]",
@@ -2265,7 +2306,9 @@ def _handoff_cells(
     if stage.notes:
         lines.extend(_comment("Note", stage.notes))
     for gate in gates:
-        lines.append(f"_gate_{name} = {gate}  # this cell stays hidden until that step is recorded")
+        # Not "until that step is recorded": a read-only hand-off's token is its statement, and
+        # reading one says the step above is on screen rather than that anybody has done it.
+        lines.append(f"_gate_{name} = {gate}  # nothing here is shown before that step")
 
     if handoff.is_generated:
         upstream = names.get(handoff.built_from or "", "handin_frame")
@@ -2301,12 +2344,24 @@ def _handoff_cells(
                     for parameter in handoff.parameters
                 ),
                 "}",
-                "mo.stop(",
-                f'    any(value in (None, "") for value in {name}_parameters.values()),',
-                f"    mo.md({_waiting(index, total, stage.id, 'Fill in the inputs above before this statement can be built.')!r}),",
-                ")",
-                f"kedge.runs.record_parameters(KEDGE_RUNS, KEDGE_RUN_ID, **{name}_parameters)",
-                f"{name} = kedge.sql.render({handoff.statement!r}, {name}_parameters)",
+                "#",
+                "# An unfilled parameter leaves the statement unbuilt -- never half-built, and",
+                "# never recorded against the run. What it must not do is take the step off the",
+                "# page. This used to be a `mo.stop`, which meant the notebook's opening",
+                "# instruction was hidden until somebody supplied an input they had not yet been",
+                "# told what for: a fresh open showed a date box, and a box asking for the",
+                "# extract, and nowhere the query itself. The heading and the instruction render",
+                "# either way; only the statement waits.",
+                "_unfilled = [",
+                '    key.replace("_", " ")',
+                f"    for key, value in {name}_parameters.items()",
+                '    if value in (None, "")',
+                "]",
+                "if _unfilled:",
+                f"    {name} = None",
+                "else:",
+                f"    kedge.runs.record_parameters(KEDGE_RUNS, KEDGE_RUN_ID, **{name}_parameters)",
+                f"    {name} = kedge.sql.render({handoff.statement!r}, {name}_parameters)",
             ]
         )
     else:
@@ -2314,23 +2369,38 @@ def _handoff_cells(
 
     fence = handoff.medium.value
     body = 'f"```' + fence + "\\n{" + name + '}\\n```"'
+    unfilled = _waiting(
+        index,
+        total,
+        stage.id,
+        "Fill in the inputs above and the statement appears here. Still needed: ",
+    )
+    statement_lines = (
+        [
+            f"        mo.md({body})",
+            f"        if {name} is not None",
+            f'        else mo.md({unfilled!r} + ", ".join(_unfilled)),',
+        ]
+        if awaits_parameters
+        else [f"        mo.md({body}),"]
+    )
     lines.extend(
         [
             "mo.vstack(",
             "    [",
-            f"        mo.md({f'### Run this: {stage.id}'!r}),",
+            f"        mo.md({f'### Step {index} of {total} -- run this: {stage.id}'!r}),",
             f"        mo.md({handoff.instruction!r}),",
-            f"        mo.md({body}),",
+            *statement_lines,
             "    ]",
             ")",
         ]
     )
     cells: list[ScaffoldCell] = []
-    if handoff.parameters and not handoff.is_generated:
-        cells.append(_parameter_cell(stage, name, handoff))
+    if awaits_parameters:
+        cells.append(_parameter_cell(stage, name, handoff, gates))
     cells.append(ScaffoldCell(name=name, code="\n".join(lines), role="handoff", stage_id=stage.id))
     if handoff.needs_confirmation:
-        cells.extend(_confirmation_cells(stage, index, total, name))
+        cells.extend(_confirmation_cells(stage, index, total, name, handoff))
     return cells
 
 

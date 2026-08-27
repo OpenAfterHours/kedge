@@ -891,13 +891,16 @@ def _confirming_handoffs(plan: ProcessPlan) -> list[Stage]:
 def _gate_producing_stage_ids(plan: ProcessPlan) -> set[str]:
     """The stages whose cell defines a token a later cell can be held behind.
 
-    Mirrors ``scaffold._gate_map``: a checkpoint's token is its decision record and a mutating
+    Mirrors ``scaffold._gate_map``. A checkpoint's token is its decision record and a mutating
     hand-off's is its confirmation, and both mean the same thing to the cell that reads one --
-    *a person has done something, and until they had, you were not to be shown*. Only the ids
-    are wanted here; the names the tokens are built out of are the scaffolder's business.
+    *a person has done something, and until they had, you were not to be shown*. A read-only
+    hand-off's token is the statement itself, which says only *the step above you is on screen*
+    -- weak, but enough to order a file box below the query it is asking for, and enough to
+    carry a confirmation across when it sits between one and a re-extract. Only the ids are
+    wanted here; the names the tokens are built out of are the scaffolder's business.
     """
     return {stage.id for stage in plan.stages if stage.is_checkpoint} | {
-        stage.id for stage in _confirming_handoffs(plan)
+        stage.id for stage in plan.stages if stage.is_handoff
     }
 
 
