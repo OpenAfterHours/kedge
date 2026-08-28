@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -51,6 +52,7 @@ from kedge.plan.model import (
     Approval,
     ApprovalState,
     Checkpoint,
+    Handoff,
     ProcessPlan,
     SourceOrigin,
     Stage,
@@ -774,7 +776,12 @@ def test_the_handin_cell_waits_rather_than_erroring_on_an_empty_selection() -> N
     code = named(cells_for(), "handin").code
     stop = code.index("mo.stop(")
     assert stop < code.index("kedge.ingest.receive(")
-    assert "Waiting for a hand-in" in code
+    # It names its step, like every other stop in the scaffold. This was the one that did not --
+    # it said "Waiting for a hand-in" and stopped there -- because the head hand-in belongs to
+    # the notebook rather than to a stage. In app mode a stopped cell is the whole user
+    # interface, and "waiting" without a position is indistinguishable from a page that died.
+    assert re.search(r"\*\*Step \d+ of \d+: .+\.\*\*", code), code
+    assert "Drop the file above" in code
 
 
 def test_the_drift_cell_calls_check_drift_and_degrades_to_a_message() -> None:
@@ -904,7 +911,7 @@ def test_a_selected_file_wins_over_a_paste_left_in_the_box(tmp_path: Path) -> No
 
 
 def test_the_head_waits_rather_than_erroring_when_nothing_is_selected(tmp_path: Path) -> None:
-    with pytest.raises(StoppedError, match="Waiting for a hand-in"):
+    with pytest.raises(StoppedError, match=r"Step \d+ of \d+"):
         run_head(cells_for(), store=tmp_path / "store")
 
 
@@ -1233,6 +1240,439 @@ def test_a_stage_listing_its_checkpoint_first_still_builds_on_a_frame() -> None:
     code = named(build_cells(plan), "summarise").code
     assert "summarise = load_it" in code
     assert '_gate_summarise = sign_off["decision"]' in code
+
+
+# ── a checkpoint that reads a file of its own ────────────────────────────────
+
+
+def runbook_plan(**checkpoint_overrides: Any) -> ProcessPlan:
+    """`load -> verify`, with the re-extract declared on the checkpoint that asks about it.
+
+    Where a model puts it, and where the process itself puts it: "does the re-extract agree with
+    what we predicted?" is one step, and the file it needs arrives at the moment it is asked for.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="load_it",
+                    intent="Read the opening extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="opening extract")],
+                ),
+                Stage(
+                    id="verify",
+                    intent="Check the re-extract against what was predicted",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    depends_on=["load_it"],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                    **checkpoint_overrides,
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def test_a_checkpoint_that_reads_a_file_of_its_own_gets_the_cells_to_receive_it() -> None:
+    """The runbook whose re-extract had nowhere to arrive.
+
+    `build_cells` used to `continue` past a checkpoint before it looked for a hand-in source, so
+    a `{origin: handin, ref: ...}` declared there scaffolded the approval card and nothing else:
+    the file was read out of the plan, validated, rendered on the card the user approved, and
+    then dropped. A real hub conversion stopped dead at that step, waiting for a grid the
+    notebook never asked for -- and the shape that needed a second hand-in most was the one
+    shape that could not have one, because a re-extract arrives at the checkpoint by definition.
+    """
+    cells = build_cells(runbook_plan())
+    receivers = [cell.name for cell in cells if cell.role == "handin" and cell.stage_id == "verify"]
+
+    assert receivers == ["verify_input", "verify_handin", "verify_frame"]
+    assert "kedge.ingest.receive(" in named(cells, "verify_handin").code
+    assert "kedge.ingest.read_data(verify_handin.path)" in named(cells, "verify_frame").code
+
+
+def test_the_file_is_asked_for_before_the_decision_it_is_evidence_for() -> None:
+    """Supply the re-extract, then record what you make of it -- the order a user works in.
+
+    Emitted the other way round the page reads as an approval with its evidence filed underneath
+    it, which is the same mistake `_with_reconciliation` exists to undo one cell further down.
+    """
+    names = [cell.name for cell in build_cells(runbook_plan())]
+
+    assert names.index("verify_input") < names.index("verify_ui")
+    assert names.index("verify_frame") < names.index("verify_ui")
+    assert names.index("verify_ui") < names.index("verify")
+
+
+def test_the_approval_card_stays_dark_until_that_file_has_arrived() -> None:
+    """Position on the page hides nothing; only a dataflow edge does.
+
+    A cell that just builds `mo.ui` elements reads no upstream name, so marimo has nothing to
+    gate it on and it renders from the moment the notebook opens -- offering a sign-off on data
+    nobody has supplied yet, above the selector asking for it. Reading the frame is the edge.
+    """
+    ui = named(build_cells(runbook_plan()), "verify_ui").code
+
+    assert "_after_verify = verify_frame" in ui
+    assert "mo.ui.dropdown(" in ui
+
+
+def test_a_checkpoint_with_a_file_of_its_own_still_reserves_its_decision_names() -> None:
+    """Both sets of derived names, not whichever the name map matched last.
+
+    The name map reassigned one satellite function over another, so a stage that was a checkpoint
+    *and* carried a hand-in reserved the receiver names and quietly stopped reserving
+    `<name>_decision` and `<name>_note`. A plan with a checkpoint `review` beside a stage
+    `review_decision` would then scaffold two cells defining one name, which marimo rejects as
+    multiply defined and the user meets as a notebook that will not open.
+    """
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(id="review_decision", intent="A stage that wants the checkpoint's name"),
+                Stage(
+                    id="review",
+                    intent="The checkpoint itself",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="the re-extract")],
+                    checkpoint=Checkpoint(question="Approved?"),
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    owner: dict[str, str] = {}
+    for cell in build_cells(plan):
+        for name in public_names(cell.code):
+            assert name not in owner, f"{name!r} defined by {owner.get(name)!r} and {cell.name!r}"
+            owner[name] = cell.name
+
+
+def test_a_checkpoints_own_file_does_not_summon_the_head_hand_in() -> None:
+    """The head hand-in blocks the whole notebook, so it is emitted only where something reads it.
+
+    A checkpoint reads no frame at all, and where it declares a hand-in it reads *that* one, under
+    its own name. Neither is `handin_frame`, so a checkpoint's file never summons the head on its
+    own account -- and here nothing else does either, because `load_it` reads a file of its own.
+    """
+    names = {cell.name for cell in build_cells(runbook_plan())}
+
+    assert "handin_source" not in names, "the head hand-in was emitted for nobody to read"
+    assert "handin_frame" not in names
+    assert {"verify_input", "load_it_input"} <= names
+
+
+def _checkpoint_only_plan(consumer: Stage) -> ProcessPlan:
+    """A checkpoint carrying the plan's only named hand-in, and one stage built on it.
+
+    The shape `_stranded_handin_warnings` tells a plan's author to take apart, scaffolded anyway,
+    because a warning is advice and the notebook still has to be built.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="verify",
+                    intent="Sign off the re-extract",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                ),
+                consumer,
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def test_a_stage_built_on_a_checkpoint_falls_through_and_the_head_is_emitted_for_it() -> None:
+    """Correcting a docstring that promised the opposite, rather than the behaviour.
+
+    `head_handin_reader` claimed a checkpoint's own hand-in "must therefore not put six cells and
+    a blocking `mo.stop` at the top of the notebook for a file no step of the process names", and
+    for a plan of checkpoint-plus-output it did exactly that: two file boxes for one declared
+    file, and the blocking one is the box nothing named.
+
+    It is not the walk's doing. `_upstream_name` never treats a checkpoint as a frame, so a stage
+    depending only on one falls through to `handin_frame` -- something genuinely does read the
+    head hand-in, and emitting it is right. What is wrong is the plan, and the approval card says
+    so in `_stranded_handin_warnings`; the docstring now says which of the two it is.
+    """
+    consumer = Stage(
+        id="report",
+        intent="The impact statement",
+        kind=StageKind.OUTPUT,
+        depends_on=["verify"],
+    )
+    cells = build_cells(_checkpoint_only_plan(consumer))
+    names = [cell.name for cell in cells]
+
+    assert "handin_frame" in names
+    assert "report = handin_frame.collect()" in named(cells, "report").code
+    assert [name for name in names if name.endswith("_input")] == ["verify_input"]
+
+
+def test_the_acceptance_is_keyed_to_the_file_the_arithmetic_actually_ran_on() -> None:
+    """PLAN 6.2 and CLAUDE.md non-negotiable 6: a wrong baseline is worse than a loud break.
+
+    A checkpoint's hand-in is an ancestor of anything downstream of the checkpoint, and
+    `_baseline_handin` walked ancestors without asking whether the frame was *read*. So the panel
+    cited `verify_handin.sha256` while `compare` was built on `handin_frame` -- the head hand-in,
+    reached by fall-through -- and `check_translation` decides by digest whether a later run may
+    re-compare itself against the workbook. Keyed to a file that takes no part in the computation,
+    that decision means nothing, which is what `_baseline_handin`'s own docstring forbids.
+
+    Before a checkpoint's hand-in scaffolded any cells this was a `NameError`: loud, and broken.
+    Quiet and wrong is the worse of the two.
+    """
+    consumer = Stage(
+        id="compare",
+        intent="Compare the re-extract against the prediction",
+        depends_on=["verify"],
+        operations=["calc_h2_h500"],
+    )
+    cells = build_cells(_checkpoint_only_plan(consumer))
+
+    computed = named(cells, "compare").code
+    cited = [
+        line.strip()
+        for line in named(cells, "reconciliation").code.splitlines()
+        if "handin_sha256" in line
+    ]
+
+    assert "compare = handin_frame" in computed
+    assert cited == ["handin_sha256=handin.sha256,"]
+
+
+def test_a_gated_checkpoint_with_a_file_of_its_own_reads_both_and_assigns_once() -> None:
+    """Two `_after_<name> = ...` lines assigning one name made the first a dead store.
+
+    Harmless to marimo, which took the edges either way, and not harmless in a cell a reviewer is
+    meant to read: the line that looks like it holds the frame holds the checkpoint above it.
+    """
+    plan = approved(
+        draft=make_draft(
+            stages=[
+                Stage(id="approve", intent="Approve first", kind=StageKind.CHECKPOINT),
+                Stage(
+                    id="verify",
+                    intent="Sign off the re-extract",
+                    kind=StageKind.CHECKPOINT,
+                    sources=[
+                        StageSource(origin=SourceOrigin.HANDIN, ref="post-adjustment extract")
+                    ],
+                    depends_on=["approve"],
+                    checkpoint=Checkpoint(question="Does the re-extract agree?"),
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+    ui = named(build_cells(plan), "verify_ui").code
+    reads = [line for line in ui.splitlines() if line.startswith("_after_verify")]
+
+    assert reads == ["_after_verify = (verify_frame, approve)"]
+
+
+# ── a hand-off, and the two halves of one step ───────────────────────────────
+#
+# "Run this query" and "give me what it returned" are one step of a runbook, and they were
+# coming out in the wrong order. The box asking for a file builds `mo.ui` elements and reads
+# nothing, so nothing could hide it; the query above it was behind a `mo.stop` on parameters
+# nobody had been shown a reason to fill in. A fresh open therefore offered a drop zone for an
+# extract and nowhere the extract's query -- which a real user met as "where is the sql to run
+# to get the starting data?", then "i can't see it".
+
+
+def handoff_plan() -> ProcessPlan:
+    """The shape every runbook has: extract, load, update, re-extract, load.
+
+    Both hand-offs take a period end, because that is the parameter almost every periodic
+    process has and it is the one that used to hide the step asking for it.
+    """
+    return approved(
+        draft=make_draft(
+            stages=[
+                Stage(
+                    id="extract",
+                    intent="Hand over the opening extract",
+                    kind=StageKind.HANDOFF,
+                    handoff=Handoff(
+                        instruction="Run this against the warehouse and bring the grid back.",
+                        statement="SELECT * FROM t WHERE period_end = {period_end}",
+                        connection="Warehouse",
+                        parameters=["period_end"],
+                    ),
+                ),
+                Stage(
+                    id="load_extract",
+                    intent="Read the opening extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="opening extract")],
+                    depends_on=["extract"],
+                ),
+                Stage(
+                    id="apply",
+                    intent="Hand over the update",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["load_extract"],
+                    handoff=Handoff(
+                        instruction="Run this in one transaction.",
+                        statement="UPDATE t SET a = 1 WHERE period_end = {period_end}",
+                        parameters=["period_end"],
+                        mutates=True,
+                    ),
+                ),
+                Stage(
+                    id="re_extract",
+                    intent="Hand over the same extract again",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["apply"],
+                    handoff=Handoff(
+                        instruction="Run the extract again now the update has been applied.",
+                        statement="SELECT * FROM t WHERE period_end = {period_end}",
+                        parameters=["period_end"],
+                    ),
+                ),
+                Stage(
+                    id="reload",
+                    intent="Read the re-extract",
+                    kind=StageKind.LOAD,
+                    sources=[StageSource(origin=SourceOrigin.HANDIN, ref="post-update extract")],
+                    depends_on=["re_extract", "apply"],
+                ),
+            ],
+            open_questions=[],
+            dropped=[],
+        )
+    )
+
+
+def run_handoff(cells: list[ScaffoldCell], name: str, **values: Any) -> dict[str, Any]:
+    """Execute one hand-off cell with its inputs supplied, or deliberately not supplied.
+
+    Executed rather than read, because the claim is about what a user is shown. A test that
+    matched on the emitted text would have passed just as happily against the `mo.stop` this
+    replaced: the step's heading was in that cell's source the whole time, and never once on
+    screen.
+    """
+    recorded: list[dict[str, Any]] = []
+    namespace: dict[str, Any] = {
+        "mo": FakeMarimo(),
+        "kedge": SimpleNamespace(
+            sql=kedge.sql,
+            runs=SimpleNamespace(
+                record_parameters=lambda _runs, _id, **kw: recorded.append(kw),
+            ),
+        ),
+        "KEDGE_RUNS": Path("runs"),
+        "KEDGE_RUN_ID": "20260827T000000Z",
+        "recorded": recorded,
+        **{f"{name}_{key}": Selection(value) for key, value in values.items()},
+    }
+    exec(compile(named(cells, name).code, f"<{name}>", "exec"), namespace)
+    return namespace
+
+
+def test_a_handoff_waiting_on_its_parameters_still_shows_the_user_the_step() -> None:
+    """The first thing a runbook asks of anybody must be on screen when it opens.
+
+    A `mo.stop` here took the heading and the instruction down with the statement, and in app
+    mode everything below a stopped cell goes too -- so the page a user met was a date box and
+    a drop zone for a file, with nothing saying what either was for.
+    """
+    namespace = run_handoff(build_cells(handoff_plan()), "extract", period_end=None)
+
+    rendered = namespace["mo"].rendered
+    assert "### Step 1 of 5 -- run this: extract" in rendered
+    assert "Run this against the warehouse and bring the grid back." in rendered
+    assert namespace["extract"] is None, "an unfilled parameter must not build a statement"
+    assert namespace["recorded"] == [], "nor record itself against the run"
+    waiting = [text for text in rendered if "Still needed" in text]
+    assert waiting and "period end" in waiting[0], (
+        f"the step does not say which input it is waiting for: {rendered}"
+    )
+    assert not any("SELECT" in text for text in rendered), (
+        "an unscoped statement is worse than none: it is copyable"
+    )
+
+
+def test_a_handoff_with_its_parameters_filled_in_renders_the_statement() -> None:
+    """The other half of the same rule -- withholding the statement, never the step."""
+    import datetime as dt
+
+    cells = build_cells(handoff_plan())
+    namespace = run_handoff(cells, "extract", period_end=dt.date(2026, 6, 30))
+
+    assert namespace["extract"] == "SELECT * FROM t WHERE period_end = DATE '2026-06-30'"
+    assert namespace["recorded"] == [{"period_end": dt.date(2026, 6, 30)}]
+    assert any("```sql" in text for text in namespace["mo"].rendered)
+
+
+def test_a_handin_selector_cannot_render_above_the_query_that_produces_the_file() -> None:
+    """The ordering rule, and the only mechanism marimo offers for it.
+
+    A read-only hand-off scaffolds no confirmation, so before this the plan's own
+    `depends_on: [extract]` bought the selector nothing at all and the box rendered from the
+    moment the notebook opened. Reading the statement is a weaker claim than reading a
+    confirmation -- it says the step above is on screen, not that anybody has done it -- and
+    ordering the two halves of one step is exactly what it is for.
+    """
+    selector = named(build_cells(handoff_plan()), "load_extract_input").code
+    reads = [line for line in selector.splitlines() if line.startswith("_after_load_extract")]
+
+    assert reads == ["_after_load_extract = extract"]
+
+
+def test_a_re_extract_still_waits_for_the_confirmation_and_not_merely_the_statement() -> None:
+    """Ordering must not be bought at the price of the gate that matters.
+
+    A mutating hand-off's token stays its confirmation, so the box for the re-extract appears
+    only once somebody has said the UPDATE was run. A statement token here would put the box on
+    screen as soon as the UPDATE was *rendered*, which is the defect
+    `MUST_BE_HIDDEN_AT_THE_START` exists for: a grid pasted before the update ran looks exactly
+    like one pasted after, and nothing afterwards can tell them apart.
+    """
+    cells = build_cells(handoff_plan())
+    reload_reads = [
+        line for line in named(cells, "reload_input").code.splitlines() if line.startswith("_after")
+    ]
+    inputs_reads = [
+        line
+        for line in named(cells, "re_extract_inputs").code.splitlines()
+        if line.startswith("_after")
+    ]
+
+    assert reload_reads == ["_after_reload = (re_extract, apply_confirmed)"]
+    assert inputs_reads == ["_after_re_extract_inputs = apply_confirmed"], (
+        "the boxes asking which period to re-extract for render before the update is confirmed"
+    )
+
+
+def test_a_confirmation_is_not_offered_for_a_statement_that_was_never_built() -> None:
+    """ "I have run the statement above" over an unbuilt statement is a way to record a lie.
+
+    Reading the name is enough of an edge where the statement is fixed or generated. Where it
+    waits on a parameter the name is bound either way -- to `None` -- and an edge cannot see
+    that, so the check has to be on the value.
+    """
+    ui = named(build_cells(handoff_plan()), "apply_ran").code
+
+    assert "mo.stop(" in ui
+    assert "apply is None" in ui
+    assert "Step 3 of 5" in ui
 
 
 # ── what a stage cell tells the person who has to finish it ──────────────────

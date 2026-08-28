@@ -42,14 +42,13 @@ from kedge.plan.model import (
     ProcessPlan,
     SourceOrigin,
     Stage,
-    StageKind,
     StageSource,
 )
 from kedge.plan.triage import complexity
 from kedge.sql import changes_data, reads_as_sql
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
     from kedge.analysis.model import LogicalOperation, ProcessNote, WorkbookAnalysis
     from kedge.plan.triage import TriageResult
@@ -74,6 +73,7 @@ __all__ = [
     "render_diff",
     "render_plan",
     "reorder_stages",
+    "repairable_warnings",
     "request_changes",
     "review_warnings",
     "split_stage",
@@ -694,8 +694,9 @@ def reject(
 # =============================================================================
 #
 # The checks below the ordinary ones are about what :mod:`kedge.notebook.scaffold` will *do* with
-# the plan, and two of those need a predicate the scaffolder owns: which stage kinds it emits
-# hand-in cells for, and when a stage's upstream frame resolves to the notebook's head hand-in.
+# the plan, and three of those need a predicate the scaffolder owns: which hand-in a stage reads
+# as its own, when a stage's upstream frame resolves to the notebook's head hand-in, and which
+# stages define a token a later cell can be held behind.
 #
 # **They are reimplemented here rather than imported, deliberately.** CLAUDE.md's layering is
 # ``analysis/ -> plan/ -> notebook/ -> agent/ -> server/``; the scaffolder imports this package,
@@ -720,14 +721,6 @@ def reject(
 # the card permanently amber and the whole list stops being read -- the argument CLAUDE.md makes
 # about ``NOT RECONCILED``. Each is therefore run over the analyser's own output for every
 # workbook in ``tests/fixtures`` with a plausible correct plan, and has to stay quiet.
-
-_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: frozenset[StageKind] = frozenset({StageKind.CHECKPOINT})
-"""Stage kinds whose own ``handin`` source produces no cells.
-
-Mirrors the ``if stage.is_checkpoint: ... continue`` that ``scaffold.build_cells`` takes before
-it reaches ``_handin_cells``. Kept as a set rather than a bare comparison so the tripwire test
-can assert it against the scaffolder for every member of :class:`StageKind`.
-"""
 
 _IN_THE_WORKBOOK: frozenset[str] = frozenset({"sheet", "cell_comment"})
 """The two :attr:`~kedge.analysis.model.ProcessNote.source` values that mean *this file*.
@@ -870,6 +863,118 @@ def _plan_handoffs(plan: ProcessPlan) -> list[Handoff]:
         for stage in plan.stages
         if stage.is_handoff or stage.handoff is not None
     ]
+
+
+def _confirming_handoffs(plan: ProcessPlan) -> list[Stage]:
+    """The hand-off stages the notebook will ask somebody to confirm as having been run.
+
+    **Whether a hand-off writes is asked of the statement**, through
+    :attr:`~kedge.plan.model.Handoff.needs_confirmation` and so through
+    :func:`kedge.sql.changes_data` -- non-negotiable 3, and CLAUDE.md's "``mutates`` is a claim;
+    the statement is the fact". A hand-off that only *claims* to mutate is included as well,
+    because the scaffolder emits a confirmation for that too and this list exists to describe
+    what the scaffolder does.
+
+    ``kind: handoff`` and nothing else, even though a ``load`` stage may carry a ``handoff``
+    (:func:`_plan_handoffs`). ``scaffold.build_cells`` reaches ``_handoff_cells`` only on
+    ``stage.is_handoff``, so a hand-off hanging off another kind scaffolds no confirmation cell
+    and therefore defines no token -- and a warning telling somebody to depend on a token that
+    is never defined is a warning whose repair changes nothing.
+    """
+    return [
+        stage
+        for stage in plan.stages
+        if stage.is_handoff and stage.effective_handoff().needs_confirmation
+    ]
+
+
+def _gate_producing_stage_ids(plan: ProcessPlan) -> set[str]:
+    """The stages whose cell defines a token a later cell can be held behind.
+
+    Mirrors ``scaffold._gate_map``. A checkpoint's token is its decision record and a mutating
+    hand-off's is its confirmation, and both mean the same thing to the cell that reads one --
+    *a person has done something, and until they had, you were not to be shown*. A read-only
+    hand-off's token is the statement itself, which says only *the step above you is on screen*
+    -- weak, but enough to order a file box below the query it is asking for, and enough to
+    carry a confirmation across when it sits between one and a re-extract. Only the ids are
+    wanted here; the names the tokens are built out of are the scaffolder's business.
+    """
+    return {stage.id for stage in plan.stages if stage.is_checkpoint} | {
+        stage.id for stage in plan.stages if stage.is_handoff
+    }
+
+
+def _gates_a_stage_waits_for(plan: ProcessPlan, producers: set[str]) -> dict[str, set[str]]:
+    """Stage id to every gate its cells are held behind, following gate edges and nothing else.
+
+    ``scaffold._gate_tokens`` is ``[gated[item] for item in stage.depends_on if item in gated]``
+    -- the stage's **direct** dependencies -- and a gate cell in turn reads only its own. Chained,
+    those edges are exactly what a hand-in selector waits for, because a selector reads nothing
+    else: it constructs ``mo.ui`` elements, and a frame it never reads can gate nothing. So a
+    second checkpoint or hand-off between an approval and a re-extract carries the protection
+    across, and a plain transform in the same position does not.
+
+    Iterative and in emission order, for the reason :func:`_transitive_depends_on` gives: a
+    ``RecursionError`` here would cost the whole approval card rather than one warning.
+    """
+    reached: dict[str, set[str]] = {}
+    for stage in plan.ordered_stages():
+        found: set[str] = set()
+        for dependency in stage.depends_on:
+            if dependency in producers:
+                found.add(dependency)
+                found |= reached.get(dependency, set())
+        reached[stage.id] = found
+    return reached
+
+
+def _transitive_dependents(
+    plan: ProcessPlan, upstream: Mapping[str, set[str]]
+) -> dict[str, set[str]]:
+    """Stage id to every stage that runs after it: :func:`_transitive_depends_on` read backwards.
+
+    Only ids the plan actually declares appear as keys, so a stage naming a dependency that does
+    not exist contributes nothing here -- the same tolerance the forward walk shows.
+    """
+    dependents: dict[str, set[str]] = {stage.id: set() for stage in plan.stages}
+    for stage in plan.stages:
+        for ancestor in upstream[stage.id]:
+            if ancestor in dependents:
+                dependents[ancestor].add(stage.id)
+    return dependents
+
+
+def _shares_a_branch_with(
+    stage_id: str,
+    writer_id: str,
+    upstream: Mapping[str, set[str]],
+    dependents: Mapping[str, set[str]],
+) -> bool:
+    """Whether the plan relates this stage to that hand-off at all.
+
+    The question :func:`_ungated_handin_warnings` could not answer without it, and the one that
+    separates a re-extract from a file that has nothing to do with the statement. A re-extract is
+    evidence **about** a statement, so a plan that means one says so somewhere: either the stage
+    itself is built on something the hand-off is built on -- the reference plan's ``adjust``,
+    which is both the arithmetic the ``UPDATE`` is rendered from and the prediction the re-extract
+    is checked against -- or something downstream joins the two, which is what a comparison stage
+    is. Either way the branches converge.
+
+    Where they never converge the plan is describing two unrelated things, and the older rule --
+    "no edge to the hand-off, therefore gate it on the hand-off" -- told it to invent one: a
+    reference mapping file was told to wait for an ``UPDATE`` it is not evidence for, a runbook's
+    *first* extract was told to hide behind an unrelated closing statement, and two independently
+    correct update/re-extract pairs in one workbook were told to cross-wire, which
+    :class:`~kedge.plan.model.PlanDraft` then refused as a cycle.
+
+    Args:
+        stage_id: The stage that takes a hand-in of its own.
+        writer_id: The hand-off whose statement changes data.
+        upstream: :func:`_transitive_depends_on` for this plan.
+        dependents: :func:`_transitive_dependents` for this plan.
+    """
+    branch = upstream[writer_id] | {writer_id}
+    return any(upstream[joining] & branch for joining in (stage_id, *dependents[stage_id]))
 
 
 def _cite(note: ProcessNote) -> str:
@@ -1037,27 +1142,37 @@ def _dropped_briefing_warning(plan: ProcessPlan, analysis: WorkbookAnalysis | No
 
 
 def _stranded_handin_warnings(plan: ProcessPlan) -> list[str]:
-    """A hand-in declared where the scaffolder does not look for one.
+    """A hand-in declared on a checkpoint: it arrives now, but nothing computes on it.
 
-    ``build_cells`` emits the three receiver cells for every stage kind but ``checkpoint``, which
-    it has already ``continue``d past. A re-extract declared on the checkpoint that gates it
-    therefore produces no selector, no receipt and no frame, and the file the rest of the process
-    exists to verify against has nowhere to arrive. Nothing else reports it: the plan validates,
-    the notebook scaffolds, and the missing input surfaces as a stage built on the wrong frame.
+    This used to be the sharper finding of the two. ``build_cells`` ``continue``d past a checkpoint
+    before it looked for a hand-in source, so the file had *nowhere to arrive* -- no selector, no
+    receipt, no frame -- and a runbook stopped dead at the step meant to prove the update had
+    worked. The scaffolder now emits the receiver cells for a checkpoint like any other stage, and
+    ``test_the_scaffolder_emits_hand_in_cells_for_every_stage_kind`` is what keeps that true.
+
+    **The wording follows the consequence down rather than keeping the louder claim.** What is
+    left is real but smaller: a checkpoint records a decision and generates no code, and
+    ``scaffold._upstream_name`` never treats a checkpoint as the frame a stage builds on, so
+    nothing is scaffolded to *read* the file the checkpoint now receives -- the comparison a
+    re-extract exists for has no cell of its own. Saying "that file has nowhere to arrive" about a
+    notebook that visibly asks for it would be the worse error of the two: an approval card is
+    read exactly as long as everything on it is true.
     """
-    ignored = _and_more(sorted(kind.value for kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES))
     warnings: list[str] = []
     for stage in plan.stages:
-        if stage.kind not in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES:
+        if not stage.is_checkpoint:
             continue
         label = _stage_handin_label(stage)
         if label is None:
             continue
         warnings.append(
             f"Move the hand-in ({label!r}) off {stage.id!r} and onto the stage that reads the "
-            f"file: the scaffolder emits hand-in cells for every kind but {ignored}, so declared "
-            f"on a `kind: {stage.kind.value}` stage it gets no selector cell, no receipt cell and "
-            f"no frame, and that file has nowhere to arrive"
+            f"file: a `kind: checkpoint` stage does get its own selector, receipt and frame, so "
+            f"{label!r} arrives -- but a checkpoint records a decision and computes nothing, and "
+            f"no stage builds on a checkpoint's frame, so nothing is scaffolded to compare that "
+            f"file against what this process predicted. Declared on the `kind: load` or "
+            f"`kind: transform` stage that reads it, with {stage.id!r} left to record the "
+            f"decision, the comparison has a cell to live in"
         )
     return warnings
 
@@ -1108,6 +1223,91 @@ def _checkpoint_as_a_frame_warnings(plan: ProcessPlan) -> list[str]:
             f"it currently names {cited}, which is a checkpoint, and a checkpoint records a "
             f"decision rather than producing a frame — so the scaffolder has nothing to build "
             f"this stage on and falls back to the notebook's own hand-in"
+        )
+    return warnings
+
+
+def _ungated_handin_warnings(plan: ProcessPlan) -> list[str]:
+    """A re-extract with no dataflow edge to the statement it is evidence for.
+
+    Observed on all three plans a live sweep proposed for the adjustment workbook, every one of
+    them losing the same eval item for the same reason: the stage receiving the post-adjustment
+    extract was emitted below the hand-off that runs the ``UPDATE`` and read none of its
+    confirmation tokens. **The scaffolder is not at fault.** ``_gate_map`` produces a token for a
+    mutating hand-off and ``_handin_cells`` gates the selector on it; ``_gate_tokens`` reads
+    ``depends_on`` *directly*, and the plans declared no dependency there to read.
+
+    What that costs is the failure CLAUDE.md describes. A cell that only constructs ``mo.ui``
+    elements has no dataflow edges, so nothing can hide it, and the box for the re-extract is on
+    screen from the moment the notebook opens. A grid pasted into it before the ``UPDATE`` ran
+    looks exactly like one pasted after, and no later step can tell them apart -- which is why
+    this is worth a paragraph on the card rather than a tidier plan.
+
+    **Four things keep it quiet, in the order the loop asks them, and the last one is the whole
+    difficulty.**
+
+    A checkpoint's own hand-in belongs to :func:`_stranded_handin_warnings` alone. That warning's
+    repair is to move the file *off* the stage and this one's is to add a dependency *to* it, and
+    one plan defect must never produce two repair instructions pulling opposite ways -- least of
+    all through :func:`repairable_warnings`, which puts them to a model told every finding is a
+    defect it may not decline. The guard that used to say this was ``stage.kind in
+    _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES``, written one commit after that set was emptied, so it
+    was never once true and the double report happened on every plan that could produce it.
+
+    A stage already held behind **some** writing hand-off is left alone, whichever one it is.
+    The harm named below is a file box on screen from the moment the notebook opens; a stage
+    waiting on any confirmation at all does not have it, and which statement a re-extract is
+    evidence for is a judgement the plan has made that this check is in no position to overrule.
+    A chain of gates counts, because each gate cell reads the token before it and defines its own
+    (:func:`_gates_a_stage_waits_for`).
+
+    A hand-in the plan puts *before* the statement is not a re-extract: where the hand-off depends
+    on the stage, however indirectly, the file demonstrably arrives first, which is the reference
+    plan's ``pre_adjustment`` -- it feeds the arithmetic the ``UPDATE`` is rendered from.
+
+    And the plan has to relate the two at all (:func:`_shares_a_branch_with`). Without that this
+    fired on correct plans, because absent an edge the rule read "no relation stated, therefore
+    gate it" -- the wrong default in a plan language where most pairs of stages have no relation
+    to state. A rule cannot be both ordering-free and silent on unrelated files without asking
+    what actually ties a re-extract to a statement, and that is what convergence answers.
+    """
+    writers = _confirming_handoffs(plan)
+    if not writers:
+        return []
+    writer_ids = {writer.id for writer in writers}
+    reached = _gates_a_stage_waits_for(plan, _gate_producing_stage_ids(plan))
+    upstream = _transitive_depends_on(plan)
+    dependents = _transitive_dependents(plan, upstream)
+    warnings: list[str] = []
+    for stage in plan.stages:
+        if stage.is_checkpoint:
+            continue
+        label = _stage_handin_label(stage)
+        if label is None:
+            continue
+        if reached[stage.id] & writer_ids:
+            continue
+        missed = [
+            writer.id
+            for writer in writers
+            # A hand-off that receives a file of its own is excluded, because the remedy would be
+            # a self-dependency and the plan would not validate with one.
+            if writer.id != stage.id
+            and stage.id not in upstream[writer.id]
+            and _shares_a_branch_with(stage.id, writer.id, upstream, dependents)
+        ]
+        if not missed:
+            continue
+        named = _and_more([f"{item!r}" for item in missed])
+        warnings.append(
+            f"Add {named} to `depends_on` on {stage.id!r}: it takes a hand-in of its own "
+            f"({label!r}) and waits on no statement confirmation at all, so its file box renders "
+            f"from the moment the notebook opens. A hand-in selector builds `mo.ui` elements and "
+            f"reads nothing else, so a confirmation token is the only thing that can hide it — "
+            f"read where this stage names the hand-off in `depends_on`, or names a checkpoint or "
+            f"hand-off that waits for it in turn. Ungated, a re-extract taken before the "
+            f"statement ran arrives looking exactly like one taken after, and nothing afterwards "
+            f"can tell them apart"
         )
     return warnings
 
@@ -1217,13 +1417,55 @@ def review_warnings(
                     f"analysis: {', '.join(sorted(invented)[:5])}"
                 )
 
-    # What the scaffolder will make of this. Each of these was observed on one real conversion,
-    # which produced a notebook that opened, ran, and was wrong.
+    warnings.extend(repairable_warnings(plan, analysis))
+    return warnings
+
+
+def repairable_warnings(plan: ProcessPlan, analysis: WorkbookAnalysis | None = None) -> list[str]:
+    """The subset a model can be asked to fix, and be expected to.
+
+    Everything :func:`review_warnings` raises is worth a reviewer's attention. Only some of it is
+    worth putting back to the model, and the line between the two is not severity -- it is
+    whether the warning names a **defect with a fix in the plan's own fields**.
+
+    These do. Each one names the field to change (``kind: handoff``, ``briefing``, a stage's
+    ``sources`` or its ``depends_on``), the thing in the workbook it is about (a range, a
+    connection, the sheets a note came from, the file a stage waits for), and what the notebook
+    loses without it. They are already written in the
+    imperative, so they need no rewriting to become a repair instruction. And every one describes
+    a plan that *validates perfectly* and scaffolds a notebook that opens, runs, and is wrong --
+    which is why nothing downstream catches them.
+
+    The rest are deliberately excluded, because a model must not be asked to make them go away:
+
+    - **Open questions outstanding.** A plan that asks the user four things is doing its job. Ask
+      a model to clear that warning and it deletes the questions.
+    - **An empty ``open_questions`` on a complex workbook.** The remedy is to have understood the
+      workbook, not to invent a question to satisfy a check.
+    - **Low confidence, operations claimed by no stage, convertibility.** Judgements and coverage
+      facts. A model told to clear them raises its own confidence and claims the operations.
+
+    Every one of those is a warning whose *only* honest audience is a person, and the failure mode
+    of automating them is a plan that looks better and is not.
+
+    Args:
+        plan: The plan under review.
+        analysis: The analysis it was written against. The two warnings that compare the plan
+            against the workbook -- the unhandled write and the dropped briefing -- need it and
+            are skipped without it.
+
+    Returns:
+        The repairable warnings, in the order :func:`review_warnings` renders them.
+    """
+    # Each of these was observed on one real conversion, which produced a notebook that opened,
+    # ran, and was wrong.
+    warnings: list[str] = []
     warnings.extend(_unhandled_write_warnings(plan, analysis))
     warnings.extend(_unapproved_write_warnings(plan))
     warnings.extend(_dropped_briefing_warning(plan, analysis))
     warnings.extend(_stranded_handin_warnings(plan))
     warnings.extend(_checkpoint_as_a_frame_warnings(plan))
+    warnings.extend(_ungated_handin_warnings(plan))
     return warnings
 
 

@@ -363,17 +363,25 @@ def test_a_leg_the_sweep_could_not_grade_in_full_never_prints_full_marks(
     reference_plan: ProcessPlan,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A skip must not arrive as a PASS at a denominator only one leg has.
+    """A refusal must not arrive as a PASS at a denominator only one leg has.
 
-    A plan the scaffolder refuses makes items skip that every other leg was graded on. The leg
-    then earned everything that was left and rendered, verbatim, ``PASS 18/18`` -- directly under
-    a header saying legs are scored out of 21, with the line saying kedge could not build a
+    A plan the scaffolder refuses used to make items *skip* that every other leg was graded on.
+    The leg then earned everything that was left and rendered, verbatim, ``PASS 18/18`` -- directly
+    under a header saying legs are scored out of 21, with the line saying kedge could not build a
     notebook from that plan appearing nowhere in the report. That is the reconciliation sin in a
     table: a measurement nobody took, printed as a result somebody got.
 
-    Three things have to be true, and none of them is "call it a failure": the score renders
-    against the *sweep's* denominator, the preamble's list of what nobody can be graded on is not
-    taken from the short leg, and the leg's own missing measurement is named under "Why".
+    It is now fixed one layer lower down, which is why this test reads the way it does. A plan the
+    scaffolder refuses is the *plan's* defect, so those items are ``BLOCKED`` rather than skipped
+    and keep their weight: the leg is scored out of the whole tier like everybody else and simply
+    earns less of it. The denominators no longer diverge, so there is nothing left here for
+    :meth:`LegResult.score_cell`'s short-leg marker to mark --
+    :func:`test_a_leg_scored_on_less_than_the_sweep_says_so_in_its_cell` covers that guard
+    directly, because a guard whose only exercise has been deleted is a guard nobody is watching.
+
+    What still has to be true: the refusal reaches the graders, the leg is scored out of the full
+    tier, the score renders against the sweep's denominator, the preamble's list of what nobody
+    can be graded on is not taken from this leg, and the reason is named under "Why".
     """
     from kedge.notebook import scaffold
 
@@ -406,22 +414,72 @@ def test_a_leg_the_sweep_could_not_grade_in_full_never_prints_full_marks(
     )
 
     healthy, short = report.legs
-    assert short.available is not None and short.available < FULL_MARKS, (
+    # The control used to be `short.available < FULL_MARKS`: the refusal was detected by the
+    # denominator shrinking under it. It does not shrink any more -- a plan that will not scaffold
+    # is the plan's defect, so those items are BLOCKED and keep their points -- and the refusal is
+    # now looked for where it actually is, in the reasons the graders gave.
+    refused = [
+        item for repeat in short.repeats if repeat.tier is not None for item in repeat.tier.blocked
+    ]
+    assert refused and any("would not parse" in item.detail for item in refused), (
         "the injected refusal did not reach a grader, so this control measures nothing"
+    )
+    assert short.available == FULL_MARKS, (
+        "a plan that will not scaffold must be scored out of the whole tier, not out of the part "
+        "that survived it"
     )
     assert report.available == FULL_MARKS
     assert healthy.score_cell(report.available) == f"{FULL_MARKS}/{FULL_MARKS}"
     cell = short.score_cell(report.available)
-    assert cell.endswith(f"/{FULL_MARKS}") or "unmeasured" in cell, cell
-    assert f"/{short.available}" not in cell.split()[0], (
-        f"the short leg printed its own denominator: {cell}"
+    assert cell.endswith(f"/{FULL_MARKS}"), cell
+    assert short.scores and max(short.scores) < FULL_MARKS, (
+        f"the refused plan still printed full marks: {cell}"
     )
 
     table = render(report)
-    assert f"{short.available}/{short.available}" not in table, table
-    assert "could not be measured on this plan" in table
+    # The reason has to be in the report. It used to arrive as the short-leg line; the points now
+    # come off the score instead, so the sentence saying why comes with the blocked items.
+    assert "would not parse" in table, table
+    assert "BLOCKED" in table, table
     # And the preamble must not adopt the short leg's skips as everybody's.
     assert {item.id for item in report.ungradeable} == set(NEEDS_MORE_THAN_A_PLAN)
+
+
+def test_a_leg_scored_on_less_than_the_sweep_says_so_in_its_cell() -> None:
+    """The short-leg marker, exercised directly rather than through a scaffold refusal.
+
+    A refusal no longer shortens a denominator -- it blocks items, which keep their weight -- so
+    the sweep test above cannot reach this branch any more. The branch is still right and still
+    reachable: a genuine ``SKIP`` leaves the denominator, and one leg skipping something the
+    others were graded on is exactly the case that once printed ``18/18 PASS`` under a header
+    saying 21.
+    """
+    from harness.live import MeteredCall
+    from harness.model import ItemResult, Outcome, TierResult
+    from harness.sweep import LegResult, ModelSpec, RepeatResult
+
+    short = LegResult(
+        spec=ModelSpec(model="short"),
+        repeats=(
+            RepeatResult(
+                spec=ModelSpec(model="short"),
+                repeat=1,
+                call=MeteredCall(),
+                tier=TierResult(
+                    name="structural",
+                    items=(
+                        ItemResult(id="graded", outcome=Outcome.PASS, weight=18),
+                        ItemResult(id="ungradeable", outcome=Outcome.SKIP, weight=3),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    assert short.available == 18
+    assert short.score_cell() == "18/18", "its own denominator, when nobody asked for another"
+    assert short.score_cell(21) == "18/21 (3 unmeasured)"
+    assert "3 point(s) could not be measured on this plan" in " ".join(short.why(21))
 
 
 def test_the_stand_in_notebook_refuses_every_read() -> None:

@@ -120,7 +120,31 @@ def _refuse_confounded(parser: argparse.ArgumentParser, args: argparse.Namespace
     - ``--model`` with ``--convert`` is two reports, not one. A sweep tabulates several models
       over the planning seam; a conversion grades one notebook. Neither is a section of the other.
     - ``--plan`` with ``--plan-from`` names two different plans for one conversion.
+    - ``--plan`` with no ``--notebook`` is the *same* confound as the first, reached offline and
+      by accident rather than by asking for it. ``--notebook`` defaults to the committed reference
+      conversion, so ``--plan a-model-plan.yaml`` alone grades a model's plan alongside a human's
+      cell bodies. Measured on the plan from a real hub run: **49/66, 74%** -- of which 45 points
+      are the reference notebook's deterministic tier and 4 are the plan's. The same plan graded
+      with the notebook it actually produced scores 6.
     """
+    if args.project is not None and (args.notebook is not None or args.plan is not None):
+        parser.error(
+            "--project resolves the notebook and the plan out of one directory; naming either "
+            "of them as well says two different things about which conversion is being graded."
+        )
+    if args.project is not None and (args.convert or args.model):
+        parser.error(
+            "--project grades a conversion that already exists on disk. --convert makes a new "
+            "one and --model sweeps the planning seam; neither reads a project directory."
+        )
+    if args.plan is not None and args.notebook is None and not args.convert:
+        parser.error(
+            "--plan on its own grades the committed reference conversion against the plan you "
+            "named, so the deterministic tier -- 45 of the rubric's points, all of them a "
+            "human's -- would be printed over a plan somebody else wrote. Name the notebook that "
+            "plan produced with --notebook, or point --project at the .kedge directory holding "
+            "both. To grade the plan alone, use --model to sweep the planning seam."
+        )
     if args.model and args.convert:
         parser.error(
             "--model sweeps the planning seam and --convert grades a notebook; pick one. For the "
@@ -176,7 +200,17 @@ def _parser() -> argparse.ArgumentParser:
         "--plan",
         type=Path,
         default=None,
-        help="a saved process plan, for the structural tier. Skipped without one.",
+        help="a saved process plan, for the structural tier. Skipped without one. Needs "
+        "--notebook beside it: on its own it would grade the reference conversion against "
+        "somebody else's plan.",
+    )
+    parser.add_argument(
+        "--project",
+        type=Path,
+        default=None,
+        help="a .kedge project directory, as the hub leaves it. Resolves the notebook and the "
+        "latest approved plan from it, so grading a real conversion is one flag rather than two "
+        "long paths. Mutually exclusive with --notebook and --plan.",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON rather than text")
     parser.add_argument("-v", "--verbose", action="store_true", help="log at INFO")
@@ -246,14 +280,54 @@ def _parser() -> argparse.ArgumentParser:
 
 def _grade(args: argparse.Namespace, case: Any) -> int:
     """The offline path: grade a conversion that already exists."""
-    notebook = args.notebook or case.REFERENCE_NOTEBOOK
+    notebook, plan_path = (
+        _from_project(args.project)
+        if args.project is not None
+        else (args.notebook or case.REFERENCE_NOTEBOOK, args.plan)
+    )
     if not notebook.is_file():
         msg = f"no notebook at {notebook}"
         raise SystemExit(msg)
 
-    report = grade(case, notebook=notebook, plan=load_plan(args.plan))
+    report = grade(case, notebook=notebook, plan=load_plan(plan_path))
     print(as_json(report) if args.json else report.render())
     return report.exit_code()
+
+
+def _from_project(project: Path) -> tuple[Path, Path | None]:
+    """Resolve the notebook and the plan out of a ``.kedge`` directory.
+
+    The hub leaves both, in known places, and until this existed grading a real conversion meant
+    typing two long paths and getting the pairing right by hand -- which is exactly the step that
+    stopped anybody doing it. The composed path had never been graded once.
+
+    The **latest approved** plan, not the latest plan. An unapproved one was never scaffolded, so
+    grading a notebook against it reports a shape the notebook was never asked to have.
+    """
+    if not project.is_dir():
+        msg = f"no project directory at {project}"
+        raise SystemExit(msg)
+
+    notebooks = sorted(project.glob("*.py"))
+    if not notebooks:
+        msg = f"{project} holds no notebook (*.py at its top level)"
+        raise SystemExit(msg)
+    if len(notebooks) > 1:
+        names = ", ".join(path.name for path in notebooks)
+        msg = f"{project} holds more than one notebook ({names}); name one with --notebook"
+        raise SystemExit(msg)
+
+    approved = [
+        path
+        for path in sorted(project.glob("plans/plan-v*.yaml"))
+        if getattr(load_plan(path).approval, "state", None) == "approved"
+    ]
+    if not approved:
+        print(
+            f"note: {project} holds no approved plan, so the structural tier is skipped in full "
+            f"and the notebook is graded on its own.\n"
+        )
+    return notebooks[0], approved[-1] if approved else None
 
 
 def _sweep(args: argparse.Namespace, case: Any) -> int:

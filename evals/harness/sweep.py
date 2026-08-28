@@ -439,7 +439,10 @@ class RepeatResult:
             return self.call.failure.as_outcome()
         if not self.tier.available:
             return Outcome.SKIP
-        if any(item.outcome is Outcome.FAIL for item in self.tier.items):
+        # A blocked item counts as a failure of the leg, not as an absence. It means the plan
+        # omitted the thing the item asks about -- so the leg produced a plan and the plan was
+        # wrong, which is the FAIL column by the rule this docstring already states.
+        if any(item.outcome in (Outcome.FAIL, Outcome.BLOCKED) for item in self.tier.items):
             return Outcome.FAIL
         return Outcome.PASS
 
@@ -615,6 +618,16 @@ class LegResult:
                 f"{prefix}: {failed.id} FAIL: {_clip(failed.detail)}"
                 for failed in item.failed_items
             )
+            # Blocked items keep their weight, so they cost the leg marks without ever reaching
+            # `failed_items` -- and a plan the scaffolder refuses is now blocked rather than
+            # short. Without this line the points would come off the score with the sentence
+            # saying why appearing nowhere in the report, which is the exact defect the short-leg
+            # line below was written to fix, arriving by a different route.
+            if item.tier is not None:
+                lines.extend(
+                    f"{prefix}: {blocked.id} BLOCKED: {_clip(blocked.detail)}"
+                    for blocked in item.tier.blocked
+                )
             short = out_of is not None and item.available is not None and item.available < out_of
             if short and item.tier is not None:
                 lines.append(

@@ -255,7 +255,13 @@ def test_carrying_the_memos_stale_figures_forward_fails(tmp_path: Path) -> None:
 
 
 def test_a_notebook_that_stops_fails_completion_and_skips_the_rest(tmp_path: Path) -> None:
-    """One problem reported once. The items about cells that never ran are skips, not failures."""
+    """One problem reported once, and still paid for.
+
+    The items about cells that never ran are not failures -- fifteen red lines that are all one
+    bug bury the bug. They are not skips either: a skip leaves the denominator, so a notebook that
+    stopped early used to be scored out of only the part of the rubric it survived long enough to
+    be asked about. ``BLOCKED`` is counted and not diagnosed.
+    """
     target = tmp_path / "stops.py"
     source = adjustment_case.REFERENCE_NOTEBOOK.read_text(encoding="utf-8")
     target.write_text(
@@ -268,10 +274,18 @@ def test_a_notebook_that_stops_fails_completion_and_skips_the_rest(tmp_path: Pat
     report = grade_mutant(target)
 
     assert outcome_of(report, "ran_to_completion") is Outcome.FAIL
-    assert outcome_of(report, "totals_to_the_penny") is Outcome.SKIP
-    assert outcome_of(report, "verification_finds_exactly_one_break") is Outcome.SKIP
+    assert outcome_of(report, "totals_to_the_penny") is Outcome.BLOCKED
+    assert outcome_of(report, "verification_finds_exactly_one_break") is Outcome.BLOCKED
     # The structural tier grades the plan, which is unaffected by the notebook stopping.
     assert outcome_of(report, "hands_over_rather_than_pretends") is Outcome.PASS
+    # The point of the outcome: a stop must not shrink the denominator. Only a SKIP leaves it, so
+    # a conversion cannot buy a better percentage by breaking earlier -- which is what SKIP did,
+    # in proportion to how early it broke.
+    declared = sum(item.weight for tier in report.tiers for item in tier.items)
+    lost_to_skips = sum(item.weight for item in report.skipped)
+    assert report.available == declared - lost_to_skips
+    assert report.blocked, "a notebook that stopped blocked nothing"
+    assert not report.ok
 
 
 # ── negative controls on the plan ────────────────────────────────────────────
@@ -657,12 +671,19 @@ def test_a_hand_in_below_the_update_that_reads_no_token_also_fails() -> None:
     assert "position in the file is not the gate" in detail.lower()
 
 
-def test_a_re_extract_declared_on_a_checkpoint_fails_the_two_handins_item() -> None:
-    """The sharpest of the four, because the loose version was green on exactly this plan.
+def test_a_re_extract_declared_on_a_checkpoint_is_graded_on_the_cells_that_now_exist() -> None:
+    """This item follows the scaffolder, and the scaffolder moved.
 
-    ``build_cells`` returns early for a ``checkpoint`` stage before ``_named_handin`` is
-    consulted, so the hand-in is read by the schema, rendered on the approval card, and emitted
-    as nothing. The plan still declares two hand-ins; the notebook has one place to put a grid.
+    It was red on this plan, and correctly: ``build_cells`` returned early for a ``checkpoint``
+    before ``_named_handin`` was consulted, so the hand-in was read by the schema, rendered on the
+    approval card, and emitted as nothing -- two hand-ins declared, one place to put a grid. The
+    scaffolder now asks for a stage's own hand-in ahead of every kind branch, so the same plan
+    scaffolds the selector, the receipt and the frame, and the honest grade is green.
+
+    What is asserted is therefore not the outcome alone but *why* it is green: the cells are
+    there, under the checkpoint's own name. An item that passed here while the notebook had
+    nowhere to put the grid is the failure this whole tier was rebuilt to prevent, and it would
+    look identical from the outcome.
     """
     plan = restaged(load_plan(PLAN_PATH), {"post_adjustment": {"kind": "checkpoint"}})
     handins = [
@@ -671,12 +692,21 @@ def test_a_re_extract_declared_on_a_checkpoint_fails_the_two_handins_item() -> N
         for source in stage.sources
         if source.origin.value == "handin" and source.ref
     ]
-    assert len(handins) == 2, "the mutation removed a declared hand-in rather than stranding it"
+    assert len(handins) == 2, "the mutation removed a declared hand-in rather than retyping it"
+
+    from kedge.notebook.scaffold import build_cells
+
+    emitted = {
+        cell.name
+        for cell in build_cells(plan, allow_unapproved=True)
+        if cell.role == "handin" and cell.stage_id == "post_adjustment"
+    }
+    assert emitted == {"post_adjustment_input", "post_adjustment_handin", "post_adjustment_frame"}
 
     report = graded_plan(plan)
 
-    assert outcome_of(report, "takes_two_handins") is Outcome.FAIL
-    assert "nowhere to arrive" in detail_of(report, "takes_two_handins")
+    assert outcome_of(report, "takes_two_handins") is Outcome.PASS
+    assert "post_adjustment" in detail_of(report, "takes_two_handins")
 
 
 def test_a_plan_that_declares_no_handin_of_its_own_still_fails_for_the_old_reason() -> None:
@@ -691,6 +721,202 @@ def test_a_plan_that_declares_no_handin_of_its_own_still_fails_for_the_old_reaso
 
     assert outcome_of(report, "takes_two_handins") is Outcome.FAIL
     assert "head hand-in" in detail_of(report, "takes_two_handins")
+
+
+def test_the_reference_plan_resolves_to_the_names_this_case_hardcodes() -> None:
+    """The role script and the literal one must be the same script on the reference.
+
+    This is what stops the role layer being a second, looser way to drive. If resolving by role
+    reached one widget the hand-written script does not, or missed one it does, the two runs
+    would not be measuring the same thing -- and the literal script is the one every committed
+    71/71 was earned through.
+    """
+    from harness.roles import bind_by_role
+
+    plan = load_plan(PLAN_PATH)
+    pre, post = Path("pre.csv"), Path("post.csv")
+
+    bound, unresolved = bind_by_role(
+        plan, adjustment_case.REFERENCE_NOTEBOOK, adjustment_case.role_script(pre, post)
+    )
+
+    assert not unresolved, unresolved
+    assert set(bound) == set(adjustment_case.script_for(pre, post))
+
+
+def _scaffolded(plan: Any, path: Path) -> Path:
+    """This plan's notebook, holes and all, written where ``bind_by_role`` can read it."""
+    from harness.cellgen import ConversionResult
+    from harness.render import write_notebook
+
+    from kedge.notebook.scaffold import build_cells
+
+    cells = build_cells(plan, allow_unapproved=True)
+    return write_notebook(
+        ConversionResult(
+            names=tuple(cell.name for cell in cells),
+            codes=tuple(cell.code for cell in cells),
+            cells=(),
+            plan=plan,
+        ),
+        path,
+    )
+
+
+def test_the_first_stage_hand_in_takes_the_first_grid_beside_the_head_one(tmp_path: Path) -> None:
+    """The defect that had a whole conversion computing off the wrong extract.
+
+    A plan can declare a hand-in on its load stage *and* still have something reading the
+    notebook's fixed head one, and then there are two selectors above the arithmetic with one
+    process input between them. Numbering them 0 and 1 gave the head the pre-adjustment grid and
+    the pre-adjustment stage the **post**-adjustment one, and left the re-extract with nothing.
+
+    It was close to invisible from the report. Entity names and row counts passed -- both grids
+    have the same 120 rows and the same names -- while ``Adjustment!D/E/F`` and ``D94:F94``
+    reconciled as ``failed``, which reads as arithmetic that is out rather than as an input that
+    is the wrong one. ``null_is_not_zero`` and ``cancelled_rows_excluded`` were passing by luck.
+
+    Graded on the real artifact: the plan a model proposed through the hub, committed verbatim as
+    ``observed_conversion.py``. The head is emitted there for the reason it is emitted anywhere,
+    which is that a stage of that plan reads the notebook's own frame -- not because a test
+    author arranged it.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+    from observed_conversion import observed_plan
+
+    from kedge.notebook.scaffold import head_handin_is_read
+
+    plan = observed_plan()
+    assert head_handin_is_read(plan), "this plan no longer exercises the head hand-in at all"
+
+    handins = [slot for slot in slots_for(plan) if slot.role is Role.HANDIN]
+    assert [(slot.stage_id, slot.ordinal) for slot in handins] == [
+        ("", 0),
+        ("load_pre_adjustment", 0),
+        ("verify_post_adjustment", 1),
+    ], "the head hand-in consumed an ordinal that belongs to a stage"
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    bound, unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "scaffolded.py"),
+        adjustment_case.role_script(pre, post),
+    )
+
+    assert not unresolved, unresolved
+    # The head is fed from the process's own first input rather than competing with it, which is
+    # what `harness.align._head_feed` already does on the name-driven path.
+    assert bound["handin_pick"] == (pre,)
+    assert bound["load_pre_adjustment_pick"] == (pre,)
+    assert bound["verify_post_adjustment_pick"] == (post,)
+
+
+def test_the_head_hand_in_still_takes_the_first_grid_when_it_is_the_only_one(
+    tmp_path: Path,
+) -> None:
+    """The other half of the same rule, and the shape almost every plan before hand-offs had.
+
+    A plan whose stages declare no hand-in of their own falls through to the head entirely. Fixing
+    the ordinal by simply refusing to drive a stage-less slot would have stopped that notebook in
+    its third cell -- with no defect anywhere in the conversion -- so the head keeps ordinal 0 and
+    only declines to *consume* it.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+    from observed_conversion import observed_plan
+
+    from kedge.notebook.scaffold import head_handin_is_read
+
+    original = observed_plan()
+    declared = {
+        stage.id
+        for stage in original.stages
+        if any(source.origin.value == "handin" and source.ref for source in stage.sources)
+    }
+    plan = restaged(original, {stage_id: {"sources": []} for stage_id in declared})
+    assert head_handin_is_read(plan), "the mutation left a stage hand-in in place"
+
+    handins = [slot for slot in slots_for(plan) if slot.role is Role.HANDIN]
+    assert [(slot.stage_id, slot.ordinal) for slot in handins] == [("", 0)]
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    bound, _unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "head_only.py"),
+        adjustment_case.role_script(pre, post),
+    )
+
+    assert bound["handin_pick"] == (pre,)
+
+
+def test_a_pasted_grid_reaches_the_first_hand_in_of_whatever_plan_it_is(tmp_path: Path) -> None:
+    """``a_paste_out_of_excel_works`` has to be posable against a notebook it did not name.
+
+    The paste box was not classified at all, so the one grader that drives a paste could only
+    ever be posed by spelling ``pre_adjustment_paste`` -- the reference conversion's name for it.
+    Against anything else the paste went nowhere and the grader reported the conversion could not
+    take a grid out of Excel, which was a statement about the harness.
+    """
+    from harness.roles import Role, bind_by_role
+    from observed_conversion import observed_plan
+
+    plan = observed_plan()
+    post = Path("post.csv")
+    bound, unresolved = bind_by_role(
+        plan,
+        _scaffolded(plan, tmp_path / "scaffolded.py"),
+        {
+            **adjustment_case.role_script(post, post),
+            Role.HANDIN: ((), (post,)),
+            Role.PASTE: ("trade\tentity\n",),
+        },
+    )
+
+    assert not unresolved, unresolved
+    assert bound["load_pre_adjustment_paste"] == "trade\tentity\n"
+    assert bound["handin_paste"] == "trade\tentity\n"
+    # The grid arrives by paste and by nothing else, and only at the step that takes it.
+    assert bound["load_pre_adjustment_pick"] == ()
+    assert "verify_post_adjustment_paste" not in bound
+    assert bound["verify_post_adjustment_pick"] == (post,)
+
+
+def test_the_reference_plan_aliases_to_itself() -> None:
+    """The rubric's vocabulary *is* the reference plan's stage ids, so the map is the identity.
+
+    A mapping that renamed anything here would be scoring the gold conversion through a
+    translation layer, and every number this eval has ever published would be a number about
+    that layer as much as about the notebook.
+    """
+    from harness.roles import frame_aliases, stage_roles
+
+    plan = load_plan(PLAN_PATH)
+
+    assert frame_aliases(plan, plan) == {}
+    # And the roles it fills are the stage ids the graders ask for by name.
+    roles = stage_roles(plan)
+    assert roles["computing"] == "adjust"
+    assert roles["writing_handoff"] == "update_statement"
+    assert roles["verifying"] == "verification"
+    assert roles["final"] == "signoff"
+
+
+def test_a_plan_that_names_its_stages_differently_still_answers_the_rubric() -> None:
+    """The whole point of the role layer, on the plan that made the case for it.
+
+    The observed hub plan calls the arithmetic ``calculate_uplift`` and the sign-off
+    ``produce_signoff``. Those are the same two steps, and before this every grader that asked
+    for ``adjust`` or ``signoff`` found nothing and skipped -- which took the points out of the
+    denominator, so the score went *up* as the naming diverged.
+    """
+    from harness.roles import frame_aliases
+    from observed_conversion import observed_plan
+
+    aliases = frame_aliases(load_plan(PLAN_PATH), observed_plan())
+
+    assert aliases["adjust"] == "apply_uplift"
+    # A role the other plan does not fill is absent rather than guessed at: this plan types its
+    # update as `output`, so it hands nothing over and there is no `update_statement` to find.
+    assert "update_statement" not in aliases
 
 
 def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> None:
@@ -709,11 +935,21 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
 
     The item-by-item outcome is asserted as well as the total, because the total moves whenever a
     weight does and what is pinned here is *which* items see the defect. Three are worth reading
-    twice. ``takes_two_handins`` was **green** on this plan while the notebook it scaffolded had
-    one place to put a grid. And two items **skip** rather than failing: a plan that hands nothing
-    over has no statement for ``mutates`` to contradict and no update for a re-extract to wait
-    for, so reporting either as a failure would name the wrong defect.
-    ``hands_over_rather_than_pretends`` is the item about that, and it is red.
+    twice. ``takes_two_handins`` is **green**, and it was red here until the scaffolder was fixed:
+    the mistyped ``kind`` cost the notebook its second hand-in entirely, and now it does not --
+    a ``kind: checkpoint`` stage gets its own selector, receipt and frame like any other. The plan
+    is still wrong about where that hand-in belongs, and ``review_warnings`` still says so on the
+    approval card, but the notebook does ask for the grid and this item grades the notebook. And
+    two items are **blocked** rather than failing: a plan that hands nothing over has no statement
+    for ``mutates`` to contradict and no update for a re-extract to wait for, so reporting either
+    as a failure would name the wrong defect. ``hands_over_rather_than_pretends`` is the item
+    about that, and it is red.
+
+    Blocked, though, and no longer skipped -- so their five points stay in the denominator. This
+    plan scored 5/19 while the defect that cost it those points also removed them from what it
+    was scored out of; it scored 5/24 once they were counted, and 8/24 once the scaffolder stopped
+    dropping the hand-in. The one thing a plan must not gain by omitting a hand-off is a smaller
+    rubric.
     """
     from harness.sweep import Bench, grade_structural
     from observed_conversion import observed_plan
@@ -723,18 +959,190 @@ def test_the_plan_that_got_past_the_loose_tier_does_not_get_past_this_one() -> N
 
     assert outcomes == {
         "hands_over_rather_than_pretends": Outcome.FAIL,
-        "takes_two_handins": Outcome.FAIL,
+        "takes_two_handins": Outcome.PASS,
         "generates_the_update_from_the_frame": Outcome.FAIL,
         "does_not_drop_the_sql_column": Outcome.PASS,
         "raises_the_memo_discrepancy": Outcome.PASS,
         "does_not_trust_the_impact_summary": Outcome.SKIP,
         "has_a_checkpoint_before_the_update": Outcome.FAIL,
-        "the_re_extract_waits_for_the_update": Outcome.SKIP,
-        "mutates_agrees_with_the_statement": Outcome.SKIP,
+        "the_re_extract_waits_for_the_update": Outcome.BLOCKED,
+        "mutates_agrees_with_the_statement": Outcome.BLOCKED,
         "the_briefing_survives_the_workbook": Outcome.FAIL,
         "consults_the_knowledge_pack": Outcome.SKIP,
     }, tier.render()
-    assert (tier.earned, tier.available) == (5, 19), tier.render()
+    assert (tier.earned, tier.available) == (8, 24), tier.render()
     details = {item.id: item.detail for item in tier.items}
-    assert "nowhere to arrive" in details["takes_two_handins"]
+    assert "verify_post_adjustment" in details["takes_two_handins"]
     assert "Sign-off" in details["the_briefing_survives_the_workbook"]
+
+
+# =============================================================================
+# THE VALUES ARE THE PLAN'S TOO
+# =============================================================================
+#
+# `harness.roles` resolved every widget *name* through the plan and left the scripted *values*
+# keyed to the reference conversion, which is the same defect one level down. A checkpoint's
+# vocabulary is `Checkpoint.options` -- the model's free choice, exactly as a stage id is -- and
+# the scaffolder gates on `options[0]`. So a script saying the literal "approve" recorded a
+# decision the gate rejects, the checkpoint never opened, and the whole tier below it was blocked.
+
+
+def _decision_gate(notebook: Path, name: str) -> str:
+    """The one answer this notebook's ``mo.stop`` will let past, read off the emitted gate.
+
+    The assertion that keeps the harness honest about what "approve" means. Comparing the bound
+    value against ``options[0]`` would only prove the harness agrees with itself; comparing it
+    against the code the scaffolder actually wrote proves it agrees with the notebook.
+    """
+    import re
+
+    text = notebook.read_text(encoding="utf-8")
+    match = re.search(r"_decision\s*!=\s*(['\"])(.+?)\1", text)
+    assert match is not None, f"no decision gate for {name!r} in the scaffolded notebook"
+    return match.group(2)
+
+
+def test_a_checkpoint_that_spells_approval_its_own_way_is_still_approved(tmp_path: Path) -> None:
+    """The 27-point defect: a plan may name its decisions, and one real one did.
+
+    ``plan-from-gpt-5-6-terra.yaml`` asks for *"Approve entities E-04, E-07, E-09 and E-12;
+    statutory ledger; the selected period; exclude CANCELLED trades"*. Against that,
+    ``Role.CHECKPOINT_DECISION: "approve"`` wrote a decision into the run record, the gate
+    compared it against the plan's own first option, and the notebook stopped at step 3 of 9 with
+    every deterministic item below it BLOCKED -- a conversion that could not be driven, reported
+    as one that did not work.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+
+    original = load_plan(PLAN_PATH)
+    checkpoint = next(
+        stage.checkpoint for stage in original.stages if stage.id == "approve_adjustment"
+    )
+    plan = restaged(
+        original,
+        {
+            "approve_adjustment": {
+                "checkpoint": checkpoint.model_copy(update={"options": ["agreed", "disputed"]})
+            }
+        },
+    )
+    notebook = _scaffolded(plan, tmp_path / "own_words.py")
+
+    decisions = [slot for slot in slots_for(plan) if slot.role is Role.CHECKPOINT_DECISION]
+    assert [slot.options for slot in decisions] == [("agreed", "disputed")]
+
+    bound, unresolved = bind_by_role(
+        plan, notebook, adjustment_case.role_script(Path("pre.csv"), Path("post.csv"))
+    )
+
+    assert not unresolved, unresolved
+    assert bound["approve_adjustment_decision"] == "agreed"
+    assert bound["approve_adjustment_decision"] == _decision_gate(notebook, "approve_adjustment"), (
+        "the harness approved the checkpoint with a word its own gate would refuse"
+    )
+
+
+def test_the_reference_plan_is_still_approved_with_the_word_it_uses() -> None:
+    """Deriving the decision must not change what the gold conversion is driven with.
+
+    Every committed 71/71 was earned by writing ``approve`` into ``approve_adjustment_decision``,
+    and the reference plan says ``approve``. If it did not, the derivation would be scoring the
+    gold conversion through a translation layer -- which is the same thing
+    :func:`test_the_reference_plan_aliases_to_itself` refuses on the naming side.
+    """
+    from harness.roles import bind_by_role
+
+    plan = load_plan(PLAN_PATH)
+    pre, post = Path("pre.csv"), Path("post.csv")
+
+    bound, _unresolved = bind_by_role(
+        plan, adjustment_case.REFERENCE_NOTEBOOK, adjustment_case.role_script(pre, post)
+    )
+
+    assert bound["approve_adjustment_decision"] == "approve"
+    # And the literal script -- the one run with no plan to resolve anything through -- says the
+    # same word, derived rather than written out a second time beside it.
+    assert adjustment_case.script_for(pre, post)["approve_adjustment_decision"] == "approve"
+
+
+def test_a_period_wanted_by_two_hand_offs_reaches_both(tmp_path: Path) -> None:
+    """Two steps asking for the same thing is not two steps disagreeing about one widget.
+
+    A runbook that extracts, updates and re-extracts hands over two statements, and both of them
+    want the period. The scaffolder gives each hand-off its own widget, so a script with one
+    ``period_end`` has two slots to fill and must fill both -- an extract query left without its
+    period is a step driven with nothing at all.
+    """
+    from harness.roles import Role, bind_by_role, slots_for
+
+    plan = _both_hand_offs_want_the_period()
+    notebook = _scaffolded(plan, tmp_path / "two_periods.py")
+
+    wanted = [
+        slot.name
+        for slot in slots_for(plan)
+        if slot.role is Role.PARAMETER and slot.name.endswith("_period_end")
+    ]
+    assert wanted == ["extract_query_period_end", "update_statement_period_end"]
+
+    bound, unresolved = bind_by_role(
+        plan, notebook, adjustment_case.role_script(Path("pre.csv"), Path("post.csv"))
+    )
+
+    assert not unresolved, unresolved
+    assert bound["extract_query_period_end"] == adjustment_case.PERIOD
+    assert bound["update_statement_period_end"] == adjustment_case.PERIOD
+
+
+def test_two_steps_that_disagree_about_one_widget_still_bind_neither() -> None:
+    """The guard the sharing above must not weaken, and the half of it that was never true.
+
+    Two slots landing on one widget with two *different* values is one step driven with another
+    step's value, and there is no way to tell which afterwards. It used to bind the first and
+    report only the second -- so the loud wrong answer its own comment promised was a quiet one
+    for whichever slot the scaffolder happened to emit first.
+
+    Reached the way it is reached in the wild: a notebook whose widget is named for the parameter
+    rather than for the stage, so both hand-offs' slots strip down onto the same name.
+    """
+    import datetime as dt
+
+    from harness.roles import bind_by_role
+
+    pre, post = Path("pre.csv"), Path("post.csv")
+    quarrelling = {
+        **adjustment_case.role_script(pre, post),
+        "query_period_end": dt.date(2026, 3, 31),
+    }
+
+    bound, unresolved = bind_by_role(
+        _both_hand_offs_want_the_period(), adjustment_case.REFERENCE_NOTEBOOK, quarrelling
+    )
+
+    assert "period_end" not in bound, "one hand-off was driven with the other hand-off's period"
+    said = "; ".join(unresolved)
+    assert "extract_query_period_end" in said
+    assert "update_statement_period_end" in said
+
+
+def _both_hand_offs_want_the_period() -> Any:
+    """The reference plan with a second statement hand-off that also asks for the period.
+
+    The shape every runbook that re-extracts has, and the one
+    ``plan-from-gpt-5-6-terra.yaml`` really wrote: two statements handed over, both needing to
+    know which period they are for. ``update_statement`` is turned from a generated hand-off into
+    a plain one because the scaffolder offers parameter widgets only where there is a statement to
+    substitute them into -- ``awaits_parameters`` is ``parameters and not is_generated`` -- so a
+    generated stage could not pose this question at all.
+    """
+    return _with_handoff(
+        load_plan(PLAN_PATH),
+        "update_statement",
+        template=None,
+        built_from=None,
+        statement=(
+            "UPDATE fin.accruals SET accrual_gbp = accrual_gbp * 1.045 "
+            "WHERE period_end = '{period_end}'"
+        ),
+        parameters=["period_end"],
+    )

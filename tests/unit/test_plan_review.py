@@ -31,7 +31,7 @@ from kedge.analysis.model import (
     PowerQueryExtraction,
     ProcessNote,
 )
-from kedge.notebook.scaffold import _named_handin, _upstream_name, build_cells
+from kedge.notebook.scaffold import _gate_map, _named_handin, _upstream_name, build_cells
 from kedge.plan.model import (
     Approval,
     ApprovalState,
@@ -51,10 +51,10 @@ from kedge.plan.model import (
     StageSource,
 )
 from kedge.plan.review import (
-    _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES,
     PlanNotApprovableError,
     _drop_refusal_question,
     _falls_through_to_the_head_handin,
+    _gate_producing_stage_ids,
     _stage_handin_label,
     acknowledge_all_drops,
     acknowledge_drop,
@@ -1097,10 +1097,11 @@ def test_a_clean_plan_against_its_own_analysis_warns_about_nothing_structural() 
 # WARNINGS ABOUT WHAT THE SCAFFOLDER WILL BUILD
 # =============================================================================
 #
-# Five checks, every one of them a defect observed on one real conversion whose artifacts are
-# copied into `observed_conversion.py`. That plan was valid, was approved, and scaffolded a
-# notebook that opened and ran; `review_warnings` had one thing to say about it and it was about
-# open questions.
+# Six checks, every one of them a defect observed on a real conversion. Five come from the one
+# whose artifacts are copied into `observed_conversion.py`: that plan was valid, was approved, and
+# scaffolded a notebook that opened and ran; `review_warnings` had one thing to say about it and
+# it was about open questions. The sixth came from a later sweep, where three separately proposed
+# plans for the same workbook all left the re-extract with no dependency on the update.
 #
 # The tests come in pairs, and the second half of each pair is the important one. A warning that
 # fires on a correct plan makes the approval card permanently amber, and a permanently amber
@@ -1114,6 +1115,7 @@ _NEW_WARNINGS = {
     "dropped briefing": "Fill `briefing` from the workbook's own words",
     "stranded hand-in": "Move the hand-in",
     "checkpoint as a frame": "which is a checkpoint, and a checkpoint records a decision",
+    "ungated hand-in": "to `depends_on` on",
 }
 """Marker to distinctive substring, so one list serves both directions of every assertion."""
 
@@ -1601,10 +1603,19 @@ def test_a_workbook_that_explained_nothing_is_not_asked_for_a_briefing() -> None
     assert "dropped briefing" not in _fired(review_warnings(_clean_plan(), make_analysis()))
 
 
-# ── 4. a hand-in with nowhere to arrive ─────────────────────────────────────
+# ── 4. a hand-in on a stage that computes nothing ───────────────────────────
 
 
-def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nowhere_to_arrive() -> None:
+def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nothing_to_read_it() -> None:
+    """The warning has to shrink when the defect it described does.
+
+    It used to say the file had nowhere to arrive, and that was true while ``build_cells``
+    ``continue``d past a checkpoint before looking for a hand-in source. The scaffolder emits the
+    receiver cells now, so a card still claiming the file is lost is a card describing a notebook
+    that visibly asks for it -- and an approval card is read exactly as long as everything on it
+    is true. What survives is the part that is still the case: a checkpoint computes nothing, so
+    the comparison the re-extract exists for has no cell.
+    """
     plan = _clean_plan(
         stages=[
             Stage(id="adjust", intent="Apply the uplift", confidence=Confidence.HIGH),
@@ -1621,9 +1632,10 @@ def test_a_hand_in_declared_on_a_checkpoint_is_reported_as_having_nowhere_to_arr
     assert any(
         "'verify'" in warning
         and "'post-adjustment extract'" in warning
-        and "no selector cell, no receipt cell and no frame" in warning
+        and "computes nothing" in warning
         for warning in warnings
     )
+    assert not any("nowhere to arrive" in warning for warning in warnings)
 
 
 def test_the_same_hand_in_on_the_stage_that_reads_it_is_not_reported() -> None:
@@ -1803,18 +1815,516 @@ def test_a_stage_reading_something_it_does_not_depend_on_gets_one_warning_not_tw
     assert "checkpoint as a frame" not in _fired(warnings)
 
 
+# ── 6. a re-extract nothing hides ───────────────────────────────────────────
+#
+# The defect a live sweep found in all three plans it proposed for the adjustment workbook, each
+# losing the same eval item: the stage receiving the post-adjustment extract named no dependency
+# on the hand-off that runs the UPDATE. `_gate_tokens` reads `depends_on` *directly*, so there was
+# no token to read, so there was no dataflow edge -- and a hand-in selector builds `mo.ui`
+# elements and reads nothing else, so nothing else could hide it. The file box sat on screen from
+# the moment the notebook opened, inviting a re-extract taken before the statement ran, which
+# looks exactly like one taken after and cannot be told from it afterwards.
+
+
+def _runbook(*, post_depends_on: list[str], middle: bool = False) -> ProcessPlan:
+    """extract -> adjust -> approve -> UPDATE -> re-extract, with the last edge under test.
+
+    `middle` inserts a plain transform between the hand-off and the re-extract, which is the
+    shape that separates "reads the token" from "is somewhere downstream of it".
+    """
+    stages = [
+        Stage(
+            id="pre_adjustment",
+            intent="The position before any adjustment",
+            kind=StageKind.LOAD,
+            sources=[_handin("pre-adjustment extract")],
+            confidence=Confidence.HIGH,
+        ),
+        Stage(
+            id="adjust",
+            intent="Apply the uplift",
+            depends_on=["pre_adjustment"],
+            confidence=Confidence.HIGH,
+        ),
+        Stage(
+            id="approve",
+            intent="Approve the adjustment before it is applied",
+            kind=StageKind.CHECKPOINT,
+            depends_on=["adjust"],
+        ),
+        Stage(
+            id="update_statement",
+            intent="Hand over the UPDATE",
+            kind=StageKind.HANDOFF,
+            depends_on=["approve", "adjust"],
+            handoff=_update_handoff(),
+        ),
+    ]
+    if middle:
+        stages.append(
+            Stage(
+                id="expected_rows",
+                intent="The rows the update should have written",
+                depends_on=["update_statement", "adjust"],
+                confidence=Confidence.HIGH,
+            )
+        )
+    stages.append(
+        Stage(
+            id="post_adjustment",
+            intent="The re-extract, as evidence the update did what was intended",
+            kind=StageKind.LOAD,
+            sources=[_handin("post-adjustment extract")],
+            depends_on=post_depends_on,
+            confidence=Confidence.HIGH,
+        )
+    )
+    return _clean_plan(stages=stages)
+
+
+def test_a_re_extract_that_does_not_depend_on_the_update_is_reported() -> None:
+    """The sweep's finding. The plan validates, the notebook scaffolds, and it is wrong."""
+    warnings = review_warnings(_runbook(post_depends_on=["adjust"]))
+
+    assert any(
+        "'update_statement'" in warning
+        and "'post_adjustment'" in warning
+        and "'post-adjustment extract'" in warning
+        and "`depends_on`" in warning
+        for warning in warnings
+    ), warnings
+
+
+def test_the_same_plan_naming_the_update_in_depends_on_is_not_reported() -> None:
+    """The minimal pair: one edge, and it is the edge the whole runbook hangs on."""
+    assert "ungated hand-in" not in _fired(
+        review_warnings(_runbook(post_depends_on=["update_statement"]))
+    )
+
+
+def test_a_transform_between_the_update_and_the_re_extract_carries_no_gate() -> None:
+    """Downstream of the hand-off is not the same as gated on it, and the difference is the bug.
+
+    A transform reads the confirmation token, so *it* is hidden until the statement is confirmed.
+    The selector below it reads no frame at all -- `_handin_cells` emits `mo.ui` elements and the
+    gate tokens of this stage's own `depends_on` -- so being a descendant of the transform buys it
+    nothing. Answering this transitively would call the defect a correct plan.
+    """
+    plan = _runbook(post_depends_on=["expected_rows"], middle=True)
+    assert "ungated hand-in" in _fired(review_warnings(plan))
+
+
+def test_a_re_extract_behind_a_checkpoint_that_follows_the_update_is_gated() -> None:
+    """And answering it too strictly is the other bug.
+
+    A checkpoint below the hand-off reads its confirmation token and defines one of its own, so a
+    selector reading the checkpoint's decision is held behind the statement as surely as if it
+    named the hand-off. That chain is what `_gates_a_stage_waits_for` follows.
+    """
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="update_statement",
+                intent="Hand over the UPDATE",
+                kind=StageKind.HANDOFF,
+                handoff=_update_handoff(
+                    built_from=None, template=None, statement="UPDATE t SET a=1"
+                ),
+            ),
+            Stage(
+                id="confirm_it_ran",
+                intent="Confirm the statement was run before asking for the re-extract",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["update_statement"],
+            ),
+            Stage(
+                id="post_adjustment",
+                intent="The re-extract",
+                kind=StageKind.LOAD,
+                sources=[_handin("post-adjustment extract")],
+                depends_on=["confirm_it_ran"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_the_hand_in_the_plan_puts_before_the_statement_is_not_a_re_extract() -> None:
+    """`pre_adjustment` feeds the arithmetic the UPDATE is rendered from, so it arrives first.
+
+    Asserted on the plan that *does* fire, because that is where getting it wrong would show:
+    fired on both, the check would tell every runbook to hide its own first input behind the
+    update that input is used to compute, and the card would be amber on every correct plan.
+    """
+    ungated = [
+        warning
+        for warning in review_warnings(_runbook(post_depends_on=["adjust"]))
+        if "`depends_on` on" in warning
+    ]
+
+    assert len(ungated) == 1, ungated
+    assert "'post_adjustment'" in ungated[0]
+    assert "'pre_adjustment'" not in ungated[0]
+
+
+def test_a_read_only_hand_off_gates_nothing_so_a_later_hand_in_owes_it_nothing() -> None:
+    """The extract query hands over a SELECT: `needs_confirmation` is false, the scaffolder emits
+    no confirmation cell, and there is no token for anything to read. The hand-in that follows is
+    itself the evidence the query was run."""
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="extract_query",
+                intent="Hand over the extract",
+                kind=StageKind.HANDOFF,
+                handoff=Handoff(
+                    instruction="Run this and bring the grid back",
+                    statement="SELECT trade_id FROM fin.accruals FOR UPDATE",
+                ),
+            ),
+            Stage(
+                id="pre_adjustment",
+                intent="What it returned",
+                kind=StageKind.LOAD,
+                sources=[_handin("pre-adjustment extract")],
+                depends_on=["extract_query"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_the_reference_decomposition_of_the_observed_workbook_is_left_alone() -> None:
+    """The committed `evals/adjustment_signoff/plan.yaml` in the shape this file keeps it.
+
+    Its `post_adjustment` names `update_statement` in `depends_on` and its `pre_adjustment` feeds
+    the adjustment, so both halves of the silence rule are exercised by one plan -- the one every
+    other part of the project treats as correct.
+    """
+    assert "ungated hand-in" not in _fired(review_warnings(corrected_plan(), observed_analysis()))
+
+
+@pytest.mark.parametrize("depends_on", [["adjust"], []])
+def test_the_reference_plan_with_its_re_extract_unhooked_is_reported(
+    depends_on: list[str],
+) -> None:
+    """The two shapes of the defect, on the plan the project treats as correct.
+
+    `['adjust']` is what the live sweep produced. `[]` is the one that made the author refuse an
+    order-based rule: with no dependency at all the stage floats *above* the hand-off in
+    `ordered_stages()`, so "does it come after the write?" answers no on the plan most in need of
+    the warning. Both have to fire, and neither may be bought by a rule that fires on unrelated
+    files as well.
+    """
+    plan = edit_stage(corrected_plan(), "post_adjustment", depends_on=depends_on)
+
+    ungated = [warning for warning in review_warnings(plan) if "`depends_on` on" in warning]
+
+    assert len(ungated) == 1, ungated
+    assert "'update_statement'" in ungated[0]
+    assert "'post_adjustment'" in ungated[0]
+
+
+# ── ... and the three shapes it used to cry wolf on ──────────────────────────
+#
+# The rule this replaced asked "is this stage held behind that hand-off?" and demanded an edge
+# wherever the answer was no -- which is the wrong default in a plan language where most pairs of
+# stages have no relation at all. Each of the three below is a plan that validates, scaffolds a
+# correct notebook, and was told to wire itself to a statement it has nothing to do with.
+#
+# What that costs is more than an amber card. `propose.py` picks the surviving proposal by
+# `len(findings)`, so a false positive changes which plan is kept; `propose_amend.md` calls every
+# finding "a defect the scaffolder cannot work around" and forbids declining one, so a compliant
+# model wires the edge; and in the third case obeying every warning builds a dependency cycle
+# that `PlanDraft` then refuses, discarding the whole proposal.
+
+
+def test_a_second_unrelated_writing_hand_off_does_not_recruit_every_hand_in() -> None:
+    """A closing UPDATE on its own branch, beside an ordinary correctly-gated runbook.
+
+    Every hand-in in the plan was told to depend on it -- including the runbook's *first* extract,
+    which would put the notebook's opening file box behind the confirmation of a statement that
+    has nothing to do with it, at the top of a page where nothing else is visible yet.
+    """
+    plan = _clean_plan(
+        stages=[
+            *_runbook(post_depends_on=["update_statement"]).stages,
+            Stage(
+                id="close_period",
+                intent="Close the period once everything else is done",
+                kind=StageKind.HANDOFF,
+                handoff=Handoff(
+                    instruction="Run this when the month is closed",
+                    statement="UPDATE fin.periods SET closed = 1 WHERE period = 'Q2'",
+                    mutates=True,
+                ),
+            ),
+        ]
+    )
+
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_a_reference_file_on_a_branch_of_its_own_is_not_a_re_extract() -> None:
+    """A rate-card mapping, read by one output stage and by nothing the UPDATE touches.
+
+    It is a hand-in, it is not gated, and it is not evidence about anything -- the file box being
+    on screen from the start is the whole of what it is for. Nothing in the plan ties it to the
+    statement, and inventing the tie is not a repair.
+    """
+    plan = _clean_plan(
+        stages=[
+            *_runbook(post_depends_on=["update_statement"]).stages,
+            Stage(
+                id="rate_card",
+                intent="The rate-card mapping, supplied by Product Control",
+                kind=StageKind.LOAD,
+                sources=[_handin("rate card mapping")],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="rate_summary",
+                intent="Summarise the rate card as supplied",
+                kind=StageKind.OUTPUT,
+                depends_on=["rate_card"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_two_correctly_gated_pairs_are_not_told_to_cross_wire_into_a_cycle() -> None:
+    """One workbook, two independent update/re-extract pairs, each already gated on its own.
+
+    Four warnings came out of this, and obeying them is not merely noise: `recheck_a` waits for
+    `update_b`, `pull_b` waits for `update_a`, and `update_a` already waits for `pull_a`. That is
+    a cycle, `PlanDraft` refuses it by name, and the amendment carrying it is discarded whole.
+
+    The plan is asserted valid here as well as quiet, because the point is that both halves of it
+    are already right.
+    """
+
+    def _pair(suffix: str) -> list[Stage]:
+        return [
+            Stage(
+                id=f"pull_{suffix}",
+                intent=f"Extract {suffix}",
+                kind=StageKind.LOAD,
+                sources=[_handin(f"{suffix} extract")],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id=f"approve_{suffix}",
+                intent=f"Approve {suffix}",
+                kind=StageKind.CHECKPOINT,
+                depends_on=[f"pull_{suffix}"],
+            ),
+            Stage(
+                id=f"update_{suffix}",
+                intent=f"Hand over the {suffix} UPDATE",
+                kind=StageKind.HANDOFF,
+                depends_on=[f"approve_{suffix}"],
+                handoff=Handoff(
+                    instruction="Run this, then re-extract",
+                    statement=f"UPDATE fin.{suffix} SET amount = 1 WHERE id = 2",
+                    mutates=True,
+                ),
+            ),
+            Stage(
+                id=f"recheck_{suffix}",
+                intent=f"The {suffix} re-extract",
+                kind=StageKind.LOAD,
+                sources=[_handin(f"{suffix} re-extract")],
+                depends_on=[f"update_{suffix}"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+
+    plan = _clean_plan(stages=[*_pair("a"), *_pair("b")])
+
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_a_stage_already_waiting_on_one_statement_is_not_asked_to_wait_on_another() -> None:
+    """The same argument where the two writes *do* share a root, which is the harder half.
+
+    Convergence alone cannot separate these: one extract feeding two independent UPDATEs relates
+    every stage to every other. What separates them is the harm the warning names -- a file box on
+    screen from the moment the notebook opens -- which a stage gated on *any* confirmation does
+    not have. Which statement a re-extract is evidence for is then the plan's judgement, and this
+    check is in no position to overrule it.
+    """
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="opening",
+                intent="The opening position",
+                kind=StageKind.LOAD,
+                sources=[_handin("opening extract")],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="approve",
+                intent="Approve both adjustments",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["opening"],
+            ),
+            *(
+                Stage(
+                    id=f"update_{suffix}",
+                    intent=f"Hand over the {suffix} UPDATE",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["approve", "opening"],
+                    handoff=Handoff(
+                        instruction="Run this, then re-extract",
+                        statement=f"UPDATE fin.{suffix} SET amount = 1 WHERE id = 2",
+                        mutates=True,
+                    ),
+                )
+                for suffix in ("a", "b")
+            ),
+            Stage(
+                id="recheck_a",
+                intent="The re-extract that follows the a UPDATE",
+                kind=StageKind.LOAD,
+                sources=[_handin("a re-extract")],
+                depends_on=["update_a"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+
+    assert "ungated hand-in" not in _fired(review_warnings(plan))
+
+
+def test_one_ungated_re_extract_still_names_every_statement_it_could_be_evidence_for() -> None:
+    """The other side of that: gated on neither, and both are on its own branch.
+
+    The silence rules narrow which hand-offs a stage is measured against; they must not switch the
+    check off wherever a plan has two of them.
+    """
+    plan = _clean_plan(
+        stages=[
+            Stage(
+                id="opening",
+                intent="The opening position",
+                kind=StageKind.LOAD,
+                sources=[_handin("opening extract")],
+                confidence=Confidence.HIGH,
+            ),
+            Stage(
+                id="approve",
+                intent="Approve both adjustments",
+                kind=StageKind.CHECKPOINT,
+                depends_on=["opening"],
+            ),
+            *(
+                Stage(
+                    id=f"update_{suffix}",
+                    intent=f"Hand over the {suffix} UPDATE",
+                    kind=StageKind.HANDOFF,
+                    depends_on=["approve", "opening"],
+                    handoff=Handoff(
+                        instruction="Run this, then re-extract",
+                        statement=f"UPDATE fin.{suffix} SET amount = 1 WHERE id = 2",
+                        mutates=True,
+                    ),
+                )
+                for suffix in ("a", "b")
+            ),
+            Stage(
+                id="recheck",
+                intent="The re-extract, gated on neither statement",
+                kind=StageKind.LOAD,
+                sources=[_handin("re-extract")],
+                depends_on=["opening"],
+                confidence=Confidence.HIGH,
+            ),
+        ]
+    )
+
+    ungated = [warning for warning in review_warnings(plan) if "`depends_on` on" in warning]
+
+    assert len(ungated) == 1, ungated
+    assert "'update_a'" in ungated[0]
+    assert "'update_b'" in ungated[0]
+
+
+def test_the_warning_claims_nothing_about_the_plan_that_is_not_true() -> None:
+    """An approval card is read exactly as long as everything on it is true.
+
+    It used to say the stage "depends on nothing that records the statement as having been run"
+    and that the hand-off's token was "the only thing" that could hide it, and that it is read
+    "never through another stage". All three were false on a plan with two writing hand-offs and
+    a re-extract gated on the other one -- and the module's own `_gates_a_stage_waits_for` exists
+    precisely because a chain of gate cells *does* carry the protection across.
+    """
+    plan = edit_stage(corrected_plan(), "post_adjustment", depends_on=["adjust"])
+
+    ungated = next(warning for warning in review_warnings(plan) if "`depends_on` on" in warning)
+
+    assert "depends on nothing that records" not in ungated
+    assert "never through another stage" not in ungated
+    assert "waits on no statement confirmation at all" in ungated
+    assert "names a checkpoint or hand-off that waits for it in turn" in ungated
+
+
+def test_a_checkpoints_own_hand_in_gets_one_repair_instruction_not_two_opposing_ones() -> None:
+    """`_stranded_handin_warnings` says move the file off this stage; this one said add an edge
+    to it. Both fired on the same defect, and a model reading `propose_amend.md` -- which calls
+    every finding a defect it may not decline -- has to obey both.
+
+    The guard meant to prevent it was `if stage.kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES`,
+    written one commit after that set was emptied, so it was never true. Skipping a checkpoint by
+    name is the same rule with nothing to go stale underneath it.
+    """
+    stages = list(_runbook(post_depends_on=["adjust"]).stages)
+    stages[-1] = Stage(
+        id="post_adjustment",
+        intent="Does the re-extract agree with what we predicted?",
+        kind=StageKind.CHECKPOINT,
+        sources=[_handin("post-adjustment extract")],
+        depends_on=["adjust"],
+    )
+    plan = _clean_plan(stages=stages)
+
+    fired = _fired(review_warnings(plan))
+
+    assert "stranded hand-in" in fired
+    assert "ungated hand-in" not in fired
+
+
 # ── the layering tripwire ───────────────────────────────────────────────────
 #
-# `review.py` reimplements two of the scaffolder's predicates rather than importing them, because
-# `analysis/ -> plan/ -> notebook/` runs the other way and a function-local import to dodge the
-# cycle would hide the inversion rather than avoid it. The reasoning is in the WARNINGS banner of
-# `review.py`; this is the half that keeps it honest. A test may cross layers freely, so both
-# copies are asserted against the scaffolder's own code here, and a change to either side fails.
+# `review.py` reimplements three of the scaffolder's predicates rather than importing them,
+# because `analysis/ -> plan/ -> notebook/` runs the other way and a function-local import to
+# dodge the cycle would hide the inversion rather than avoid it. The reasoning is in the WARNINGS
+# banner of `review.py`; this is the half that keeps it honest. A test may cross layers freely, so
+# every copy is asserted against the scaffolder's own code here, and a change to either side
+# fails.
 
 
-def test_the_only_kind_the_scaffolder_ignores_a_hand_in_for_is_the_one_review_names() -> None:
-    """Scaffold one stage of every `StageKind`, each declaring its own hand-in, and see which
-    ones got no hand-in cells. That set is what `_HANDIN_KINDS_THE_SCAFFOLDER_IGNORES` claims."""
+def test_the_scaffolder_emits_hand_in_cells_for_every_stage_kind() -> None:
+    """Scaffold one stage of every `StageKind`, each declaring its own hand-in, and check that
+    every one of them got the cells to receive it.
+
+    This is the tripwire under `_stranded_handin_warnings`, which now says a checkpoint's own
+    hand-in *arrives* and only complains that nothing computes on it. While `build_cells`
+    `continue`d past a checkpoint before looking for a hand-in source, the file had nowhere to
+    arrive at all and a runbook stopped dead at the step meant to prove the update had worked.
+
+    It used to be asserted against a `review.py` constant naming the kinds that got nothing. The
+    constant went empty when the scaffolder was fixed, and one commit later a guard reading it --
+    `if stage.kind in _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES: continue` -- was written against a set
+    that could never contain anything, so the double-report it was meant to prevent happened on
+    every plan that could trigger it. An empty set as a shared premise is a premise nobody can
+    see is empty; asserting the emptiness here says the same thing and cannot be mistaken for a
+    live rule.
+    """
     stages = [
         Stage(
             id=f"stage_{kind.value}",
@@ -1837,7 +2347,9 @@ def test_the_only_kind_the_scaffolder_ignores_a_hand_in_for_is_the_one_review_na
         if not any(cell.role == "handin" and cell.stage_id == stage.id for cell in cells)
     }
 
-    assert ignored == _HANDIN_KINDS_THE_SCAFFOLDER_IGNORES
+    assert ignored == set(), (
+        f"no kind may go without hand-in cells; these did: {sorted(kind.value for kind in ignored)}"
+    )
 
 
 def test_the_review_copy_of_named_handin_agrees_with_the_scaffolders() -> None:
@@ -1849,6 +2361,65 @@ def test_the_review_copy_of_named_handin_agrees_with_the_scaffolders() -> None:
     ]
     for stage in stages:
         assert _stage_handin_label(stage) == _named_handin(stage), stage.id
+
+
+def test_the_review_copy_of_the_gate_map_agrees_with_the_scaffolders() -> None:
+    """Which stages define a token something later can be held behind.
+
+    The battery is the set of near-misses, because the whole warning turns on this: a read-only
+    hand-off scaffolds no confirmation and gates on its statement instead, a claimed mutation
+    scaffolds one even over a `SELECT`, a written statement scaffolds one even where the plan
+    calls itself read-only (`mutates` is a claim; the statement is the fact), and a `handoff`
+    block hanging off a `load` stage never reaches `_handoff_cells` at all. Told any of those
+    wrongly, the check either demands a dependency on a token that is never defined or misses the
+    one plan it exists for.
+
+    The read-only case is the one that changed, and it is a *weaker* token rather than none: it
+    orders a file box below the query producing it, and carries a confirmation across where it
+    stands between one and a re-extract. It still asserts nothing about anybody having run
+    anything, which is why `_ungated_handin_warnings` intersects against the writing hand-offs
+    and not against this set.
+    """
+    stages = [
+        Stage(id="approve", intent="Approve it", kind=StageKind.CHECKPOINT),
+        Stage(id="compute", intent="Compute something", confidence=Confidence.HIGH),
+        Stage(
+            id="read_only_handoff",
+            intent="Hand over the extract",
+            kind=StageKind.HANDOFF,
+            handoff=Handoff(instruction="Run this", statement="SELECT 1 FROM t FOR UPDATE"),
+        ),
+        Stage(
+            id="writing_handoff",
+            intent="Hand over the UPDATE",
+            kind=StageKind.HANDOFF,
+            handoff=Handoff(instruction="Run this", statement="UPDATE t SET a = 1", mutates=False),
+        ),
+        Stage(
+            id="claimed_handoff",
+            intent="Ask the DBA",
+            kind=StageKind.HANDOFF,
+            handoff=Handoff(
+                instruction="Raise a ticket",
+                medium=HandoffMedium.TEXT,
+                statement="Ask the DBA to run the migration",
+                mutates=True,
+            ),
+        ),
+        Stage(
+            id="load_carrying_a_handoff",
+            intent="Here is the query, and here is where you paste what it returns",
+            kind=StageKind.LOAD,
+            sources=[_handin("second extract")],
+            confidence=Confidence.HIGH,
+            handoff=Handoff(instruction="Run this", statement="UPDATE t SET b = 2", mutates=True),
+        ),
+    ]
+    plan = _clean_plan(stages=stages)
+
+    assert _gate_producing_stage_ids(plan) == set(
+        _gate_map(plan, {stage.id: stage.id for stage in plan.stages})
+    )
 
 
 def _fallthrough_battery() -> list[Stage]:

@@ -101,6 +101,7 @@ __all__ = [
     "build_cells",
     "cell_name_for",
     "head_handin_is_read",
+    "head_handin_reader",
     "holes_in",
     "is_unwritten",
     "split_hole",
@@ -599,21 +600,37 @@ def _satellite_names(name: str) -> tuple[str, ...]:
     return (f"{name}_ui", f"{name}_decision", f"{name}_note")
 
 
+def _claimed_names(stage: Stage, name: str) -> tuple[str, ...]:
+    """Every name this stage's cells define beyond the stage name itself.
+
+    A union rather than a choice, because a stage is allowed to be more than one of these at
+    once. A checkpoint that declares a hand-in of its own scaffolds the three receiver cells
+    *and* the approval pair, so it claims both sets of derived names. Reserving only the last
+    match -- which is what a chain of reassignments did -- left a checkpoint's ``<name>_ui``,
+    ``<name>_decision`` and ``<name>_note`` unreserved the moment it also carried a hand-in, so
+    a plan with a checkpoint ``verify`` beside a stage ``verify_decision`` would scaffold two
+    cells defining one name. marimo rejects that as multiply defined, and the user meets it as a
+    notebook that will not open.
+    """
+    claimed: tuple[str, ...] = ()
+    if stage.is_checkpoint:
+        claimed += _satellite_names(name)
+    if stage.is_handoff:
+        claimed += _handoff_satellites(name)
+    if _named_handin(stage) is not None:
+        claimed += _handin_satellites(name)
+    return claimed
+
+
 def _name_map(plan: ProcessPlan) -> dict[str, str]:
     """Map every stage id to its cell name, assigned in emission order."""
     names: dict[str, str] = {}
     used: set[str] = set()
     for stage in plan.ordered_stages():
         name = cell_name_for(stage.id, used)
-        satellites = _satellite_names if stage.is_checkpoint else None
-        if stage.is_handoff:
-            satellites = _handoff_satellites
-        if _named_handin(stage) is not None:
-            satellites = _handin_satellites
-        if satellites is not None:
-            while any(taken in used for taken in satellites(name)):
-                name = cell_name_for(name, used | {name})
-            used.update(satellites(name))
+        while any(taken in used for taken in _claimed_names(stage, name)):
+            name = cell_name_for(name, used | {name})
+        used.update(_claimed_names(stage, name))
         names[stage.id] = name
         used.add(name)
     return names
@@ -670,15 +687,24 @@ def build_cells(
 
     ordered = plan.ordered_stages()
     for index, stage in enumerate(ordered, start=1):
-        if stage.is_checkpoint:
-            cells.extend(_checkpoint_cells(stage, index, len(ordered), names, gated))
-            continue
         # A stage that reads a hand-in of its own gets the three receiver cells first, and its
         # own cell then computes on the frame they define. Emitted before the stage rather than
-        # instead of it, so a stage that both receives and transforms keeps both.
+        # instead of it, so a stage that both receives and transforms keeps both -- and asked
+        # ahead of the kind branches, because *any* kind may declare one.
+        #
+        # This used to sit below the checkpoint branch, which `continue`d past it. A `kind:
+        # checkpoint` stage declaring `{origin: handin, ref: ...}` therefore got no selector, no
+        # receipt and no frame: the source was read, validated, rendered on the approval card,
+        # and then dropped. The shape that needed it most was the one shape that could not have
+        # it -- a runbook's re-extract arrives precisely at the checkpoint that asks "did the
+        # update do what we predicted?", and a real hub conversion stopped dead at that step
+        # with the file it was waiting for having nowhere to go.
         label = _named_handin(stage)
         if label is not None:
             cells.extend(_handin_cells(stage, index, len(ordered), names[stage.id], label, gated))
+        if stage.is_checkpoint:
+            cells.extend(_checkpoint_cells(stage, index, len(ordered), names, gated))
+            continue
         if stage.is_handoff:
             cells.extend(_handoff_cells(stage, index, len(ordered), names, gated))
             continue
@@ -695,17 +721,31 @@ def build_cells(
 def _gate_map(plan: ProcessPlan, names: dict[str, str]) -> dict[str, str]:
     """Stage id to the token a downstream cell must read to be allowed to render.
 
-    Two kinds of stage produce one. A checkpoint's token is its decision record; a mutating
-    hand-off's is its confirmation. Both mean the same thing to the cell that reads it -- *a
-    person has done something, and until they had, you were not to be shown* -- which is why one
-    map covers both rather than the scaffolder branching on kind at every use.
+    Three kinds of stage produce one, and they are two different strengths of claim.
+
+    A checkpoint's token is its decision record and a mutating hand-off's is its confirmation.
+    Both say *a person has done something, and until they had, you were not to be shown*, and
+    both are withheld by a ``mo.stop`` until they have.
+
+    A read-only hand-off's token is the statement itself, and it says only *the step above you
+    is on screen*. That is weaker, and it is the whole of the ordering guarantee a runbook
+    needs: the box asking for an extract must not appear above the query that produces it.
+    Nothing else can supply it -- a selector cell builds ``mo.ui`` elements and reads nothing,
+    so marimo has no edge to place it behind, and a real user met that as "where is the sql to
+    run to get the starting data?" with the drop-box in front of them. A read-only query needs
+    no confirmation (the hand-in that follows *is* the evidence it was run), so the statement is
+    the only token there is.
     """
     gates: dict[str, str] = {}
     for stage in plan.stages:
         if stage.is_checkpoint:
             gates[stage.id] = names[stage.id]
-        elif stage.is_handoff and stage.effective_handoff().needs_confirmation:
-            gates[stage.id] = f"{names[stage.id]}_confirmed"
+        elif stage.is_handoff:
+            gates[stage.id] = (
+                f"{names[stage.id]}_confirmed"
+                if stage.effective_handoff().needs_confirmation
+                else names[stage.id]
+            )
     return gates
 
 
@@ -1114,7 +1154,22 @@ templates. It is the cell's name, which is the only thing about the head hand-in
 any one step of the process.
 """
 
-_HANDIN_CELL = f"""# All three entry points converge here, and kedge.ingest.receive does the whole job: a
+
+def _handin_cell_code(blocking: str) -> str:
+    """The head hand-in's body, with the message it renders when it is waiting.
+
+    A function rather than a constant for one interpolation, and that interpolation is the point.
+    This was the only ``mo.stop`` in the scaffold that did not name its step -- it said "Waiting
+    for a hand-in", full stop -- because the head hand-in belongs to the notebook rather than to
+    any one stage and there was no number to quote. But in app mode a stopped cell is the entire
+    user interface, and the rule the rest of the file follows exists precisely for that moment:
+    a page that says "waiting" and a page that has died look identical. The step it is waiting
+    *for* is knowable -- it is the first stage that reads the frame -- so it is quoted.
+    """
+    return _HANDIN_TEMPLATE.replace("{{BLOCKING}}", repr(blocking))
+
+
+_HANDIN_TEMPLATE = f"""# All three entry points converge here, and kedge.ingest.receive does the whole job: a
 # dropped file's bytes are written into the managed store, a selected path is copied into it,
 # pasted text is sniffed for its delimiter and normalised to CSV, every one of them is hashed
 # and deduplicated against what is already there, and a receipt is recorded. `handin` is a
@@ -1136,7 +1191,7 @@ mo.stop(
     and not handin_drop.value
     and not handin_pick.value
     and not _pasted,
-    mo.md("**Waiting for a hand-in.** Drop a file above, select one, or paste a grid."),
+    mo.md({{{{BLOCKING}}}}),
 )
 
 # Precedence is by reproducibility, most reproducible first. A selected path is a file that
@@ -1496,6 +1551,39 @@ def head_handin_is_read(
         Whether ``handin_frame`` -- or a stage source naming the notebook's own hand-in -- is
         read by anything the plan calls for.
     """
+    return head_handin_reader(plan, names, checkpoints) is not None
+
+
+def head_handin_reader(
+    plan: ProcessPlan, names: dict[str, str] | None = None, checkpoints: set[str] | None = None
+) -> Stage | None:
+    """The first stage that reads the notebook's own hand-in, or ``None`` when nothing does.
+
+    :func:`head_handin_is_read` is this question asked as a yes or no, and everything about *why*
+    is documented there. The stage itself is wanted for one reason: the head hand-in's ``mo.stop``
+    has to name the step it is waiting for, and this is the step.
+
+    Note what a caller must not read into the answer. A stage reaching the head hand-in is often
+    a **fall-through** rather than a declaration -- ``_upstream_name`` returns ``handin_frame``
+    when nothing else matched -- so this names the stage that will consume the file, not
+    necessarily one that asked for it.
+
+    A checkpoint is skipped by the branch below, and it stays skipped now that a checkpoint may
+    carry a hand-in of its own: :func:`_checkpoint_cells` renders a decision, and where the stage
+    declares a hand-in of its own, :func:`_handin_cells` gives it ``<name>_frame`` under its own
+    name. Neither reads ``handin_frame``. Note that the branch *above* it does not skip: a stage
+    declaring the bare ``{origin: handin}`` is the head hand-in's reader whatever kind it is, and
+    a checkpoint may say so as legitimately as anything else.
+
+    **What this does not promise is that a checkpoint's own hand-in keeps the head cells out.**
+    ``_upstream_name`` never treats a checkpoint as a frame, so a stage whose only dependency is
+    one falls through to ``handin_frame`` -- and then something genuinely does read the head
+    hand-in, and it is emitted, correctly, beside the checkpoint's own file box. Two boxes for a
+    process that declared one file is the plan's shape showing through rather than this walk's
+    doing, and it is :func:`kedge.plan.review._stranded_handin_warnings` that says so on the
+    approval card: move the file onto the stage that computes on it, and the fall-through and the
+    second box both go with it.
+    """
     resolved = names if names is not None else _name_map(plan)
     gates = (
         checkpoints
@@ -1504,18 +1592,18 @@ def head_handin_is_read(
     )
     for stage in plan.ordered_stages():
         if any(source.origin is SourceOrigin.HANDIN and not source.ref for source in stage.sources):
-            return True
+            return stage
         if stage.is_checkpoint:
             continue
         if stage.is_handoff:
             handoff = stage.effective_handoff()
             # A generated hand-off with no resolvable `built_from` falls back to the head frame.
             if handoff.is_generated and (handoff.built_from or "") not in resolved:
-                return True
+                return stage
             continue
         if _upstream_name(stage, resolved, gates) == "handin_frame":
-            return True
-    return False
+            return stage
+    return None
 
 
 def _head_cells(
@@ -1543,16 +1631,38 @@ def _head_cells(
         ScaffoldCell(name="kedge_run_mode", role="setup", code=_RUN_MODE_CELL),
         ScaffoldCell(name="kedge_run", role="setup", code=_RUN_CELL),
     ]
-    if not head_handin_is_read(plan, names, checkpoints):
+    reader = head_handin_reader(plan, names, checkpoints)
+    if reader is None:
         logger.info(
             "plan v%d declares every hand-in on a stage, so the fixed head hand-in is not emitted",
             plan.version,
         )
         return cells
+    # Emitted, and said so. This used to happen silently, and it is most often a *fall-through*
+    # -- no stage declared `origin: handin`, so `_upstream_name` reached the head frame because
+    # nothing else matched. Six cells and a blocking `mo.stop` then arrived at the top of the
+    # notebook for an input no step of the plan names, and nothing anywhere reported it. The
+    # scaffold report is where a reader finds out.
+    ordered = list(plan.ordered_stages())
+    logger.info(
+        "plan v%d reaches the notebook's own hand-in at stage %r (step %d of %d), so the fixed "
+        "head hand-in is emitted",
+        plan.version,
+        reader.id,
+        ordered.index(reader) + 1,
+        len(ordered),
+    )
+    blocking = _waiting(
+        ordered.index(reader) + 1,
+        len(ordered),
+        _one_line(reader.id),
+        "Drop the file above, select one on this machine, or paste the grid. Nothing below "
+        "this runs until it arrives.",
+    )
     cells.extend(
         [
             ScaffoldCell(name="handin_source", role="handin", code=_SOURCE_CELL),
-            ScaffoldCell(name="handin", role="handin", code=_HANDIN_CELL),
+            ScaffoldCell(name="handin", role="handin", code=_handin_cell_code(blocking)),
             ScaffoldCell(name="handin_contract", role="handin", code=_CONTRACT_CELL),
             ScaffoldCell(name="handin_drift", role="handin", code=_DRIFT_CELL),
             ScaffoldCell(name="handin_check", role="handin", code=_CHECK_CELL),
@@ -1647,6 +1757,13 @@ def _checkpoint_cells(
     value — the defining cell does not re-run on interaction. The gate cell is where ``mo.stop``
     lives, and ``mo.stop`` halts this cell *and its descendants*, so the block is real rather
     than advisory: a downstream cell referencing this stage's output is cancelled, not skipped.
+
+    Where the checkpoint declares a hand-in of its own, the UI cell reads that hand-in's frame as
+    well as whatever gates it. The decision is *about* that file -- "does the re-extract say what
+    we predicted?" -- so offering the dropdown before the file has arrived asks somebody to sign
+    off on data nobody has seen. And nothing else could hide it: a cell that only builds ``mo.ui``
+    elements has no dataflow edges, so it renders from the moment the notebook opens whatever
+    sits above it. Reading the frame is what creates the edge.
     """
     name = names[stage.id]
     checkpoint = stage.effective_checkpoint()
@@ -1669,9 +1786,22 @@ def _checkpoint_cells(
     )
 
     gates = _gate_tokens(stage, names, gated or {})
+    reads_a_handin = _named_handin(stage) is not None
+    if reads_a_handin:
+        gates = [f"{name}_frame", *gates]
     ui_lines = [
         f"# Checkpoint {index} of {total}: {_one_line(stage.id)}",
-        *(f"_after_{name} = {gate}" for gate in gates),
+        *(
+            [
+                "# Dark until the hand-in above it has arrived. This decision is about that",
+                "# file, and a card that only builds `mo.ui` elements reads nothing, so nothing",
+                "# could hide it -- it would offer a sign-off on data nobody has supplied yet.",
+                "# Reading the frame is what creates the edge marimo hides this cell on.",
+            ]
+            if reads_a_handin
+            else []
+        ),
+        *_after_lines(name, gates),
         "# Deliberately NOT automated. Forcing a judgement call into code either fabricates",
         "# logic that was never there or silently drops a control (PLAN 2.2). Recording the",
         "# decision and the reason here is better than the Excel original, where the same step",
@@ -1829,15 +1959,16 @@ def _handin_cells(
         *(
             [
                 "#",
-                "# And this cell is itself hidden until the step above it is confirmed. Reading",
-                "# that token is what creates the edge marimo hides the cell on -- a selector",
+                "# And this cell is itself held behind the step above it, whose token it reads.",
+                "# Reading it is what creates the edge marimo hides the cell on -- a selector",
                 "# that constructed widgets and read nothing would render from the moment the",
-                "# notebook opened, inviting a re-extract taken before the statement ever ran.",
+                "# notebook opened: above the query whose output it is asking for, and, where",
+                "# the step above changes data, inviting an extract taken before it ever ran.",
             ]
             if gates
             else []
         ),
-        *(f"_after_{name} = {gate}" for gate in gates),
+        *_after_lines(name, gates),
         # `!r` rather than interpolation into a quoted literal, exactly as `heading` and
         # `waiting` are handled three lines down. A hand-in ref is plan-supplied free text, and
         # `the "after" extract` -- an entirely ordinary thing to call one -- closed the literal
@@ -1960,6 +2091,21 @@ def _gate_tokens(stage: Stage, names: dict[str, str], gated: Mapping[str, str]) 
     return [gated[item] for item in stage.depends_on if item in gated]
 
 
+def _after_lines(name: str, gates: Sequence[str]) -> list[str]:
+    """The assignment that reads every token this cell waits for. One line, or none.
+
+    Reading the name is the whole job; the assignment exists only so that the reading happens.
+    One line per token, each assigning the *same* ``_after_<name>``, is what this was, and it
+    made every line but the last a dead store -- which marimo does not care about, because it
+    took the edges either way, and a reviewer does, because these cells are meant to be read.
+    """
+    if not gates:
+        return []
+    if len(gates) == 1:
+        return [f"_after_{name} = {gates[0]}"]
+    return [f"_after_{name} = ({', '.join(gates)})"]
+
+
 def _waiting(index: int, total: int, title: str, instruction: str) -> str:
     """The text a blocked cell renders.
 
@@ -1971,7 +2117,9 @@ def _waiting(index: int, total: int, title: str, instruction: str) -> str:
     return f"**Step {index} of {total}: {title}.** {instruction}"
 
 
-def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list[ScaffoldCell]:
+def _confirmation_cells(
+    stage: Stage, index: int, total: int, name: str, handoff: Handoff
+) -> list[ScaffoldCell]:
     """The two cells that record a mutating statement as having been run.
 
     A read-only query needs none of this: the hand-in that follows *is* the evidence it was run,
@@ -1990,6 +2138,13 @@ def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list
     ran = f"{name}_ran"
     note = f"{name}_ran_note"
     confirmed = f"{name}_confirmed"
+    unbuilt = _waiting(
+        index,
+        total,
+        stage.id,
+        "Fill in the inputs above. The statement is not built yet, so there is nothing to "
+        "confirm having run.",
+    )
 
     ui_lines = [
         f"# Confirmation for '{_one_line(stage.id)}'. The statement above changes data, so nothing",
@@ -1998,7 +2153,15 @@ def _confirmation_cells(stage: Stage, index: int, total: int, name: str) -> list
         "# Reads the statement so this cell is itself hidden until there is something to",
         "# confirm. A tick-box offering 'I have run it' above a statement that has not",
         "# been generated yet is not useless -- it is a way to record a lie.",
-        f"_awaiting_{name} = {name}",
+        # Reading the name is the edge; where the statement waits on a parameter it can be
+        # bound and still be `None`, and an edge does not see that. Then the check has to be on
+        # the value, or the tick-box comes back the moment the hand-off renders its "still
+        # needed" line -- offering to confirm a statement nobody has been shown.
+        *(
+            ["mo.stop(", f"    {name} is None,", f"    mo.md({unbuilt!r}),", ")"]
+            if handoff.parameters and not handoff.is_generated
+            else [f"_awaiting_{name} = {name}"]
+        ),
         f'{ran} = mo.ui.checkbox(label="I have run the statement above")',
         f"{note} = mo.ui.text_area(",
         '    label="Anything worth recording about the run (rows affected, ticket, who ran it)",',
@@ -2066,7 +2229,9 @@ def _identifier(text: str) -> str:
     return cleaned or "parameter"
 
 
-def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
+def _parameter_cell(
+    stage: Stage, name: str, handoff: Handoff, gates: Sequence[str] = ()
+) -> ScaffoldCell:
     """The inputs a parameterised statement is built from.
 
     A separate cell because marimo's single-definition rule forbids one cell from both creating
@@ -2079,10 +2244,16 @@ def _parameter_cell(stage: Stage, name: str, handoff: Handoff) -> ScaffoldCell:
     parameter is called and not what shape it is. A date is worth detecting: it is the parameter
     almost every periodic process has, and `mo.ui.date` yields a `datetime.date` that
     `kedge.sql.literal` renders as a proper `DATE` literal.
+
+    It reads whatever gates its own stage, for the reason every other widget-only cell does: at
+    the top of the process there is nothing to gate on and the boxes are the first thing anybody
+    sees, but a *later* hand-off's inputs are not, and "which period are you re-extracting for"
+    on screen at the moment the notebook opens is a question about a step nobody has reached.
     """
     lines = [
         f"# Inputs for '{_one_line(stage.id)}'. Fill these in first -- the statement below is built",
         "# from them, and the run records what they were.",
+        *_after_lines(f"{name}_inputs", gates),
     ]
     for parameter in handoff.parameters:
         variable = f"{name}_{_identifier(parameter)}"
@@ -2121,6 +2292,7 @@ def _handoff_cells(
     name = names[stage.id]
     handoff = stage.effective_handoff()
     gates = _gate_tokens(stage, names, gated)
+    awaits_parameters = bool(handoff.parameters) and not handoff.is_generated
 
     lines = [
         f"# Stage {index} of {total}: {_one_line(stage.id)}  [handoff]",
@@ -2134,7 +2306,9 @@ def _handoff_cells(
     if stage.notes:
         lines.extend(_comment("Note", stage.notes))
     for gate in gates:
-        lines.append(f"_gate_{name} = {gate}  # this cell stays hidden until that step is recorded")
+        # Not "until that step is recorded": a read-only hand-off's token is its statement, and
+        # reading one says the step above is on screen rather than that anybody has done it.
+        lines.append(f"_gate_{name} = {gate}  # nothing here is shown before that step")
 
     if handoff.is_generated:
         upstream = names.get(handoff.built_from or "", "handin_frame")
@@ -2170,12 +2344,24 @@ def _handoff_cells(
                     for parameter in handoff.parameters
                 ),
                 "}",
-                "mo.stop(",
-                f'    any(value in (None, "") for value in {name}_parameters.values()),',
-                f"    mo.md({_waiting(index, total, stage.id, 'Fill in the inputs above before this statement can be built.')!r}),",
-                ")",
-                f"kedge.runs.record_parameters(KEDGE_RUNS, KEDGE_RUN_ID, **{name}_parameters)",
-                f"{name} = kedge.sql.render({handoff.statement!r}, {name}_parameters)",
+                "#",
+                "# An unfilled parameter leaves the statement unbuilt -- never half-built, and",
+                "# never recorded against the run. What it must not do is take the step off the",
+                "# page. This used to be a `mo.stop`, which meant the notebook's opening",
+                "# instruction was hidden until somebody supplied an input they had not yet been",
+                "# told what for: a fresh open showed a date box, and a box asking for the",
+                "# extract, and nowhere the query itself. The heading and the instruction render",
+                "# either way; only the statement waits.",
+                "_unfilled = [",
+                '    key.replace("_", " ")',
+                f"    for key, value in {name}_parameters.items()",
+                '    if value in (None, "")',
+                "]",
+                "if _unfilled:",
+                f"    {name} = None",
+                "else:",
+                f"    kedge.runs.record_parameters(KEDGE_RUNS, KEDGE_RUN_ID, **{name}_parameters)",
+                f"    {name} = kedge.sql.render({handoff.statement!r}, {name}_parameters)",
             ]
         )
     else:
@@ -2183,23 +2369,38 @@ def _handoff_cells(
 
     fence = handoff.medium.value
     body = 'f"```' + fence + "\\n{" + name + '}\\n```"'
+    unfilled = _waiting(
+        index,
+        total,
+        stage.id,
+        "Fill in the inputs above and the statement appears here. Still needed: ",
+    )
+    statement_lines = (
+        [
+            f"        mo.md({body})",
+            f"        if {name} is not None",
+            f'        else mo.md({unfilled!r} + ", ".join(_unfilled)),',
+        ]
+        if awaits_parameters
+        else [f"        mo.md({body}),"]
+    )
     lines.extend(
         [
             "mo.vstack(",
             "    [",
-            f"        mo.md({f'### Run this: {stage.id}'!r}),",
+            f"        mo.md({f'### Step {index} of {total} -- run this: {stage.id}'!r}),",
             f"        mo.md({handoff.instruction!r}),",
-            f"        mo.md({body}),",
+            *statement_lines,
             "    ]",
             ")",
         ]
     )
     cells: list[ScaffoldCell] = []
-    if handoff.parameters and not handoff.is_generated:
-        cells.append(_parameter_cell(stage, name, handoff))
+    if awaits_parameters:
+        cells.append(_parameter_cell(stage, name, handoff, gates))
     cells.append(ScaffoldCell(name=name, code="\n".join(lines), role="handoff", stage_id=stage.id))
     if handoff.needs_confirmation:
-        cells.extend(_confirmation_cells(stage, index, total, name))
+        cells.extend(_confirmation_cells(stage, index, total, name, handoff))
     return cells
 
 
@@ -2426,14 +2627,31 @@ def _baseline_handin(plan: ProcessPlan, names: dict[str, str], head: bool) -> st
     nearest, because a process with several inputs is reconciled against the position it starts
     from, and that is the extract the workbook itself was built on.
 
+    **A stage that generates no code is passed over even when it declares a hand-in**, and that
+    is the paragraph above enforced rather than restated. Being an ancestor of the arithmetic is
+    not the same as feeding it: :func:`_upstream_name` never resolves to a checkpoint or a
+    hand-off, so a stage depending on one is built on whatever *it* found -- usually
+    ``handin_frame`` -- while its own ``<name>_frame`` is read by its approval card and by
+    nothing that computes. Walking past that distinction cited ``<checkpoint>_handin.sha256``
+    over a comparison that ran on the head hand-in, which is exactly the file-that-takes-no-part
+    this function exists to refuse. It was a ``NameError`` before a checkpoint's hand-in
+    scaffolded any cells; quiet and wrong is the worse of the two (CLAUDE.md non-negotiable 6).
+
+    The fall-through is then consistent by construction rather than by coincidence: whatever
+    made the computation reach ``handin_frame`` is what made :func:`head_handin_is_read` true,
+    so ``head`` is set exactly when ``handin`` is the record to cite.
+
     Args:
         plan: The plan being scaffolded.
         names: Stage id to cell name.
         head: Whether the notebook's own hand-in cells were emitted.
 
     Returns:
-        The name of the ``HandIn`` record to take the digest from, or ``None`` when this plan
-        reads no hand-in at all.
+        The name of the ``HandIn`` record to take the digest from, or ``None`` when nothing the
+        map reports on was computed from a hand-in at all.
+        :func:`kedge.reconcile.check_translation` takes ``None`` as "this run's data cannot be
+        identified" and declines to re-compare, which is the safe direction: it cites the
+        recorded acceptance rather than passing a comparison it has no business making.
     """
     contributing = {
         stage.id
@@ -2450,6 +2668,8 @@ def _baseline_handin(plan: ProcessPlan, names: dict[str, str], head: bool) -> st
         ancestors.add(stage_id)
         frontier.extend(by_id[stage_id].depends_on)
     for stage in plan.ordered_stages():
+        if stage.generates_no_code:
+            continue
         if (not contributing or stage.id in ancestors) and _named_handin(stage) is not None:
             return f"{names[stage.id]}_handin"
     return "handin" if head else None

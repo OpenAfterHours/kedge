@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -49,6 +49,7 @@ from kedge.plan.model import (
     PlanError,
     ProcessPlan,
 )
+from kedge.plan.review import repairable_warnings
 from kedge.plan.triage import TriageResult, triage
 
 if TYPE_CHECKING:
@@ -1013,6 +1014,12 @@ def propose_plan(
     # of the workbook, so it cannot depend on which attempt happened to parse.
     scored = assessment.as_assessment()
     failures: list[str] = []
+    # The best plan seen so far, and how many things the scaffolder would trip over in it. A plan
+    # that validates is never thrown away again: an amendment that comes back malformed, or comes
+    # back worse, loses to the plan already in hand rather than costing the caller everything.
+    best: ProcessPlan | None = None
+    best_findings: list[str] = []
+    amended = False
 
     for attempt in range(1, max(1, max_attempts) + 1):
         logger.info(
@@ -1035,6 +1042,16 @@ def propose_plan(
             detail = describe_errors(exc) if isinstance(exc, ValidationError) else str(exc)
             failures.append(f"attempt {attempt}: {detail}")
             logger.warning("proposal attempt %d did not validate: %s", attempt, detail)
+            if best is not None:
+                # This was the amendment, and it came back malformed. There is already a valid
+                # plan in hand, so there is nothing left to repair towards: spending the
+                # remaining attempts re-asking would cost whole proposals to improve a plan the
+                # caller is going to get either way.
+                logger.warning(
+                    "the amendment for %s did not validate; keeping the plan already proposed",
+                    analysis.workbook.filename,
+                )
+                break
             if attempt >= max_attempts:
                 break
             messages = [
@@ -1061,7 +1078,43 @@ def propose_plan(
             len(plan.dropped),
             analysis.workbook.filename,
         )
-        return plan
+
+        findings = repairable_warnings(plan, analysis)
+        if best is None or len(findings) < len(best_findings):
+            best, best_findings = plan, findings
+        if not findings or amended or attempt >= max_attempts:
+            break
+
+        # One amendment, never more. These findings are deterministic, so a model that did not
+        # act on them the first time will not act on them the fifth, and every further round is
+        # a whole proposal's tokens spent to re-read the same sentences. The user's review is
+        # what catches a model that ignored them -- the card still renders every warning.
+        amended = True
+        logger.info(
+            "amending the plan for %s: %d finding(s) the scaffolder would trip over",
+            analysis.workbook.filename,
+            len(findings),
+        )
+        messages = [
+            *messages,
+            {"role": "assistant", "content": text},
+            {
+                "role": "user",
+                "content": _fill(
+                    load_prompt("propose_amend.md"), {"warnings": _numbered(findings)}
+                ),
+            },
+        ]
+
+    if best is not None:
+        if best_findings:
+            logger.warning(
+                "the plan for %s still carries %d finding(s) after amendment: %s",
+                analysis.workbook.filename,
+                len(best_findings),
+                "; ".join(best_findings),
+            )
+        return best
 
     joined = "\n".join(failures)
     msg = (
@@ -1069,6 +1122,11 @@ def propose_plan(
         f"{analysis.workbook.filename}:\n{joined}"
     )
     raise ProposalError(msg)
+
+
+def _numbered(findings: Sequence[str]) -> str:
+    """The findings as a numbered list, which is how the amend prompt refers to them."""
+    return "\n\n".join(f"{index}. {finding}" for index, finding in enumerate(findings, start=1))
 
 
 def record_responses(

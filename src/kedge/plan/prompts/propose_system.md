@@ -151,5 +151,7 @@ Return **one JSON object** and nothing else. No prose before or after, no markdo
 | `dropped` | array | Objects with `range` and `reason` |
 | `summary` | string or null | One or two sentences on the shape of the process overall |
 | `briefing` | object or null | Why the *business* process exists, from the workbook's own documentation: `purpose`, `background`, `cadence`, `audience`, `watch_for`, and `sources`. `sources` is required wherever there is prose — cite the sheet and cells, or leave the fields empty |
+| `briefing.watch_for` | array of strings | Known issues and gotchas, one string each. A single warning is still an array of one |
+| `briefing.sources` | array of strings | One citation per entry, each written as a single line: `Sign-off!A3:A4 (Purpose)`, `cell comment on Calc!C1`, `procedure.docx`. Strings, not the note objects you were shown |
 
 Do not emit `version`, `created_at`, hashes, or approval state. kedge fills those in.
