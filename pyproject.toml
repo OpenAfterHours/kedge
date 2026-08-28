@@ -192,6 +192,15 @@ markers = [
 # Both are opt-in: `uv run pytest -m contract`, `uv run pytest -m llm`.
 addopts = "-ra --strict-markers -m 'not contract and not llm'"
 filterwarnings = ["ignore::DeprecationWarning"]
+# If a test hangs, say which one and what it was doing. The Ubuntu 3.13 leg once sat in `pytest`
+# for the full 25 minutes and was cancelled by the runner; the same suite passed on the other
+# three legs and on a rerun in 3m23s, and by the time anyone looked the log had expired -- so a
+# real intermittent deadlock and a flaky runner were indistinguishable, and neither was
+# actionable. faulthandler is in the standard library and costs nothing until it fires: after
+# five minutes on one test it dumps every thread's stack and carries on, which turns a silent
+# cancellation into a named test and a traceback. Well clear of the slowest test here (~13s) and
+# of the whole suite on the slowest leg (~7min), so it cannot fire on a merely slow run.
+faulthandler_timeout = 300
 
 [tool.coverage.run]
 source = ["src/kedge"]

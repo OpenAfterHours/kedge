@@ -280,6 +280,8 @@ class Context:
     unused_inputs: tuple[str, ...] = ()
     plan: Any = None
     notes: list[str] = field(default_factory=list)
+    _alias_cache: dict[str, str] | None = field(default=None, compare=False, repr=False, init=False)
+    """Filled on first use by :attr:`_aliases`. Not an input; see that property for why."""
 
     @property
     def defs(self) -> dict[str, Any]:
@@ -325,11 +327,28 @@ class Context:
 
     @property
     def _aliases(self) -> dict[str, str]:
+        """The rubric's stage names mapped onto this plan's, worked out once.
+
+        Memoised because the map is not cheap and :attr:`defs` is not rare.
+        :func:`~harness.roles.frame_aliases` plays the role lookup over both plans, and
+        ``stage_roles`` reads its hand-in roles off ``build_cells`` -- so an uncached property
+        here **scaffolded two entire notebooks on every dictionary lookup a grader made**. It
+        cost about a third of this file's runtime and grew with every grader added.
+
+        Stashed through ``object.__setattr__`` because the dataclass is frozen: the value is a
+        pure function of two plans that cannot change during a run, so caching it changes no
+        answer. ``_alias_cache`` is excluded from equality for the same reason.
+        """
+        if self._alias_cache is not None:
+            return self._alias_cache
         if self.plan is None:
+            object.__setattr__(self, "_alias_cache", {})
             return {}
         from harness.roles import frame_aliases
 
-        return frame_aliases(_reference_plan(), self.plan)
+        resolved = frame_aliases(_reference_plan(), self.plan)
+        object.__setattr__(self, "_alias_cache", resolved)
+        return resolved
 
     def rename(self, name: str) -> str:
         """A cell name in the rubric's vocabulary, said in this plan's.
