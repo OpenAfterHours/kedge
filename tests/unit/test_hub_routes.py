@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from kedge import purge
 from kedge.server.app import ServerError, ServerState, create_hub_app
 from kedge.server.events import OPEN_STEPS
 from kedge.server.hub import OpenJob
@@ -194,15 +195,715 @@ def test_a_dropped_file_that_is_not_really_a_workbook_leaves_nothing_behind(
     assert list((home / "dropped").iterdir()) == []
 
 
-def test_forgetting_a_workbook_removes_the_row_and_not_the_file(
+def test_the_upload_request_the_browser_actually_sends_is_diagnosable(
     client: TestClient, workbook: Path
 ) -> None:
+    """The shape every dropped workbook arrived in, and the shape of the refusal.
+
+    `hub.js` announced ``application/json`` over its ``FormData`` body, which is what stops the
+    browser generating the multipart boundary -- so the file field never arrived and FastAPI
+    rejected the request before the route ran. The refusal's ``detail`` is a *list*, and
+    ``new Error`` on a list stringifies to "[object Object]", which is what the user actually saw.
+
+    Both halves are asserted here because the client has to survive both: the header fix stops
+    this request being sent, and the flattening stops any future 422 reading as nothing at all.
+    """
+    body = (
+        b'--X\r\nContent-Disposition: form-data; name="file"; filename="dropped.xlsx"\r\n\r\n'
+        + workbook.read_bytes()
+        + b"\r\n--X--\r\n"
+    )
+
+    response = client.post(
+        "/api/hub/upload", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+
+
+def test_the_hub_client_never_announces_json_over_a_body_that_frames_itself(
+    client: TestClient,
+) -> None:
+    """The regression guard for the drop bug, asserted on the asset the browser is served.
+
+    There is no JS runner in this repo, and the project already asserts on served asset text for
+    exactly this class of drift. A `FormData` body must reach `fetch` with no content type of its
+    own, or the boundary is never generated and every upload 422s.
+    """
+    for path in ("/static/hub.js", "/static/app.js"):
+        script = client.get(path).text
+        assert "instanceof FormData" in script, f"{path} does not guard the content type"
+        assert "Array.isArray(detail)" in script, f"{path} would render a 422 as [object Object]"
+
+
+def test_forgetting_a_workbook_deletes_it_and_everything_derived_from_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Forget means delete. The row was never the thing that made a workbook come back.
+
+    Everything kedge writes is addressed from the workbook's resolved path, so removing the row
+    alone left the notebook, the plans and the run records exactly where they were and re-adding
+    the same file restored the lot.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.notebook_path.write_text("# notebook", encoding="utf-8")
+    (workspace.plans_dir / "plan-v001.yaml").write_text("stages: []", encoding="utf-8")
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 200
+    assert client.get("/api/hub/state").json()["workbooks"] == []
+    assert not workspace.project_dir.exists()
+    assert not workbook.exists()
+    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 404
+
+
+def test_the_deletion_preview_names_what_will_go_and_removes_none_of_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The confirmation is the whole safety mechanism, so its counts must be read, not written."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.runs_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.runs_dir / "20260829T000000Z.json").write_text("{}", encoding="utf-8")
+
+    data = client.get(f"/api/hub/workbooks/{key}/deletion").json()
+
+    assert data["workbook_exists"] is True
+    assert data["workbook"] == str(workbook.resolve())
+    assert any("project directory" in line for line in data["items"])
+    assert workbook.is_file(), "asking what would go must not make any of it go"
+    assert workspace.project_dir.is_dir()
+
+
+def test_a_workbook_that_is_open_on_this_server_cannot_be_forgotten(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Deleting a notebook a running marimo holds leaves the kernel on a file that is not there."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _state(client).workspace = Workspace.for_workbook(workbook, user_directory=home)
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 409
+    assert "Close it first" in response.json()["detail"]
+    assert workbook.is_file()
+    assert client.get(f"/api/hub/workbooks/{key}/deletion").json()["open"] is True
+
+
+def test_forgetting_a_workbook_takes_its_chat_sessions_with_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Sessions key off the notebook path, which is why the conversation used to come back."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    store = _state(client).store
+    session = store.create_session(
+        workbook_path=str(workbook), notebook_path=str(workspace.notebook_path)
+    )
+    store.append_message(session.id, role="user", content="convert this")
+
+    data = client.delete(f"/api/hub/workbooks/{key}").json()
+
+    assert data["sessions"] == 1
+    assert store.get_session(session.id) is None
+
+
+def test_the_registry_row_survives_a_purge_that_could_not_finish(
+    client: TestClient, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-deleted workspace must stay visible, because the hub is where it can be retried."""
     key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
 
-    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 200
-    assert client.get("/api/hub/state").json()["workbooks"] == []
+    def refuse(plan: object, **_: object) -> purge.PurgeResult:
+        return purge.PurgeResult(removed=(), failures=((workbook, "being used by Excel"),))
+
+    monkeypatch.setattr(purge, "execute", refuse)
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 409
+    assert "being used by Excel" in response.json()["detail"]
+    assert [item["key"] for item in client.get("/api/hub/state").json()["workbooks"]] == [key]
+
+
+# ── releasing ────────────────────────────────────────────────────────────────────────────────
+#
+# Releasing is the successful end of a conversion, not a gentler forget: the notebook has become
+# the monthly process and the spreadsheet is what has stopped being true. The tests below are
+# about the two halves that are easy to get backwards -- that everything except the workbook
+# survives, and that the registry never records a release the filesystem did not carry out.
+
+
+def _converted(workbook: Path, home: Path) -> Workspace:
+    """A workspace with a notebook in it, which is the precondition a release enforces.
+
+    Releasing records that the notebook has become the process, so the route refuses a workbook
+    kedge has built nothing from. Every test that expects a release to actually happen has to set
+    that up rather than lean on a route that used to take anything.
+    """
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.notebook_path.write_text("# notebook", encoding="utf-8")
+    return workspace
+
+
+def test_the_release_preview_names_what_survives_and_removes_none_of_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The deletion preview makes a user hesitate; this one has to make a user confident.
+
+    Deleting the spreadsheet a whole process was built on is only a reasonable click if the user
+    is told exactly what is still there afterwards, with counts read off the disk rather than
+    written into a sentence once. So the list has to be real -- and asking must cost nothing,
+    which is the half that a preview quietly doing the work would break.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    workspace.runs_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.runs_dir / "20260829T000000Z.json").write_text("{}", encoding="utf-8")
+
+    data = client.get(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["workbook_exists"] is True
+    assert data["notebook_exists"] is True
+    assert data["released"] is False
+    assert any("project directory" in line for line in data["kept"])
+    assert workbook.is_file(), "asking what a release keeps must not release anything"
+    assert workspace.notebook_path.is_file()
+
+
+def test_releasing_deletes_the_workbook_and_keeps_everything_else(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The whole feature in one assertion pair: the spreadsheet goes, the process stays.
+
+    A release is derived from the purge enumeration with every item moved into ``kept``, so this
+    also guards the direction that fails safely -- the next artifact added to that enumeration is
+    kept by a release without anybody remembering to say so.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    (workspace.plans_dir / "plan-v001.yaml").write_text("stages: []", encoding="utf-8")
+
+    response = client.post(f"/api/hub/workbooks/{key}/release")
+
+    assert response.status_code == 200
+    assert response.json()["removed"] == 1, "only the workbook is removed"
+    assert not workbook.exists()
+    assert workspace.project_dir.is_dir()
+    assert workspace.notebook_path.is_file()
+    assert (workspace.plans_dir / "plan-v001.yaml").is_file()
+
+
+def test_the_registry_reports_a_released_workbook_as_released_rather_than_missing(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The row stays, and its absence is reported as a decision rather than as breakage.
+
+    This is the state the hub renders differently, and reading ``exists`` alone is how the
+    successful end of a conversion came to be drawn as a file somebody had lost. ``exists`` is
+    still false and still reported, because the two facts are kept apart on purpose.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _converted(workbook, home)
+
+    client.post(f"/api/hub/workbooks/{key}/release")
+
+    listed = client.get("/api/hub/state").json()["workbooks"]
+    assert [item["key"] for item in listed] == [key]
+    assert listed[0]["source_state"] == "released"
+    assert listed[0]["exists"] is False
+    assert listed[0]["released_at"]
+
+
+def test_a_workbook_that_is_open_on_this_server_cannot_be_released(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Deleting the source under a live kernel is the same hazard a deletion is refused for.
+
+    The scaffolded reconciliation cell reads the workbook, so a release taken mid-session leaves a
+    running notebook failing on a file that is no longer there. The refusal has to say *that*,
+    though, and not the deletion's sentence about the notebook -- a message describing the wrong
+    hazard sends the user looking for a problem they do not have.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _state(client).workspace = Workspace.for_workbook(workbook, user_directory=home)
+
+    response = client.post(f"/api/hub/workbooks/{key}/release")
+
+    assert response.status_code == 409
+    assert "Close it first, then release it." in response.json()["detail"]
+    assert "reconciliation cell" in response.json()["detail"]
     assert workbook.is_file()
-    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 404
+    assert client.get(f"/api/hub/workbooks/{key}/release").json()["open"] is True
+
+
+def test_releasing_keeps_the_chat_sessions_that_record_how_it_was_converted(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Forgetting takes the conversation; releasing must not, and must say so.
+
+    The sessions are the record of how the conversion was arrived at, and the process is
+    continuing rather than ending. They are passed to the release plan only so the confirmation
+    can name them among what survives -- naming them and then deleting them would be the worst of
+    both, so both halves are asserted here.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    store = _state(client).store
+    session = store.create_session(
+        workbook_path=str(workbook), notebook_path=str(workspace.notebook_path)
+    )
+    store.append_message(session.id, role="user", content="convert this")
+
+    preview = client.get(f"/api/hub/workbooks/{key}/release").json()
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert preview["sessions"] == 1
+    assert any("chat session" in line for line in preview["kept"])
+    assert data["sessions"] == 1
+    assert store.get_session(session.id) is not None
+
+
+def test_a_release_that_could_not_delete_the_workbook_is_not_recorded_as_one(
+    client: TestClient, workbook: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordering decision, asserted from the side that matters.
+
+    ``released_at`` is a claim that the spreadsheet is gone, so it is stamped last and only on a
+    clean result. Stamping first would leave the hub saying "released, the notebook is the
+    process" over a workbook still sitting on the share -- which is precisely the lie this whole
+    feature exists to stop telling, arrived at from the other direction.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _converted(workbook, home)
+
+    def refuse(plan: object, **_: object) -> purge.PurgeResult:
+        return purge.PurgeResult(removed=(), failures=((workbook, "being used by Excel"),))
+
+    monkeypatch.setattr(purge, "execute", refuse)
+
+    response = client.post(f"/api/hub/workbooks/{key}/release")
+
+    assert response.status_code == 409
+    assert "being used by Excel" in response.json()["detail"]
+    listed = client.get("/api/hub/state").json()["workbooks"]
+    assert listed[0]["released_at"] is None
+    assert listed[0]["source_state"] == "linked", "nothing was deleted, so nothing is released"
+
+
+def test_releasing_a_workbook_that_has_already_gone_records_the_decision(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The retry that recovers the one failure stamping last can leave behind.
+
+    A delete that succeeds and a registry write that does not shows as ``missing``, which is the
+    wrong framing for a deliberate act. It is recoverable rather than terminal precisely because
+    removing an absent file is a success, so a second Release finishes the job -- and that is the
+    same call a user makes on a workbook they deleted in Explorer themselves.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _converted(workbook, home)
+    workbook.unlink()
+
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["removed"] == 0, "there was nothing left to delete"
+    assert client.get("/api/hub/state").json()["workbooks"][0]["source_state"] == "released"
+
+
+def test_a_released_workbook_can_still_be_forgotten(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Release keeps the artifacts; forget is still how a user is rid of them.
+
+    And the deletion preview has to stay honest about a workbook that has already gone, because
+    the confirmation is built from it: promising to delete a file that is not there is how a
+    dialogue teaches a user to stop reading it.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    client.post(f"/api/hub/workbooks/{key}/release")
+
+    preview = client.get(f"/api/hub/workbooks/{key}/deletion").json()
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert preview["workbook_exists"] is False
+    assert response.status_code == 200
+    assert client.get("/api/hub/state").json()["workbooks"] == []
+    assert not workspace.project_dir.exists()
+
+
+def test_the_release_preview_says_whether_there_is_an_acceptance_left_to_cite(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The one fact in this dialogue that a release destroys rather than deletes.
+
+    Everything on the kept list survives the workbook. Whether the translation was ever accepted
+    does not: the spreadsheet is the only thing the notebook's arithmetic could be measured
+    against, so releasing without a record ends that question for the life of the notebook.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+
+    before = client.get(f"/api/hub/workbooks/{key}/release").json()
+    (workspace.project_dir / "reconciliation.json").write_text(
+        json.dumps({"status": "PASSED", "generated_at": "2026-08-29T00:00:00Z"}), encoding="utf-8"
+    )
+    after = client.get(f"/api/hub/workbooks/{key}/release").json()
+
+    assert before["acceptance"] == "none"
+    assert before["acceptance_status"] is None
+    assert after["acceptance"] == "recorded"
+    assert after["acceptance_status"] == "PASSED"
+    assert after["accepted_at"] == "2026-08-29T00:00:00Z"
+
+
+def test_an_acceptance_that_did_not_pass_still_counts_as_something_to_cite(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The question is whether a record survives, not whether it says what the user hoped.
+
+    An acceptance recorded as a failure outlives the spreadsheet and is visible for ever, which is
+    the opposite of the silence a release makes permanent. Grading it here would put the verdict in
+    the route; it is passed through so the dialogue quotes it instead.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    (workspace.project_dir / "reconciliation.json").write_text(
+        json.dumps({"status": "NOT RECONCILED", "generated_at": "2026-08-29T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    data = client.get(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["acceptance"] == "recorded"
+    assert data["acceptance_status"] == "NOT RECONCILED"
+
+
+def test_a_conversion_that_was_never_reconciled_is_still_allowed_to_be_released(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Warned about, never refused, and the refusal was the tempting mistake.
+
+    A conversion that deliberately improves on the workbook reproduces nothing and can never be
+    reconciled -- ``not_reproduced`` exists for exactly that -- so a gate here would make release
+    unreachable for the conversions most likely to deserve it. It would also be the first place in
+    kedge where an unreconciled state blocks an action rather than being reported as a decision
+    with a reason, and it would be walked around by Forget or by one Explorer window. The friction
+    belongs in the dialogue's typing box, not in a route that says no.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _converted(workbook, home)
+
+    assert client.get(f"/api/hub/workbooks/{key}/release").json()["acceptance"] == "none"
+    response = client.post(f"/api/hub/workbooks/{key}/release")
+
+    assert response.status_code == 200
+    assert not workbook.exists()
+
+
+def test_a_workbook_kedge_has_built_no_notebook_from_cannot_be_released(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The hub hides the button here; the route has to refuse it, and they are not the same thing.
+
+    A button is a convenience and a route is the contract, so a script, a stale page or a verb
+    added later would otherwise get the purge of the wrong half: the spreadsheet deleted and an
+    empty project directory kept. Worse than the deletion is the record -- a release files a claim
+    the hub then renders as "the spreadsheet is gone and this notebook is the process", and over a
+    workspace with no notebook that sentence is false. Forget is the verb for this, and the
+    refusal names it, instruction first.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    Workspace.for_workbook(workbook, user_directory=home).ensure_dirs()
+
+    response = client.post(f"/api/hub/workbooks/{key}/release")
+
+    assert response.status_code == 409
+    assert response.json()["detail"].startswith("Convert rwa_monthly.xlsx first, or forget it")
+    assert workbook.is_file()
+    assert client.get("/api/hub/state").json()["workbooks"][0]["source_state"] == "linked"
+    assert client.get(f"/api/hub/workbooks/{key}/release").json()["notebook_exists"] is False
+
+
+def _marked(workspace: Workspace, *, port: int = 2718) -> None:
+    """Give this workspace a marimo marker and token file, as a launch would leave behind."""
+    workspace.attach_marimo(host="127.0.0.1", port=port, token="tok-release", pid=999_999)
+    workspace.write_token_file("tok-release")
+    workspace.write_marker(kedge_version="0.1.0")
+
+
+def test_a_release_leaves_the_marker_alone_while_something_is_still_serving_it(
+    client: TestClient, workbook: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker is the only record of a live marimo's port and token.
+
+    Removing it orphans the very process ``cleanup_orphan`` exists to find, so a release keeps it
+    for as long as the reason to keep it holds. This is also why the release route does not simply
+    call ``cleanup_orphan``: that answers the same liveness question by *stopping* the server, and
+    the notebook that server is serving is the process this release is graduating.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    _marked(workspace)
+    monkeypatch.setattr("kedge.lifecycle.health_check", lambda *_a, **_k: True)
+
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["marker"] == "kept"
+    assert "still serving" in data["marker_detail"]
+    assert workspace.marker_path.is_file()
+    assert workspace.token_file_path.is_file()
+    assert not workbook.exists(), "the release itself still happened"
+
+
+def test_a_release_takes_a_stale_marker_and_its_token_with_the_workbook(
+    client: TestClient, workbook: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A marker for a server that is gone is an inert credential, and inert is not fine.
+
+    It sits in plaintext under ``~/.kedge`` until somebody opens the workspace again, and a
+    released workspace is precisely the one nobody opens for a month. The workbook is gone by then
+    anyway, so there is nothing left for the marker to be the trail to.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    _marked(workspace)
+    monkeypatch.setattr("kedge.lifecycle.health_check", lambda *_a, **_k: False)
+
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["marker"] == "cleared"
+    assert not workspace.marker_path.exists()
+    assert not workspace.token_file_path.exists()
+
+
+def test_the_release_preview_never_lists_the_marker_among_what_survives(
+    client: TestClient, workbook: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kept list is a list of guarantees, and the marker's fate is not one of them.
+
+    ``plan_release`` keeps the marker and token, correctly -- it does no HTTP and cannot tell a
+    running server from a dead one. Striking them only when the probe says *stale right now* was
+    the obvious fix and it left a race with a consequence out of proportion to its size: a marker
+    live at the preview and dead at the click was promised as kept and then swept, so the one list
+    whose entire job is to be a list of guarantees was the thing that turned out not to be one.
+
+    They are therefore struck whatever the probe says. Why a live marker survives is prose in the
+    dialogue, where it can be conditional, and what actually happened comes back on the POST.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    _marked(workspace)
+
+    monkeypatch.setattr("kedge.lifecycle.health_check", lambda *_a, **_k: True)
+    live = client.get(f"/api/hub/workbooks/{key}/release").json()
+    monkeypatch.setattr("kedge.lifecycle.health_check", lambda *_a, **_k: False)
+    stale = client.get(f"/api/hub/workbooks/{key}/release").json()
+
+    assert live["marker"] == "live"
+    assert stale["marker"] == "stale"
+    for shown in (live, stale):
+        assert not any("marimo marker" in line for line in shown["kept"])
+        assert not any("marimo token" in line for line in shown["kept"])
+    assert any("project directory" in line for line in live["kept"]), "the rest is still listed"
+    assert workspace.marker_path.is_file(), "asking must still not sweep anything"
+
+
+def test_the_count_of_what_a_release_kept_excludes_what_it_swept(
+    client: TestClient, workbook: Path, home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Counted after the sweep, because ``kept_present`` is read off the disk.
+
+    Taken before it, the number includes the marker and token the same call is about to delete.
+    Nothing renders it today, which is exactly the reason to get it right now: a wrong number
+    nobody looks at is a wrong number that gets shipped the day somebody does.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = _converted(workbook, home)
+    _marked(workspace)
+    monkeypatch.setattr("kedge.lifecycle.health_check", lambda *_a, **_k: False)
+
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["marker"] == "cleared"
+    assert data["kept"] == 1, "the project directory, and not the two files just deleted"
+
+
+def test_a_release_says_plainly_when_there_was_no_marker_at_all(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The ordinary case, and it must not be reported as though something was tidied away."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _converted(workbook, home)
+
+    data = client.post(f"/api/hub/workbooks/{key}/release").json()
+
+    assert data["marker"] == "absent"
+
+
+async def test_opening_a_released_workbook_reads_the_analysis_kedge_kept(
+    tmp_path: Path, home: Path
+) -> None:
+    """The hub offers Open on a released row, so the open sequence has to survive one.
+
+    ``analyse`` raises on a file that is not there, which made that button a sequence that always
+    died on the analysis step -- the notebook is the process now, and the process could not be
+    started. The recorded ``analysis.json`` sits inside the project directory a release keeps, so
+    there is nothing to regenerate and nothing to guess.
+    """
+    from kedge.analysis.model import WorkbookAnalysis
+    from kedge.analysis.workbook import read_identity
+    from kedge.server.hub import _step_analyse
+
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    recorded = WorkbookAnalysis(
+        kedge_version="0.0.0-test",
+        generated_at="2026-08-29T00:00:00Z",
+        workbook=read_identity(workbook),
+    )
+    workspace.analysis_path.write_text(recorded.model_dump_json(indent=2), encoding="utf-8")
+    workbook.unlink()
+    job = OpenJob(job_id="released", workbook=str(workbook))
+
+    analysis = await _step_analyse(workspace, job)
+
+    assert analysis is not None
+    assert [frame.state for frame in job.frames] == ["ok"]
+    assert "released" in job.frames[0].detail
+
+
+async def test_a_released_workbook_with_no_recorded_analysis_says_the_file_is_missing(
+    tmp_path: Path, home: Path
+) -> None:
+    """The fallback is narrow on purpose: an absent workbook, and an analysis that was kept.
+
+    An empty analysis invented for a workbook nobody ever analysed would let the open sequence run
+    all the way to a chat pane whose every answer is about a spreadsheet kedge has never read.
+    Naming the file that is not there is the honest answer, and it is the one the analyser already
+    gives.
+    """
+    from kedge.errors import KedgeError
+    from kedge.server.hub import _step_analyse
+
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workbook.unlink()
+    job = OpenJob(job_id="never-analysed", workbook=str(workbook))
+
+    with pytest.raises(KedgeError, match="does not exist"):
+        await _step_analyse(workspace, job)
+
+
+# ── marimo's own AI assistant ────────────────────────────────────────────────────────────────
+#
+# kedge writes a `.marimo.toml` at launch to switch marimo's built-in assistant off, and that
+# control fails open on purpose: a write that fails leaves the assistant live and the launch goes
+# ahead, because refusing to start would not un-write a credential and would take away the
+# settings panel that clears it. Failing open into a log line is the part that is not acceptable,
+# and these are the two places the user is told instead.
+
+
+def _marimo_toml(workspace: Workspace, body: str) -> Path:
+    """Write a `.marimo.toml` into the project directory, as marimo's own editor would."""
+    workspace.ensure_dirs()
+    path = workspace.project_dir / ".marimo.toml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_a_credential_left_in_marimo_toml_is_reported_by_name_and_never_by_value(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The exposure is a key in plaintext in the project directory, and naming it is the warning.
+
+    Naming it is also the whole of what may be said: the value is a live credential and there is
+    no reading of "show the user their exposure" that involves putting it in an HTTP response a
+    browser will cache. The API hands back dotted names for that reason, and this asserts the
+    route did not go looking for anything else.
+    """
+    client.post("/api/hub/workbooks", json={"path": str(workbook)})
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    _marimo_toml(
+        workspace,
+        '[ai]\nenabled = false\n\n[ai.open_ai]\napi_key = "sk-not-a-real-key"\n\n'
+        "[completion]\ncopilot = false\n",
+    )
+
+    body = client.get("/api/hub/state")
+
+    assert body.json()["workbooks"][0]["assistant_keys"] == ["ai.open_ai.api_key"]
+    assert "sk-not-a-real-key" not in body.text, "a credential must never reach the browser"
+
+
+def test_the_hub_reports_whether_marimos_own_assistant_is_disabled(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Read on every sweep, not captured at open, and that is the point of the API.
+
+    marimo rewrites that file whenever a setting changes in its own editor, so the assistant can
+    be switched back on an hour after a launch that reported the notebook clean. The hub polls, so
+    what a card shows has to be what the file says now.
+    """
+    client.post("/api/hub/workbooks", json={"path": str(workbook)})
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    _marimo_toml(workspace, "[ai]\nenabled = false\n\n[completion]\ncopilot = false\n")
+
+    locked = client.get("/api/hub/state").json()["workbooks"][0]
+    _marimo_toml(workspace, "[ai]\nenabled = true\n\n[completion]\ncopilot = false\n")
+    live = client.get("/api/hub/state").json()["workbooks"][0]
+
+    assert locked["assistant_enforced"] is True
+    assert live["assistant_enforced"] is False
+    assert live["assistant_keys"] == []
+
+
+def test_the_launching_step_says_when_marimos_assistant_is_still_live(
+    tmp_path: Path, home: Path
+) -> None:
+    """The sentence that replaces the log line nobody reads.
+
+    A `.marimo.toml` kedge could not write leaves marimo's assistant live, which puts everything
+    it sends outside kedge's tool surface and outside the outbound payload log. The launch is
+    deliberately not refused over it -- declining to start un-writes nothing and removes the only
+    route to the panel that would fix it -- so the whole of the control is that the user is told.
+    """
+    from kedge.server.hub import _assistant_note
+
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    _marimo_toml(workspace, '[ai]\nenabled = true\n\n[ai.anthropic]\napi_key = "sk-ant-nope"\n')
+
+    note = _assistant_note(workspace)
+
+    assert "built-in AI assistant is" in note
+    assert "outbound log" in note
+    assert "ai.anthropic.api_key" in note
+    assert "sk-ant-nope" not in note, "the name is the warning; the value is the exposure"
+
+
+def test_the_launching_step_stays_quiet_when_the_assistant_is_off_and_nothing_is_stored(
+    tmp_path: Path, home: Path
+) -> None:
+    """A warning on every successful open is a warning nobody reads by the third one."""
+    from kedge.server.hub import _assistant_note
+
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    _marimo_toml(workspace, "[ai]\nenabled = false\n\n[completion]\ncopilot = false\n")
+
+    assert _assistant_note(workspace) == ""
 
 
 # ── derived state over HTTP ──────────────────────────────────────────────────────────────────

@@ -59,12 +59,21 @@
     return new Date(then).toLocaleDateString("en-GB");
   }
 
+  /* Kept identical to `hub.js`. See the note there: a body the browser frames for itself must not
+     be given a content type, or the boundary never gets generated. */
+  const selfDescribing = (body) =>
+    (typeof FormData !== "undefined" && body instanceof FormData) ||
+    (typeof Blob !== "undefined" && body instanceof Blob) ||
+    (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams);
+
   async function api(path, options) {
-    /* The header follows the body, as it does in `hub.js`. Announced unconditionally it was a
+    /* The header follows the body, and follows its *type*. Announced unconditionally it was a
        claim about requests that carried nothing, and a POST declaring JSON with an empty body is
-       rejected as malformed before the route is reached. */
+       rejected as malformed before the route is reached. Announced over a body that frames
+       itself, it suppresses the framing. */
+    const body = options && options.body;
     const response = await fetch(path, {
-      headers: options && options.body ? { "Content-Type": "application/json" } : {},
+      headers: body && !selfDescribing(body) ? { "Content-Type": "application/json" } : {},
       ...options,
     });
     if (!response.ok) {

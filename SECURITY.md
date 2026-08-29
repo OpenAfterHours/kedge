@@ -58,6 +58,33 @@ naming the file and the offending key and printing the `keyring set` command tha
 used instead. `kedge config` and `kedge doctor` report only whether the configured entry resolves —
 set, not set, or the keyring itself unreachable — and never the value.
 
+**That rule covers the files kedge loads. There is one file kedge writes that it cannot enforce
+it on, and it sits beside the workbook.** To disable marimo's own AI assistant, kedge writes
+`<workbook>.kedge/.marimo.toml` before each launch (`src/kedge/marimo_config.py`, and the section
+below on what leaves the machine). That is marimo's *user* config, and marimo writes back to
+whichever file its search found — so changing any setting from inside the editor makes marimo save
+its whole configuration there. Its schema has `api_key` on five provider configs, plus
+`completion.codeium_api_key` and two Bedrock credentials, all plaintext. A model key typed into
+marimo's settings panel lands in that file. `ai.enabled = false` withdraws the panels that ask for
+one, which makes it unlikely rather than impossible.
+
+kedge does the two things it can here, and neither is prevention:
+
+- **It preserves what it finds.** Silently deleting a key somebody deliberately entered is its own
+  surprise, and a tool that quietly edits your credentials is not one you can reason about.
+- **It reports it by name.** Every launch scans that file and lists any secret-shaped key on
+  `AssistantLockdown.secret_keys` — dotted names such as `ai.open_ai.api_key`, never values, in
+  the return value and in the log alike. `kedge.lifecycle.assistant_status` re-reads it on demand,
+  because marimo can write a key into that file an hour after the launch that found it clean.
+
+**Note where this file is.** Every other credential kedge touches lives under `~/.kedge` or in the
+keyring, machine-scoped, specifically so it cannot reach a directory that might be a git
+repository or a shared drive. This one is in the project directory next to the workbook, and it is
+the only such place in kedge. It is a dotfile, so `kedge`'s own hand-over does not ship it and a
+directory listing will not show it — which cuts both ways, because `git add .` does not care. If
+the project directory is under version control or a syncing folder, put `.marimo.toml` in
+`.gitignore`; kedge rewrites it on every launch and nothing is lost by not tracking it.
+
 **The marimo token is generated per launch.** 32 bytes from `secrets.token_urlsafe`, fresh every
 time kedge spawns a server, and it is the whole of the auth story between the kedge server and the
 marimo kernel. Three things about it are worth knowing:
@@ -110,7 +137,8 @@ judgement call: they are metadata, capped at 64 names of 64 characters, and a lo
 which columns went out answers none of the questions it exists to answer.
 
 **It is not a complete account of what leaves the machine, and reading it as one would be a
-mistake.** Two things are outside it:
+mistake.** Three things are outside it. The first two are kedge requests that write no line; the
+third is not a kedge request at all.
 
 - **The log is per chat session.** It is opened against a session id when the agent loop builds
   that session's tool registry, so a request made outside a chat session writes no line at all.
@@ -125,10 +153,65 @@ mistake.** Two things are outside it:
   of the column, each truncated to 24 characters. Redacted columns contribute no values. None of
   this is a tool result, so none of it appears in the log, and it goes out again on every step of
   every turn rather than once.
+- **marimo's own assistant is a second channel — controlled, not absent.** marimo ships an AI
+  assistant of its own: a chat panel, cell-generation actions, inline completion. It is configured
+  from the user's personal `~/.marimo.toml`, not from anything kedge owns, and points at whatever
+  endpoint that names. It runs inside the `<iframe>` kedge serves, one click from the workbook
+  data, and nothing it sends is a kedge tool call — so none of it meets the log, the sampling
+  caps, or the redaction patterns. kedge switches it off by writing a `.marimo.toml` that marimo's
+  config search finds ahead of the user's. Three limits qualify that, and none of them is
+  theoretical: `ai.enabled` is a front-end gate, so marimo's `/api/ai/*` endpoints stay reachable
+  to anything holding the marimo token; a `[tool.marimo]` section in the nearest `pyproject.toml`
+  is merged *over* the file kedge writes and can re-enable the assistant; and because marimo saves
+  its own settings back into whichever config its search found, that file is a plaintext location
+  for a model API key, sitting beside the workbook. The next section is the detail.
 
 So the log answers "which sampled payloads did the model ask for", accurately and per session. It
 does not answer "what has this endpoint seen about this workbook" — for that, the honest answers
 are the ones above and the design choice at the top of this section.
+
+### How partially marimo's assistant is switched off
+
+kedge writes `<workbook>.kedge/.marimo.toml` before each launch, forcing `ai.enabled = false` and
+`completion.copilot = false`. marimo's config search starts at the process's working directory and
+walks up, and kedge launches marimo from that directory, so those two settings are found ahead of
+the user's own (`src/kedge/marimo_config.py`; verified against 0.23.15 by running marimo's
+resolver, not by reading it). One module composes that file and nothing else names it, enforced by
+`scripts/guardrails.py`, because the filename and the keys are marimo's rather than kedge's.
+
+An unlogged second channel out of a tool pointed at finance data is not a rough edge; it is the
+account above failing quietly. So the point of this section is not that the channel is closed. It
+is **how narrowly**, stated plainly:
+
+- **`ai.enabled` is a front-end gate.** It withdraws the AI panels and actions from the editor.
+  It does not gate the server — marimo's `/api/ai/*` endpoints stay reachable to anything holding
+  the marimo token, which against the boundary this document already draws (the machine, not the
+  user account) is a real difference. What the setting buys is that the affordance is not on
+  screen. It does not buy that the endpoint is sealed.
+- **A nearer `pyproject.toml` outranks it.** `.marimo.toml` is marimo's *user* config, and marimo
+  merges `[tool.marimo]` from the nearest `pyproject.toml` on top of it. A workbook converted from
+  inside a Python project whose pyproject enables the assistant re-enables it, and nothing kedge
+  writes into its own directory changes that. kedge detects that case and names the file rather
+  than claiming a control it does not have.
+- **A file kedge cannot write, or cannot read, leaves the assistant live.** A read-only
+  `.marimo.toml` cannot be corrected. One that is locked or mid-sync is not overwritten *by
+  choice*: kedge cannot merge a file it cannot read, so replacing it would discard the whole of
+  the user's marimo configuration in order to assert two keys, and that is the worse trade.
+  Either way kedge logs it at ERROR and reports it, rather than refusing to open the notebook
+  over a file the user can fix in seconds.
+- **It is also a new place a credential can sit.** See "Credentials" above: marimo saves its own
+  settings into this file, and its schema has plaintext API keys.
+- **It says nothing about what you type.** The gate is on marimo's assistant, not on you. A cell
+  you write yourself is between you and marimo, the same boundary as the last paragraph of "Code
+  the model writes".
+
+`kedge.lifecycle.assistant_status` is where all of that surfaces: it re-reads the file and returns
+whether the assistant is disabled, why not if it is not, and any credential the file has acquired.
+Read it rather than assuming the launch succeeded.
+
+One route back in is genuinely closed. A notebook's own PEP 723 header cannot re-enable the
+assistant: marimo's script-config allowlist excludes `ai` and `completion`, so a header written by
+the model has nothing to say on the subject.
 
 The endpoint itself is yours to choose and yours to trust. kedge speaks to whatever
 OpenAI-compatible `base_url` is configured, over TLS if you give it an `https` URL and not if you

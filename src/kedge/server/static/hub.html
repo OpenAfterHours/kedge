@@ -26,6 +26,7 @@
   <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 12.5v-9M4 7.5 8 3.5l4 4"/></symbol>
   <symbol id="i-sheet" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="11" height="11" rx="1.2"/><path d="M2.5 6h11M6 6v7.5"/></symbol>
   <symbol id="i-link" viewBox="0 0 16 16"><path d="M6.5 9.5a2.5 2.5 0 0 0 3.5 0l2-2a2.5 2.5 0 0 0-3.5-3.5l-.8.8"/><path d="M9.5 6.5a2.5 2.5 0 0 0-3.5 0l-2 2a2.5 2.5 0 0 0 3.5 3.5l.8-.8"/></symbol>
+  <symbol id="i-flag" viewBox="0 0 16 16"><path d="M4 14V2.5"/><path d="M4 3h8l-1.7 2.6L12 8.2H4z"/></symbol>
   <symbol id="i-cog" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.1"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.2 1.2M11.2 11.2l1.2 1.2M12.4 3.6l-1.2 1.2M4.8 11.2l-1.2 1.2"/></symbol>
 </svg>
 
@@ -132,6 +133,66 @@
       <svg class="icon"><use href="#i-play"></use></svg><span>Go to the notebook</span>
     </a>
   </div>
+</dialog>
+
+<dialog class="forgetting" id="forgetting">
+  <div class="forgetting-head">
+    <h2 id="forgetting-title">Forget this workbook</h2>
+    <p class="forgetting-lede">
+      Type the workbook's name below and choose Forget everything to delete the workbook and
+      everything kedge derived from it. This cannot be undone.
+    </p>
+  </div>
+  <ul class="forgetting-list" id="forgetting-list"></ul>
+  <p class="forgetting-note" id="forgetting-note" hidden></p>
+  <form method="dialog" class="forgetting-foot">
+    <label class="forgetting-label" for="forgetting-confirm" id="forgetting-label">
+      Type the name to confirm
+    </label>
+    <input class="forgetting-input" id="forgetting-confirm" type="text" autocomplete="off"
+           spellcheck="false" />
+    <div class="forgetting-actions">
+      <button class="ghost-button" value="cancel">Keep it</button>
+      <button class="ghost-button danger" id="forgetting-go" type="button" disabled>
+        <svg class="icon"><use href="#i-bin"></use></svg><span>Forget everything</span>
+      </button>
+    </div>
+  </form>
+</dialog>
+
+<!-- The counterpart to the dialogue above, and the opposite argument. That one lists what will be
+     destroyed so the user hesitates; this one lists what survives so the user can go ahead. No
+     name box for an ordinary release: one named file the user has already decided is obsolete does
+     not need the gate that defends eight months of conversation, and spending it there is what
+     would make it mean nothing here.
+
+     The box does appear for the one case that meets the same criterion the gate above meets. A
+     conversion whose translation was never accepted has only the spreadsheet to be checked
+     against, so releasing ends that question for the life of the notebook — an irreversible loss
+     that is invisible afterwards, because a notebook that was never checked and one that passed
+     look identical on screen. -->
+<dialog class="releasing" id="releasing">
+  <div class="releasing-head">
+    <h2 id="releasing-title">Release this workbook</h2>
+    <p class="releasing-lede" id="releasing-lede"></p>
+    <code class="releasing-target" id="releasing-target"></code>
+  </div>
+  <p class="releasing-acceptance" id="releasing-acceptance"></p>
+  <p class="releasing-keeps-label" id="releasing-keeps">Kept, exactly as it is:</p>
+  <ul class="releasing-list" id="releasing-list"></ul>
+  <p class="releasing-note" id="releasing-note" hidden></p>
+  <form method="dialog" class="releasing-foot">
+    <label class="releasing-label" for="releasing-confirm" id="releasing-label" hidden></label>
+    <input class="releasing-input" id="releasing-confirm" type="text" autocomplete="off"
+           spellcheck="false" hidden />
+    <div class="releasing-actions">
+      <button class="ghost-button" id="releasing-keep" value="cancel">Keep it</button>
+      <button class="ghost-button danger" id="releasing-go" type="button">
+        <svg class="icon"><use href="#i-flag"></use></svg>
+        <span id="releasing-go-label">Release the workbook</span>
+      </button>
+    </div>
+  </form>
 </dialog>
 
 <dialog class="settings" id="settings">

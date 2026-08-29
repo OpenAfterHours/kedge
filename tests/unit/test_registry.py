@@ -9,8 +9,10 @@ from pathlib import Path
 import pytest
 
 from kedge.registry import (
+    REGISTRY_SCHEMA_VERSION,
     RegistryEntry,
     RegistryError,
+    SourceState,
     WorkbookRegistry,
     describe,
     validate_workbook,
@@ -314,3 +316,224 @@ def test_an_entry_dict_survives_a_round_trip() -> None:
 
 def test_a_row_with_no_path_is_dropped() -> None:
     assert RegistryEntry.from_dict({"name": "orphan.xlsx"}) is None
+
+
+# ── releasing ────────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_workbook_that_is_still_there_is_linked(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    entry = registry.add(workbook)
+
+    assert describe(entry, user_directory=home).source_state is SourceState.LINKED
+
+
+def test_a_workbook_that_has_gone_with_nobody_saying_so_is_missing(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    """Moved, renamed, or on a drive that is not mounted -- the one reading that is a fault."""
+    entry = registry.add(workbook)
+    workbook.unlink()
+
+    status = describe(entry, user_directory=home)
+
+    assert status.source_state is SourceState.MISSING
+    assert status.exists is False
+
+
+def test_a_released_workbook_is_not_reported_as_breakage(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    """kedge's happy path terminates here, and it used to render as a file somebody had lost."""
+    entry = registry.add(workbook)
+    released = registry.release(entry.key)
+    workbook.unlink()
+
+    assert released is not None
+    status = describe(released, user_directory=home)
+    assert status.source_state is SourceState.RELEASED
+    assert status.exists is False
+    assert status.to_dict()["source_state"] == "released"
+
+
+def test_a_released_entry_survives_a_registry_round_trip(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    """A release the registry forgets on the next page load is a release that did not happen."""
+    entry = registry.add(workbook)
+    registry.release(entry.key)
+
+    stored = WorkbookRegistry.for_user(home).get(entry.key)
+
+    assert stored is not None
+    assert stored.released is True
+    assert stored.released_at is not None
+    assert stored.sha256 == entry.sha256, "the digest is evidence, and outlives the file"
+
+
+def test_releasing_twice_keeps_the_first_answer(registry: WorkbookRegistry, workbook: Path) -> None:
+    """When a process graduated is history, not something a second click gets to rewrite."""
+    entry = registry.add(workbook)
+    first = registry.release(entry.key)
+    second = registry.release(entry.key)
+
+    assert first is not None
+    assert second is not None
+    assert second.released_at == first.released_at
+
+
+def test_releasing_a_key_nobody_registered_says_so(registry: WorkbookRegistry) -> None:
+    assert registry.release("rwa_monthly-000000000000") is None
+
+
+def test_releasing_marks_the_row_and_deletes_nothing(
+    registry: WorkbookRegistry, workbook: Path
+) -> None:
+    """The file is kedge.purge's to remove and the decision is the registry's to record. Keeping
+    them apart is what lets a failed delete leave a row that does not claim the file is gone."""
+    entry = registry.add(workbook)
+    registry.release(entry.key)
+
+    assert workbook.is_file()
+
+
+def test_putting_the_workbook_back_and_re_adding_it_undoes_the_release(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    """A readable, validated file at that path is the opposite of 'retired on purpose', so there
+    is no separate un-release verb for a caller to forget."""
+    entry = registry.add(workbook)
+    registry.release(entry.key)
+
+    relinked = registry.add(workbook)
+
+    assert relinked.released_at is None
+    assert describe(relinked, user_directory=home).source_state is SourceState.LINKED
+
+
+def test_the_key_of_a_released_workbook_is_the_key_it_always_had(
+    registry: WorkbookRegistry, workbook: Path, home: Path
+) -> None:
+    """Identity is a hash of the path *string*, which does not need a file to be stable, so the
+    notebook and the project directory a released process keeps are still addressable."""
+    entry = registry.add(workbook)
+    registry.release(entry.key)
+    workbook.unlink()
+
+    stored = registry.get(entry.key)
+
+    assert stored is not None
+    assert describe(stored, user_directory=home).notebook_path == str(
+        Workspace.for_workbook(workbook, user_directory=home).notebook_path
+    )
+
+
+# ── schema compatibility ─────────────────────────────────────────────────────────────────────
+
+
+def test_a_row_written_before_the_release_field_existed_loads_as_linked(
+    home: Path, workbook: Path
+) -> None:
+    """An older kedge wrote no released_at, and its absence has to mean 'still linked' rather
+    than costing the user the row."""
+    (home / "registry.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "workbooks": [{"key": "k", "path": str(workbook), "name": workbook.name}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entry = WorkbookRegistry.for_user(home).get("k")
+
+    assert entry is not None
+    assert entry.released_at is None
+    assert entry.released is False
+    assert describe(entry, user_directory=home).source_state is SourceState.LINKED
+
+
+def test_a_registry_from_a_newer_kedge_is_read_rather_than_refused(
+    home: Path, workbook: Path
+) -> None:
+    """Nothing gates on schema_version and nothing should: every change to this file has been
+    additive, so refusing a number you do not recognise would lose rows for no reason."""
+    (home / "registry.json").write_text(
+        json.dumps(
+            {
+                "schema_version": REGISTRY_SCHEMA_VERSION + 7,
+                "workbooks": [
+                    {
+                        "key": "k",
+                        "path": str(workbook),
+                        "name": workbook.name,
+                        "something_a_later_kedge_added": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [entry.key for entry in WorkbookRegistry.for_user(home).entries()] == ["k"]
+
+
+def test_a_released_entry_dict_survives_a_round_trip() -> None:
+    entry = RegistryEntry(key="k", path="C:/a.xlsx", name="a.xlsx", released_at="2026-08-29T00:00Z")
+
+    assert RegistryEntry.from_dict(entry.to_dict()) == entry
+
+
+# ── re-adopting a released process ───────────────────────────────────────────────────────────
+
+
+def test_a_released_process_can_be_registered_with_no_workbook_to_validate(
+    registry: WorkbookRegistry, tmp_path: Path, home: Path
+) -> None:
+    """add() requires a readable .xlsx, which is right for a new conversion and wrong for a
+    process whose spreadsheet was retired on purpose."""
+    retired = tmp_path / "processes" / "rwa_monthly.xlsx"
+    retired.parent.mkdir(parents=True, exist_ok=True)
+
+    entry = registry.register_released(retired)
+
+    assert entry.released is True
+    assert entry.key == Workspace.for_workbook(retired, user_directory=home).key
+    assert describe(entry, user_directory=home).source_state is SourceState.RELEASED
+
+
+def test_re_registering_a_released_process_keeps_its_history(
+    registry: WorkbookRegistry, workbook: Path
+) -> None:
+    """The digest and the add time are the evidence the acceptance record cites, and they are
+    the half of a released workbook that can never be recovered from disk."""
+    entry = registry.add(workbook)
+    released = registry.release(entry.key)
+    assert released is not None
+    workbook.unlink()
+
+    again = registry.register_released(entry.path)
+
+    assert again.key == entry.key
+    assert again.added_at == entry.added_at
+    assert again.sha256 == entry.sha256
+    assert again.released_at == released.released_at
+    assert len(registry.entries()) == 1
+
+
+def test_registering_a_notebook_as_a_released_workbook_is_refused(
+    registry: WorkbookRegistry, tmp_path: Path
+) -> None:
+    """The key, the project directory and the notebook name all come off this path, so a
+    notebook handed in here would address a workspace nothing else in kedge agrees with."""
+    with pytest.raises(RegistryError, match="not a workbook kedge can read"):
+        registry.register_released(tmp_path / "rwa_monthly.kedge" / "rwa_monthly.py")
+
+
+def test_registering_a_directory_as_a_released_workbook_is_refused(
+    registry: WorkbookRegistry, tmp_path: Path
+) -> None:
+    with pytest.raises(RegistryError, match="is a directory"):
+        registry.register_released(tmp_path)

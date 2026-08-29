@@ -1800,7 +1800,13 @@ def test_the_tail_never_uses_the_word_passed_as_a_verdict() -> None:
 
 
 def test_a_missing_workbook_reconciles_to_not_reconciled(tmp_path: Path) -> None:
-    """Non-negotiable 6, executed rather than asserted on the text."""
+    """Non-negotiable 6, executed rather than asserted on the text.
+
+    A workbook that is gone is now cited against rather than opened and failed against, so there
+    is no live report to read a headline off. With nothing ever recorded there is nothing to cite
+    either, and the answer has to stay NOT RECONCILED: citing may never slide into passing, which
+    is the half of the release change that would be dangerous if it drifted.
+    """
     panel = run_reconciliation(
         cells_for(),
         tmp_path / "never-existed.xlsx",
@@ -1809,8 +1815,10 @@ def test_a_missing_workbook_reconciles_to_not_reconciled(tmp_path: Path) -> None
 
     assert panel.status is ReconciliationStatus.NOT_RECONCILED
     assert not panel
-    assert "NOT RECONCILED" in panel.report.headline()
-    assert "not a pass" in " ".join(panel.report.notes)
+    assert panel.translation_accepted is False
+    assert panel.report is None, "a workbook that is gone is not opened and failed against"
+    assert "never been reconciled" in panel.summary_line()
+    assert "Check the path" not in panel.render()
 
 
 def test_a_workbook_with_no_cached_values_reconciles_to_not_reconciled(tmp_path: Path) -> None:

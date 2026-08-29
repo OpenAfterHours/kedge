@@ -17,8 +17,19 @@ analysis found, and whether a marimo server of ours is live for it. A registry t
 status would be wrong the first time somebody deleted a notebook in Explorer, and the failure mode
 of a stale cache here is a user told their work is safe when it is not.
 
-An entry whose file has since gone renders as missing. It is not dropped silently — the user
-chose to add it, and "that workbook has moved" is information — and it never raises.
+**A workbook that is gone is not necessarily a fault.** The successful end of a conversion is
+that the notebook becomes the process and the spreadsheet is retired, so an absent file has
+two readings and the registry has to be able to tell them apart. It does that the only way
+consistent with the paragraph above: by recording the *decision*. ``released_at`` is a fact
+about something the user did, exactly like ``added_at``, and :class:`SourceState` is derived
+from it and from disk on every read — ``released`` where a release was recorded, ``linked``
+where the file is there, ``missing`` where it is not and nobody said so. An entry is dropped
+silently in none of the three; the user chose to add it, "that workbook has moved" is
+information, and describing one never raises.
+
+Identity is untouched by any of this. The key is ``slug + sha256(str(path))[:12]`` — a hash
+of a *string*, which does not have to resolve to a file to be stable — so a released workbook
+keeps the key, the project directory and the notebook it has always had.
 """
 
 from __future__ import annotations
@@ -29,6 +40,7 @@ import logging
 import zipfile
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +60,7 @@ __all__ = [
     "WORKBOOK_SUFFIXES",
     "RegistryEntry",
     "RegistryError",
+    "SourceState",
     "WorkbookRegistry",
     "WorkbookStatus",
     "describe",
@@ -59,7 +72,14 @@ __all__ = [
 ]
 
 REGISTRY_FILENAME = "registry.json"
-REGISTRY_SCHEMA_VERSION = 1
+
+REGISTRY_SCHEMA_VERSION = 2
+"""2 adds ``released_at``. Every change to this file so far has been additive and both
+directions degrade correctly — an older kedge ignores the key it does not know and reads a
+released workbook as one that has moved, a newer kedge reads a row without it as linked — so
+**a reader must not refuse a version it does not recognise**, and none does. The number moves
+anyway, because it is the only record that the row shape changed, and the first time somebody
+needs it to mean something is far too late to make it honest retrospectively."""
 
 WORKBOOK_SUFFIXES = frozenset({".xlsx", ".xlsm"})
 """What the hub will accept. ``.xls`` and ``.xlsb`` are not OOXML and the analyser cannot read
@@ -74,12 +94,79 @@ class RegistryError(KedgeError):
     """The workbook registry could not be read, written, or added to."""
 
 
+class SourceState(StrEnum):
+    """What has become of the workbook an entry names.
+
+    Derived on every read by :func:`describe`, never stored — see the module docstring for why
+    the registry holds the decision (``released_at``) and not the state.
+
+    Example:
+        >>> SourceState.RELEASED.value
+        'released'
+    """
+
+    LINKED = "linked"
+    """The workbook is where kedge last saw it. The ordinary case, and the only one during a
+    conversion."""
+
+    RELEASED = "released"
+    """The workbook was retired on purpose: the notebook is the process now. Everything kedge
+    derived — the notebook, the plans, the contract, the run records, the acceptance — is
+    still there, which is the whole point."""
+
+    MISSING = "missing"
+    """The workbook is not there and nobody said it should not be. Moved, renamed, or on a
+    drive that is not mounted. This is the one the hub should treat as a fault."""
+
+
 def registry_path(user_directory: Path | None = None) -> Path:
     """Return the registry file's location, whether or not it exists."""
     return (user_directory or user_dir()) / REGISTRY_FILENAME
 
 
 # ── validation ───────────────────────────────────────────────────────────────────────────────
+
+
+def _resolve_workbook_path(path: Path) -> Path:
+    """Return ``path`` resolved and shaped like a workbook, without requiring it to exist.
+
+    The half of :func:`validate_workbook` that is about the *name*. Split out because a released
+    process has no file left to open, and every check below this one would be a lie about it,
+    while these two still hold: the key, the project directory and the notebook name are all
+    derived from this path, so a directory or a notebook handed in here would address a workspace
+    nothing else agrees with.
+
+    Args:
+        path: The candidate workbook path.
+
+    Returns:
+        The resolved absolute path.
+
+    Raises:
+        RegistryError: The path will not resolve, is a directory, or is not named like a workbook
+            kedge can read.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError as exc:
+        msg = f"could not resolve {path}: {exc}"
+        raise RegistryError(msg) from exc
+
+    if resolved.is_dir():
+        msg = f"{resolved} is a directory, not a workbook file"
+        raise RegistryError(msg)
+
+    suffix = resolved.suffix.lower()
+    if suffix not in WORKBOOK_SUFFIXES:
+        accepted = ", ".join(sorted(WORKBOOK_SUFFIXES))
+        extra = (
+            " The legacy binary formats .xls and .xlsb are not OOXML; re-save as .xlsx in Excel."
+            if suffix in (".xls", ".xlsb")
+            else ""
+        )
+        msg = f"{resolved.name} is not a workbook kedge can read. Accepted: {accepted}.{extra}"
+        raise RegistryError(msg)
+    return resolved
 
 
 def validate_workbook(path: Path) -> Path:
@@ -100,28 +187,9 @@ def validate_workbook(path: Path) -> Path:
     Raises:
         RegistryError: Naming what was wrong with the file and what would be acceptable.
     """
-    try:
-        resolved = Path(path).expanduser().resolve()
-    except OSError as exc:
-        msg = f"could not resolve {path}: {exc}"
-        raise RegistryError(msg) from exc
-
-    if resolved.is_dir():
-        msg = f"{resolved} is a directory, not a workbook file"
-        raise RegistryError(msg)
+    resolved = _resolve_workbook_path(path)
     if not resolved.is_file():
         msg = f"no such file: {resolved}"
-        raise RegistryError(msg)
-
-    suffix = resolved.suffix.lower()
-    if suffix not in WORKBOOK_SUFFIXES:
-        accepted = ", ".join(sorted(WORKBOOK_SUFFIXES))
-        extra = (
-            " The legacy binary formats .xls and .xlsb are not OOXML; re-save as .xlsx in Excel."
-            if suffix in (".xls", ".xlsb")
-            else ""
-        )
-        msg = f"{resolved.name} is not a workbook kedge can read. Accepted: {accepted}.{extra}"
         raise RegistryError(msg)
 
     try:
@@ -188,6 +256,17 @@ class RegistryEntry:
     added_at: str = ""
     last_opened_at: str | None = None
     open_count: int = 0
+    released_at: str | None = None
+    """When the user retired the workbook, if they did.
+
+    A decision, not a status — which is what makes it the one thing about an absent file the
+    registry is entitled to remember. Everything downstream (:class:`SourceState`,
+    :attr:`WorkbookStatus.exists`) is still derived from disk on every read."""
+
+    @property
+    def released(self) -> bool:
+        """Whether this workbook was retired on purpose."""
+        return self.released_at is not None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serialisable form written to disk."""
@@ -201,6 +280,7 @@ class RegistryEntry:
             "added_at": self.added_at,
             "last_opened_at": self.last_opened_at,
             "open_count": self.open_count,
+            "released_at": self.released_at,
         }
 
     @classmethod
@@ -222,6 +302,8 @@ class RegistryEntry:
                 added_at=str(raw.get("added_at") or ""),
                 last_opened_at=(str(raw["last_opened_at"]) if raw.get("last_opened_at") else None),
                 open_count=int(raw.get("open_count") or 0),
+                # Absent in a registry written before schema 2, which is exactly the linked case.
+                released_at=(str(raw["released_at"]) if raw.get("released_at") else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning("ignoring an unusable registry row: %s", exc)
@@ -242,6 +324,9 @@ class WorkbookStatus:
     entry: RegistryEntry
     exists: bool = False
     changed_on_disk: bool = False
+    source_state: SourceState = SourceState.MISSING
+    """Which reading of the workbook applies. Defaults to ``MISSING`` for the same reason
+    ``exists`` defaults to ``False``: a status built with nothing known has found nothing."""
     project_dir: str = ""
     notebook_path: str = ""
     notebook_exists: bool = False
@@ -268,6 +353,7 @@ class WorkbookStatus:
             **self.entry.to_dict(),
             "exists": self.exists,
             "changed_on_disk": self.changed_on_disk,
+            "source_state": self.source_state.value,
             "project_dir": self.project_dir,
             "notebook_path": self.notebook_path,
             "notebook_exists": self.notebook_exists,
@@ -303,6 +389,11 @@ def describe(
     Never raises. A workbook that has been deleted, a project directory somebody removed, a
     half-written ``analysis.json`` and an unparseable plan all degrade to an absent field.
 
+    A deleted workbook is reported twice over, and deliberately: :attr:`WorkbookStatus.exists`
+    says whether the file is there, :attr:`WorkbookStatus.source_state` says whether its absence
+    was asked for. Reading the first alone is how "the notebook is the process now" came to be
+    rendered as breakage.
+
     Args:
         entry: The recorded entry.
         user_directory: Overrides ``~/.kedge``, for tests.
@@ -329,7 +420,12 @@ def describe(
         workspace = Workspace.for_workbook(path, user_directory=user_directory)
     except KedgeError as exc:
         logger.warning("could not build a workspace for %s: %s", entry.path, exc)
-        return WorkbookStatus(entry=entry, exists=exists, changed_on_disk=changed)
+        return WorkbookStatus(
+            entry=entry,
+            exists=exists,
+            changed_on_disk=changed,
+            source_state=_source_state(entry, exists=exists),
+        )
 
     analysis = _read_analysis(workspace.analysis_path)
     plan_state, plan_version, approved_version, convertible, blockers = _read_plans(
@@ -342,6 +438,7 @@ def describe(
         entry=entry,
         exists=exists,
         changed_on_disk=changed,
+        source_state=_source_state(entry, exists=exists),
         project_dir=str(workspace.project_dir),
         notebook_path=str(workspace.notebook_path),
         notebook_exists=workspace.notebook_path.is_file(),
@@ -362,6 +459,19 @@ def describe(
         marimo_base_url=None if marimo is None else marimo[0],
         marimo_port=None if marimo is None else marimo[1],
     )
+
+
+def _source_state(entry: RegistryEntry, *, exists: bool) -> SourceState:
+    """Which of the three readings of the workbook applies.
+
+    A recorded release outranks the filesystem. A spreadsheet back at that path is a restore, a
+    different file, or a release whose delete did not finish — none of which is "kedge never
+    retired this", and all of which read better as a release with the file still present than as
+    a live link. ``exists`` sits beside this on the status so the hub can say both.
+    """
+    if entry.released:
+        return SourceState.RELEASED
+    return SourceState.LINKED if exists else SourceState.MISSING
 
 
 REPORT_FILENAME = "report.html"
@@ -624,6 +734,11 @@ class WorkbookRegistry:
         size rather than creating a second row, so a user who re-adds a file after editing it in
         Excel sees one entry with current facts.
 
+        This is also how a release is undone. Adding a workbook means a readable file was found
+        and validated at that path, which is the opposite of "retired on purpose" whatever the
+        row said a moment ago, so ``released_at`` is cleared. There is no separate un-release
+        verb, because there is nothing to un-release without the spreadsheet back.
+
         Args:
             workbook: The candidate workbook.
 
@@ -651,9 +766,101 @@ class WorkbookRegistry:
             added_at=existing.added_at if existing else now,
             last_opened_at=existing.last_opened_at if existing else None,
             open_count=existing.open_count if existing else 0,
+            released_at=None,
         )
         self._write([entry, *(item for item in entries if item.key != key)])
         logger.info("registered workbook %s", resolved)
+        if existing is not None and existing.released:
+            logger.info(
+                "workbook %s is back on disk, so it is linked again rather than released", resolved
+            )
+        return entry
+
+    def release(self, key: str) -> RegistryEntry | None:
+        """Record that this workbook has been retired on purpose, and return the entry.
+
+        A release is the successful end of a conversion, not a failure: the notebook has become
+        the process and the spreadsheet is obsolete. Recording it is what lets the hub tell a
+        deliberate retirement from a file somebody moved by accident, which are otherwise the
+        same absence and were, until this existed, both reported as breakage.
+
+        Nothing on disk is touched. Removing the workbook is
+        :func:`kedge.purge.plan_release` and :func:`kedge.purge.execute`, and the caller runs
+        those *first* and only marks the row on a clean result — the same ordering the delete
+        path uses, and for the same reason. A row marked released whose spreadsheet is still
+        there is a half-finished release the hub can show as one; a deleted workbook with no row
+        marked is indistinguishable from an accident.
+
+        Idempotent. Releasing an entry that is already released keeps the original timestamp,
+        for the same reason :meth:`add` keeps the original ``added_at``: it is history.
+
+        Args:
+            key: The workspace key of the entry to release.
+
+        Returns:
+            The stored entry, or ``None`` if no entry has that key.
+        """
+        entries = self.entries()
+        existing = next((entry for entry in entries if entry.key == key), None)
+        if existing is None:
+            return None
+        if existing.released:
+            return existing
+        updated = replace(existing, released_at=_now())
+        self._write([updated, *(item for item in entries if item.key != key)])
+        logger.info("released workbook %s; the notebook is the process now", existing.path)
+        return updated
+
+    def register_released(self, workbook: Path | str) -> RegistryEntry:
+        """Register, or keep, an entry whose workbook is deliberately gone.
+
+        :meth:`add` validates that the path really is a readable OOXML workbook, which is right
+        for a new conversion and wrong here: the subject of a released process is the notebook,
+        and the spreadsheet it came from was retired on purpose. A separate verb rather than a
+        flag on :meth:`add`, because registering a file that is not there is a different act with
+        a different failure mode, and a boolean at a call site does not say which of the two was
+        meant.
+
+        The *shape* of the path is still checked, by :func:`_resolve_workbook_path`. The key, the
+        project directory and the notebook name are all derived from it, so this has to be the
+        path the workbook had — hand in the notebook and you address a workspace nothing else
+        agrees with. Sharp edge worth knowing: on Windows a resolved path picks up the on-disk
+        casing of the components that still exist, so the reliable caller passes the ``path`` off
+        an existing row rather than retyping it.
+
+        History is kept where a row is already there. The last digest and size of the spreadsheet
+        are evidence — the acceptance record cites a digest — and outlive the file itself.
+
+        Args:
+            workbook: Where the workbook was, whether or not anything is there now.
+
+        Returns:
+            The stored entry, marked released.
+
+        Raises:
+            RegistryError: The path is not shaped like a workbook, or the registry could not be
+                written.
+        """
+        resolved = _resolve_workbook_path(Path(workbook))
+        key = Workspace.for_workbook(resolved, user_directory=self._user_directory).key
+        now = _now()
+
+        entries = self.entries()
+        existing = next((entry for entry in entries if entry.key == key), None)
+        entry = RegistryEntry(
+            key=key,
+            path=str(resolved),
+            name=resolved.name,
+            sha256=existing.sha256 if existing else "",
+            size_bytes=existing.size_bytes if existing else 0,
+            mtime_ns=existing.mtime_ns if existing else 0,
+            added_at=existing.added_at if existing else now,
+            last_opened_at=existing.last_opened_at if existing else None,
+            open_count=existing.open_count if existing else 0,
+            released_at=existing.released_at if existing and existing.released else now,
+        )
+        self._write([entry, *(item for item in entries if item.key != key)])
+        logger.info("registered released workbook %s", resolved)
         return entry
 
     def record_open(self, key: str) -> RegistryEntry | None:
@@ -669,8 +876,16 @@ class WorkbookRegistry:
     def forget(self, key: str) -> bool:
         """Remove an entry. Returns whether one was there to remove.
 
-        Removes the row only. Nothing on disk is touched: the notebook, the plans and the
-        analysis are the user's artifacts, and a landing page must not be able to delete them.
+        Removes the row only -- and do not read that as the product's promise, because it stopped
+        being one. ``server/hub.py``'s ``forget_workbook`` runs :func:`kedge.purge.execute`
+        first and calls this last, so Forget on the hub takes the workbook and everything kedge
+        derived from it as well. Two docstrings giving opposite accounts of the same button is
+        worse than either being wrong on its own, and this is the one that was stale.
+
+        The split is deliberate rather than left over. The row is the registry's business and the
+        files are :mod:`kedge.purge`'s, and keeping them apart is exactly what lets a deletion
+        that fails halfway leave the card in the list, where the user can see it and try again.
+        A version of this method that deleted as well would have nowhere to put that failure.
         """
         entries = self.entries()
         remaining = [entry for entry in entries if entry.key != key]

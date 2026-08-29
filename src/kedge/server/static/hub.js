@@ -69,9 +69,20 @@
     return `${value < 10 && unit ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
   }
 
+  /* A body the browser knows how to frame for itself. Announcing a content type over one of these
+     is not merely redundant, it is destructive: setting the header explicitly is what stops the
+     browser generating the `multipart/form-data; boundary=...` a `FormData` needs, and the
+     boundary is the only way the server can find the parts. Every dropped workbook 422'd on this
+     -- for long enough that `~/.kedge/dropped` was never once created. */
+  const selfDescribing = (body) =>
+    (typeof FormData !== "undefined" && body instanceof FormData) ||
+    (typeof Blob !== "undefined" && body instanceof Blob) ||
+    (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams);
+
   async function api(path, options) {
+    const body = options && options.body;
     const response = await fetch(path, {
-      headers: options && options.body ? { "Content-Type": "application/json" } : {},
+      headers: body && !selfDescribing(body) ? { "Content-Type": "application/json" } : {},
       ...options,
     });
     if (!response.ok) {
@@ -80,6 +91,13 @@
         detail = (await response.json()).detail || detail;
       } catch (_) {
         /* the body was not JSON; the status text will do */
+      }
+      /* A `detail` is a string when kedge raised the HTTPException and a list of {loc, msg, type}
+         when FastAPI rejected the request before the handler ran. Left as it was, `new Error` on
+         that list stringified to "[object Object]" -- the one error shape that tells the user
+         nothing at all, on the one path where they have done nothing wrong. */
+      if (Array.isArray(detail)) {
+        detail = detail.map((item) => (item && item.msg) || JSON.stringify(item)).join("; ");
       }
       const error = new Error(detail);
       // Carried because one refusal here is answerable rather than fatal: a 409 from the open
@@ -114,12 +132,67 @@
 
   /* Every pill answers one question a user standing in front of a list of workbooks actually
      has: is the file still there, is there a notebook, has a plan been approved, is something
-     running, and did the last reconciliation pass. */
-  function pillsFor(item) {
+     running, and did the last reconciliation pass.
+
+     `source_state` rather than `exists` decides the framing, and that is the whole of the fix.
+     An absent workbook has two readings — released on purpose, or lost — and reading the boolean
+     alone rendered the successful end of a conversion as breakage, then returned early so the
+     released row showed none of the notebook, plan and reconciliation it had every right to.
+     `exists` is still read, on one row only: `released` with the file still there is a release
+     whose delete did not finish, and the two facts are kept apart on the server precisely so the
+     hub can say both rather than collapse them into one comfortable lie. */
+  function pillsFor(item, current) {
     const pills = [];
-    if (!item.exists) {
+    /* Ahead of every branch below, including the early return: a model credential sitting in
+       plaintext in the project directory is not something an unrelated condition gets to
+       suppress, and a workbook that has been moved still has the file. The server sends dotted
+       key *names* and never values, which is why the tooltip can name them at all. */
+    if (item.assistant_keys && item.assistant_keys.length) {
+      pills.push(
+        el(
+          "span",
+          {
+            class: "pill bad",
+            title:
+              `.marimo.toml in this workbook's project directory holds ` +
+              `${item.assistant_keys.join(", ")} in plain text. kedge neither reads nor sends ` +
+              `them; clear them in marimo's own settings panel.`,
+          },
+          icon("i-warn"),
+          "Key in .marimo.toml",
+        ),
+      );
+    }
+    /* Shown only where a kernel is actually up. kedge writes the lockdown at launch, so a
+       workbook nobody has opened has no `.marimo.toml` and reads as "not enforced" — true, and
+       harmless, because there is no marimo to be enforcing it against. A warning that sat on
+       every unopened card would be permanently amber, which is how a signal stops being read. */
+    if (Boolean(current || (item.marimo && item.marimo.live)) && item.assistant_enforced === false) {
+      pills.push(
+        el(
+          "span",
+          {
+            class: "pill warn",
+            title:
+              "marimo's own AI assistant is live for this notebook. What it sends goes outside " +
+              "kedge's tool surface and does not appear in the outbound payload log.",
+          },
+          icon("i-warn"),
+          "marimo AI live",
+        ),
+      );
+    }
+    if (item.source_state === "missing") {
       pills.push(el("span", { class: "pill bad" }, icon("i-warn"), "File missing"));
       return pills;
+    }
+    if (item.source_state === "released") {
+      pills.push(el("span", { class: "pill ok" }, icon("i-check"), "Released"));
+      if (item.exists) {
+        pills.push(
+          el("span", { class: "pill bad" }, icon("i-warn"), "Workbook still on disk"),
+        );
+      }
     }
     if (item.changed_on_disk) {
       pills.push(el("span", { class: "pill warn" }, "Changed since kedge last saw it"));
@@ -238,8 +311,13 @@
 
   function cardFor(item) {
     const current = state.attached && state.attached.key === item.key;
+    const released = item.source_state === "released";
     const card = el("div", {
-      class: "card" + (item.exists ? "" : " missing") + (current ? " current" : ""),
+      class:
+        "card" +
+        (item.source_state === "missing" ? " missing" : "") +
+        (released ? (item.exists ? " released unfinished" : " released") : "") +
+        (current ? " current" : ""),
     });
 
     card.append(
@@ -247,7 +325,7 @@
         "div",
         { class: "card-head" },
         el("span", { class: "card-name", text: item.name }),
-        el("span", { class: "pills" }, pillsFor(item)),
+        el("span", { class: "pills" }, pillsFor(item, current)),
       ),
       el("code", { class: "card-path", text: item.path }),
       el("div", { class: "facts" }, factsFor(item)),
@@ -263,12 +341,37 @@
       );
     }
 
+    /* A released row is a running process, so its note explains rather than warns. The one case
+       that genuinely is a fault gets its own sentence: released with the file still on disk means
+       the delete did not finish, the registry is claiming something the filesystem did not do,
+       and a user never told that goes on editing a spreadsheet nothing reads any more. */
+    if (released) {
+      card.append(
+        item.exists
+          ? el("p", {
+              class: "card-note bad",
+              text:
+                `${item.name} is recorded as released, but the workbook is still on disk. The ` +
+                `delete did not finish — usually because Excel had the file open. Release it ` +
+                `again to clear it, or delete the file yourself.`,
+            })
+          : el("p", {
+              class: "card-note",
+              text:
+                `Released ${ago(item.released_at)}: the spreadsheet is gone and this notebook is ` +
+                `the process. Everything kedge derived from it is still here.`,
+            }),
+      );
+    }
+
     const actions = el("div", { class: "card-actions" });
-    if (!item.exists) {
+    if (item.source_state === "missing") {
       actions.append(
         el("span", {
           class: "hub-hint",
-          text: "This file is no longer where kedge last saw it. Move it back, or forget it.",
+          text:
+            "This file is no longer where kedge last saw it. Move it back, or forget it — " +
+            "which deletes the notebook and the plans kedge made from it.",
         }),
       );
     } else if (current) {
@@ -314,12 +417,34 @@
       );
     }
     actions.append(el("div", { class: "topbar-spacer" }));
+
+    /* Release is offered only where there is something to keep. A workbook kedge has not built a
+       notebook from has not become a process yet, so releasing it would delete the spreadsheet
+       and leave an empty folder -- a purge of the wrong half, under a word promising the
+       opposite. The one exception is a released row whose file is still there, which is a
+       half-finished release and needs the button back to finish it. */
+    if (item.notebook_exists && (!released || item.exists)) {
+      actions.append(
+        el(
+          "button",
+          {
+            class: "ghost-button",
+            title:
+              "Delete the workbook and keep the notebook, the plans, the run records and the " +
+              "conversation.",
+            onclick: () => release(item),
+          },
+          icon("i-flag"),
+          el("span", { text: released ? "Finish releasing" : "Release" }),
+        ),
+      );
+    }
     actions.append(
       el(
         "button",
         {
           class: "ghost-button",
-          title: "Remove from this list. Nothing on disk is touched.",
+          title: "Delete this workbook and everything kedge made from it.",
           onclick: () => forget(item),
         },
         icon("i-bin"),
@@ -386,16 +511,71 @@
     }
   }
 
+  /* Reports rather than announces, because a drop can carry several files and the caller has to
+     compose one banner out of all of them. Saying it here meant a drop of three workbooks showed
+     only whatever the third one did. */
   async function upload(file) {
     const form = new FormData();
     form.append("file", file, file.name);
     try {
       const data = await api("/api/hub/upload", { method: "POST", body: form });
-      say(`Added ${data.workbook.name}, saved to ${data.saved_to}.`, "ok");
-      await refresh();
+      return { ok: true, name: data.workbook.name, saved: data.saved_to };
     } catch (error) {
-      say(error.message, null);
+      return { ok: false, name: file.name, message: error.message };
     }
+  }
+
+  /* What a drop is actually carrying. A folder reaches `dataTransfer.files` as an entry with no
+     extension and no bytes, so without this it was refused as "not a .xlsx or .xlsm file" -- true,
+     unhelpful, and not what the user did. `webkitGetAsEntry` is the only reliable way to tell one
+     from a genuinely empty file; the size-and-type heuristic is the fallback where it is absent. */
+  function sortDrop(transfer) {
+    const files = Array.from(transfer ? transfer.files : []);
+    const items = Array.from(transfer && transfer.items ? transfer.items : []);
+    const directories = new Set();
+    items.forEach((item, index) => {
+      if (item.kind !== "file" || !item.webkitGetAsEntry) return;
+      const entry = item.webkitGetAsEntry();
+      if (entry && entry.isDirectory && files[index]) directories.add(files[index]);
+    });
+    const looksLikeFolder = (file) =>
+      directories.has(file) || (file.size === 0 && !file.type && !file.name.includes("."));
+    return {
+      folders: files.filter(looksLikeFolder).map((file) => file.name),
+      workbooks: files.filter((file) => !looksLikeFolder(file)),
+    };
+  }
+
+  async function receiveDrop(transfer) {
+    const { folders, workbooks } = sortDrop(transfer);
+
+    if (!folders.length && !workbooks.length) {
+      say("That drop carried no file. Drag a .xlsx or .xlsm workbook, or use Browse.", null);
+      return;
+    }
+
+    const notes = folders.map(
+      (name) =>
+        `${name} is a folder. kedge registers one workbook at a time -- open it and drag the ` +
+        `.xlsx or .xlsm file inside.`,
+    );
+    const results = [];
+    for (const [index, file] of workbooks.entries()) {
+      const progress = workbooks.length > 1 ? ` (${index + 1} of ${workbooks.length})` : "";
+      say(`Copying ${file.name}${progress}...`, null);
+      results.push(await upload(file));
+    }
+
+    const added = results.filter((result) => result.ok);
+    const refused = results.filter((result) => !result.ok);
+    if (added.length === 1 && !refused.length && !notes.length) {
+      say(`Added ${added[0].name}, saved to ${added[0].saved}.`, "ok");
+    } else {
+      if (added.length) notes.unshift(`Added ${added.map((r) => r.name).join(", ")}.`);
+      for (const result of refused) notes.push(`${result.name}: ${result.message}`);
+      say(notes.join(" "), refused.length || folders.length ? null : "ok");
+    }
+    if (added.length) await refresh();
   }
 
   // ── the file browser ───────────────────────────────────────────────────────────────
@@ -649,14 +829,242 @@
     await refresh();
   }
 
+  /* Forgetting deletes, so the dialogue enumerates. A user cannot be expected to know that a
+     signed-off run record and eight months of conversation are inside the phrase "forget this
+     workbook", and a generic "are you sure?" over that set of files is not consent. The counts
+     come from the server reading the actual directory, not from a sentence written once.
+
+     The instruction leads and the justification follows, as every other blocking message in kedge
+     does -- a user who is stuck needs to know where to type before they need to know why. */
   async function forget(item) {
+    const dialog = $("forgetting");
+    let preview;
     try {
-      await api(`/api/hub/workbooks/${item.key}`, { method: "DELETE" });
-      say(`Removed ${item.name} from the list. Nothing on disk was touched.`, "ok");
-      await refresh();
+      preview = await api(`/api/hub/workbooks/${item.key}/deletion`);
     } catch (error) {
       say(error.message, null);
+      return;
     }
+
+    if (preview.open) {
+      say(
+        `${item.name} is the workbook this server has open. Close it first, then forget it.`,
+        null,
+      );
+      return;
+    }
+
+    $("forgetting-title").textContent = `Forget ${item.name}`;
+    $("forgetting-label").textContent = `Type ${item.name} to confirm`;
+    $("forgetting-list").replaceChildren(
+      ...[
+        preview.workbook_exists && `the workbook itself, ${preview.workbook}`,
+        ...preview.items,
+      ]
+        .filter(Boolean)
+        .map((line) => el("li", { text: line })),
+    );
+
+    /* A released workbook has no file left to delete, and a list that quietly omits it reads as a
+       list that forgot to mention it -- so it is said, in the right words for why it is gone. A
+       release is a decision the user took; "not where kedge last saw it" is not. */
+    const notes = [];
+    if (!preview.workbook_exists) {
+      notes.push(
+        item.source_state === "released"
+          ? `${item.name} was released, so the workbook itself has already gone. Forgetting ` +
+              `removes what kedge derived from it, which the release deliberately kept.`
+          : `${preview.workbook} is not there, so there is no workbook to delete. Forgetting ` +
+              `removes what kedge derived from it.`,
+      );
+    }
+    if (preview.external.length) {
+      notes.push(
+        `Also configured outside the project directory: ${preview.external.join(", ")}. These go ` +
+          `too, unless another registered workbook is using them.`,
+      );
+    }
+    const note = $("forgetting-note");
+    note.textContent = notes.join(" ");
+    note.hidden = !notes.length;
+
+    const input = $("forgetting-confirm");
+    const go = $("forgetting-go");
+    input.value = "";
+    go.disabled = true;
+    const check = () => {
+      go.disabled = input.value.trim().toLowerCase() !== item.name.toLowerCase();
+    };
+    input.oninput = check;
+    go.onclick = async () => {
+      go.disabled = true;
+      dialog.close();
+      say(`Forgetting ${item.name}...`, null);
+      try {
+        const data = await api(`/api/hub/workbooks/${item.key}`, { method: "DELETE" });
+        const left = data.left_behind && data.left_behind.length;
+        say(
+          `Forgot ${item.name}. ${data.removed} item(s) and ${data.sessions} chat session(s) ` +
+            `deleted.` +
+            (left ? ` Left in place, because another workbook uses it: ${data.left_behind}.` : ""),
+          "ok",
+        );
+      } catch (error) {
+        say(error.message, null);
+      }
+      await refresh();
+    };
+
+    if (!dialog.open) dialog.showModal();
+    input.focus();
+  }
+
+  /* Releasing is the mirror image of forgetting, and so is its confirmation. That one enumerates
+     what will be destroyed, to make the user hesitate over consequences they cannot hold in their
+     head — a directory they have never opened, signed-off run records, months of conversation.
+     This one enumerates what *survives*, because that is the only thing that makes deleting the
+     spreadsheet a whole process was built on a reasonable click.
+
+     No type-to-confirm box, deliberately. The destructive scope here is one named file the user
+     has just decided is obsolete, with nothing kedge made at risk; demanding they type its name
+     over that teaches them the gate means nothing in particular, which is exactly what would
+     devalue it on Forget, where it is load-bearing — and it puts maximum friction on the happy
+     path, which is how people learn to click through friction. What the copy owes them instead is
+     the one fact a Recycle Bin habit hides: the file is deleted, not recycled. Focus lands on
+     Keep it, so a stray Enter is the safe answer. */
+  async function release(item) {
+    const dialog = $("releasing");
+    let preview;
+    try {
+      preview = await api(`/api/hub/workbooks/${item.key}/release`);
+    } catch (error) {
+      say(error.message, null);
+      return;
+    }
+
+    if (preview.open) {
+      say(
+        `${item.name} is the workbook this server has open, and releasing it deletes the ` +
+          `spreadsheet a running kernel may still be reading. Close it first, then release it.`,
+        null,
+      );
+      return;
+    }
+
+    $("releasing-title").textContent = `Release ${item.name}`;
+    $("releasing-lede").textContent = preview.workbook_exists
+      ? "The workbook is deleted and everything else is kept. It is deleted rather than moved to " +
+        "the Recycle Bin, so take a copy first if you want one. The notebook goes on running " +
+        "monthly, which is the point."
+      : "The workbook has already gone. Releasing records that as a decision, so kedge stops " +
+        "showing this process as a file somebody lost.";
+    $("releasing-target").textContent = preview.workbook;
+    $("releasing-target").hidden = !preview.workbook_exists;
+
+    /* Whether the translation was ever accepted is the one fact here that a release can destroy
+       rather than merely delete. Everything in the list below survives; this does not, because the
+       spreadsheet is the only thing the notebook's arithmetic could ever be measured against. Said
+       high, before the reassurance, and in the right words for each of the three answers -- a
+       recorded failure is still a record, and grading it as a pass would be the reassuring lie. */
+    const unchecked = preview.acceptance === "none";
+    const passed =
+      !unchecked && String(preview.acceptance_status).toLowerCase().includes("passed");
+    const acceptance = $("releasing-acceptance");
+    acceptance.className = "releasing-acceptance " + (unchecked ? "bad" : passed ? "ok" : "warn");
+    acceptance.textContent = unchecked
+      ? `Reconcile this conversion before you release it. The translation has never been checked ` +
+        `against the spreadsheet, and the spreadsheet is the only thing it could ever be checked ` +
+        `against — release it and that check can never be made, for the life of the notebook.`
+      : passed
+        ? `The translation was accepted ${ago(preview.accepted_at)} (${preview.acceptance_status}), ` +
+          `and that record is kept and cited from here on. It is what makes the spreadsheet safe ` +
+          `to let go of.`
+        : `The translation check is on record as ${preview.acceptance_status}, taken ` +
+          `${ago(preview.accepted_at)}. The record is kept and cited from here on, but read it ` +
+          `before you delete the only thing it was ever measured against.`;
+    /* The heading goes with the list. "Kept, exactly as it is:" over nothing at all is the
+       dialogue's reassurance contradicted by its own layout, on the one screen where the layout
+       is the argument. */
+    $("releasing-list").replaceChildren(
+      ...preview.kept.map((line) => el("li", { text: line })),
+    );
+    $("releasing-keeps").hidden = !preview.kept.length;
+
+    const notes = [];
+    if (!preview.notebook_exists) {
+      // The route refuses this outright, so the note says so rather than describing a release
+      // that will not happen. The button is hidden here too; this is the stale-page case.
+      notes.push(
+        "Convert this workbook first, or forget it instead. kedge has not generated a notebook " +
+          "from it, so there is no process to release it to and the server will refuse.",
+      );
+    }
+    /* A live marimo on this notebook is not a refusal -- only the workbook *this* server has open
+       is refused, and another kedge serving it is allowed to go on. It is worth saying, though:
+       its kernel reads the workbook, so a cell that ran before the file went is not evidence
+       about the notebook as it stands now. */
+    if (preview.marker === "live") {
+      notes.push(
+        `A marimo is still serving this notebook on port ${preview.marker_port}. Releasing does ` +
+          `not stop it, and its marker and token are kept — but its kernel reads the workbook, ` +
+          `so re-run the notebook there afterwards rather than trusting what is on screen.`,
+      );
+    }
+    const note = $("releasing-note");
+    note.textContent = notes.join(" ");
+    note.hidden = !notes.length;
+
+    /* The typing gate, armed for the unchecked case alone. It is the same criterion the Forget
+       dialogue's box meets and an ordinary release does not: a consequence the user cannot hold in
+       their head, because a notebook whose translation was never checked and one whose check
+       passed look identical on screen for ever afterwards. Instruction first — the label names
+       reconciling as the fix and the box is the way past it, in that order. */
+    const input = $("releasing-confirm");
+    const label = $("releasing-label");
+    const go = $("releasing-go");
+    input.hidden = !unchecked;
+    label.hidden = !unchecked;
+    label.textContent = unchecked ? `Or type ${item.name} to release it unchecked` : "";
+    $("releasing-go-label").textContent = unchecked
+      ? "Release without a check"
+      : "Release the workbook";
+    input.value = "";
+    go.disabled = unchecked;
+    input.oninput = () => {
+      go.disabled = input.value.trim().toLowerCase() !== item.name.toLowerCase();
+    };
+    go.onclick = async () => {
+      go.disabled = true;
+      dialog.close();
+      say(`Releasing ${item.name}...`, null);
+      try {
+        const data = await api(`/api/hub/workbooks/${item.key}/release`, { method: "POST" });
+        /* The marker sentence is carried through when something is still serving the notebook,
+           and — the case that would otherwise go quiet — when the dialogue said something was and
+           it turned out not to be. A server can die between the preview and the click, and this
+           is the one place the promise made a moment ago can be corrected. A stale pair tidied
+           after saying nothing about it is housekeeping the user did not ask about. */
+        const brokePromise = preview.marker === "live" && data.marker === "cleared";
+        const marimo =
+          data.marker === "kept" || brokePromise ? ` ${data.marker_detail}` : "";
+        say(
+          (data.removed
+            ? `Released ${data.name}: the workbook has been deleted. Everything kedge derived ` +
+                `from it is still here, and the notebook is the process now.`
+            : `Recorded ${data.name} as released. The workbook had already gone; everything ` +
+                `kedge derived from it is still here.`) + marimo,
+          "ok",
+        );
+      } catch (error) {
+        say(error.message, null);
+      }
+      await refresh();
+    };
+
+    if (!dialog.open) dialog.showModal();
+    // "Keep it" is the form's first submit button, so Enter closes the dialogue safely wherever
+    // focus sits. Focus goes to the box only when there is one to fill in.
+    (unchecked ? input : $("releasing-keep")).focus();
   }
 
   // ── settings ───────────────────────────────────────────────────────────────────────
@@ -907,8 +1315,7 @@
       event.preventDefault();
       depth = 0;
       overlay.hidden = true;
-      const files = Array.from(event.dataTransfer ? event.dataTransfer.files : []);
-      for (const file of files) await upload(file);
+      await receiveDrop(event.dataTransfer);
     });
   }
 

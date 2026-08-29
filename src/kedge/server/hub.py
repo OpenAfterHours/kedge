@@ -20,6 +20,11 @@ Three parts:
 * **Closing** — the counterpart, and the reason opening a second workbook can go on being refused.
   One server owns one workbook and one marimo process; ``/api/hub/close`` is how the first one is
   let go, so picking the wrong file from the list costs a click rather than a restart.
+* **Forgetting and releasing** — the two ways a conversion ends, and they are opposites.
+  Forgetting deletes the workbook *and* everything kedge derived from it. Releasing deletes only
+  the workbook: the notebook has become the monthly process and the spreadsheet is obsolete, which
+  is the successful ending and, until this existed, the one the product could only render as
+  breakage. Each is previewed before it is carried out and each stamps the registry last.
 
 The job runs in an :class:`asyncio.Task` rather than inside the streaming response, and every
 frame it emits is retained, so a browser that reloads mid-open reattaches and catches up instead
@@ -38,8 +43,8 @@ import logging
 import string
 import sys
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 
@@ -48,8 +53,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from kedge import purge
 from kedge.errors import KedgeError
-from kedge.registry import RegistryError, WorkbookRegistry, report_path_for
+from kedge.registry import RegistryEntry, RegistryError, WorkbookRegistry, report_path_for
 from kedge.server.events import (
     OPEN_STEPS,
     ErrorEvent,
@@ -148,11 +154,13 @@ async def hub_state(request: Request) -> dict[str, Any]:
     """Everything the hub page needs to draw itself: the workbooks, and what is open here.
 
     The status sweep touches the filesystem for every entry and probes every recorded marimo over
-    HTTP, so it runs in a threadpool rather than blocking the loop.
+    HTTP, so it runs in a threadpool rather than blocking the loop. The assistant lockdown is read
+    in the same pass and for the same reason -- see :func:`_assistant_of`.
     """
     state = _state(request)
     registry = _registry(state)
     statuses = await run_in_threadpool(registry.statuses)
+    rows = await run_in_threadpool(_workbook_rows, state, statuses)
     workspace = state.workspace
     return {
         "version": state.version,
@@ -167,7 +175,52 @@ async def hub_state(request: Request) -> dict[str, Any]:
         },
         "registry_path": str(registry.path),
         "steps": list(OPEN_STEPS),
-        "workbooks": [status.to_dict() for status in statuses],
+        "workbooks": rows,
+    }
+
+
+def _workbook_rows(state: ServerState, statuses: Sequence[Any]) -> list[dict[str, Any]]:
+    """The derived status of every workbook, with the assistant lockdown merged onto each.
+
+    Merged here rather than added to :class:`~kedge.registry.WorkbookStatus`, because that class
+    is deliberately about what the *registry* can derive from the workbook and its project
+    directory, and marimo's own configuration is a fact about a different tool.
+    """
+    return [status.to_dict() | _assistant_of(state, status.entry) for status in statuses]
+
+
+def _assistant_of(state: ServerState, entry: RegistryEntry) -> dict[str, Any]:
+    """Whether marimo's own AI assistant is live for one workbook, and what is stored beside it.
+
+    Two independent facts, and the hub shows them under different conditions because they are
+    dangerous under different conditions. ``assistant_enforced`` being false only matters where a
+    kernel is actually up -- a workbook nobody has opened has no ``.marimo.toml`` at all and would
+    otherwise wear the warning for ever, which is how a signal becomes one people stop reading.
+    ``assistant_keys`` is a credential sitting in plaintext in the project directory, which is an
+    exposure whether or not anything is running.
+
+    Read on every sweep rather than captured at open, and that is the whole point of
+    :func:`~kedge.lifecycle.assistant_status`: marimo rewrites that file whenever a setting changes
+    in its own editor, so the assistant can be switched back on, or a key typed into its settings
+    panel, an hour after a launch that reported the notebook clean. The hub polls, so what it shows
+    is current rather than a snapshot of the open.
+
+    Returns:
+        ``assistant_enforced`` and ``assistant_keys`` -- dotted key *names*, never values, which
+        is a guarantee of the API and the reason nothing downstream can render a credential. An
+        empty mapping for a row whose path no longer resolves to a workspace: there is no project
+        directory to have left anything in.
+    """
+    from kedge import lifecycle
+
+    try:
+        workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    except KedgeError:  # pragma: no cover - describe() has already logged the same failure
+        return {}
+    lockdown = lifecycle.assistant_status(workspace)
+    return {
+        "assistant_enforced": lockdown.enforced,
+        "assistant_keys": list(lockdown.secret_keys),
     }
 
 
@@ -235,13 +288,452 @@ async def upload_workbook(request: Request, file: UploadFile) -> dict[str, Any]:
     return {"workbook": entry.to_dict(), "saved_to": str(destination)}
 
 
+@router.get("/api/hub/workbooks/{key}/deletion")
+async def preview_deletion(key: str, request: Request) -> dict[str, Any]:
+    """Say exactly what forgetting this workbook would destroy, without destroying any of it.
+
+    The confirmation is the whole safety mechanism now that forgetting deletes, and a confirmation
+    the user cannot check is not one. So the counts here are read off the filesystem and the
+    sessions table at the moment they are asked for, rather than described in the abstract by a
+    dialogue that was written once and never sees a particular workbook.
+    """
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_purge, workspace, session_ids=sessions)
+    return {
+        "key": key,
+        "name": entry.name,
+        "workbook": str(plan.workbook),
+        "workbook_exists": plan.workbook.is_file(),
+        "sessions": len(sessions),
+        "items": list(purge.describe(plan, sessions=len(sessions))),
+        "external": [str(item.path) for item in plan.external_present],
+        "open": state.workspace is not None and state.workspace.key == key,
+    }
+
+
 @router.delete("/api/hub/workbooks/{key}")
-def forget_workbook(key: str, request: Request) -> dict[str, Any]:
-    """Remove a workbook from the list. Nothing on disk is touched."""
-    registry = _registry(_state(request))
-    if not registry.forget(key):
+async def forget_workbook(key: str, request: Request) -> dict[str, Any]:
+    """Forget a workbook: delete it and everything kedge derived from it.
+
+    This used to remove the registry row alone, on the reasoning that a landing page must not be
+    able to delete a user's artifacts. The reasoning was sound and the behaviour was still wrong,
+    because every artifact is addressed from the workbook's resolved *path* -- so re-adding the
+    same file brought the plan, the notebook, the run records and the whole conversation straight
+    back, and "forget" was a word the product did not mean. It means it now.
+
+    Three things make that safe enough to do from a browser. The workbook currently open on this
+    server is refused outright, because deleting the notebook out from under a running marimo
+    leaves a kernel holding a file that no longer exists. The registry row goes **last** and only
+    on a clean purge, so a deletion that fails halfway leaves the card in the list where the user
+    can see it and try again rather than orphaning a directory nothing points at any more. And
+    the caller is expected to have shown the user :func:`preview_deletion` first.
+
+    Configured locations *outside* the project directory are removed too, but only when no other
+    registered workbook resolves to the same place: ``ingest.store_dir`` may be an absolute path
+    two workbooks share, and taking one workbook's hand-ins with another's is not a thing the user
+    asked for.
+    """
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    _refuse_if_open(state, key, entry.name)
+
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_purge, workspace, session_ids=sessions)
+    shared = _externals_shared_with_others(state, key, plan)
+
+    result = await run_in_threadpool(
+        purge.execute,
+        plan,
+        include_workbook=True,
+        include_external=not shared,
+    )
+    removed_sessions = await run_in_threadpool(
+        state.store.delete_sessions_for_notebook, str(workspace.notebook_path)
+    )
+
+    if not result.ok:
+        # The row is deliberately still there. Everything below reads as "this went wrong, the
+        # workbook is still in your list, here is the file that would not go" -- which is what a
+        # locked .xlsx open in Excel looks like, and is fixable by closing Excel.
+        first, reason = result.failures[0]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{entry.name} could not be fully deleted: {first.name} is in use ({reason}). "
+                f"Close anything holding it and try again. {len(result.removed)} of "
+                f"{len(result.removed) + len(result.failures)} items were removed."
+            ),
+        )
+
+    registry = _registry(state)
+    if not registry.forget(key):  # pragma: no cover - _entry_or_404 has already found it
         raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
-    return {"forgotten": key}
+    return {
+        "forgotten": key,
+        "removed": len(result.removed),
+        "sessions": removed_sessions,
+        "left_behind": [str(item.path) for item in plan.external_present] if shared else [],
+    }
+
+
+@router.get("/api/hub/workbooks/{key}/release")
+async def preview_release(key: str, request: Request) -> dict[str, Any]:
+    """Say what releasing this workbook would delete and, far more importantly, what it keeps.
+
+    The counterpart to :func:`preview_deletion`, and it carries the opposite burden. That
+    confirmation has to make a user hesitate over a set of files they cannot see; this one has to
+    make a user *confident* about deleting the spreadsheet a whole process was built on, and the
+    only thing that earns that is a list of what survives, with counts read off the disk at the
+    moment they are asked for.
+
+    Chat sessions are counted and named among what is kept. They are the record of how the
+    conversion was arrived at and the process is continuing rather than ending, so nothing here or
+    in :func:`release_workbook` removes them -- ``session_ids`` reaches
+    :func:`~kedge.purge.plan_release` so the list can say so out loud.
+
+    The marimo marker and token are the one exception, and the list has to be honest about it.
+    :func:`~kedge.purge.plan_release` keeps them, correctly, because it cannot tell a marker for a
+    running server from a marker for a dead one -- but :func:`_sweep_marker` can, and does remove
+    a stale pair. A dialogue that promises to keep something the very next click deletes is how a
+    confirmation teaches a user to stop reading it, so when the marker is stale the two are struck
+    off what is shown rather than left in it.
+
+    **Whether the translation was ever accepted is the load-bearing fact here**, and it is the one
+    the enumeration cannot reach: everything else in the list is a file that survives, while this
+    is a property of the conversion that a release can destroy the possibility of. The workbook is
+    the only thing the notebook's arithmetic could ever be measured against, so releasing without a
+    recorded acceptance ends that question for the life of the notebook. It is read off
+    :class:`~kedge.registry.WorkbookStatus`, which already derives it from the acceptance record,
+    rather than reconstructed here.
+    """
+    # Aliased on the way in: ``purge.describe`` is a different function about the same workbook,
+    # and two bare ``describe``s a few lines apart is a reading hazard rather than a naming one.
+    from kedge.registry import describe as describe_workbook
+
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_release, workspace, session_ids=sessions)
+    marker, port = await run_in_threadpool(_marker_state, workspace)
+    status = await run_in_threadpool(describe_workbook, entry, user_directory=state.user_directory)
+
+    # Struck off unconditionally, not merely when they are stale right now. Filtering on the
+    # current answer left a race with a consequence out of all proportion to its size: a marker
+    # live at preview and dead at the click was promised as kept and then swept, so the list --
+    # whose entire job is to be a list of guarantees -- was the thing that turned out not to be
+    # one. The marker's fate is decided at click time and belongs in the sentence about the live
+    # marimo, which says why it survives, and in the POST's own report of what it did.
+    #
+    # Rebuilt as a plan rather than filtered as rendered lines, so there is still exactly one
+    # function that turns a retained item into a phrase.
+    shown = replace(
+        plan,
+        kept=tuple(item for item in plan.kept if item.path not in _marker_and_token(workspace)),
+    )
+    return {
+        "key": key,
+        "name": entry.name,
+        "workbook": str(plan.workbook),
+        "workbook_exists": plan.workbook.is_file(),
+        "released": entry.released,
+        "released_at": entry.released_at,
+        "notebook": str(workspace.notebook_path),
+        "notebook_exists": workspace.notebook_path.is_file(),
+        "sessions": len(sessions),
+        "kept": list(purge.describe_kept(shown, sessions=len(sessions))),
+        "marker": marker,
+        "marker_port": port,
+        # "recorded" whatever the verdict says, because the question is whether there is anything
+        # left to cite. An acceptance recorded as a failure is still a fact that outlives the
+        # spreadsheet and is visible for ever; no acceptance at all is the silence a release makes
+        # permanent. The verdict rides alongside so the dialogue can quote it rather than grade it.
+        "acceptance": "recorded" if status.reconciliation else "none",
+        "acceptance_status": status.reconciliation,
+        "accepted_at": status.reconciled_at,
+        "open": state.workspace is not None and state.workspace.key == key,
+    }
+
+
+@router.post("/api/hub/workbooks/{key}/release")
+async def release_workbook(key: str, request: Request) -> dict[str, Any]:
+    """Release a workbook: delete the spreadsheet, keep everything kedge derived from it.
+
+    This is the successful end of a conversion rather than a way of tidying up after a failed one.
+    The notebook is the monthly process now, the plans, contract, run records, acceptance record,
+    hand-ins and chat sessions all go on being the evidence behind it, and the workbook is the one
+    thing that has stopped being true. Until this route existed kedge could not express that: a
+    workbook not on disk rendered as a file somebody had lost.
+
+    **The registry is stamped last, and only on a clean result.** For a deletion "last" means the
+    row is *removed* last, so a half-finished purge leaves the card in the list where it can be
+    retried. Nothing is removed here, so the equivalent has to be worked out rather than copied,
+    and it is this: ``released_at`` is a *claim that the spreadsheet is gone*, and kedge must not
+    record a decision the filesystem has not carried out. Stamping first and then failing to
+    delete would leave the hub saying "released, the notebook is the process" over a workbook
+    still sitting on the share, which is the one lie this whole feature exists to stop telling.
+    Stamping last inverts the failure: a delete that succeeds and a registry write that does not
+    shows as ``missing``, which is the wrong framing but is exactly the state kedge was in before
+    any of this existed -- and one more click of Release fixes it, because
+    :func:`~kedge.purge.execute` treats an already-absent file as a success.
+
+    The workbook this server has open is refused for the same reason a deletion is. Chat sessions
+    are deliberately left alone; see :func:`preview_release`. The marimo marker and token are the
+    one thing a release removes besides the workbook, and only when nothing is answering on the
+    port they record -- :func:`_sweep_marker` owns that decision and says what it did in the
+    response, so a release taken while a server is still up is visible rather than silent.
+
+    **A conversion with no recorded acceptance is warned about, not refused**, and the warning
+    lives in the dialogue :func:`preview_release` feeds rather than here. Refusing was the obvious
+    alternative and it is wrong three times over. It would make release unreachable for exactly
+    the conversions that can never be reconciled -- the ones that deliberately improve on the
+    workbook and reproduce nothing, which is why ``not_reproduced`` exists at all. It would be the
+    first place in kedge where an unreconciled state blocks an action, against a doctrine that
+    reports reconciliation as a decision with a reason and never as a gate. And it would be walked
+    around in one Explorer window, or by Forget, which takes the workbook too with no such check --
+    a control that is one click to evade is not a control, it is a lesson in routing around kedge.
+    What the dialogue does instead is arm its type-to-confirm box for that case alone, which is the
+    criterion :func:`forget_workbook` uses and which this case meets and an ordinary release does
+    not: the loss is invisible afterwards, permanent, and about the notebook rather than a file.
+
+    Idempotent, because :meth:`~kedge.registry.WorkbookRegistry.release` is: releasing a row that
+    is already released keeps the original timestamp, and re-releasing one whose delete failed
+    last time is how the user retries it.
+    """
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    _refuse_if_open(state, key, entry.name, hazard=_RELEASE_HAZARD, verb="release")
+
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    _refuse_if_unconverted(workspace, entry.name)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_release, workspace, session_ids=sessions)
+    result = await run_in_threadpool(purge.execute, plan, include_workbook=True)
+
+    if not result.ok:
+        # Nothing is stamped. The row stays linked, the card keeps offering Release, and the
+        # sentence below names the one file that would not go -- which on Windows is almost
+        # always the workbook still open in Excel.
+        first, reason = result.failures[0]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{entry.name} could not be released: {first.name} could not be deleted "
+                f"({reason}). Close anything holding it and try again. Nothing else was touched, "
+                f"and kedge has not recorded the release."
+            ),
+        )
+
+    # Before the stamp, so the registry write stays the last thing that happens on this path and
+    # the ordering rule above has no exception to carry.
+    marker, marker_detail = await run_in_threadpool(_sweep_marker, workspace)
+
+    # Counted here rather than off the plan built above, and the difference is not cosmetic:
+    # `kept_present` stats the disk, so taken before the sweep it counts the marker and token this
+    # very call has just deleted. Nothing renders this number today, which is exactly why it would
+    # have been wrong on the day something did.
+    kept = len(plan.kept_present)
+
+    released = _registry(state).release(key)
+    if released is None:  # pragma: no cover - _entry_or_404 has already found it
+        raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
+    return {
+        "released": key,
+        "name": entry.name,
+        "workbook": str(plan.workbook),
+        "released_at": released.released_at,
+        "removed": len(result.removed),
+        "kept": kept,
+        "sessions": len(sessions),
+        "marker": marker,
+        "marker_detail": marker_detail,
+    }
+
+
+def _entry_or_404(state: ServerState, key: str) -> RegistryEntry:
+    """The registry row for ``key``, or a 404 naming it."""
+    entry = next((item for item in _registry(state).entries() if item.key == key), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
+    return entry
+
+
+_DELETE_HAZARD = (
+    "deleting a notebook a running marimo is holding would leave the kernel on a file that no "
+    "longer exists"
+)
+
+_RELEASE_HAZARD = (
+    "releasing it deletes the spreadsheet while a kernel that may still be reading it is running "
+    "-- the notebook's reconciliation cell re-reads the workbook whenever the translation check "
+    "runs, so a release taken mid-session can leave a working notebook failing on a file that is "
+    "no longer there"
+)
+
+
+def _refuse_if_open(
+    state: ServerState,
+    key: str,
+    name: str,
+    *,
+    hazard: str = _DELETE_HAZARD,
+    verb: str = "delete",
+) -> None:
+    """Refuse to destroy anything belonging to the workbook this server currently has open.
+
+    Not :func:`_refuse_if_busy`, which is the opposite test: that one permits the workbook already
+    open, because re-opening it is how a reattach works. Here that is precisely the case to stop.
+
+    Args:
+        state: The server state, holding whichever workspace is attached.
+        key: The workspace key the caller wants to act on.
+        name: The workbook's name, for the message.
+        hazard: What would go wrong, in a clause that follows "and". A release and a deletion take
+            different files away from a live kernel, and a refusal that describes the wrong one
+            sends the user looking for a problem they do not have.
+        verb: What the user was trying to do, for the closing instruction.
+    """
+    if state.workspace is not None and state.workspace.key == key:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{name} is the workbook this kedge server has open, and {hazard}. Close it "
+                f"first, then {verb} it."
+            ),
+        )
+
+
+def _externals_shared_with_others(state: ServerState, key: str, plan: purge.PurgePlan) -> bool:
+    """Whether another registered workbook resolves to the same configured external location."""
+    if not plan.external_present:
+        return False
+    wanted = {item.path for item in plan.external_present}
+    for entry in _registry(state).entries():
+        if entry.key == key:
+            continue
+        try:
+            other = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+        except KedgeError:  # pragma: no cover - an unresolvable row cannot be sharing anything
+            continue
+        if {other.handins_dir, other.contract_path} & wanted:
+            return True
+    return False
+
+
+def _refuse_if_unconverted(workspace: Workspace, name: str) -> None:
+    """Refuse to release a workbook kedge has built no notebook from.
+
+    The hub already hides the button in this case, and that gate is not enough. A button is a
+    convenience and the route is the contract, so anything reaching it another way -- a script, a
+    stale page, a verb added later -- would get the purge of the wrong half under a word promising
+    the opposite: the spreadsheet deleted and an empty project directory kept.
+
+    The deletion is not even the worst of it. A release *writes a claim into the registry*, and
+    the hub renders that claim as "the spreadsheet is gone and this notebook is the process".
+    Over a workspace with no notebook that sentence is simply false, and a product stating
+    something false about its own artifacts is the exact failure this whole feature exists to
+    stop. Forget is the verb for a workbook with nothing derived from it, and the message says so
+    -- instruction first, because a user stopped here needs the way forward before the reason.
+
+    Raises:
+        HTTPException: 409, naming both ways out.
+    """
+    if workspace.notebook_path.is_file():
+        return
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"Convert {name} first, or forget it instead. Releasing records that the notebook has "
+            f"become the process, and kedge has not generated a notebook from this workbook -- so "
+            f"a release would delete the spreadsheet, keep an empty project directory, and file a "
+            f"claim that a process is running here when nothing here runs."
+        ),
+    )
+
+
+def _marker_state(workspace: Workspace) -> tuple[str, int | None]:
+    """Whether a marimo marker exists for this workspace, and whether anything answers it.
+
+    The one question both halves of a release need and neither can answer from the plan:
+    :mod:`kedge.purge` does no HTTP, so it cannot tell a marker for a running server from a
+    marker for a dead one, and it is right not to try -- a second artifact list in there is the
+    drift the ``kept`` inversion exists to prevent.
+
+    Returns:
+        ``absent``, ``live`` or ``stale``, and the port the marker records -- ``None`` when there
+        is no marker. The port is what the two callers' sentences need; they write their own,
+        because one of them is about what *would* happen and the other about what did.
+    """
+    from kedge.lifecycle import health_check
+
+    marker = workspace.read_marker()
+    if marker is None:
+        return "absent", None
+    return ("live" if health_check(marker.base_url) else "stale"), marker.port
+
+
+def _marker_and_token(workspace: Workspace) -> set[Path]:
+    """The two machine-scoped files a release sweeps when nothing is serving the notebook."""
+    return {workspace.marker_path, workspace.token_file_path}
+
+
+def _sweep_marker(workspace: Workspace) -> tuple[str, str]:
+    """Remove a released workspace's marimo marker and token, but only if nothing is serving it.
+
+    A release keeps both deliberately while a server is alive: the marker is the only record of a
+    live marimo's port and token, and removing it orphans the very process
+    :func:`~kedge.lifecycle.cleanup_orphan` exists to find. That reasoning stops holding the
+    moment the server does. What is left then is an inert credential sitting in plaintext under
+    ``~/.kedge`` on a workspace nobody will open for a month, and inert is not the same as fine.
+
+    **Not** :func:`~kedge.lifecycle.cleanup_orphan`, though it asks the same liveness question.
+    That function answers it by *stopping* the server it finds, which is right before an open,
+    where the job is to reclaim a port. It is wrong twice here: a release must not kill a marimo
+    another kedge is serving, and the notebook that server is serving is the process this release
+    is graduating -- the one thing that should go on running. It would also clear the marker on
+    the way past, which is precisely the case for keeping it.
+
+    Never raises. The workbook is gone by the time this is called, so a marker that will not
+    delete must not turn a completed release into a 500; the next open clears it either way.
+
+    Returns:
+        What happened -- ``absent``, ``kept`` or ``cleared`` -- and one sentence for the response.
+        ``kept`` is reported rather than passed over, because a release taken while something is
+        still serving this notebook is worth seeing rather than inferring.
+    """
+    condition, port = _marker_state(workspace)
+    if condition == "absent":
+        return "absent", "No marimo marker was recorded for this workbook."
+    if condition == "live":
+        return "kept", (
+            f"A marimo is still serving this notebook on port {port}, so its marker and token "
+            f"were left where they are -- removing them would orphan a running server."
+        )
+    try:
+        workspace.clear_marker()
+    except KedgeError as exc:
+        logger.warning("could not clear the marker for %s: %s", workspace.key, exc)
+        return "kept", (
+            f"Nothing is answering on port {port}, but the marker could not be removed ({exc}). "
+            f"The next open will clear it."
+        )
+    workspace.clear_token_file()
+    return "cleared", (
+        f"Nothing was answering on port {port}, so the stale marker and its token file went with "
+        f"the workbook rather than staying readable until the next open."
+    )
 
 
 @router.post("/api/hub/close")
@@ -560,7 +1052,12 @@ async def _run_open(
         if adopted is None:
             await _step_launch(workspace, job, kedge_version=__version__)
         else:
-            job.step("launching", "skipped", f"reattached to our own marimo on {adopted}")
+            # The same warning on the reattach path. An adopted server is one kedge started, so
+            # its lockdown was written -- and its `.marimo.toml` has had the whole of that
+            # server's lifetime to be rewritten from inside the editor, which is the case the
+            # note exists for.
+            note = await run_in_threadpool(_assistant_note, workspace)
+            job.step("launching", "skipped", f"reattached to our own marimo on {adopted}{note}")
         await _step_session(workspace, job)
 
         driver = await _step_scaffold(workspace, plan, job, plan_path=plan_path)
@@ -786,9 +1283,35 @@ async def _step_analyse(workspace: Workspace, job: OpenJob) -> Any:
     The sketch rides on this step's frame rather than getting its own because ``OpenStep`` is a
     closed vocabulary shared with the client (``server/events.py``), and this is the step that
     already turns the analysis into files. Its detail line says what was written.
+
+    **A released workbook is opened from the analysis kedge kept.** Releasing is the successful
+    end of a conversion, and the hub offers Open on a released row precisely because the notebook
+    is the monthly process now -- but :func:`~kedge.analysis.analyse.analyse` raises on a file
+    that is not there, so without :func:`_recorded_analysis` that button was a sequence that
+    always died on this step. The recorded ``analysis.json`` sits inside the project directory a
+    release deliberately keeps, so there is nothing to regenerate and nothing to guess.
+
+    The frame says the workbook is not on disk rather than that it was released, because this
+    function cannot tell the two absences apart -- ``released_at`` is a registry fact and a step
+    is handed a workspace. It names the released reading, which is the ordinary one, and gives the
+    other its remedy in the same breath.
     """
     from kedge.analysis.analyse import analyse
     from kedge.report import write_report
+
+    recorded = _recorded_analysis(workspace)
+    if recorded is not None:
+        job.step(
+            "analysing",
+            "ok",
+            f"{workspace.workbook_path.name} is not on disk, so the analysis kedge recorded at "
+            f"the last open was read back rather than the workbook: {len(recorded.sheets)} "
+            f"sheet(s), {len(recorded.operations)} logical operation(s). That is the ordinary "
+            f"state for a released workbook — the notebook is the process now. If the file was "
+            f"moved rather than retired, put it back and open again to analyse the current "
+            f"version.",
+        )
+        return recorded
 
     job.step("analysing", "running", f"reading {workspace.workbook_path.name}")
     analysis = await run_in_threadpool(analyse, workspace.workbook_path)
@@ -807,6 +1330,32 @@ async def _step_analyse(workspace: Workspace, job: OpenJob) -> Any:
         f"{contract}",
     )
     return analysis
+
+
+def _recorded_analysis(workspace: Workspace) -> Any | None:
+    """The analysis kedge kept, for a workbook that is no longer on disk to read.
+
+    Deliberately narrow: it answers only for a workbook that is *absent*. A file that is there is
+    always re-analysed, because ``analysis.json`` is a snapshot of a spreadsheet that changes
+    every month and preferring it would be a cache that goes quietly stale.
+
+    Returns:
+        The recorded analysis, or None when the workbook is on disk (analyse it) or nothing usable
+        was recorded -- in which case the caller carries on and the analyser raises, naming the
+        file, which is the honest answer for a released workbook that was never analysed.
+    """
+    if workspace.workbook_path.is_file():
+        return None
+
+    from kedge.analysis.model import WorkbookAnalysis
+
+    try:
+        return WorkbookAnalysis.model_validate_json(
+            workspace.analysis_path.read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError) as exc:
+        logger.info("no usable recorded analysis for %s: %s", workspace.key, exc)
+        return None
 
 
 def _sketch_contract(workspace: Workspace, analysis: Any) -> str:
@@ -1182,14 +1731,58 @@ async def _step_notebook(workspace: Workspace, job: OpenJob) -> None:
 
 
 async def _step_launch(workspace: Workspace, job: OpenJob, *, kedge_version: str) -> None:
-    """Spawn the marimo server kedge owns, and register the handlers that tear it down."""
+    """Spawn the marimo server kedge owns, and register the handlers that tear it down.
+
+    The step also reports the assistant lockdown; :func:`_assistant_note` says why that has to
+    happen where a user can see it rather than only in the log.
+    """
     from kedge.lifecycle import launch_marimo, register_teardown
 
     job.step("launching", "running", "starting a marimo server that kedge owns")
     register_teardown(workspace)
     await run_in_threadpool(launch_marimo, workspace, kedge_version=kedge_version)
     session = workspace.require_marimo()
-    job.step("launching", "ok", f"marimo is serving {session.base_url} (pid {session.pid})")
+    note = await run_in_threadpool(_assistant_note, workspace)
+    job.step("launching", "ok", f"marimo is serving {session.base_url} (pid {session.pid}){note}")
+
+
+def _assistant_note(workspace: Workspace) -> str:
+    """One sentence about marimo's own AI assistant, or empty when there is nothing to say.
+
+    The control fails open on purpose. A ``.marimo.toml`` that cannot be written -- a read-only
+    directory, a locked file -- leaves marimo's assistant live and the launch goes ahead anyway,
+    because refusing to start would not un-write a credential already on disk and would take away
+    the settings panel that is the user's only route to clearing it. Failing open **into a log
+    line**, though, is a control nobody can act on: the assistant stays live, everything it sends
+    goes outside kedge's tool surface and outside the outbound payload log, and the only record is
+    a WARNING in a file the user has no reason to open. This is that sentence, put in front of
+    them.
+
+    A credential is reported separately and by name, never by value -- the API hands back dotted
+    key names for exactly that reason -- and it is worth saying whether or not the assistant was
+    disabled, because a key in that file is an exposure on its own account.
+
+    Read fresh rather than taken from the launch. The file is live: a key typed into marimo's own
+    settings panel lands in a file that was clean when the server started, and this step runs
+    again on every open.
+
+    Returns:
+        A sentence to append to the launching step's detail, beginning with a space, or empty when
+        the assistant is off and nothing is stored. Never raises.
+    """
+    from kedge import lifecycle
+
+    lockdown = lifecycle.assistant_status(workspace)
+    parts = []
+    if not lockdown.enforced:
+        parts.append(f"Warning: {lockdown.detail}.")
+    if lockdown.secret_keys:
+        parts.append(
+            f"Warning: {lockdown.path.name} holds {len(lockdown.secret_keys)} model credential(s) "
+            f"in plain text, under {', '.join(lockdown.secret_keys)}. kedge neither reads nor "
+            f"sends them; clear them in marimo's own settings panel."
+        )
+    return f" {' '.join(parts)}" if parts else ""
 
 
 async def _step_session(workspace: Workspace, job: OpenJob) -> None:

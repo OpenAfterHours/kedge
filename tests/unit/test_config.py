@@ -156,6 +156,27 @@ def test_explicit_paths_override_the_discovered_locations(tmp_path: Path, kedge_
     assert loaded.files == (elsewhere,)
 
 
+# ── sharing hand-ins ─────────────────────────────────────────────────────────────────────────
+
+
+def test_hand_ins_do_not_travel_to_the_team_repo_until_a_project_says_so(
+    kedge_home: Path, project: Path
+) -> None:
+    """The default has to be the safe one, because the unsafe one is unrecoverable.
+
+    Everything else in a project directory describes the process; the hand-in store holds the
+    production extracts themselves, and a push to a shared repository cannot be taken back.
+    It is a per-project decision, so it belongs in the file that travels with the workbook.
+    """
+    assert load_config(project_dir=project).config.ingest.share_handins is False
+
+    (project / "kedge.toml").write_text("[ingest]\nshare_handins = true\n", encoding="utf-8")
+    loaded = load_config(project_dir=project)
+
+    assert loaded.config.ingest.share_handins is True
+    assert loaded.origin("ingest.share_handins") == str(project / "kedge.toml")
+
+
 # ── the policy allowlists ────────────────────────────────────────────────────────────────────
 
 

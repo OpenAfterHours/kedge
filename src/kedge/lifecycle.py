@@ -18,6 +18,12 @@ Keeping that in one file is what makes a marimo bump a one-file correction; the 
 below are marimo_http's, kept importable from here because process supervision is what callers
 come to this module for.
 
+One thing crosses to marimo by a route other than HTTP, and it has to: the ``.marimo.toml`` that
+disables marimo's own AI assistant, which is read once at startup and so must be on disk before
+the process is spawned. That file is composed by :mod:`kedge.marimo_config` for the same reason
+the endpoints live in one module — the filename and the keys are marimo's, and a release renaming
+either should cost one file.
+
 It does not import ``marimo._code_mode`` and must never do so — driving the kernel is
 ``notebook/driver.py``'s job alone, and this module's job stops at "the process is up, the
 session exists, here is its id".
@@ -43,6 +49,11 @@ from typing import TYPE_CHECKING, Literal
 import httpx
 
 from kedge.errors import NotebookError
+from kedge.marimo_config import (
+    AssistantLockdown,
+    disable_marimo_assistant,
+    inspect_marimo_assistant,
+)
 from kedge.marimo_http import (
     MarimoHealthTimeoutError,
     MarimoLaunchError,
@@ -63,10 +74,12 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "MARIMO_PIN",
+    "AssistantLockdown",
     "MarimoHealthTimeoutError",
     "MarimoLaunchError",
     "MarimoSessionNotFoundError",
     "OrphanOutcome",
+    "assistant_status",
     "bootstrap_session",
     "build_marimo_argv",
     "cleanup_orphan",
@@ -223,9 +236,31 @@ def launch_marimo(
     On return the workspace has a :class:`~kedge.workspace.MarimoSession` carrying the port,
     token and pid, and a marker file has been written. The kernel session does *not* exist yet —
     call :func:`establish_session` for that.
+
+    marimo's own AI assistant is turned off first, by writing the ``.marimo.toml`` its config
+    search finds ahead of the user's (:mod:`kedge.marimo_config`). That has to happen before the
+    process exists, because marimo reads its config once at startup.
+
+    Neither of the two things that can go wrong there stops the launch, and they are refused for
+    different reasons. A failed write is argued in that module. A **credential found in the
+    project config** is not a reason to refuse at all: the key is already on disk, so declining to
+    launch does not un-write it — it leaves the exposure exactly as it is while removing the
+    user's only route to the settings panel that would clear it, which is inside the editor being
+    refused. It is also not kedge's key to hold a conversion hostage over. The proportionate place
+    for a hard stop is the point where that directory would be *copied* somewhere, not the point
+    where it is opened.
+
+    Neither is discoverable from the returned process handle, so anything with a user in front of
+    it reads :func:`assistant_status` instead.
     """
     settings = workspace.config.marimo
     workspace.ensure_dirs()
+
+    lockdown = disable_marimo_assistant(workspace.project_dir)
+    if not lockdown.enforced:
+        logger.warning(
+            "starting marimo anyway, with its own AI assistant live: %s", lockdown.detail
+        )
 
     port = settings.port or pick_free_port(settings.host)
     token = generate_token()
@@ -290,6 +325,32 @@ def launch_marimo(
 
     logger.info("marimo ready for %s at %s", workspace.notebook_path, base_url)
     return process
+
+
+def assistant_status(workspace: Workspace) -> AssistantLockdown:
+    """Report whether marimo's own AI assistant is disabled for ``workspace``, as things stand.
+
+    This is what anything with a user in front of it should render — the hub's open sequence, a
+    diagnostic, a hand-over check. It exists because :func:`launch_marimo` returns a process
+    handle and has nowhere to put the answer, and its callers are spread across the CLI and the
+    server.
+
+    It re-reads the file rather than replaying what the launch found, and that is what makes it
+    correct rather than merely convenient: marimo rewrites that file whenever a setting changes in
+    the editor, so both halves of the answer — whether the assistant is off, and whether a
+    credential has been left sitting in the project directory — can change while the notebook is
+    open. A value cached at launch would be stale in exactly the case that matters most.
+
+    Args:
+        workspace: The workspace whose marimo was, or is about to be, launched.
+
+    Returns:
+        The current state of the control. ``detail`` is a sentence written for a person and is the
+        field to display; ``enforced`` and ``secret_keys`` are the two facts behind it, and they
+        are independent on purpose — a credential in the file says nothing about whether the
+        assistant was disabled. Never raises, and names keys rather than reporting values.
+    """
+    return inspect_marimo_assistant(workspace.project_dir)
 
 
 def establish_session(workspace: Workspace, *, client: httpx.Client | None = None) -> str:

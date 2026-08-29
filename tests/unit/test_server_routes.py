@@ -177,6 +177,98 @@ def test_the_static_assets_are_revalidated_rather_than_assumed_fresh(client: Tes
         assert response.headers["cache-control"] == "no-cache", path
 
 
+def test_the_hub_frames_an_absent_workbook_on_the_state_and_never_on_the_boolean(
+    client: TestClient,
+) -> None:
+    # An absent workbook has two readings and only one of them is a fault. `exists` cannot tell
+    # them apart, so a hub that branches on it renders the successful end of a conversion -- the
+    # notebook is the process, the spreadsheet is retired -- as "this file is no longer where
+    # kedge last saw it. Move it back." The server derives `source_state` for exactly this, and
+    # there is no JS runner here, so the asset the browser is served is where the drift is caught.
+    script = client.get("/static/hub.js").text
+    assert 'item.source_state === "missing"' in script, "the warning must be for `missing` alone"
+    assert 'item.source_state === "released"' in script, "a released row needs its own framing"
+    # `exists` is still read, on one row only. A release whose delete failed is `released` *and*
+    # present, and the server keeps the two facts apart precisely so the hub can say both rather
+    # than show a half-finished release as a clean one.
+    assert "Workbook still on disk" in script, (
+        "a release whose delete did not finish must stay visible as one"
+    )
+
+
+def test_the_release_dialogue_the_hub_script_drives_is_in_the_page_it_is_served_with(
+    client: TestClient,
+) -> None:
+    # hub.html and hub.js are separate URLs that go stale independently, and the failure is
+    # silent: `$("releasing-list")` returning null throws inside the click handler, so the button
+    # does nothing at all and the user is left clicking Release on a page that never answers.
+    # Every id one half names, the other half must have.
+    script = client.get("/static/hub.js").text
+    page = client.get("/hub").text
+    for element in (
+        "releasing",
+        "releasing-title",
+        "releasing-lede",
+        "releasing-target",
+        "releasing-acceptance",
+        "releasing-keeps",
+        "releasing-list",
+        "releasing-note",
+        "releasing-label",
+        "releasing-confirm",
+        "releasing-go",
+        "releasing-go-label",
+        "releasing-keep",
+    ):
+        assert f'id="{element}"' in page, f"hub.html has no #{element}"
+        assert f'"{element}"' in script, f"hub.js never reaches #{element}"
+    # The icon is in the same sprite as every other one, and a `use` pointing at a symbol that is
+    # not there renders as nothing -- a button with a label and a hole where its glyph should be.
+    assert 'id="i-flag"' in page
+
+
+def test_the_release_dialogue_asks_for_typing_only_when_nothing_can_ever_be_checked_again(
+    client: TestClient,
+) -> None:
+    # The typing gate is worth exactly as much as the restraint with which it is spent. Forget
+    # earns it because a directory the user has never opened goes with the click; an ordinary
+    # release does not, because the destructive scope is one named file they have already decided
+    # is obsolete. The unchecked case earns it on the same criterion Forget does -- the loss is
+    # permanent and invisible afterwards, since a notebook that was never checked against the
+    # spreadsheet and one whose check passed look identical on screen for ever.
+    #
+    # Asserted on the served script because that is where the arming lives, and because a future
+    # edit that arms it unconditionally would look like a tidy-up and read as one in review.
+    script = client.get("/static/hub.js").text
+    assert 'preview.acceptance === "none"' in script, "the gate must key off the acceptance"
+    assert "go.disabled = unchecked" in script, "an ordinary release must not inherit the gate"
+    assert "Release without a check" in script, "the button has to say which release this is"
+    # Instruction before justification, as every other blocking message in kedge is.
+    assert "Reconcile this conversion before you release it." in script
+
+
+def test_the_hub_warns_about_marimos_own_assistant_without_crying_wolf(
+    client: TestClient,
+) -> None:
+    # Two facts with different shelf lives, and the difference is what keeps the warning worth
+    # reading. A credential in `.marimo.toml` is an exposure whether or not anything is running,
+    # so it is shown unconditionally and ahead of the early return that would otherwise suppress
+    # it on a moved workbook. The assistant being live only matters where a kernel is up: kedge
+    # writes the lockdown at launch, so every workbook nobody has opened reads as "not enforced",
+    # and a pill on all of those would be permanently amber -- which is how a signal stops being
+    # read at all.
+    script = client.get("/static/hub.js").text
+    assert "item.assistant_keys" in script, "a plaintext credential must reach the card"
+    assert "item.assistant_enforced === false" in script
+    assert "item.marimo && item.marimo.live" in script, (
+        "the assistant pill must be conditioned on a kernel actually being up"
+    )
+    # Names, never values: the server sends dotted key names and nothing here may go looking for
+    # anything else. `assistant_keys` is the only assistant field the script is allowed to render.
+    assert "assistant_value" not in script
+    assert "api_key]" not in script
+
+
 def test_the_hidden_attribute_is_not_disarmed_by_a_display_rule(client: TestClient) -> None:
     # Both scripts show and hide everything conditional by assigning `hidden`, and an author
     # `display` beats the user agent's own `[hidden] { display: none }` before specificity is

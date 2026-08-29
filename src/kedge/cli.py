@@ -63,6 +63,7 @@ from kedge.workspace import Workspace, iter_markers
 if TYPE_CHECKING:
     from kedge.agent.fill import FillReport
     from kedge.analysis.model import WorkbookAnalysis
+    from kedge.handover import Handover
     from kedge.plan import PlanRun, PlanStore, ProcessPlan
 
 logger = logging.getLogger(__name__)
@@ -1636,6 +1637,130 @@ def _reconcile_exit_code(report: Any) -> int:
     than silently reporting success (PLAN 4.5).
     """
     return 0 if report.status else 1
+
+
+# ── handover ─────────────────────────────────────────────────────────────────────────────────
+#
+# The verb reports; it never acts. Nothing here copies, uploads, registers or deletes anything,
+# and kedge does not shell out to mooring or require it to be installed -- mooring is a sibling
+# tool, not a dependency. What comes back is the correct on-disk state plus the commands to run,
+# which the user runs themselves. The output says so in as many words, because a command that
+# prints a tidy list of paths and a green line is one somebody will read as "done".
+#
+# Exit code 1 on a blocker, so `kedge handover ... && mooring push ...` cannot chain past a
+# conversion that has no notebook. Warnings do not affect the code: they qualify a handover that
+# can still go ahead, and a script that stopped on them would stop on the ordinary case.
+
+
+@app.command()
+def handover(
+    workbook: Annotated[Path, typer.Argument(help="The converted workbook to hand over.")],
+    repo: Annotated[
+        Path,
+        typer.Option("--repo", help="The mooring workspace root, holding pyproject.toml."),
+    ],
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the handover to stdout as JSON.")
+    ] = False,
+) -> None:
+    """Report how to hand a converted process to the team over mooring.
+
+    Says what would be shared, what is withheld and why, whether the repository declares kedge,
+    and the commands to run in order. It runs none of them. The dependency matters more than it
+    looks: the notebook's import cell needs kedge, and marimo draws a failed import as a page
+    that just ends.
+    """
+    from kedge.handover import plan_handover
+
+    if not workbook.is_file():
+        raise _fail(f"no such workbook: {workbook}")
+
+    workspace = _workspace_for(workbook)
+    plan = plan_handover(
+        workspace.project_dir,
+        repo,
+        config=workspace.config,
+        handins_dir=workspace.handins_dir,
+    )
+
+    if as_json:
+        typer.echo(json.dumps(_handover_payload(plan), indent=2))
+    else:
+        _print_handover(plan)
+
+    if not plan.ready:
+        raise typer.Exit(code=1)
+
+
+def _print_handover(plan: Handover) -> None:
+    """Render a :class:`kedge.handover.Handover` for a terminal."""
+    console = _console()
+    console.print(f"[bold]{_plain(plan.project_dir)}[/bold]")
+    console.print(f"  into [bold]{_plain(plan.repo_dir)}[/bold]")
+    console.print(f"  as   [bold]{_plain(plan.workspace_path)}[/bold]")
+
+    # Entry names rather than workspace paths: the prefix is identical on every row and is
+    # already on the line above, and carrying it here costs enough width that rich truncates the
+    # end of each path -- which is the only part that differs. The full paths are in the push
+    # command, where they have to be exact.
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("")
+    table.add_column("entry")
+    table.add_column("why")
+    for item in plan.items:
+        mark = "[green]share[/green]" if item.shared else "[yellow]withhold[/yellow]"
+        name = f"{item.name}/" if item.is_dir else item.name
+        table.add_row(mark, _plain(name), _plain(item.reason))
+    if plan.items:
+        console.print()
+        console.print(table)
+
+    console.print()
+    verdict = "green" if plan.dependency.satisfied else "yellow"
+    console.print(f"[{verdict}]dependency[/{verdict}] {_plain(plan.dependency.detail)}")
+
+    for warning in plan.warnings:
+        console.print(f"[yellow]warning[/yellow] {_plain(warning)}")
+
+    if plan.blockers:
+        console.print()
+        for blocker in plan.blockers:
+            console.print(f"[bold red]blocked[/bold red] {_plain(blocker)}")
+        console.print("[dim]Nothing to run until that is resolved.[/dim]")
+        return
+
+    console.print()
+    console.print("[bold]Run these yourself, in order. kedge has not run any of them.[/bold]")
+    for number, step in enumerate(plan.steps, start=1):
+        console.print(f"  [bold]{number}.[/bold] {_plain(step.instruction)}")
+        if step.command is not None:
+            console.print(f"     [cyan]{_plain(step.command)}[/cyan]")
+
+
+def _handover_payload(plan: Handover) -> dict[str, Any]:
+    """The same handover as JSON, for a script that would rather not parse a table."""
+    return {
+        "project_dir": str(plan.project_dir),
+        "repo_dir": str(plan.repo_dir),
+        "workspace_path": plan.workspace_path,
+        "notebook": plan.notebook,
+        "ready": plan.ready,
+        "dependency": {
+            "state": str(plan.dependency.state),
+            "satisfied": plan.dependency.satisfied,
+            "detail": plan.dependency.detail,
+            "requirement": plan.dependency.requirement,
+        },
+        "shared": [item.workspace_path for item in plan.shared],
+        "withheld": [
+            {"path": item.workspace_path, "reason": item.reason} for item in plan.withheld
+        ],
+        "steps": [
+            {"instruction": step.instruction, "command": step.command} for step in plan.steps
+        ],
+        "warnings": list(plan.warnings),
+        "blockers": list(plan.blockers),
+    }
 
 
 # ── watch ────────────────────────────────────────────────────────────────────────────────────
