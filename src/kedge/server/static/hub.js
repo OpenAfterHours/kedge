@@ -69,9 +69,20 @@
     return `${value < 10 && unit ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
   }
 
+  /* A body the browser knows how to frame for itself. Announcing a content type over one of these
+     is not merely redundant, it is destructive: setting the header explicitly is what stops the
+     browser generating the `multipart/form-data; boundary=...` a `FormData` needs, and the
+     boundary is the only way the server can find the parts. Every dropped workbook 422'd on this
+     -- for long enough that `~/.kedge/dropped` was never once created. */
+  const selfDescribing = (body) =>
+    (typeof FormData !== "undefined" && body instanceof FormData) ||
+    (typeof Blob !== "undefined" && body instanceof Blob) ||
+    (typeof URLSearchParams !== "undefined" && body instanceof URLSearchParams);
+
   async function api(path, options) {
+    const body = options && options.body;
     const response = await fetch(path, {
-      headers: options && options.body ? { "Content-Type": "application/json" } : {},
+      headers: body && !selfDescribing(body) ? { "Content-Type": "application/json" } : {},
       ...options,
     });
     if (!response.ok) {
@@ -80,6 +91,13 @@
         detail = (await response.json()).detail || detail;
       } catch (_) {
         /* the body was not JSON; the status text will do */
+      }
+      /* A `detail` is a string when kedge raised the HTTPException and a list of {loc, msg, type}
+         when FastAPI rejected the request before the handler ran. Left as it was, `new Error` on
+         that list stringified to "[object Object]" -- the one error shape that tells the user
+         nothing at all, on the one path where they have done nothing wrong. */
+      if (Array.isArray(detail)) {
+        detail = detail.map((item) => (item && item.msg) || JSON.stringify(item)).join("; ");
       }
       const error = new Error(detail);
       // Carried because one refusal here is answerable rather than fatal: a 409 from the open
@@ -268,7 +286,9 @@
       actions.append(
         el("span", {
           class: "hub-hint",
-          text: "This file is no longer where kedge last saw it. Move it back, or forget it.",
+          text:
+            "This file is no longer where kedge last saw it. Move it back, or forget it — " +
+            "which deletes the notebook and the plans kedge made from it.",
         }),
       );
     } else if (current) {
@@ -319,7 +339,7 @@
         "button",
         {
           class: "ghost-button",
-          title: "Remove from this list. Nothing on disk is touched.",
+          title: "Delete this workbook and everything kedge made from it.",
           onclick: () => forget(item),
         },
         icon("i-bin"),
@@ -386,16 +406,71 @@
     }
   }
 
+  /* Reports rather than announces, because a drop can carry several files and the caller has to
+     compose one banner out of all of them. Saying it here meant a drop of three workbooks showed
+     only whatever the third one did. */
   async function upload(file) {
     const form = new FormData();
     form.append("file", file, file.name);
     try {
       const data = await api("/api/hub/upload", { method: "POST", body: form });
-      say(`Added ${data.workbook.name}, saved to ${data.saved_to}.`, "ok");
-      await refresh();
+      return { ok: true, name: data.workbook.name, saved: data.saved_to };
     } catch (error) {
-      say(error.message, null);
+      return { ok: false, name: file.name, message: error.message };
     }
+  }
+
+  /* What a drop is actually carrying. A folder reaches `dataTransfer.files` as an entry with no
+     extension and no bytes, so without this it was refused as "not a .xlsx or .xlsm file" -- true,
+     unhelpful, and not what the user did. `webkitGetAsEntry` is the only reliable way to tell one
+     from a genuinely empty file; the size-and-type heuristic is the fallback where it is absent. */
+  function sortDrop(transfer) {
+    const files = Array.from(transfer ? transfer.files : []);
+    const items = Array.from(transfer && transfer.items ? transfer.items : []);
+    const directories = new Set();
+    items.forEach((item, index) => {
+      if (item.kind !== "file" || !item.webkitGetAsEntry) return;
+      const entry = item.webkitGetAsEntry();
+      if (entry && entry.isDirectory && files[index]) directories.add(files[index]);
+    });
+    const looksLikeFolder = (file) =>
+      directories.has(file) || (file.size === 0 && !file.type && !file.name.includes("."));
+    return {
+      folders: files.filter(looksLikeFolder).map((file) => file.name),
+      workbooks: files.filter((file) => !looksLikeFolder(file)),
+    };
+  }
+
+  async function receiveDrop(transfer) {
+    const { folders, workbooks } = sortDrop(transfer);
+
+    if (!folders.length && !workbooks.length) {
+      say("That drop carried no file. Drag a .xlsx or .xlsm workbook, or use Browse.", null);
+      return;
+    }
+
+    const notes = folders.map(
+      (name) =>
+        `${name} is a folder. kedge registers one workbook at a time -- open it and drag the ` +
+        `.xlsx or .xlsm file inside.`,
+    );
+    const results = [];
+    for (const [index, file] of workbooks.entries()) {
+      const progress = workbooks.length > 1 ? ` (${index + 1} of ${workbooks.length})` : "";
+      say(`Copying ${file.name}${progress}...`, null);
+      results.push(await upload(file));
+    }
+
+    const added = results.filter((result) => result.ok);
+    const refused = results.filter((result) => !result.ok);
+    if (added.length === 1 && !refused.length && !notes.length) {
+      say(`Added ${added[0].name}, saved to ${added[0].saved}.`, "ok");
+    } else {
+      if (added.length) notes.unshift(`Added ${added.map((r) => r.name).join(", ")}.`);
+      for (const result of refused) notes.push(`${result.name}: ${result.message}`);
+      say(notes.join(" "), refused.length || folders.length ? null : "ok");
+    }
+    if (added.length) await refresh();
   }
 
   // ── the file browser ───────────────────────────────────────────────────────────────
@@ -649,14 +724,78 @@
     await refresh();
   }
 
+  /* Forgetting deletes, so the dialogue enumerates. A user cannot be expected to know that a
+     signed-off run record and eight months of conversation are inside the phrase "forget this
+     workbook", and a generic "are you sure?" over that set of files is not consent. The counts
+     come from the server reading the actual directory, not from a sentence written once.
+
+     The instruction leads and the justification follows, as every other blocking message in kedge
+     does -- a user who is stuck needs to know where to type before they need to know why. */
   async function forget(item) {
+    const dialog = $("forgetting");
+    let preview;
     try {
-      await api(`/api/hub/workbooks/${item.key}`, { method: "DELETE" });
-      say(`Removed ${item.name} from the list. Nothing on disk was touched.`, "ok");
-      await refresh();
+      preview = await api(`/api/hub/workbooks/${item.key}/deletion`);
     } catch (error) {
       say(error.message, null);
+      return;
     }
+
+    if (preview.open) {
+      say(
+        `${item.name} is the workbook this server has open. Close it first, then forget it.`,
+        null,
+      );
+      return;
+    }
+
+    $("forgetting-title").textContent = `Forget ${item.name}`;
+    $("forgetting-label").textContent = `Type ${item.name} to confirm`;
+    $("forgetting-list").replaceChildren(
+      ...[
+        preview.workbook_exists && `the workbook itself, ${preview.workbook}`,
+        ...preview.items,
+      ]
+        .filter(Boolean)
+        .map((line) => el("li", { text: line })),
+    );
+
+    const note = $("forgetting-note");
+    note.textContent = preview.external.length
+      ? `Also configured outside the project directory: ${preview.external.join(", ")}. These go ` +
+        `too, unless another registered workbook is using them.`
+      : "";
+    note.hidden = !preview.external.length;
+
+    const input = $("forgetting-confirm");
+    const go = $("forgetting-go");
+    input.value = "";
+    go.disabled = true;
+    const check = () => {
+      go.disabled = input.value.trim().toLowerCase() !== item.name.toLowerCase();
+    };
+    input.oninput = check;
+    go.onclick = async () => {
+      go.disabled = true;
+      dialog.close();
+      say(`Forgetting ${item.name}...`, null);
+      try {
+        const data = await api(`/api/hub/workbooks/${item.key}`, { method: "DELETE" });
+        const left = data.left_behind && data.left_behind.length;
+        say(
+          `Forgot ${item.name}. ${data.removed} item(s) and ${data.sessions} chat session(s) ` +
+            `deleted.` +
+            (left ? ` Left in place, because another workbook uses it: ${data.left_behind}.` : ""),
+          "ok",
+        );
+      } catch (error) {
+        say(error.message, null);
+      }
+      await refresh();
+    };
+
+    if (!dialog.open) dialog.showModal();
+    input.focus();
   }
 
   // ── settings ───────────────────────────────────────────────────────────────────────
@@ -907,8 +1046,7 @@
       event.preventDefault();
       depth = 0;
       overlay.hidden = true;
-      const files = Array.from(event.dataTransfer ? event.dataTransfer.files : []);
-      for (const file of files) await upload(file);
+      await receiveDrop(event.dataTransfer);
     });
   }
 

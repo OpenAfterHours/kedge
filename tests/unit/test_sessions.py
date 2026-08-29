@@ -61,6 +61,37 @@ def test_deleting_a_session_removes_its_messages(store: SessionStore) -> None:
     assert store.delete_session(session.id) is False
 
 
+def test_deleting_a_notebook_s_sessions_takes_every_one_of_them(store: SessionStore) -> None:
+    """Forgetting a workbook has to take the whole conversation, not the first page of it.
+
+    ``list_sessions`` caps at ``limit``, so a caller that listed and then deleted would leave
+    everything past the fiftieth row behind -- waiting to reappear the moment the same workbook
+    was added again, which is the exact bug this is part of fixing.
+    """
+    kept = _make(store, notebook_path="C:/other/other.py")
+    mine = [_make(store) for _ in range(60)]
+    store.append_message(mine[0].id, role="user", content="hello")
+
+    assert store.delete_sessions_for_notebook("C:/work/rwa.kedge/rwa.py") == 60
+    assert store.list_sessions(notebook_path="C:/work/rwa.kedge/rwa.py") == []
+    assert store.messages(mine[0].id) == []
+    assert store.get_session(kept.id) is not None
+
+
+def test_deleting_the_sessions_of_a_notebook_with_none_is_not_an_error(
+    store: SessionStore,
+) -> None:
+    assert store.delete_sessions_for_notebook("C:/nowhere/none.py") == 0
+
+
+def test_session_ids_for_a_notebook_are_not_capped(store: SessionStore) -> None:
+    """The id list is what the purge is planned from, so a truncated one under-deletes."""
+    for _ in range(60):
+        _make(store)
+
+    assert len(store.session_ids_for_notebook("C:/work/rwa.kedge/rwa.py")) == 60
+
+
 def test_updating_only_touches_the_fields_supplied(store: SessionStore) -> None:
     session = _make(store, model="gpt-4o", snapshot="sha256:aaa")
     updated = store.update_session(session.id, title="Haircuts")

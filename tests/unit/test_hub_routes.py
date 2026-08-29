@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from kedge import purge
 from kedge.server.app import ServerError, ServerState, create_hub_app
 from kedge.server.events import OPEN_STEPS
 from kedge.server.hub import OpenJob
@@ -194,15 +195,140 @@ def test_a_dropped_file_that_is_not_really_a_workbook_leaves_nothing_behind(
     assert list((home / "dropped").iterdir()) == []
 
 
-def test_forgetting_a_workbook_removes_the_row_and_not_the_file(
+def test_the_upload_request_the_browser_actually_sends_is_diagnosable(
     client: TestClient, workbook: Path
 ) -> None:
+    """The shape every dropped workbook arrived in, and the shape of the refusal.
+
+    `hub.js` announced ``application/json`` over its ``FormData`` body, which is what stops the
+    browser generating the multipart boundary -- so the file field never arrived and FastAPI
+    rejected the request before the route ran. The refusal's ``detail`` is a *list*, and
+    ``new Error`` on a list stringifies to "[object Object]", which is what the user actually saw.
+
+    Both halves are asserted here because the client has to survive both: the header fix stops
+    this request being sent, and the flattening stops any future 422 reading as nothing at all.
+    """
+    body = (
+        b'--X\r\nContent-Disposition: form-data; name="file"; filename="dropped.xlsx"\r\n\r\n'
+        + workbook.read_bytes()
+        + b"\r\n--X--\r\n"
+    )
+
+    response = client.post(
+        "/api/hub/upload", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 422
+    assert isinstance(response.json()["detail"], list)
+
+
+def test_the_hub_client_never_announces_json_over_a_body_that_frames_itself(
+    client: TestClient,
+) -> None:
+    """The regression guard for the drop bug, asserted on the asset the browser is served.
+
+    There is no JS runner in this repo, and the project already asserts on served asset text for
+    exactly this class of drift. A `FormData` body must reach `fetch` with no content type of its
+    own, or the boundary is never generated and every upload 422s.
+    """
+    for path in ("/static/hub.js", "/static/app.js"):
+        script = client.get(path).text
+        assert "instanceof FormData" in script, f"{path} does not guard the content type"
+        assert "Array.isArray(detail)" in script, f"{path} would render a 422 as [object Object]"
+
+
+def test_forgetting_a_workbook_deletes_it_and_everything_derived_from_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Forget means delete. The row was never the thing that made a workbook come back.
+
+    Everything kedge writes is addressed from the workbook's resolved path, so removing the row
+    alone left the notebook, the plans and the run records exactly where they were and re-adding
+    the same file restored the lot.
+    """
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.notebook_path.write_text("# notebook", encoding="utf-8")
+    (workspace.plans_dir / "plan-v001.yaml").write_text("stages: []", encoding="utf-8")
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 200
+    assert client.get("/api/hub/state").json()["workbooks"] == []
+    assert not workspace.project_dir.exists()
+    assert not workbook.exists()
+    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 404
+
+
+def test_the_deletion_preview_names_what_will_go_and_removes_none_of_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """The confirmation is the whole safety mechanism, so its counts must be read, not written."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    workspace.ensure_dirs()
+    workspace.runs_dir.mkdir(parents=True, exist_ok=True)
+    (workspace.runs_dir / "20260829T000000Z.json").write_text("{}", encoding="utf-8")
+
+    data = client.get(f"/api/hub/workbooks/{key}/deletion").json()
+
+    assert data["workbook_exists"] is True
+    assert data["workbook"] == str(workbook.resolve())
+    assert any("project directory" in line for line in data["items"])
+    assert workbook.is_file(), "asking what would go must not make any of it go"
+    assert workspace.project_dir.is_dir()
+
+
+def test_a_workbook_that_is_open_on_this_server_cannot_be_forgotten(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Deleting a notebook a running marimo holds leaves the kernel on a file that is not there."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    _state(client).workspace = Workspace.for_workbook(workbook, user_directory=home)
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 409
+    assert "Close it first" in response.json()["detail"]
+    assert workbook.is_file()
+    assert client.get(f"/api/hub/workbooks/{key}/deletion").json()["open"] is True
+
+
+def test_forgetting_a_workbook_takes_its_chat_sessions_with_it(
+    client: TestClient, workbook: Path, home: Path
+) -> None:
+    """Sessions key off the notebook path, which is why the conversation used to come back."""
+    key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
+    workspace = Workspace.for_workbook(workbook, user_directory=home)
+    store = _state(client).store
+    session = store.create_session(
+        workbook_path=str(workbook), notebook_path=str(workspace.notebook_path)
+    )
+    store.append_message(session.id, role="user", content="convert this")
+
+    data = client.delete(f"/api/hub/workbooks/{key}").json()
+
+    assert data["sessions"] == 1
+    assert store.get_session(session.id) is None
+
+
+def test_the_registry_row_survives_a_purge_that_could_not_finish(
+    client: TestClient, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A half-deleted workspace must stay visible, because the hub is where it can be retried."""
     key = client.post("/api/hub/workbooks", json={"path": str(workbook)}).json()["workbook"]["key"]
 
-    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 200
-    assert client.get("/api/hub/state").json()["workbooks"] == []
-    assert workbook.is_file()
-    assert client.delete(f"/api/hub/workbooks/{key}").status_code == 404
+    def refuse(plan: object, **_: object) -> purge.PurgeResult:
+        return purge.PurgeResult(removed=(), failures=((workbook, "being used by Excel"),))
+
+    monkeypatch.setattr(purge, "execute", refuse)
+
+    response = client.delete(f"/api/hub/workbooks/{key}")
+
+    assert response.status_code == 409
+    assert "being used by Excel" in response.json()["detail"]
+    assert [item["key"] for item in client.get("/api/hub/state").json()["workbooks"]] == [key]
 
 
 # ── derived state over HTTP ──────────────────────────────────────────────────────────────────

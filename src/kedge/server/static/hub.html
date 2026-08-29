@@ -134,6 +134,31 @@
   </div>
 </dialog>
 
+<dialog class="forgetting" id="forgetting">
+  <div class="forgetting-head">
+    <h2 id="forgetting-title">Forget this workbook</h2>
+    <p class="forgetting-lede">
+      Type the workbook's name below and choose Forget everything to delete the workbook and
+      everything kedge derived from it. This cannot be undone.
+    </p>
+  </div>
+  <ul class="forgetting-list" id="forgetting-list"></ul>
+  <p class="forgetting-note" id="forgetting-note" hidden></p>
+  <form method="dialog" class="forgetting-foot">
+    <label class="forgetting-label" for="forgetting-confirm" id="forgetting-label">
+      Type the name to confirm
+    </label>
+    <input class="forgetting-input" id="forgetting-confirm" type="text" autocomplete="off"
+           spellcheck="false" />
+    <div class="forgetting-actions">
+      <button class="ghost-button" value="cancel">Keep it</button>
+      <button class="ghost-button danger" id="forgetting-go" type="button" disabled>
+        <svg class="icon"><use href="#i-bin"></use></svg><span>Forget everything</span>
+      </button>
+    </div>
+  </form>
+</dialog>
+
 <dialog class="settings" id="settings">
   <form method="dialog" class="settings-head">
     <h2>Model endpoint</h2>

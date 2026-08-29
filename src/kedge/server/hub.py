@@ -48,8 +48,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from kedge import purge
 from kedge.errors import KedgeError
-from kedge.registry import RegistryError, WorkbookRegistry, report_path_for
+from kedge.registry import RegistryEntry, RegistryError, WorkbookRegistry, report_path_for
 from kedge.server.events import (
     OPEN_STEPS,
     ErrorEvent,
@@ -235,13 +236,142 @@ async def upload_workbook(request: Request, file: UploadFile) -> dict[str, Any]:
     return {"workbook": entry.to_dict(), "saved_to": str(destination)}
 
 
+@router.get("/api/hub/workbooks/{key}/deletion")
+async def preview_deletion(key: str, request: Request) -> dict[str, Any]:
+    """Say exactly what forgetting this workbook would destroy, without destroying any of it.
+
+    The confirmation is the whole safety mechanism now that forgetting deletes, and a confirmation
+    the user cannot check is not one. So the counts here are read off the filesystem and the
+    sessions table at the moment they are asked for, rather than described in the abstract by a
+    dialogue that was written once and never sees a particular workbook.
+    """
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_purge, workspace, session_ids=sessions)
+    return {
+        "key": key,
+        "name": entry.name,
+        "workbook": str(plan.workbook),
+        "workbook_exists": plan.workbook.is_file(),
+        "sessions": len(sessions),
+        "items": list(purge.describe(plan, sessions=len(sessions))),
+        "external": [str(item.path) for item in plan.external_present],
+        "open": state.workspace is not None and state.workspace.key == key,
+    }
+
+
 @router.delete("/api/hub/workbooks/{key}")
-def forget_workbook(key: str, request: Request) -> dict[str, Any]:
-    """Remove a workbook from the list. Nothing on disk is touched."""
-    registry = _registry(_state(request))
-    if not registry.forget(key):
+async def forget_workbook(key: str, request: Request) -> dict[str, Any]:
+    """Forget a workbook: delete it and everything kedge derived from it.
+
+    This used to remove the registry row alone, on the reasoning that a landing page must not be
+    able to delete a user's artifacts. The reasoning was sound and the behaviour was still wrong,
+    because every artifact is addressed from the workbook's resolved *path* -- so re-adding the
+    same file brought the plan, the notebook, the run records and the whole conversation straight
+    back, and "forget" was a word the product did not mean. It means it now.
+
+    Three things make that safe enough to do from a browser. The workbook currently open on this
+    server is refused outright, because deleting the notebook out from under a running marimo
+    leaves a kernel holding a file that no longer exists. The registry row goes **last** and only
+    on a clean purge, so a deletion that fails halfway leaves the card in the list where the user
+    can see it and try again rather than orphaning a directory nothing points at any more. And
+    the caller is expected to have shown the user :func:`preview_deletion` first.
+
+    Configured locations *outside* the project directory are removed too, but only when no other
+    registered workbook resolves to the same place: ``ingest.store_dir`` may be an absolute path
+    two workbooks share, and taking one workbook's hand-ins with another's is not a thing the user
+    asked for.
+    """
+    state = _state(request)
+    entry = _entry_or_404(state, key)
+    _refuse_if_open(state, key, entry.name)
+
+    workspace = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+    sessions = await run_in_threadpool(
+        state.store.session_ids_for_notebook, str(workspace.notebook_path)
+    )
+    plan = await run_in_threadpool(purge.plan_purge, workspace, session_ids=sessions)
+    shared = _externals_shared_with_others(state, key, plan)
+
+    result = await run_in_threadpool(
+        purge.execute,
+        plan,
+        include_workbook=True,
+        include_external=not shared,
+    )
+    removed_sessions = await run_in_threadpool(
+        state.store.delete_sessions_for_notebook, str(workspace.notebook_path)
+    )
+
+    if not result.ok:
+        # The row is deliberately still there. Everything below reads as "this went wrong, the
+        # workbook is still in your list, here is the file that would not go" -- which is what a
+        # locked .xlsx open in Excel looks like, and is fixable by closing Excel.
+        first, reason = result.failures[0]
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{entry.name} could not be fully deleted: {first.name} is in use ({reason}). "
+                f"Close anything holding it and try again. {len(result.removed)} of "
+                f"{len(result.removed) + len(result.failures)} items were removed."
+            ),
+        )
+
+    registry = _registry(state)
+    if not registry.forget(key):  # pragma: no cover - _entry_or_404 has already found it
         raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
-    return {"forgotten": key}
+    return {
+        "forgotten": key,
+        "removed": len(result.removed),
+        "sessions": removed_sessions,
+        "left_behind": [str(item.path) for item in plan.external_present] if shared else [],
+    }
+
+
+def _entry_or_404(state: ServerState, key: str) -> RegistryEntry:
+    """The registry row for ``key``, or a 404 naming it."""
+    entry = next((item for item in _registry(state).entries() if item.key == key), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No workbook with key {key!r} is registered.")
+    return entry
+
+
+def _refuse_if_open(state: ServerState, key: str, name: str) -> None:
+    """Refuse to delete the workbook this server currently has open.
+
+    Not :func:`_refuse_if_busy`, which is the opposite test: that one permits the workbook already
+    open, because re-opening it is how a reattach works. Here that is precisely the case to stop.
+    """
+    if state.workspace is not None and state.workspace.key == key:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{name} is the workbook this kedge server has open, and deleting a notebook a "
+                f"running marimo is holding would leave the kernel on a file that no longer "
+                f"exists. Close it first, then delete it."
+            ),
+        )
+
+
+def _externals_shared_with_others(state: ServerState, key: str, plan: purge.PurgePlan) -> bool:
+    """Whether another registered workbook resolves to the same configured external location."""
+    if not plan.external_present:
+        return False
+    wanted = {item.path for item in plan.external_present}
+    for entry in _registry(state).entries():
+        if entry.key == key:
+            continue
+        try:
+            other = Workspace.for_workbook(entry.path, user_directory=state.user_directory)
+        except KedgeError:  # pragma: no cover - an unresolvable row cannot be sharing anything
+            continue
+        if {other.handins_dir, other.contract_path} & wanted:
+            return True
+    return False
 
 
 @router.post("/api/hub/close")

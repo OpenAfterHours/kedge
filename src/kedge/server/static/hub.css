@@ -445,6 +445,60 @@ dialog::backdrop { background: rgba(10, 13, 16, 0.42); }
 .nudge .icon { flex: none; }
 .nudge .ghost-button { flex: none; color: var(--warn); border-color: var(--warn); }
 
+/* ── forgetting a workbook ──────────────────────────────────────────────────────────── */
+
+/* Forgetting deletes now, so this dialogue is the whole safety mechanism. It is built to be read
+   rather than dismissed: the list is the actual contents of the project directory, and the name
+   box exists so that clicking through it cannot be muscle memory. */
+
+.forgetting { max-width: min(560px, 94vw); }
+
+.forgetting-head { padding: 14px 16px 10px; border-bottom: 1px solid var(--border); }
+.forgetting-head h2 { margin: 0 0 6px; font-size: 16px; font-weight: 620; }
+
+.forgetting-lede { margin: 0; font-size: 13px; line-height: 1.5; color: var(--muted); }
+
+.forgetting-list {
+  margin: 0;
+  padding: 12px 16px 12px 32px;
+  max-height: min(40vh, 320px);
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.forgetting-note {
+  margin: 0;
+  padding: 0 16px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--danger);
+}
+
+.forgetting-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.forgetting-label { font-size: 12px; color: var(--muted); }
+
+.forgetting-input {
+  width: 100%;
+  padding: 7px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+}
+
+.forgetting-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 .settings { max-width: min(560px, 94vw); }
 
 .settings-head {

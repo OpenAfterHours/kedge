@@ -301,6 +301,42 @@ class SessionStore:
             )
         return self.get_session(session_id)
 
+    def session_ids_for_notebook(self, notebook_path: str) -> list[str]:
+        """Every session id recorded against ``notebook_path``, oldest first.
+
+        Deliberately not :meth:`list_sessions`, which caps at ``limit`` rows and would hand a
+        caller trying to delete them all a quietly truncated list -- fifty-one sessions, fifty
+        deleted, and the fifty-first waiting to reappear the moment the workbook is re-added.
+        """
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT id FROM sessions WHERE notebook_path = ? ORDER BY rowid",
+                (notebook_path,),
+            ).fetchall()
+        return [row["id"] for row in rows]
+
+    def delete_sessions_for_notebook(self, notebook_path: str) -> int:
+        """Delete every session for one notebook, with its messages. Returns how many went.
+
+        Sessions are keyed by notebook path, which is why a forgotten workbook used to come back
+        with its whole conversation intact: the registry row went, and nothing here did.
+        """
+        with self._lock, self._connection:
+            # Messages first and explicitly, for the reason `delete_session` gives: foreign keys
+            # are a per-connection pragma, so a cascade cannot be relied upon to have been armed.
+            self._connection.execute(
+                "DELETE FROM messages WHERE session_id IN "
+                "(SELECT id FROM sessions WHERE notebook_path = ?)",
+                (notebook_path,),
+            )
+            cursor = self._connection.execute(
+                "DELETE FROM sessions WHERE notebook_path = ?", (notebook_path,)
+            )
+        deleted = cursor.rowcount or 0
+        if deleted:
+            logger.info("deleted %d chat session(s) for %s", deleted, notebook_path)
+        return deleted
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and its messages. Returns whether there was one to delete."""
         with self._lock, self._connection:
