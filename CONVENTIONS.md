@@ -16,7 +16,7 @@ Read `PLAN.md` for *what* to build. This file is *how*. It is binding: reviewers
    SQL half is the same class of bug as the Excel half: an apostrophe in a counterparty name, a
    null, a date, a money value at the edge of exponent notation. Every one is ordinary in a
    finance extract and every one breaks a concatenated statement, silently, at the moment
-   somebody runs it against production. Unlike 1, 2, 6 and 7 this one is **not** machine
+   somebody runs it against production. Unlike 1, 2, 6, 7 and 8 this one is **not** machine
    enforced -- no AST pass can tell SQL-shaped string building from any other -- so it holds
    only as long as reviewers hold it.
 4. **Every extractor degrades gracefully.** An analyser sub-extractor returns an "absent" or
@@ -38,6 +38,17 @@ Read `PLAN.md` for *what* to build. This file is *how*. It is binding: reviewers
    that mentions no proxy. **There is no setting that turns verification off**, and adding one
    would be a regression, not a feature: `[model] ca_bundle` names a PEM instead, which is
    visible to whoever reads that config next. Enforced by `scripts/guardrails.py`.
+8. **marimo's own config file is composed by `src/kedge/marimo_config.py` alone.** kedge writes a
+   `.marimo.toml` into the directory it launches marimo from, because marimo's config search
+   reads that directory before the user's home, and that is what turns marimo's built-in AI
+   assistant off — an assistant that would otherwise send workbook values to an endpoint outside
+   kedge's tool surface and outside the outbound payload log (PLAN 2.3). The filename and the
+   keys inside it are marimo's, not kedge's, so a release renaming either should cost one file:
+   same argument as 6, one layer down. The realistic second home is not a rival module but a
+   one-line special case in something that already walks the project directory — `handover.py`
+   and `server/hub.py` both do — which is exactly the mention a rename would strand. Enforced by
+   `scripts/guardrails.py`, as a live string literal rather than an import, because the whole
+   coupling *is* the string.
 
 ## Python style
 

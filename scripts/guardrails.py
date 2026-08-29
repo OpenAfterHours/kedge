@@ -26,7 +26,16 @@ endpoints in order to explain the boundary. It is deliberately narrower than the
 new module could still health-poll marimo without tripping this. The two authenticated POSTs are
 the ones that matter, and they are covered.
 
-The fourth rule is not in CONVENTIONS.md's numbered list, because it is not about a library
+The fourth rule is the third one's smaller sibling. kedge disables marimo's built-in AI assistant
+by writing a `.marimo.toml` into the directory it launches marimo from, and that filename, along
+with the two keys inside it, is marimo's rather than kedge's. So `kedge/marimo_config.py` composes
+it and nothing else names it. Checked as a literal for the same reason the endpoints are, and
+because here there is nothing else to check: the whole coupling *is* the string. The realistic
+second home is not a rival module but a one-line special case in something that already walks the
+project directory -- `handover.py` and `server/hub.py` both do -- and that is exactly the kind of
+mention a marimo rename would leave behind.
+
+The fifth rule is not in CONVENTIONS.md's numbered list, because it is not about a library
 boundary -- it is the layering `CLAUDE.md` states in one line: ``analysis/ -> plan/ -> notebook/
 -> agent/ -> server/``. A layer may import what is below it and nothing above it. The agent reads
 and writes the notebook; the notebook knows nothing about the agent. A conversion driver was once
@@ -79,6 +88,16 @@ CODE_MODE_HOME = "src/kedge/notebook/driver.py"
 KERNEL_API_PREFIX = "/api/kernel/"
 KERNEL_API_ROOTS = ("src",)
 KERNEL_API_HOMES = ("src/kedge/marimo_http.py", "src/kedge/notebook/kernel.py")
+
+# CONVENTIONS.md 8: marimo's own config file is written by one module. The same shape as 6, for
+# the same reason -- the filename and the keys inside it are marimo's, so a release renaming
+# either should cost one file rather than a hunt. Checked as a literal rather than as an import
+# because there is nothing to import: the entire coupling is the string ".marimo.toml", and the
+# plausible second home is not a new module but a one-line special case in something that already
+# walks the project directory.
+MARIMO_CONFIG_FILENAME = ".marimo.toml"
+MARIMO_CONFIG_ROOTS = ("src",)
+MARIMO_CONFIG_HOMES = ("src/kedge/marimo_config.py",)
 
 # CONVENTIONS.md 7: certificate trust for the model endpoint is decided in kedge/tls.py alone.
 # Two shapes, because there are two ways to end up on certifi by accident. Building a raw httpx
@@ -225,16 +244,26 @@ def _docstring_ids(tree: ast.AST) -> set[int]:
     return found
 
 
-def _check_kernel_api() -> list[Breach]:
-    """Collect every live string literal naming a marimo kernel endpoint outside its two homes."""
-    rule = (
-        f"marimo's HTTP API is spoken by {KERNEL_API_HOMES[0]} alone, with "
-        f"{KERNEL_API_HOMES[1]} as the one deliberate exception "
-        "(CONVENTIONS.md non-negotiable 6)"
-    )
+def _check_literal(
+    needle: str, roots: tuple[str, ...], homes: tuple[str, ...], rule: str
+) -> list[Breach]:
+    """Collect every live string literal containing `needle` outside the files allowed to hold it.
+
+    Live, meaning docstrings are excluded: half a dozen of them name these strings in order to
+    explain the boundary, which is why this is an AST pass rather than a grep.
+
+    Args:
+        needle: The substring that may appear only in `homes`.
+        roots: Repo-relative directories to walk.
+        homes: The repo-relative files permitted to contain it.
+        rule: The convention to quote when reporting a breach.
+
+    Returns:
+        Every offending literal, in file then line order.
+    """
     breaches: list[Breach] = []
-    for path in _python_files(KERNEL_API_ROOTS):
-        if path.relative_to(REPO_ROOT).as_posix() in KERNEL_API_HOMES:
+    for path in _python_files(roots):
+        if path.relative_to(REPO_ROOT).as_posix() in homes:
             continue
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -245,16 +274,39 @@ def _check_kernel_api() -> list[Breach]:
             Breach(
                 path=path,
                 line=node.lineno,
-                statement=f"string literal contains {KERNEL_API_PREFIX!r}",
+                statement=f"string literal contains {needle!r}",
                 rule=rule,
             )
             for node in ast.walk(tree)
             if isinstance(node, ast.Constant)
             and isinstance(node.value, str)
-            and KERNEL_API_PREFIX in node.value
+            and needle in node.value
             and id(node) not in docstrings
         )
     return breaches
+
+
+def _check_kernel_api() -> list[Breach]:
+    """Collect every live string literal naming a marimo kernel endpoint outside its two homes."""
+    return _check_literal(
+        KERNEL_API_PREFIX,
+        KERNEL_API_ROOTS,
+        KERNEL_API_HOMES,
+        f"marimo's HTTP API is spoken by {KERNEL_API_HOMES[0]} alone, with "
+        f"{KERNEL_API_HOMES[1]} as the one deliberate exception "
+        "(CONVENTIONS.md non-negotiable 6)",
+    )
+
+
+def _check_marimo_config() -> list[Breach]:
+    """Collect every live mention of marimo's config filename outside the module that writes it."""
+    return _check_literal(
+        MARIMO_CONFIG_FILENAME,
+        MARIMO_CONFIG_ROOTS,
+        MARIMO_CONFIG_HOMES,
+        f"marimo's own config file is composed by {MARIMO_CONFIG_HOMES[0]} alone "
+        "(CONVENTIONS.md non-negotiable 8)",
+    )
 
 
 def _package_of(path: Path) -> str:
@@ -498,6 +550,7 @@ def main() -> int:
             home=CODE_MODE_HOME,
         ),
         *_check_kernel_api(),
+        *_check_marimo_config(),
         *_outbound_trust(),
         *_check_layering(),
     ]
@@ -512,6 +565,7 @@ def main() -> int:
     print(
         f"guardrails: no pandas import anywhere; marimo._code_mode confined to {CODE_MODE_HOME}; "
         f"{KERNEL_API_PREFIX} confined to {', '.join(KERNEL_API_HOMES)}; "
+        f"{MARIMO_CONFIG_FILENAME} written only by {MARIMO_CONFIG_HOMES[0]}; "
         f"outbound TLS trust decided in {HTTPX_HOMES[0]}; "
         "no upward import anywhere in "
         + " -> ".join(f"{name}/" for name in LAYERS)

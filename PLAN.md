@@ -556,6 +556,10 @@ This is a real divergence from mooring, which guarantees the copilot never sees 
 
 *Author's decision (2026-07-24): build the full plan, all milestones. marimo's built-in assistant is explicitly not to be used — the kedge AI window is how the user interacts with the AI.* M3 and M4 are therefore in scope as specified, not deferred.
 
+That decision is now mechanically enforced rather than only stated. `kedge.marimo_config` writes a `.marimo.toml` into the directory kedge launches marimo from, forcing `ai.enabled = false` and `completion.copilot = false`; marimo's config search reads the launch directory before the user's home, so those win over whatever the user has configured personally. Without it the assistant runs from that personal config, inside the iframe kedge serves, against an endpoint outside the tool surface and outside the §2.3 outbound log — the second channel that would make the log's account of what leaves the machine untrue.
+
+**How partially it is closed matters and is written down in `SECURITY.md`, not here.** Three limits in brief: `ai.enabled` is a front-end gate and marimo's `/api/ai/*` endpoints stay reachable to anything holding the marimo token; a `[tool.marimo]` section in the nearest `pyproject.toml` is merged over the file kedge writes and can re-enable the assistant; and because marimo writes its own settings back to whichever config its search found, that file is a plaintext location for a model API key, beside the workbook. kedge detects and reports all three rather than claiming a control it does not have — `kedge.lifecycle.assistant_status` is what a caller reads.
+
 ---
 
 ## 6. Risks

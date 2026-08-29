@@ -22,13 +22,41 @@ Paths that a user's own configuration has pointed *outside* the project director
 ``ingest.store_dir`` and ``ingest.contract`` may both be absolute -- are held separately in
 :attr:`PurgePlan.external`. kedge does not own those directories and may be sharing them with
 another workbook, so whether they go is the caller's decision rather than this module's.
+
+**Release is the same enumeration with the opposite disposition.** The successful end of a
+conversion is that the notebook becomes the process and the spreadsheet is obsolete, so kedge has
+to be able to take the workbook away and leave everything else standing. :func:`plan_release`
+enumerates nothing of its own: it takes :func:`plan_purge`'s answer and moves every item out of
+``owned`` and ``external`` into :attr:`PurgePlan.kept`, which leaves the workbook as the only
+thing to remove. That is not tidiness. A second enumeration would be a hand-written list of what
+a release spares -- correct on the day it was written, and then the next artifact added to
+:func:`plan_purge` would start being *deleted* by a release nobody had touched. Deriving it this
+way round means a new artifact is kept by default, which is the direction that fails safely.
+
+It also settles what becomes of the machine-scoped state *in the plan*, and the answer is:
+nothing. The marimo marker and the token file belong to a server that may still be serving the
+notebook -- a release is not a teardown, and teardown is what clears them -- and the marker is the
+only record of that server's port and token, so removing it orphans the very process
+``cleanup_orphan`` exists to find. This module speaks no HTTP and therefore cannot tell a marker
+for a running server from a marker for one that died months ago, and it is right not to guess:
+both stay in ``kept``. A caller that *can* ask finishes the job. ``server/hub.py``'s
+``_sweep_marker`` takes the pair once nothing answers on the recorded port, because what is left
+by then is an inert credential in plaintext under a workspace nobody may open for a month. Read
+the two together, because a reader of this file alone would get it wrong: a release *plan* keeps
+the marker and the token, and a release usually does not.
+
+The outbound payload logs are the record of what kedge sent to the model, which is evidence about
+a process at the moment it becomes production; destroying it as a side effect of graduating would
+be the unasked-for destruction kedge refuses everywhere else. Chat sessions are the same argument
+and are not this module's to reach anyway -- ``server/sessions.py`` sits above it, so a caller
+that wants them gone composes it.
 """
 
 from __future__ import annotations
 
 import logging
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -39,7 +67,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PurgeItem", "PurgePlan", "PurgeResult", "describe", "execute", "plan_purge"]
+__all__ = [
+    "PurgeItem",
+    "PurgePlan",
+    "PurgeResult",
+    "describe",
+    "describe_kept",
+    "execute",
+    "plan_purge",
+    "plan_release",
+]
 
 
 @dataclass(frozen=True)
@@ -69,7 +106,7 @@ class PurgeItem:
 
 @dataclass(frozen=True)
 class PurgePlan:
-    """Everything :func:`execute` would remove, assembled without removing any of it."""
+    """Everything :func:`execute` would do to a workspace, assembled without doing any of it."""
 
     key: str
     """The workspace key, so a caller can match this plan back to a registry row."""
@@ -83,6 +120,14 @@ class PurgePlan:
     external: tuple[PurgeItem, ...]
     """Configured locations outside the project directory. Removed only if the caller says so."""
 
+    kept: tuple[PurgeItem, ...] = ()
+    """Items this plan deliberately leaves alone.
+
+    Empty for a purge, which spares nothing it enumerates. For a release it holds everything the
+    enumeration found except the workbook, so the confirmation can *name* what survives instead
+    of leaving the user to infer it from the absence of a warning.
+    """
+
     @property
     def present(self) -> tuple[PurgeItem, ...]:
         """The owned items that are actually on disk, for a confirmation that does not lie."""
@@ -92,6 +137,26 @@ class PurgePlan:
     def external_present(self) -> tuple[PurgeItem, ...]:
         """The external items that are actually on disk."""
         return tuple(item for item in self.external if item.exists)
+
+    @property
+    def kept_present(self) -> tuple[PurgeItem, ...]:
+        """The retained items that are actually on disk.
+
+        Same reasoning as :attr:`present` from the other side: a release that promises to keep
+        run records the user never had is as unreadable as a deletion that threatens a token file
+        that was never written.
+        """
+        return tuple(item for item in self.kept if item.exists)
+
+    @property
+    def is_release(self) -> bool:
+        """Whether this plan graduates the workspace rather than destroying it.
+
+        A sound discriminator because :func:`plan_purge` emits the project directory, the marker
+        and the token whether or not any of them is on disk, so a release always retains at least
+        three items and a purge always retains none.
+        """
+        return bool(self.kept)
 
 
 @dataclass(frozen=True)
@@ -174,6 +239,34 @@ def plan_purge(
     )
 
 
+def plan_release(
+    workspace: Workspace,
+    *,
+    session_ids: Iterable[str] = (),
+) -> PurgePlan:
+    """Describe releasing ``workspace``: the workbook goes, everything else stays.
+
+    Releasing is what a finished conversion looks like. The notebook is run monthly on new data
+    and *is* the process; the spreadsheet it was translated from is obsolete, and kedge should be
+    able to say so rather than modelling it as a file somebody lost.
+
+    Derived from :func:`plan_purge` rather than enumerated separately, for the reason the module
+    docstring gives: anything added to that enumeration later must be *kept* by a release without
+    anyone remembering to say so.
+
+    Args:
+        workspace: The workspace to release.
+        session_ids: Chat sessions belonging to this workbook. Passed through so the confirmation
+            can name their payload logs among what is kept; nothing here removes them.
+
+    Returns:
+        A plan whose only removal is the workbook, with everything it spares in
+        :attr:`PurgePlan.kept`. Building one is read-only.
+    """
+    plan = plan_purge(workspace, session_ids=session_ids)
+    return replace(plan, owned=(), external=(), kept=plan.owned + plan.external)
+
+
 def execute(
     plan: PurgePlan,
     *,
@@ -185,8 +278,14 @@ def execute(
     The workbook goes **last**. It is the one file the user may still have a use for and the one
     thing kedge cannot regenerate, so if anything else fails the source is still there.
 
+    A :func:`plan_release` plan is carried out by this same call and needs no mode of its own: it
+    holds nothing owned and nothing external, so ``include_workbook=True`` removes the workbook
+    and leaves the notebook, the plans, the contract, the run records and the acceptance exactly
+    where they are. ``include_external`` cannot make a release destroy a shared hand-in store,
+    because a release plan has no external items for it to reach.
+
     Args:
-        plan: What to remove, from :func:`plan_purge`.
+        plan: What to do, from :func:`plan_purge` or :func:`plan_release`.
         include_workbook: Whether to delete the workbook file itself.
         include_external: Whether to delete configured locations outside the project directory.
 
@@ -205,7 +304,14 @@ def execute(
     if include_workbook:
         _remove(plan.workbook, is_tree=False, removed=removed, failures=failures)
 
-    logger.info("purged workspace %s: %d removed, %d failed", plan.key, len(removed), len(failures))
+    logger.info(
+        "%s workspace %s: %d removed, %d kept, %d failed",
+        "released" if plan.is_release else "purged",
+        plan.key,
+        len(removed),
+        len(plan.kept),
+        len(failures),
+    )
     return PurgeResult(removed=tuple(removed), failures=tuple(failures))
 
 
@@ -272,14 +378,42 @@ def describe(plan: PurgePlan, *, sessions: int = 0) -> Sequence[str]:
 
     Counts come from the plan rather than from a guess, because the point of the confirmation is
     that signed-off run records are in scope and the user cannot otherwise know it.
+
+    On a :func:`plan_release` plan this is empty, correctly: a release removes only the workbook,
+    which the caller names itself. What that confirmation wants is :func:`describe_kept`, and
+    ``sessions`` belongs there too, since a release keeps them.
     """
-    lines: list[str] = []
-    for item in plan.present:
-        if item.contains:
-            lines.append(f"{item.label} ({item.contains} files)")
-        else:
-            lines.append(item.label)
+    lines = _phrases(plan.present)
     if sessions:
         lines.append(f"{sessions} chat session{'s' if sessions != 1 else ''}")
     lines.extend(item.label for item in plan.external_present)
     return lines
+
+
+def describe_kept(plan: PurgePlan, *, sessions: int = 0) -> Sequence[str]:
+    """Phrases naming what a release leaves standing, for a confirmation that reassures.
+
+    The counterpart to :func:`describe`, and the load-bearing half of a release: the user is
+    being asked to delete the spreadsheet a whole process was built on, and the only thing that
+    makes that a reasonable click is being told, with counts read off the disk, exactly what is
+    still there afterwards.
+
+    Args:
+        plan: A plan from :func:`plan_release`. A purge plan keeps nothing and yields nothing.
+        sessions: How many chat sessions belong to this workbook. They survive a release, so they
+            are named here rather than in :func:`describe`.
+
+    Returns:
+        One phrase per retained thing that is really on disk.
+    """
+    lines = _phrases(plan.kept_present)
+    if sessions:
+        lines.append(f"{sessions} chat session{'s' if sessions != 1 else ''}")
+    return lines
+
+
+def _phrases(items: Iterable[PurgeItem]) -> list[str]:
+    """One phrase per item, carrying the file count where there is one worth showing."""
+    return [
+        f"{item.label} ({item.contains} files)" if item.contains else item.label for item in items
+    ]

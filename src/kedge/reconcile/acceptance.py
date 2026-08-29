@@ -17,6 +17,30 @@ against which workbook, at what version of it, on what date, and how it came out
 historical fact and does not rot: it stays true when the workbook is superseded, moved, or
 deleted, which is exactly what happens to the source spreadsheet a few months after a conversion.
 
+**A workbook that is gone is cited against, never compared against.** That sentence used to be
+true of the record and false of the code: :func:`check_translation` reached the live comparison in
+two of its three branches without asking whether the spreadsheet was still there, so a released
+notebook -- one whose workbook was deliberately retired because the notebook *is* the process now
+-- reported ``not_reconciled`` for ever, with a note telling the reader to go and check the path
+of a file they had chosen to delete. Worse, on a run whose hand-in digest matched the acceptance,
+a comparison that could not run shadowed a perfectly good record and the panel accused somebody of
+having edited the notebook. An absent workbook is not evidence of a regression; it is the absence
+of evidence, and the record is what stands in its place. What it can never do is manufacture an
+acceptance that was never measured: a workbook that is gone with nothing recorded is still
+NOT RECONCILED, and says so in terms that do not blame the reader for it.
+
+**This function is the generated notebook's only runtime read of the workbook, and that is load
+bearing.** Swept when the above was fixed: ``WORKBOOK`` appears in a scaffolded notebook exactly
+twice -- ``KEDGE_RUNS.start(workbook=WORKBOOK.name)``, which takes a name and touches no
+filesystem, and the :func:`check_translation` call. The hand-ins, the contract, the drift profile,
+the analysis and the run records all live in the project directory, which a release keeps. So a
+released notebook is genuinely independent of its spreadsheet rather than merely intended to be --
+and that is an invariant of the whole notebook resting on one line of this module. It is also the
+kind that stops being true in silence: one convenient ``pl.read_excel(WORKBOOK)`` added to a stage
+cell two releases from now puts the traceback back into a notebook whose workbook was deleted on
+purpose, and nothing fails until somebody releases one. Anything reaching for ``WORKBOOK`` outside
+these two places should be assumed wrong until it has explained itself.
+
 **When the live check does re-run.** Only when this run is working on the same data the
 acceptance ran on, matched by hand-in digest. That is the case where a failure means something —
 somebody edited the notebook and broke the translation — and it is the only case where the
@@ -258,6 +282,71 @@ def _reconcile_or_explain(
         )
 
 
+def _compared_anything(report: ReconciliationReport) -> bool:
+    """Whether a report is evidence about the translation at all.
+
+    A report with no verdict either way is not a live check that *failed*; it is a live check
+    that could not run -- an unreadable workbook, an absent one, or every region declared not
+    reproduced. The distinction is the same one :mod:`kedge.reconcile.verify` draws between a
+    row that is missing and a row that is different, and getting it wrong has the same shape of
+    consequence: a recorded acceptance overruled by a comparison that never happened.
+    """
+    return bool(report.passed or report.failed)
+
+
+def _first_check_reason(*, recorded: bool) -> str:
+    """Why the first live comparison ran, phrased for what it actually left behind.
+
+    Only a reconciliation that stands up becomes an acceptance, so the cheerful "the result is
+    recorded" is a lie on precisely the runs where the user most needs to know it is not.
+    """
+    if recorded:
+        return (
+            "First reconciliation of this translation against the workbook it came from. "
+            "The result is recorded, and later runs on other periods will cite it rather "
+            "than compare against a spreadsheet that does not describe their data."
+        )
+    return (
+        "First reconciliation of this translation against the workbook it came from. Nothing "
+        "has been recorded, because only a reconciliation that stands up becomes an acceptance; "
+        "the next run will try again."
+    )
+
+
+def _same_data_reason(report: ReconciliationReport) -> str:
+    """Why the live comparison ran on a digest match, phrased for what it established.
+
+    "A failure here means the notebook has been edited into disagreeing with the workbook" is
+    true of a comparison that *happened*. Said over one that could not run, it accuses the
+    reader of tampering on the strength of a file kedge could not open.
+    """
+    if _compared_anything(report):
+        return (
+            "This run is working on the same data the translation was accepted against, so "
+            "the comparison is live. A failure here means the notebook has been edited into "
+            "disagreeing with the workbook."
+        )
+    return (
+        "This run is working on the same data the translation was accepted against, so the "
+        "comparison was attempted -- but nothing could be compared, so it establishes nothing "
+        "either way and the acceptance above stands undisturbed."
+    )
+
+
+def _workbook_is_absent(workbook_path: Path | str) -> bool:
+    """Whether the spreadsheet is simply not there any more.
+
+    Deliberately narrower than "the comparison failed". A workbook that is present but corrupt,
+    or present with no cached values, is an anomaly worth surfacing live exactly as it always
+    was. One that is *gone* is the ordinary end of a conversion, and is the only case this
+    module answers from the record instead.
+    """
+    try:
+        return not Path(workbook_path).is_file()
+    except (OSError, ValueError):  # pragma: no cover - an unusable path is an absent workbook
+        return True
+
+
 @dataclass(frozen=True)
 class TranslationCheck:
     """What the notebook shows about reconciliation, whichever of the two cases it is in.
@@ -323,8 +412,14 @@ class TranslationCheck:
         A different question from :attr:`status`, and the reason for the long name. For a live
         check it is this run's own result; for a citation it is what was recorded, on a date the
         reader can see and weigh.
+
+        A live report that compared *nothing* is neither. It carries no information about the
+        translation, so it does not get to overrule the record -- which is the whole reason the
+        record is written down. Letting it through is how a released notebook came to report a
+        good acceptance as a failure, and it would do the same for any workbook that would not
+        open.
         """
-        if self.live is not None:
+        if self.live is not None and _compared_anything(self.live):
             return not self.live.failed and bool(self.live.passed)
         return self.acceptance is not None and self.acceptance.passed
 
@@ -350,6 +445,59 @@ class TranslationCheck:
             # `__str__` is the report's own full rendering; it has no `render`.
             lines.extend(["", str(self.live)])
         return "\n".join(lines)
+
+
+def _without_the_workbook(
+    recorded: Acceptance | None,
+    workbook_path: Path | str,
+    watching_this_run: Sequence[str],
+) -> TranslationCheck:
+    """The answer when the spreadsheet is gone: cite the record, or say plainly there is none.
+
+    Two outcomes, and keeping them apart is the entire point. A recorded acceptance survives the
+    workbook by design -- see this module's docstring, and :attr:`Workspace.acceptance_path` --
+    so it is cited and :attr:`TranslationCheck.translation_accepted` stays true on the strength
+    of it. With no record there is nothing to cite and nothing ever can be, because an acceptance
+    can only be measured against the workbook it came from; that stays NOT RECONCILED, because
+    non-negotiable 6 is absolute and no amount of sympathy for the reader's position makes an
+    unmeasured translation an accepted one.
+
+    Neither message tells the reader to check a path. Whether the workbook was retired on purpose
+    or lost is not knowable from here, and "check the path" is wrong and slightly insulting in the
+    case that this feature exists to create.
+
+    Args:
+        recorded: The acceptance on file, if there is one.
+        workbook_path: Where the workbook was.
+        watching_this_run: What does check today's numbers.
+
+    Returns:
+        A citation, or an honest blank.
+    """
+    if recorded is not None:
+        return TranslationCheck(
+            applies=False,
+            acceptance=recorded,
+            reason=(
+                f"`{Path(workbook_path).name}` is no longer on disk, so nothing was compared "
+                f"against it today. That is the ordinary end of a conversion rather than a "
+                f"fault -- the notebook is the process now -- and the acceptance above was "
+                f"written down at conversion time precisely so that it would outlive the "
+                f"spreadsheet it names."
+            ),
+            watching_this_run=tuple(watching_this_run),
+        )
+    return TranslationCheck(
+        applies=False,
+        reason=(
+            f"To record an acceptance, restore the workbook at `{workbook_path}` and run this "
+            f"notebook once: the outcome is written down and cited from then on. It is not "
+            f"there now, so nothing could be compared and nothing is claimed. If the "
+            f"spreadsheet was retired deliberately, this translation will simply never carry "
+            f"an acceptance -- one can only ever be measured against the workbook it came from."
+        ),
+        watching_this_run=tuple(watching_this_run),
+    )
 
 
 def check_translation(
@@ -384,10 +532,17 @@ def check_translation(
             being checked".
 
     Returns:
-        A :class:`TranslationCheck`. Never raises for the ordinary cases; a workbook that cannot
-        be opened produces a NOT_RECONCILED live report, as it always did.
+        A :class:`TranslationCheck`. Never raises for the ordinary cases. A workbook that is
+        present but cannot be opened produces a NOT_RECONCILED live report, as it always did; a
+        workbook that is *gone* is cited against rather than compared against, by
+        :func:`_without_the_workbook`.
     """
     recorded = store.load()
+
+    # Before anything else, because both branches below read the workbook off disk and a
+    # released notebook -- the successful end of a conversion -- has no workbook to read.
+    if _workbook_is_absent(workbook_path):
+        return _without_the_workbook(recorded, workbook_path, watching_this_run)
 
     # Never checked: do it now, and record it if it stands up. This is the conversion-time
     # acceptance test, and the first run of a freshly converted notebook is when it happens.
@@ -399,16 +554,13 @@ def check_translation(
             notebook=notebook,
             not_reproduced=not_reproduced,
         )
-        if report.passed and not report.failed:
+        keeps = bool(report.passed) and not report.failed
+        if keeps:
             store.record(report, handin_sha256=handin_sha256, notebook=notebook)
         return TranslationCheck(
             applies=True,
             live=report,
-            reason=(
-                "First reconciliation of this translation against the workbook it came from. "
-                "The result is recorded, and later runs on other periods will cite it rather "
-                "than compare against a spreadsheet that does not describe their data."
-            ),
+            reason=_first_check_reason(recorded=keeps),
             watching_this_run=tuple(watching_this_run),
         )
 
@@ -428,11 +580,7 @@ def check_translation(
             applies=True,
             live=report,
             acceptance=recorded,
-            reason=(
-                "This run is working on the same data the translation was accepted against, so "
-                "the comparison is live. A failure here means the notebook has been edited into "
-                "disagreeing with the workbook."
-            ),
+            reason=_same_data_reason(report),
             watching_this_run=tuple(watching_this_run),
         )
 

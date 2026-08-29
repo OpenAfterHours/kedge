@@ -329,6 +329,23 @@ class IngestConfig(_Section):
     contract: Path | None = None
     """The hand-in contract the notebook enforces. ``None`` means ``<project_dir>/contract.yaml``.
     A relative path is relative to the project directory, as ``store_dir`` is."""
+    share_handins: bool = False
+    """Whether the managed store travels when the converted process is handed to the team
+    (:mod:`kedge.handover`).
+
+    Off, and it is the one default in this section that is a data-handling decision rather than a
+    convenience. Everything else in a project directory -- the plan, the contract, the acceptance
+    record, the run history -- *describes* the process; the store holds the production extracts
+    themselves, and a shared team repository is a wider audience than the person who ran the
+    extract. Turn it on per project where the hand-ins are the point of sharing (a worked
+    example, a fixture, a reference month with nothing sensitive in it).
+
+    It lives here rather than in a section of its own because whether that directory travels is a
+    property of the store, and splitting it from ``store_dir`` would put one fact in two places.
+    Note it is a statement of intent, not a control: a store *inside* the project directory can
+    still be uploaded by a command that pushes everything, which is why
+    :func:`kedge.handover.plan_handover` names the paths and why ``store_dir`` pointing outside
+    the project directory is the stronger answer."""
 
     @field_validator("store_dir", "watch_dir", "contract")
     @classmethod

@@ -56,6 +56,18 @@ Read this first, then the document you actually need:
    `certifi`, which never holds the root a corporate TLS-inspecting proxy re-signs with. There is
    no setting that turns verification off; `[model] ca_bundle` names a PEM instead. Also enforced
    by `scripts/guardrails.py`. (CONVENTIONS.md numbers this one 7.)
+9. **marimo's own config file is composed by `src/kedge/marimo_config.py` alone.** kedge writes a
+   `.marimo.toml` into the project directory before every launch, forcing `ai.enabled` and
+   `completion.copilot` off -- marimo ships an assistant that sends *sample values* to whatever
+   endpoint it is configured with, and that is a channel outside kedge's tool surface and outside
+   the outbound payload log. marimo finds that file first because the project directory is the
+   launch `cwd`. The rule exists because the realistic second home for the filename is not a rival
+   module but a one-line special case in something that already walks the project directory --
+   `handover.py` and `server/hub.py` both do -- and a marimo rename would then strand it. Import
+   `CONFIG_FILENAME` rather than writing the literal. Also enforced by `scripts/guardrails.py`.
+   **The control is partial and `SECURITY.md` says how**: `ai.enabled` is a front-end gate rather
+   than a server-side one, and a nearer `pyproject.toml` `[tool.marimo]` outranks the file kedge
+   writes. (CONVENTIONS.md numbers this one 8.)
 
 ## Architecture in one paragraph
 
@@ -87,7 +99,7 @@ uv run pytest -m contract          # live-kernel tests; spawns a real marimo
 uv run pytest -m llm               # needs a configured model endpoint; skipped by default
 uv run ruff check --fix . && uv run ruff format .
 uv run ty check src/
-uv run python scripts/guardrails.py        # non-negotiables 1, 2, 7 and 8, by AST not by grep
+uv run python scripts/guardrails.py        # non-negotiables 1, 2, 7, 8 and 9, by AST not by grep
 uv run python scripts/version.py v0.2.0    # does that tag match __version__?
 uv run python scripts/release.py 0.2.0     # bump, gate, tag, push -- the whole release
 

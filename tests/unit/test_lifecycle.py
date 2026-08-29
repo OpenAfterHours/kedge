@@ -23,6 +23,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,7 +31,7 @@ from typing import Any
 import httpx
 import pytest
 
-from kedge import lifecycle, marimo_http
+from kedge import lifecycle, marimo_config, marimo_http
 from kedge.config import Config, LoadedConfig, MarimoConfig
 from kedge.errors import NotebookError
 from kedge.lifecycle import (
@@ -53,6 +54,7 @@ from kedge.lifecycle import (
     stop_marimo,
     teardown,
 )
+from kedge.marimo_config import disable_marimo_assistant
 from kedge.workspace import Workspace
 
 TOKEN = "a-token-nobody-else-could-guess"
@@ -540,6 +542,601 @@ def test_a_configured_port_is_used_instead_of_a_free_one(
     launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
 
     assert workspace.require_marimo().port == 54_321
+
+
+# ── marimo's own AI assistant ────────────────────────────────────────────────────────────────
+#
+# marimo ships an assistant configured from the user's personal ~/.marimo.toml, which would run
+# inside the iframe kedge serves, from an endpoint kedge neither controls nor writes to the
+# outbound payload log (PLAN 2.3). kedge writes a .marimo.toml into the launch directory to turn
+# it off. The tests below cover the mechanics; the last one covers the *mechanism*, by driving
+# marimo's own config resolver rather than reasoning about what it does.
+
+
+def _marimo_toml(project_dir: Path) -> dict[str, Any]:
+    with (project_dir / marimo_config.CONFIG_FILENAME).open("rb") as handle:
+        return tomllib.load(handle)
+
+
+def _project_dir(tmp_path: Path) -> Path:
+    """A project directory two levels down, with a ``pyproject.toml`` capping the search above it.
+
+    Both marimo's config search and kedge's check for the pyproject that outranks it walk upwards
+    until they find something or run out of parents, so without that cap what these tests assert
+    would depend on what happens to sit above the machine's temp directory.
+    """
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "cap"\n', encoding="utf-8")
+    project_dir = tmp_path / "workbooks" / "process.kedge"
+    project_dir.mkdir(parents=True)
+    return project_dir
+
+
+def _unwritable(*_args: object, **_kwargs: object) -> None:
+    raise OSError("read-only file system")
+
+
+def test_launching_disables_marimos_own_ai_assistant(
+    kedge_home: Path, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(workbook, _impatient())
+    _fake_popen(monkeypatch, _FakeProcess())
+
+    launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+
+    written = _marimo_toml(workspace.project_dir)
+    assert written["ai"]["enabled"] is False
+    assert written["completion"]["copilot"] is False
+
+
+def test_the_config_lands_in_the_directory_marimo_is_launched_from(
+    kedge_home: Path, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file only disables anything because it is in the cwd; tie the two together.
+
+    ``build_marimo_argv`` names no config, so the whole arrangement rests on marimo searching
+    upwards from where it was spawned. If the ``cwd`` handed to ``Popen`` ever stops matching the
+    directory written to, the file goes on being written and stops being read.
+    """
+    workspace = _workspace(workbook, _impatient())
+    spawned: list[dict[str, Any]] = []
+
+    def _spawn(_argv: list[str], **kwargs: Any) -> _FakeProcess:
+        spawned.append(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr(lifecycle.subprocess, "Popen", _spawn)
+
+    launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+
+    assert spawned[0]["cwd"] == workspace.project_dir
+    assert (workspace.project_dir / marimo_config.CONFIG_FILENAME).is_file()
+
+
+def test_an_existing_config_keeps_every_setting_that_is_not_ours(tmp_path: Path) -> None:
+    """marimo writes the user's own settings into whichever file its search found.
+
+    So this file is not kedge's alone even though kedge writes it: change the theme from inside
+    the editor and it lands here. Rewriting it wholesale on the next launch would quietly throw
+    that away.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text(
+        '[display]\ntheme = "dark"\n\n'
+        '[ai]\nenabled = true\nrules = "prefer polars"\n\n'
+        '[completion]\ncopilot = "github"\nactivate_on_typing = false\n',
+        encoding="utf-8",
+    )
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    written = _marimo_toml(project_dir)
+    assert outcome.enforced is True
+    assert written["ai"]["enabled"] is False, "an explicit true is overridden, not merged with"
+    assert written["completion"]["copilot"] is False
+    assert written["display"]["theme"] == "dark"
+    assert written["ai"]["rules"] == "prefer polars"
+    assert written["completion"]["activate_on_typing"] is False
+
+
+def test_a_malformed_existing_config_is_replaced_rather_than_raised_over(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Half of the malformed/unreadable distinction: this one is replaced, and should be.
+
+    marimo cannot parse it either, so it falls back to defaults -- which have the assistant on.
+    There is nothing in the file worth preserving and replacing it is strictly an improvement.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text("[ai\nenabled =", encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="kedge.marimo_config"):
+        outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is True
+    assert _marimo_toml(project_dir)["ai"]["enabled"] is False
+    assert "will not parse" in caplog.text
+
+
+def _lock_the_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make only the marimo config unopenable -- a lock, a sync, a scanner holding the handle.
+
+    Narrowed to that one filename rather than patching ``Path.open`` outright, so nothing else
+    running inside the test trips over it.
+    """
+    original = Path.open
+
+    def _open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == marimo_config.CONFIG_FILENAME:
+            raise PermissionError(13, "The process cannot access the file")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", _open)
+
+
+def test_a_config_that_cannot_be_read_is_left_alone_rather_than_clobbered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed and unreadable are different, and treating them alike destroyed the user's config.
+
+    A file that will not parse holds nothing worth keeping. A file that will not *open* holds
+    everything and kedge cannot see it, so writing would mean discarding the whole of somebody's
+    marimo configuration in order to assert two keys. Windows makes this ordinary: a lock, a
+    folder mid-sync, a scanner with the handle.
+    """
+    project_dir = _project_dir(tmp_path)
+    path = project_dir / marimo_config.CONFIG_FILENAME
+    original = '[display]\ntheme = "dark"\n\n[keymap]\npreset = "vim"\n'
+    path.write_text(original, encoding="utf-8")
+    _lock_the_config(monkeypatch)
+
+    with caplog.at_level("ERROR", logger="kedge.marimo_config"):
+        outcome = disable_marimo_assistant(project_dir)
+
+    monkeypatch.undo()
+    assert path.read_text(encoding="utf-8") == original, "the user's settings must survive"
+    assert list(project_dir.glob("*.tmp")) == []
+    assert outcome.enforced is False, "and the launch must not claim a control it does not have"
+    assert "could not be read" in outcome.detail
+    assert "could not be scanned" in outcome.detail, "an empty secret_keys is not a clean bill"
+    assert "could not be read" in caplog.text
+
+
+def test_an_unreadable_config_is_reported_to_a_caller_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text("[display]\n", encoding="utf-8")
+    _lock_the_config(monkeypatch)
+
+    outcome = marimo_config.inspect_marimo_assistant(project_dir)
+
+    assert outcome.enforced is False
+    assert "could not be read" in outcome.detail
+
+
+def test_a_forced_key_whose_table_is_not_a_table_is_replaced(tmp_path: Path) -> None:
+    """``ai = "on"`` parses, so it survives the read and has to be handled by the merge."""
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text('ai = "on"\n', encoding="utf-8")
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is True
+    assert _marimo_toml(project_dir)["ai"] == {"enabled": False}
+
+
+def test_a_config_that_cannot_be_written_is_reported_rather_than_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The failure policy, asserted: report, never refuse (kedge.marimo_config's docstring).
+
+    The detail has to name what is now live rather than only what failed, because it is the only
+    thing a caller can put in front of a user.
+    """
+    project_dir = _project_dir(tmp_path)
+    monkeypatch.setattr(marimo_config, "_write_atomically", _unwritable)
+
+    with caplog.at_level("ERROR", logger="kedge.marimo_config"):
+        outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is False
+    assert "still enabled" in outcome.detail
+    assert str(project_dir) in outcome.detail
+    assert "read-only file system" in caplog.text
+
+
+def test_a_launch_is_not_abandoned_because_the_assistant_could_not_be_disabled(
+    kedge_home: Path,
+    workbook: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The other half of that policy, at the seam where it costs something.
+
+    Refusing here would trade a conversion the user came for against a control whose failure is
+    recoverable in seconds and, in marimo 0.23.15, only ever hid a UI affordance. The price of
+    that choice is that the launch must say out loud what it started.
+    """
+    workspace = _workspace(workbook, _impatient())
+    _fake_popen(monkeypatch, _FakeProcess())
+    monkeypatch.setattr(marimo_config, "_write_atomically", _unwritable)
+
+    with caplog.at_level("WARNING"):
+        process = launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+
+    assert process.pid == 4242
+    assert workspace.has_marimo
+    assert "AI assistant live" in caplog.text
+
+
+def test_a_write_that_fails_part_way_leaves_the_old_config_and_no_debris(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """marimo falls back to its defaults when a config will not parse, and its default has the
+    assistant on -- so a half-written file is not a weakened control but an absent one.
+    """
+    project_dir = _project_dir(tmp_path)
+    path = project_dir / marimo_config.CONFIG_FILENAME
+    original = '[ai]\nenabled = false\n\n[display]\ntheme = "dark"\n'
+    path.write_text(original, encoding="utf-8")
+
+    def _refuse(_self: Path, _target: Path) -> None:
+        raise OSError("cannot replace")
+
+    monkeypatch.setattr(Path, "replace", _refuse)
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is False
+    assert path.read_text(encoding="utf-8") == original
+    assert list(project_dir.glob("*.tmp")) == [], "the temporary file must not be left behind"
+
+
+def test_a_pyproject_that_re_enables_the_assistant_is_reported_not_lost(tmp_path: Path) -> None:
+    """The one config source that outranks ``.marimo.toml``, and the mechanism test below proves
+    it really does. kedge cannot win that argument by writing a file, so it names the file that
+    won instead of reporting a control it does not have.
+    """
+    project_dir = _project_dir(tmp_path)
+    pyproject = project_dir.parent / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "somebody-elses-repo"\nversion = "0.1.0"\n\n'
+        "[tool.marimo.ai]\nenabled = true\n\n"
+        '[tool.marimo.completion]\ncopilot = "github"\n',
+        encoding="utf-8",
+    )
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is False
+    assert str(pyproject) in outcome.detail
+    assert "ai.enabled and completion.copilot" in outcome.detail
+    assert _marimo_toml(project_dir)["ai"]["enabled"] is False, "the file is still written"
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ('[project]\nname = "x"\nversion = "0.1.0"\n', "no [tool.marimo] at all -- kedge's own"),
+        ("[tool.marimo.ai]\nenabled = false\n", "a pyproject that agrees with kedge"),
+        ('[tool.marimo.display]\ntheme = "dark"\n', "a [tool.marimo] about something else"),
+        ("[tool.marimo]\nai = 3\n", "a [tool.marimo] whose ai key is not even a table"),
+    ],
+)
+def test_a_pyproject_that_changes_nothing_here_raises_no_alarm(
+    tmp_path: Path, body: str, why: str
+) -> None:
+    """A permanently amber signal is one people stop reading, so it must not fire on the common
+    case: a workbook that happens to live inside somebody's Python project.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir.parent / "pyproject.toml").write_text(body, encoding="utf-8")
+
+    assert disable_marimo_assistant(project_dir).enforced is True, why
+
+
+SECRET = "sk-not-a-real-key-9f3c2a"
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("[ai.open_ai]\napi_key", "ai.open_ai.api_key"),
+        ("[ai.anthropic]\napi_key", "ai.anthropic.api_key"),
+        (
+            '[ai.custom_providers."some-gateway"]\napi_key',
+            "ai.custom_providers.some-gateway.api_key",
+        ),
+        ("[completion]\ncodeium_api_key", "completion.codeium_api_key"),
+        ("[ai.bedrock]\naws_secret_access_key", "ai.bedrock.aws_secret_access_key"),
+    ],
+)
+def test_a_credential_left_in_the_project_config_is_reported_by_name(
+    tmp_path: Path, body: str, expected: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """marimo writes whatever is changed in its settings panel into *this* directory.
+
+    So a model key typed there lands in plaintext beside the workbook, inside whatever that
+    folder is synced or shared with. kedge cannot stop that and must not delete it, but it can
+    say so. The value never appears -- in the outcome or in the log.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text(
+        f'{body} = "{SECRET}"\n', encoding="utf-8"
+    )
+
+    with caplog.at_level("WARNING", logger="kedge.marimo_config"):
+        outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.secret_keys == (expected,)
+    assert expected in outcome.detail
+    assert SECRET not in outcome.detail
+    assert SECRET not in caplog.text
+    assert expected in caplog.text
+
+
+def test_reporting_a_credential_does_not_disturb_it_or_the_launch(tmp_path: Path) -> None:
+    """Silently stripping a key somebody deliberately entered is its own surprise.
+
+    And a credential in the file says nothing about whether the assistant was disabled, so it is
+    a separate field rather than a reason to report the control as having failed.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text(
+        f'[ai.open_ai]\napi_key = "{SECRET}"\nmodel = "gpt-4o"\n', encoding="utf-8"
+    )
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.enforced is True, "the assistant is still off; this is a separate report"
+    assert _marimo_toml(project_dir)["ai"]["open_ai"]["api_key"] == SECRET
+    assert _marimo_toml(project_dir)["ai"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        ('[display]\ntheme = "dark"\n', "nothing secret-shaped at all"),
+        ('[ai.open_ai]\napi_key = ""\n', "an empty key is not a credential"),
+        ('[ai.open_ai]\napi_key = "   "\n', "nor is a blank one"),
+        ('[ai.open_ai]\napi_key = "********"\n', "nor is marimo's masking placeholder"),
+        ('[keymap]\npreset = "vim"\n', "and a key named for keystrokes is not a key"),
+    ],
+)
+def test_nothing_secret_shaped_means_nothing_reported(tmp_path: Path, body: str, why: str) -> None:
+    """A guard that cries wolf is one people stop reading."""
+    project_dir = _project_dir(tmp_path)
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text(body, encoding="utf-8")
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert outcome.secret_keys == (), why
+    assert "plaintext" not in outcome.detail
+
+
+def test_every_secret_shaped_field_marimo_defines_is_matched() -> None:
+    """The matcher is a name rule, so it has to be checked against the schema it is a rule about.
+
+    marimo owns these names; a release adding a sixth provider config gets caught by the suffix
+    rule, but one adding a differently-named credential would not, and this is where that shows.
+    """
+    import re
+
+    from marimo._config import config as marimo_schema
+
+    fields = {
+        field
+        for obj in vars(marimo_schema).values()
+        for field in getattr(obj, "__annotations__", {})
+        if re.search(r"key|secret|token|password", field, re.IGNORECASE)
+    }
+    matched = {field for field in fields if marimo_config._is_secret_shaped(field)}
+
+    assert matched == {"api_key", "codeium_api_key", "aws_access_key_id", "aws_secret_access_key"}
+    assert fields - matched == {"max_tokens", "keymap"}, "and nothing secret is left unmatched"
+
+
+# ── what a caller with a user in front of it reads ───────────────────────────────────────────
+#
+# launch_marimo returns a Popen and has nowhere to put the lockdown, so the answer is re-derived
+# from the file. That is not a workaround: marimo rewrites that file whenever a setting changes
+# in the editor, so a value cached at launch goes stale in exactly the case that matters.
+
+
+def test_the_status_a_caller_reads_matches_what_the_launch_did(
+    kedge_home: Path, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(workbook, _impatient())
+    _fake_popen(monkeypatch, _FakeProcess())
+
+    launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+    status = lifecycle.assistant_status(workspace)
+
+    assert status.enforced is True
+    assert status.secret_keys == ()
+    assert str(workspace.project_dir) in status.detail
+
+
+def test_a_launch_that_could_not_write_leaves_a_status_saying_so(
+    kedge_home: Path, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The review's case: the write fails, the launch proceeds, and the user must be tellable.
+
+    The status is derived from the file, so it reports the state that failure left behind rather
+    than the ``OSError`` -- which is in the log. The remedy is the same either way.
+    """
+    workspace = _workspace(workbook, _impatient())
+    _fake_popen(monkeypatch, _FakeProcess())
+    monkeypatch.setattr(marimo_config, "_write_atomically", _unwritable)
+
+    launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+    status = lifecycle.assistant_status(workspace)
+
+    assert status.enforced is False
+    assert marimo_config.CONFIG_FILENAME in status.detail
+    assert "outbound log" in status.detail
+
+
+def test_the_status_is_re_read_rather_than_remembered(
+    kedge_home: Path, workbook: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """marimo rewrites this file mid-session, so a value cached at launch would be a lie.
+
+    Both halves move: a key typed into the settings panel appears in a file that was clean at
+    launch, and switching the assistant back on there survives until the next launch forces it off.
+    """
+    workspace = _workspace(workbook, _impatient())
+    _fake_popen(monkeypatch, _FakeProcess())
+    launch_marimo(workspace, kedge_version="0.1.0", client=_Server().client())
+    assert lifecycle.assistant_status(workspace).enforced is True
+
+    # What marimo's own save_config writes when somebody uses the settings panel.
+    (workspace.project_dir / marimo_config.CONFIG_FILENAME).write_text(
+        f'[ai]\nenabled = true\n\n[ai.open_ai]\napi_key = "{SECRET}"\n\n'
+        "[completion]\ncopilot = false\n",
+        encoding="utf-8",
+    )
+    status = lifecycle.assistant_status(workspace)
+
+    assert status.enforced is False, "the assistant was switched back on after the launch"
+    assert status.secret_keys == ("ai.open_ai.api_key",)
+    assert SECRET not in status.detail
+
+
+def test_a_project_with_no_config_at_all_reports_the_absence(tmp_path: Path) -> None:
+    """An absent file and a file that says nothing are the same exposure, not the same sentence."""
+    project_dir = _project_dir(tmp_path)
+
+    status = marimo_config.inspect_marimo_assistant(project_dir)
+
+    assert status.enforced is False
+    assert f"no {marimo_config.CONFIG_FILENAME}" in status.detail
+
+
+def test_inspecting_writes_nothing(tmp_path: Path) -> None:
+    """It is a status query; a status query that alters the thing it reports is a bug."""
+    project_dir = _project_dir(tmp_path)
+    disable_marimo_assistant(project_dir)
+    before = (project_dir / marimo_config.CONFIG_FILENAME).read_bytes()
+
+    marimo_config.inspect_marimo_assistant(project_dir)
+
+    assert (project_dir / marimo_config.CONFIG_FILENAME).read_bytes() == before
+    assert list(project_dir.glob("*.tmp")) == []
+
+
+def test_a_pyproject_that_outranks_us_is_visible_to_a_caller_too(tmp_path: Path) -> None:
+    project_dir = _project_dir(tmp_path)
+    (project_dir.parent / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n\n[tool.marimo.ai]\nenabled = true\n', encoding="utf-8"
+    )
+    disable_marimo_assistant(project_dir)
+
+    status = marimo_config.inspect_marimo_assistant(project_dir)
+
+    assert status.enforced is False
+    assert "pyproject.toml" in status.detail
+
+
+def _marimo_resolves(project_dir: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """The config marimo itself would end up with, launched from ``project_dir``.
+
+    ``get_user_config_path`` is ``lru_cache``d, which is harmless in the fresh subprocess marimo
+    always is and would poison the next test in this one, hence the two ``cache_clear`` calls.
+    """
+    from marimo._config import utils as marimo_utils
+    from marimo._config.manager import get_default_config_manager
+
+    monkeypatch.chdir(project_dir)
+    marimo_utils.get_user_config_path.cache_clear()
+    try:
+        return dict(get_default_config_manager(current_path=None).get_config())
+    finally:
+        marimo_utils.get_user_config_path.cache_clear()
+
+
+def test_marimo_itself_resolves_the_assistant_as_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive marimo's own config stack rather than reasoning about it.
+
+    Every other test here asserts that kedge writes a file. This one asserts the half kedge does
+    not own -- that marimo, given the cwd it is actually spawned with, resolves that file and
+    resolves it to the two values kedge forced, over a personal config a directory above saying
+    the opposite. A marimo that changed its search would leave every other test green.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir.parent / "pyproject.toml").write_text('[project]\nname = "x"\n', encoding="utf-8")
+    (project_dir.parent / marimo_config.CONFIG_FILENAME).write_text(
+        '[ai]\nenabled = true\n\n[completion]\ncopilot = "github"\n', encoding="utf-8"
+    )
+    (project_dir / marimo_config.CONFIG_FILENAME).write_text(
+        '[display]\ntheme = "dark"\n', encoding="utf-8"
+    )
+
+    disable_marimo_assistant(project_dir)
+    resolved = _marimo_resolves(project_dir, monkeypatch)
+
+    assert resolved["ai"]["enabled"] is False
+    assert resolved["completion"]["copilot"] is False
+    assert resolved["display"]["theme"] == "dark", "and the user's own setting still applied"
+
+
+def test_marimo_confirms_a_pyproject_outranks_the_file_kedge_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap reported above is real, asserted the same way: by asking marimo.
+
+    If a future marimo stops merging ``[tool.marimo]`` over the user config, this test fails and
+    the warning ``disable_marimo_assistant`` emits becomes a false alarm to be deleted. That is
+    the right way round -- the alarm is only worth having while this is true.
+    """
+    project_dir = _project_dir(tmp_path)
+    (project_dir.parent / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n\n[tool.marimo.ai]\nenabled = true\n', encoding="utf-8"
+    )
+
+    outcome = disable_marimo_assistant(project_dir)
+    resolved = _marimo_resolves(project_dir, monkeypatch)
+
+    assert outcome.enforced is False
+    assert resolved["ai"]["enabled"] is True, "which is exactly what the outcome above reports"
+
+
+def test_marimos_own_resolver_prefers_the_file_kedge_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive marimo's config search rather than reasoning about it.
+
+    Every other test here asserts that kedge writes a file. This one asserts the half kedge does
+    not own: that ``marimo._config.utils.get_user_config_path``, given the cwd marimo is actually
+    spawned with, returns *our* file and not the one sitting a directory above it. A future
+    marimo that searched differently would leave every other test green.
+
+    The resolver is ``lru_cache``d, which is harmless in a fresh subprocess and would poison the
+    next test in this one, hence the two ``cache_clear`` calls.
+    """
+    from marimo._config import utils as marimo_utils
+
+    project_dir = _project_dir(tmp_path)
+    above = project_dir.parent / marimo_config.CONFIG_FILENAME
+    above.write_text("[ai]\nenabled = true\n", encoding="utf-8")
+
+    outcome = disable_marimo_assistant(project_dir)
+
+    assert marimo_utils.CONFIG_FILENAME == marimo_config.CONFIG_FILENAME
+
+    monkeypatch.chdir(project_dir)
+    marimo_utils.get_user_config_path.cache_clear()
+    try:
+        found = marimo_utils.get_user_config_path()
+    finally:
+        marimo_utils.get_user_config_path.cache_clear()
+
+    assert found is not None
+    assert Path(found).resolve() == outcome.path.resolve()
+    with Path(found).open("rb") as handle:
+        assert tomllib.load(handle)["ai"]["enabled"] is False
 
 
 def test_establish_session_bootstraps_confirms_and_records_the_id(

@@ -193,3 +193,127 @@ def test_the_description_names_only_what_exists(workspace: Workspace) -> None:
     lines = purge.describe(purge.plan_purge(workspace))
 
     assert not any("token" in line for line in lines)
+
+
+# ── releasing ────────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_release_takes_the_workbook_and_leaves_the_process_standing(
+    workspace: Workspace,
+) -> None:
+    """The successful end of a conversion: the notebook is the process, the spreadsheet is not."""
+    _populate(workspace)
+
+    result = purge.execute(purge.plan_release(workspace), include_workbook=True)
+
+    assert result.ok
+    assert not workspace.workbook_path.exists()
+    assert workspace.project_dir.is_dir()
+    assert workspace.notebook_path.is_file()
+    assert (workspace.plans_dir / "plan-v001.yaml").is_file()
+    assert (workspace.runs_dir / "20260829T000000Z.json").is_file()
+    assert workspace.acceptance_path.is_file()
+
+
+def test_a_release_is_the_purge_enumeration_inverted(workspace: Workspace) -> None:
+    """A hand-written list of what a release spares would be correct once and stale for ever
+    after -- the next artifact added to plan_purge would start being deleted by a release nobody
+    had touched."""
+    _populate(workspace)
+
+    purged = purge.plan_purge(workspace, session_ids=["chat-abc"])
+    released = purge.plan_release(workspace, session_ids=["chat-abc"])
+
+    assert released.owned == ()
+    assert released.external == ()
+    assert released.kept == purged.owned + purged.external
+    assert released.workbook == purged.workbook
+    assert released.is_release
+    assert not purged.is_release
+
+
+def test_a_release_leaves_the_machine_state_of_a_server_that_may_still_be_serving(
+    workspace: Workspace,
+) -> None:
+    """The marker is the only record of a live marimo's port and token, so removing it orphans
+    the process cleanup_orphan exists to find. Teardown clears both; a release is not one."""
+    _populate(workspace)
+
+    purge.execute(purge.plan_release(workspace), include_workbook=True)
+
+    assert workspace.marker_path.is_file()
+    assert workspace.token_file_path.is_file()
+
+
+def test_a_release_keeps_the_outbound_payload_logs(workspace: Workspace) -> None:
+    """They record what kedge sent to the model about a process at the moment it becomes
+    production, which is the worst possible moment to destroy the evidence."""
+    _populate(workspace)
+    log = workspace.outbound_log_path("chat-abc")
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text("{}", encoding="utf-8")
+
+    purge.execute(purge.plan_release(workspace, session_ids=["chat-abc"]), include_workbook=True)
+
+    assert log.is_file()
+
+
+def test_no_flag_can_make_a_release_delete_a_shared_hand_in_store(tmp_path: Path) -> None:
+    """A released notebook still runs monthly, so it still needs its hand-ins -- and a release
+    plan holds nothing external for include_external to reach even if a caller passes it."""
+    workbook = _make_workbook(tmp_path / "processes" / "rwa_monthly.xlsx")
+    elsewhere = tmp_path / "shared_handins"
+    elsewhere.mkdir()
+    (elsewhere / "january.csv").write_text("a,b\n", encoding="utf-8")
+    (workbook.parent / "kedge.toml").write_text(
+        f'[ingest]\nstore_dir = "{elsewhere.as_posix()}"\n', encoding="utf-8"
+    )
+    workspace = Workspace.for_workbook(workbook, user_directory=tmp_path / "home")
+    _populate(workspace)
+
+    purge.execute(purge.plan_release(workspace), include_workbook=True, include_external=True)
+
+    assert elsewhere.is_dir()
+    assert (elsewhere / "january.csv").is_file()
+    assert not workspace.workbook_path.exists()
+
+
+def test_a_release_that_cannot_take_the_workbook_is_reported_rather_than_raised(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spreadsheet still open in Excel is the ordinary case, and the caller marks the registry
+    row only on a clean result -- so the failure has to come back as one."""
+    _populate(workspace)
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> None:
+        msg = "being used by another process"
+        raise OSError(msg)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+
+    result = purge.execute(purge.plan_release(workspace), include_workbook=True)
+
+    assert not result.ok
+    assert [path for path, _ in result.failures] == [workspace.workbook_path]
+
+
+# ── describing a release ─────────────────────────────────────────────────────────────────────
+
+
+def test_the_release_confirmation_names_what_survives_with_counts(workspace: Workspace) -> None:
+    """The user is deleting the spreadsheet a whole process was built on. The only thing that
+    makes that a reasonable click is being told what is still there afterwards."""
+    _populate(workspace)
+    plan = purge.plan_release(workspace, session_ids=["chat-abc", "chat-def"])
+
+    lines = purge.describe_kept(plan, sessions=2)
+
+    assert any("project directory" in line and "files" in line for line in lines)
+    assert any("2 chat sessions" in line for line in lines)
+    assert purge.describe(plan) == [], "a release removes only the workbook, which the caller names"
+
+
+def test_the_release_confirmation_names_only_what_is_really_there(workspace: Workspace) -> None:
+    """Promising to keep run records the user never had reads exactly as badly as threatening a
+    token file they never wrote."""
+    assert purge.describe_kept(purge.plan_release(workspace)) == []

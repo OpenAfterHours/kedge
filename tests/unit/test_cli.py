@@ -2058,6 +2058,159 @@ def test_hub_refuses_before_it_starts_the_server_when_the_bridge_has_moved(
     assert "0.24.0" in flattened(result.output)
 
 
+# ── handover ─────────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mooring_repo(tmp_path: Path) -> Path:
+    """A mooring workspace whose locked environment already declares kedge."""
+    directory = tmp_path / "team-notebooks"
+    directory.mkdir()
+    (directory / "pyproject.toml").write_text(
+        '[project]\nname = "team-notebooks"\ndependencies = ["marimo", "kedge>=0.2"]\n',
+        encoding="utf-8",
+    )
+    return directory
+
+
+@pytest.fixture
+def converted(workbook: Path) -> Path:
+    """The project directory a conversion leaves beside the workbook."""
+    project = workbook.parent / "process.kedge"
+    (project / "plans").mkdir(parents=True)
+    (project / "handins").mkdir()
+    (project / "handins" / "extract.csv").write_text("id,gbp\n1,2\n", encoding="utf-8")
+    (project / "process.py").write_text("import marimo\n", encoding="utf-8")
+    (project / "contract.yaml").write_text("columns: []\n", encoding="utf-8")
+    return project
+
+
+def test_handover_reports_what_travels_and_what_does_not(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """The verb exists so the module has a user, and this is the whole of what it is for."""
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+
+    assert result.exit_code == 0
+    output = flattened(result.output)
+    assert "notebooks/process.kedge/process.py" in output
+    assert "share" in output
+    assert "withhold" in output
+
+
+def test_handover_never_claims_to_have_done_anything(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """A tidy list of paths and no caveat reads as "handed over".
+
+    The commands are the user's to run, and mooring may not even be installed -- so the output
+    has to say which of the two it is, in the imperative, before anybody assumes the other.
+    """
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+
+    assert "Run these yourself" in flattened(result.output)
+    assert "kedge has not run any of them" in flattened(result.output)
+
+
+def test_handover_writes_nothing_at_all(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """It reports on a repository it does not own, so touching either side would be a surprise.
+
+    Snapshotting both trees is the assertion that survives somebody later adding a helpful
+    `mkdir` or a cached verdict file to the command.
+    """
+
+    def snapshot(root: Path) -> set[tuple[str, int]]:
+        return {
+            (str(path.relative_to(root)), path.stat().st_size)
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    # Both trees, because the interesting mistake is writing into somebody else's repo.
+    before = (snapshot(converted), snapshot(mooring_repo))
+
+    runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+
+    assert (snapshot(converted), snapshot(mooring_repo)) == before
+
+
+def test_handover_exits_non_zero_on_a_blocker_so_a_script_stops(
+    workbook: Path, mooring_repo: Path
+) -> None:
+    """`kedge handover ... && mooring push ...` must not chain past a conversion with no notebook.
+
+    The blocker is printed rather than raised, because the user still wants to see the rest of
+    what was found -- but the exit code is what a shell reads.
+    """
+    (workbook.parent / "process.kedge").mkdir()
+
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+
+    assert result.exit_code == 1
+    assert "blocked" in flattened(result.output)
+    assert "Run these yourself" not in flattened(result.output)
+
+
+def test_handover_names_the_dependency_command_when_the_repo_lacks_kedge(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """The one step that prevents the blank page, and the reason the verb reads pyproject.toml."""
+    (mooring_repo / "pyproject.toml").write_text(
+        '[project]\nname = "team-notebooks"\ndependencies = ["marimo"]\n', encoding="utf-8"
+    )
+
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+
+    assert result.exit_code == 0
+    assert "mooring deps add kedge" in flattened(result.output)
+
+
+def test_handover_json_carries_the_same_verdict_as_the_table(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """A script reading this should not have to parse a rich table to learn what is withheld."""
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo), "--json"])
+
+    payload = json.loads(result.output)
+    assert payload["ready"] is True
+    assert payload["dependency"]["satisfied"] is True
+    assert [entry["path"] for entry in payload["withheld"]] == ["notebooks/process.kedge/handins"]
+    assert "notebooks/process.kedge/handins" not in payload["shared"]
+
+
+def test_handover_stops_on_a_credential_without_printing_it(
+    workbook: Path, mooring_repo: Path, converted: Path
+) -> None:
+    """The whole point of the stop is that the key is about to be published.
+
+    Printing it to a terminal, and to whatever collects that terminal, publishes it again -- so
+    the value must be absent from stdout in every form, and both output modes are checked because
+    the JSON carries the same strings by a different route.
+    """
+    (converted / ".marimo.toml").write_text(
+        f'[ai.open_ai]\napi_key = "{SECRET}"\n', encoding="utf-8"
+    )
+
+    result = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo)])
+    machine = runner.invoke(app, ["handover", str(workbook), "--repo", str(mooring_repo), "--json"])
+
+    assert result.exit_code == 1
+    assert "ai.open_ai.api_key" in flattened(result.output)
+    assert SECRET not in result.output
+    assert SECRET not in machine.output
+    assert "Run these yourself" not in flattened(result.output)
+
+
+def test_handover_refuses_a_workbook_that_is_not_there(mooring_repo: Path) -> None:
+    """Same message as every other verb that takes a workbook, for the same reason."""
+    result = runner.invoke(app, ["handover", "absent.xlsx", "--repo", str(mooring_repo)])
+
+    assert result.exit_code == 1
+    assert "no such workbook" in flattened(result.output)
+
+
 # ── watch ────────────────────────────────────────────────────────────────────────────────────
 
 

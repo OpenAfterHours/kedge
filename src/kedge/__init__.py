@@ -6,8 +6,10 @@ that owns paths, config, and the marimo session for one workbook.
 
 Everything else is internal and should be imported from its own module. In particular
 ``kedge.lifecycle`` (process supervision), ``kedge.analysis`` (the workbook analyser),
-``kedge.xl`` (Excel-semantics polars namespace) and ``kedge.notebook`` (the marimo bridge) are
-subsystem modules with their own conventions, not part of this top-level surface.
+``kedge.xl`` (Excel-semantics polars namespace), ``kedge.notebook`` (the marimo bridge),
+``kedge.purge`` (removing a workbook and everything derived from it) and ``kedge.handover``
+(preparing a converted process for a mooring repository) are subsystem modules with their own
+conventions, not part of this top-level surface.
 """
 
 from __future__ import annotations
