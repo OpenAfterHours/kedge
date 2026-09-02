@@ -371,8 +371,16 @@ def gates(tag: str, *, contract: bool) -> tuple[Gate, ...]:
     ordered = [
         Gate("tag matches __version__", ("uv", "run", "python", "scripts/version.py", tag)),
         # --locked, not --frozen: this is where a uv.lock that has drifted from pyproject.toml
-        # gets caught, rather than resolving something nobody committed.
-        Gate("uv sync --locked", ("uv", "sync", "--locked")),
+        # gets caught, rather than resolving something nobody committed. `--group evals` for the
+        # same reason `ci.yml`'s test job passes it: duckdb is what executes the SQL a generated
+        # notebook writes, and without it the graders that run it *skip*. The eval harness's own
+        # tests assert the reference conversion scores full marks with exactly one item skipped,
+        # so a sync without the group fails six of them on a missing dependency -- and a gate
+        # that cannot pass on a green tree stops every release rather than any bad one.
+        Gate(
+            "uv sync --locked --group evals",
+            ("uv", "sync", "--locked", "--group", "evals"),
+        ),
         Gate("ruff check", ("uv", "run", "ruff", "check", ".")),
         Gate("ruff format", ("uv", "run", "ruff", "format", "--check", ".")),
         Gate("non-negotiables", ("uv", "run", "python", "scripts/guardrails.py")),

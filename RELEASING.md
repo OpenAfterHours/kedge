@@ -84,6 +84,10 @@ The script exists because this sequence is easy to half-do, not because the sequ
 uv run python scripts/version.py v0.2.0
 
 # 3. Make sure the tree is green locally. CI will run all of this again, on both platforms.
+#    The evals group is not optional here: without duckdb the graders that execute generated
+#    SQL skip, and the eval harness's own tests fail on the missing dependency rather than on
+#    anything you did.
+uv sync --locked --group evals
 uv run ruff check . && uv run ruff format --check .
 uv run python scripts/guardrails.py
 uv run pytest
