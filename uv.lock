@@ -707,7 +707,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "jinja2", specifier = ">=3.1" },
     { name = "keyring", specifier = ">=25.4" },
-    { name = "marimo", specifier = "==0.23.15" },
+    { name = "marimo", specifier = "==0.24.1" },
     { name = "openai", specifier = ">=1.60" },
     { name = "openpyxl", specifier = "==3.1.5" },
     { name = "polars", specifier = "==1.43.2" },
@@ -896,7 +896,7 @@ wheels = [
 
 [[package]]
 name = "marimo"
-version = "0.23.15"
+version = "0.24.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click", marker = "sys_platform != 'emscripten'" },
@@ -919,9 +919,9 @@ dependencies = [
     { name = "uvicorn", marker = "sys_platform != 'emscripten'" },
     { name = "websockets", marker = "sys_platform != 'emscripten'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f9/3b/e4a1e24ad97a652d25388ac602a5c35daa62980c0e4b876caddaedce4114/marimo-0.23.15.tar.gz", hash = "sha256:3c672256b420abc2b0509f2bfaedd2ee20af5902306c943cb6632e4d33b82c88", size = 38742179, upload-time = "2026-07-23T19:21:55.696Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/5f/fd4eccb17ce16b988dfccfb4afa5e85f356be61408059a491ca572d51b9d/marimo-0.24.1.tar.gz", hash = "sha256:27fcac5d477ea6e6e602b191a2913808028fb3835740ee6891c1725c22cea6a8", size = 38783633, upload-time = "2026-09-10T21:50:02.675Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/12/97b4295858db7bf5251880ffc77919a28a2179d80de62d91923f6933f264/marimo-0.23.15-py3-none-any.whl", hash = "sha256:3198ffa0403f4c5f3e2958e2d2c4d67d12de979d6a001385f95513ea411bb338", size = 39194981, upload-time = "2026-07-23T19:21:51.21Z" },
+    { url = "https://files.pythonhosted.org/packages/13/8d/56da4f3ee073980bdae729706d54ad7edd8896e9ab0a6234c0f5ee600005/marimo-0.24.1-py3-none-any.whl", hash = "sha256:590c5e4ca5026c0507f7a3613f8272c0cd0ba1b815481f5dcbe463c8b4e4ab03", size = 39250997, upload-time = "2026-09-10T21:49:59.516Z" },
 ]
 
 [[package]]
